@@ -1,0 +1,14 @@
+.*
+!.gitignore
+
+data/
+output/
+processed-data/
+data
+output
+processed-data
+
+old/qs_ledger/
+
+*.Rproj
+*.Rproj.user/
