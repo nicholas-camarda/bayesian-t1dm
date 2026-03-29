@@ -4,13 +4,50 @@
 
 The active pipeline is:
 
-1. raw Tandem exports in `data/raw/`
-2. normalized CGM, bolus, basal, and activity tables
-3. 5-minute canonical time grid
-4. derived insulin exposure and IOB
-5. lagged, rolling, and calendar features
-6. Bayesian forecast model
-7. scenario comparison and pump-setting recommendation ranking
+1. Tandem Mobi syncs to Tandem Source through the mobile app
+2. Tandem Source browser automation exports CSVs for explicit 30-day windows
+3. raw exports are stored in `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/`
+4. local browser session state, traces, and screenshots live in `~/ProjectsRuntime/bayesian-t1dm/`
+5. a raw acquisition manifest records file coverage and window completeness
+6. normalized CGM, bolus, basal, and activity tables are derived from the raw exports
+7. 5-minute canonical time grid
+8. derived insulin exposure and IOB
+9. lagged, rolling, and calendar features
+10. Bayesian forecast model
+11. scenario comparison and pump-setting recommendation ranking
+
+## Tandem Source Acquisition
+
+The implementation assumes Tandem Source is the authoritative cloud system for the Mobi data. The pipeline does not require a public Tandem API.
+
+Operational assumptions:
+
+- the Mobi app is already linked to Tandem Source
+- Tandem Source uploads are complete enough to support export windows
+- browser automation runs against a local Playwright profile
+- raw reports are saved to the cloud side-project folder before modeling
+- credentials are loaded from a local `.env` or shell environment only
+
+Storage convention:
+
+- code: `~/Projects/bayesian-t1dm`
+- runtime scratch: `~/ProjectsRuntime/bayesian-t1dm`
+- cloud raw data and manifest: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw`
+- cloud published outputs: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/output`
+
+The acquisition manifest captures:
+
+- source file name
+- requested window start and end dates
+- observed first and last timestamps in the downloaded file
+- number of rows parsed from the file
+- whether the window appears complete
+- the browser trace and screenshot paths used for debugging
+- a content hash and file size for the raw export
+
+This is the gating artifact for downstream modeling. If the manifest shows incomplete coverage, the forecast and recommendation outputs should be treated as provisional.
+
+The downstream ingest manifest, which is derived after normalization, still checks for gaps, overlaps, duplicates, and out-of-order windows across the parsed tables.
 
 ## Insulin Action Kernel
 
@@ -176,6 +213,13 @@ Known failure modes:
 - basal schedule changes not captured in the chosen export
 - poor calibration if the insulin action kernel is badly misspecified
 - overconfident recommendations if validation is not walk-forward based
+
+## Acquisition and Manifest Design Decisions
+
+- Tandem Source cloud sync is treated as the source of truth because it is the supported path for Mobi uploads.
+- The pipeline is file-based because there is no public Tandem API in the implementation.
+- A raw export manifest is required so export completeness is checked before modeling rather than after the fact.
+- Coverage completeness is defined on the acquisition manifest, while cross-file gap checks live in the normalized ingest manifest.
 
 ## Design Decisions
 

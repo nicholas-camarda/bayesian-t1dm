@@ -1,5 +1,6 @@
 .*
 !.gitignore
+!.env.example
 
 data/
 output/
@@ -9,6 +10,9 @@ output
 processed-data
 
 old/qs_ledger/
+old
 
 *.Rproj
 *.Rproj.user/
+__pycache__/
+*.pyc

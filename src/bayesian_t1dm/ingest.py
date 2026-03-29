@@ -22,12 +22,20 @@ ACTIVITY_COLUMNS = ["value", "steps", "activity", "count"]
 @dataclass(frozen=True)
 class TandemCoverage:
     source_files: int
+    manifest_rows: int
     cgm_rows: int
     bolus_rows: int
     basal_rows: int
     activity_rows: int
     first_timestamp: pd.Timestamp | None
     last_timestamp: pd.Timestamp | None
+    complete_windows: int
+    incomplete_windows: int
+    gap_count: int
+    overlap_count: int
+    duplicate_windows: int
+    out_of_order_windows: int
+    is_complete: bool
 
 
 @dataclass
@@ -36,6 +44,7 @@ class IngestedData:
     bolus: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
     basal: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
     activity: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
+    manifest: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
     source_files: list[Path] = field(default_factory=list)
 
     def all_tables(self) -> dict[str, pd.DataFrame]:
@@ -57,11 +66,175 @@ def discover_source_files(raw_dir: str | Path) -> list[Path]:
         if path.is_file()
         and path.suffix.lower() in {".csv", ".xlsx", ".xlsm", ".xls", ".parquet", ".pq"}
         and "Rproj" not in path.name
+        and "manifest" not in path.name.lower()
+        and "coverage" not in path.name.lower()
+        and "summary" not in path.name.lower()
     )
 
 
 def _parse_datetime(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors="coerce", utc=False)
+
+
+def _infer_timestamp_series(kind: str, frame: pd.DataFrame) -> pd.Series:
+    if kind == "basal":
+        timestamps: list[pd.Series] = []
+        if "start_timestamp" in frame.columns:
+            timestamps.append(pd.to_datetime(frame["start_timestamp"], errors="coerce"))
+        if "end_timestamp" in frame.columns:
+            timestamps.append(pd.to_datetime(frame["end_timestamp"], errors="coerce"))
+        if not timestamps:
+            return pd.Series(dtype="datetime64[ns]")
+        return pd.concat(timestamps, ignore_index=True)
+    if "timestamp" not in frame.columns:
+        return pd.Series(dtype="datetime64[ns]")
+    return pd.to_datetime(frame["timestamp"], errors="coerce")
+
+
+def _build_manifest_row(kind: str, frame: pd.DataFrame, source_order: int, source_file: str, source_sheet: str | None = None) -> dict[str, object]:
+    timestamps = _infer_timestamp_series(kind, frame).dropna().sort_values()
+    unique_timestamps = timestamps.drop_duplicates()
+    first_timestamp = unique_timestamps.iloc[0] if not unique_timestamps.empty else pd.NaT
+    last_timestamp = unique_timestamps.iloc[-1] if not unique_timestamps.empty else pd.NaT
+    deltas = unique_timestamps.diff().dropna().dt.total_seconds().div(60.0) if len(unique_timestamps) > 1 else pd.Series(dtype=float)
+    median_step_minutes = float(deltas.median()) if not deltas.empty else np.nan
+    max_step_minutes = float(deltas.max()) if not deltas.empty else np.nan
+    has_duplicates = bool(len(timestamps) != len(unique_timestamps))
+    if kind == "cgm":
+        has_internal_gap = bool(np.isfinite(max_step_minutes) and max_step_minutes > 7.5)
+    else:
+        has_internal_gap = False
+    is_complete_window = bool(pd.notna(first_timestamp) and pd.notna(last_timestamp) and not has_internal_gap)
+    return {
+        "kind": kind,
+        "source_order": int(source_order),
+        "source_file": source_file,
+        "source_sheet": source_sheet,
+        "rows": int(len(frame)),
+        "first_timestamp": first_timestamp,
+        "last_timestamp": last_timestamp,
+        "duration_minutes": float((last_timestamp - first_timestamp).total_seconds() / 60.0) if pd.notna(first_timestamp) and pd.notna(last_timestamp) else np.nan,
+        "median_step_minutes": median_step_minutes,
+        "max_step_minutes": max_step_minutes,
+        "has_internal_gap": has_internal_gap,
+        "has_duplicates": has_duplicates,
+        "is_complete_window": is_complete_window,
+    }
+
+
+def build_export_manifest(data: IngestedData) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    source_order_map = {Path(source).name: index for index, source in enumerate(data.source_files)}
+    for kind, frame in data.all_tables().items():
+        if frame.empty or "source_file" not in frame.columns:
+            continue
+        source_sheets = "source_sheet" in frame.columns
+        group_cols = ["source_file"] + (["source_sheet"] if source_sheets else [])
+        for group_key, group in frame.groupby(group_cols, dropna=False):
+            if source_sheets:
+                source_file, source_sheet = group_key if isinstance(group_key, tuple) else (group_key, None)
+            else:
+                source_file, source_sheet = (group_key if not isinstance(group_key, tuple) else group_key[0]), None
+            rows.append(
+                _build_manifest_row(
+                    kind=kind,
+                    frame=group,
+                    source_order=source_order_map.get(str(source_file), len(source_order_map)),
+                    source_file=str(source_file),
+                    source_sheet=None if source_sheet is None or (isinstance(source_sheet, float) and np.isnan(source_sheet)) else str(source_sheet),
+                )
+            )
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "kind",
+                "source_order",
+                "source_file",
+                "source_sheet",
+                "rows",
+                "first_timestamp",
+                "last_timestamp",
+                "duration_minutes",
+                "median_step_minutes",
+                "max_step_minutes",
+                "has_internal_gap",
+                "has_duplicates",
+                "is_complete_window",
+            ]
+        )
+    manifest = pd.DataFrame(rows)
+    return manifest.sort_values(["source_order", "kind", "source_sheet", "first_timestamp"], na_position="last").reset_index(drop=True)
+
+
+def summarize_export_manifest(manifest: pd.DataFrame, *, required_kinds: Iterable[str] = ("cgm", "bolus")) -> dict[str, object]:
+    if manifest.empty:
+        return {
+            "manifest_rows": 0,
+            "complete_windows": 0,
+            "incomplete_windows": 0,
+            "gap_count": 0,
+            "overlap_count": 0,
+            "duplicate_windows": 0,
+            "out_of_order_windows": 0,
+            "present_kinds": (),
+            "missing_kinds": tuple(required_kinds),
+            "is_complete": False,
+        }
+
+    manifest = manifest.copy()
+    manifest["first_timestamp"] = pd.to_datetime(manifest["first_timestamp"], errors="coerce")
+    manifest["last_timestamp"] = pd.to_datetime(manifest["last_timestamp"], errors="coerce")
+    present_kinds = tuple(sorted(manifest["kind"].dropna().astype(str).unique().tolist()))
+    missing_kinds = tuple(kind for kind in required_kinds if kind not in present_kinds)
+
+    complete_windows = int(manifest["is_complete_window"].fillna(False).sum()) if "is_complete_window" in manifest.columns else 0
+    incomplete_windows = int(len(manifest) - complete_windows)
+    duplicate_windows = int(
+        manifest.duplicated(subset=["kind", "source_file", "source_sheet", "first_timestamp", "last_timestamp"], keep=False).sum()
+    )
+
+    gap_count = 0
+    overlap_count = 0
+    out_of_order_windows = 0
+    for kind, kind_manifest in manifest.groupby("kind"):
+        if kind == "cgm":
+            ordered_by_source = kind_manifest.sort_values("source_order")
+            source_times = ordered_by_source["first_timestamp"].dropna()
+            if len(source_times) > 1:
+                out_of_order_windows += int((source_times.diff().dt.total_seconds().fillna(0) < 0).sum())
+            chronological = kind_manifest.sort_values(["first_timestamp", "last_timestamp", "source_order"])
+            previous_last = None
+            for row in chronological.itertuples(index=False):
+                if pd.isna(row.first_timestamp) or pd.isna(row.last_timestamp):
+                    continue
+                if previous_last is not None:
+                    gap_minutes = (row.first_timestamp - previous_last).total_seconds() / 60.0
+                    if gap_minutes > 7.5:
+                        gap_count += 1
+                    if gap_minutes < 0:
+                        overlap_count += 1
+                previous_last = row.last_timestamp if previous_last is None else max(previous_last, row.last_timestamp)
+
+    is_complete = not missing_kinds and gap_count == 0 and overlap_count == 0 and duplicate_windows == 0 and out_of_order_windows == 0 and incomplete_windows == 0
+    return {
+        "manifest_rows": int(len(manifest)),
+        "complete_windows": complete_windows,
+        "incomplete_windows": incomplete_windows,
+        "gap_count": gap_count,
+        "overlap_count": overlap_count,
+        "duplicate_windows": duplicate_windows,
+        "out_of_order_windows": out_of_order_windows,
+        "present_kinds": present_kinds,
+        "missing_kinds": missing_kinds,
+        "is_complete": is_complete,
+    }
+
+
+def write_export_manifest(manifest: pd.DataFrame, path: str | Path) -> Path:
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest.to_csv(out_path, index=False, date_format="%Y-%m-%dT%H:%M:%S")
+    return out_path
 
 
 def _standardize_cgm(df: pd.DataFrame, source: Path, sheet: str | None = None) -> pd.DataFrame:
@@ -201,16 +374,20 @@ def load_tandem_exports(raw_dir: str | Path) -> IngestedData:
                 if not parsed.empty:
                     activity_frames.append(parsed)
 
-    return IngestedData(
+    ingested = IngestedData(
         cgm=pd.concat(cgm_frames, ignore_index=True) if cgm_frames else pd.DataFrame(columns=["timestamp", "glucose", "source_file"]),
         bolus=pd.concat(bolus_frames, ignore_index=True) if bolus_frames else pd.DataFrame(columns=["timestamp", "bolus_units", "source_file"]),
         basal=pd.concat(basal_frames, ignore_index=True) if basal_frames else pd.DataFrame(columns=["start_timestamp", "end_timestamp", "basal_units_per_hour", "source_file"]),
         activity=pd.concat(activity_frames, ignore_index=True) if activity_frames else pd.DataFrame(columns=["timestamp", "activity_value", "source_file"]),
         source_files=source_files,
     )
+    ingested.manifest = build_export_manifest(ingested)
+    return ingested
 
 
 def summarize_coverage(data: IngestedData) -> TandemCoverage:
+    manifest = data.manifest if not data.manifest.empty else build_export_manifest(data)
+    manifest_summary = summarize_export_manifest(manifest)
     timestamps: list[pd.Series] = []
     for frame, column in [(data.cgm, "timestamp"), (data.bolus, "timestamp"), (data.activity, "timestamp")]:
         if column in frame.columns and not frame.empty:
@@ -223,10 +400,18 @@ def summarize_coverage(data: IngestedData) -> TandemCoverage:
     combined = pd.to_datetime(combined, errors="coerce").dropna()
     return TandemCoverage(
         source_files=len(data.source_files),
+        manifest_rows=int(manifest_summary["manifest_rows"]),
         cgm_rows=int(len(data.cgm)),
         bolus_rows=int(len(data.bolus)),
         basal_rows=int(len(data.basal)),
         activity_rows=int(len(data.activity)),
         first_timestamp=combined.min() if not combined.empty else None,
         last_timestamp=combined.max() if not combined.empty else None,
+        complete_windows=int(manifest_summary["complete_windows"]),
+        incomplete_windows=int(manifest_summary["incomplete_windows"]),
+        gap_count=int(manifest_summary["gap_count"]),
+        overlap_count=int(manifest_summary["overlap_count"]),
+        duplicate_windows=int(manifest_summary["duplicate_windows"]),
+        out_of_order_windows=int(manifest_summary["out_of_order_windows"]),
+        is_complete=bool(manifest_summary["is_complete"]),
     )

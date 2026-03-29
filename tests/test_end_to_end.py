@@ -20,6 +20,8 @@ def test_end_to_end_pipeline_smoke_runs(tandem_fixture_dir):
     recommendations, forecasts = recommend_setting_changes(model, fit, frame.frame, min_expected_gain_mgdl=0.0)
 
     assert coverage.cgm_rows == 7
+    assert coverage.manifest_rows >= 4
+    assert coverage.is_complete
     assert not predictions.empty
     assert forecasts
     assert isinstance(recommendations, list)
