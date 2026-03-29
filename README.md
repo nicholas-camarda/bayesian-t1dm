@@ -22,6 +22,7 @@ What is in place:
 - selector discovery for Tandem Source browser automation
 - export manifest generation and coverage checks
 - browser automation for Tandem Source export collection
+- login and discovery are substantially more robust than the earlier scratchpad version
 - 5-minute time-grid construction
 - insulin activity and IOB expansion from bolus events
 - Bayesian forecasting model scaffolding in PyMC
@@ -35,10 +36,17 @@ What remains to be refined:
 - calibration of priors and scenario thresholds against your own data
 - richer handling of basal schedules and meal tagging if available in exports
 - broader backtesting and comparison against simpler baselines
+- the Tandem export layer is still under active reverse engineering, so browser success does not imply that a usable tabular artifact was produced
+
+Known statuses:
+
+- fully working: ingest and reporting on already-existing raw files
+- partially working: browser login, discovery, and navigation
+- still unstable: converting Tandem exports into usable raw CSV or table-like artifacts
 
 ## Data Sources
 
-The pipeline treats Tandem Source as the authoritative cloud source for your Mobi data. There is no public Tandem API in the workflow by default, so the contract is file-based: Tandem Source exports are saved locally, then ingested in Python.
+The pipeline treats Tandem Source as the authoritative cloud source for your Mobi data. There is no public Tandem API in the main workflow by default, so the primary contract is browser-driven: discover the page, collect or backfill the export, validate that the artifact is tabular, then ingest it in Python.
 
 Typical inputs:
 
@@ -46,7 +54,7 @@ Typical inputs:
 - Daily Timeline CSV exports or equivalent Tandem Source report exports
 - CGM readings, bolus events, basal schedule data, and activity exports when available
 
-The repo expects raw Tandem Source exports to live under `data/raw/`, then records a manifest of what was seen, what window it covered, and whether the window appears complete.
+The repo expects raw Tandem Source exports to live under `data/raw/`, then records a manifest of what was seen, what window it covered, and whether the window appears complete. If Tandem returns a non-tabular response payload, that is a collection failure for the main pipeline even if the browser action itself succeeded.
 
 Raw files should live under `data/raw/`. Processed artifacts can be written to `data/processed/` or `output/` as needed.
 
@@ -61,18 +69,9 @@ Credentials should live in a root-level `.env` file that is never committed:
 - `TANDEM_SOURCE_EMAIL`
 - `TANDEM_SOURCE_PASSWORD`
 
-## Tandem Source Acquisition SOP
-
-1. Keep the Tandem Mobi mobile app linked and syncing to Tandem Source.
-2. Let Tandem Source backfill as much history as it makes available for your account.
-3. Export the relevant Tandem Source report as CSV and save it under `data/raw/`.
-4. Run the ingest command to generate `data/raw/tandem_export_manifest.csv` and a coverage report.
-5. Check the manifest for gaps, overlaps, duplicate windows, or incomplete exports before trusting downstream model results.
-6. Use the discovery command to record a Tandem page map, then let collect/backfill reuse it automatically.
-
 ## Browser Collection
 
-Install the automation extras if you want browser-based collection:
+Install the project with the browser extras if you want the primary browser-driven collection path:
 
 ```bash
 python3 -m venv .venv
@@ -81,19 +80,30 @@ python -m pip install --upgrade pip
 python -m pip install -e '.[dev,automation]'
 ```
 
+Install Playwright browsers:
+
+```bash
+playwright install
+```
+
 Verify that the cli exists:
 
 ```bash
 bayesian-t1dm --help
 ```
 
-You may need to update `playwright`:
+Create a root-level `.env` with `TANDEM_SOURCE_EMAIL` and `TANDEM_SOURCE_PASSWORD`. Do not commit it.
+
+Run discovery first so the page map and diagnostics are written:
 
 ```bash
-playwright install
+bayesian-t1dm discover
 ```
 
-Copy `.env.example` to `.env` and fill in your Tandem credentials locally. Do not commit `.env`.
+Inspect the discovery summary and saved page map before collecting:
+
+- `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/output/tandem_discovery_summary.md`
+- `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/archive/tandem_page_map.json`
 
 Collect one 30-day window:
 
@@ -107,15 +117,51 @@ Backfill a range:
 bayesian-t1dm backfill --start-date 2023-01-01 --end-date 2024-01-30
 ```
 
-Discover and save the Tandem browser selectors:
+The acquisition flow is:
 
-```bash
-bayesian-t1dm discover
-```
+1. Install with `.[dev,automation]`
+2. Run `playwright install`
+3. Create `.env`
+4. Run `bayesian-t1dm discover`
+5. Inspect diagnostics and the saved page map
+6. Run `bayesian-t1dm collect` or `bayesian-t1dm backfill`
+7. Check whether the collected artifact is actually tabular before trusting `ingest`
+8. Run `bayesian-t1dm ingest` only after confirmed raw export artifacts exist
 
-The selector map is stored in the cloud archive area by default:
+What gets written where:
 
-- `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/archive/tandem_page_map.json`
+- runtime logs, traces, screenshots, and browser scratch artifacts under `~/ProjectsRuntime/bayesian-t1dm` and its `logs/`, `traces/`, `downloads/`, `browser-profile/`, and `browser-home/` subdirectories
+- selector map in `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/archive/tandem_page_map.json`
+- raw collection artifacts in `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/`
+- collection manifest in `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/tandem_export_manifest.csv`
+- acquisition summary in `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/output/tandem_acquisition_summary.md`
+- discovery summary in `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/output/tandem_discovery_summary.md`
+- coverage report in `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/output/coverage.md`
+- run summary in `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/output/run_summary.md`
+
+Page map:
+
+- partial bootstrap maps are allowed during discovery
+- discovery may save an incomplete map if only login or report navigation was discovered
+- collection requires a complete map or a path that can finish discovery
+- the current code distinguishes `export_csv_launcher` and `export_csv_confirm`
+
+Primary collection contract:
+
+- the repo tries to acquire Tandem report data through browser automation
+- the preferred artifact is a tabular export file
+- if Tandem returns a non-tabular payload, the main pipeline treats that as a collection failure
+- `discover` success means selectors and navigation were learned
+- `collect` success means a tabular artifact was written and validated enough to record in the manifest
+- export-response capture without tabular output is diagnostic progress, not finished data collection
+
+## Experimental Fallback
+
+The repository also has a Python-only DOM fallback in [`src/bayesian_t1dm/timeline_pull.py`](./src/bayesian_t1dm/timeline_pull.py).
+
+- It is not exposed through the CLI.
+- It is a secondary, experimental path for recovering rendered Daily Timeline summary rows from the page DOM when export remains blocked.
+- It is useful for analysis rescue work, but it is not equivalent to a raw Tandem CSV export.
 
 ## Repo Layout
 
@@ -173,7 +219,8 @@ The pipeline produces:
 
 ## Limitations
 
-- The repo uses browser automation for Tandem Source collection, but the export files themselves are still the source of truth.
+- The repo uses browser automation for Tandem Source collection, but the export layer is still under active reverse engineering.
+- Browser success does not imply a usable tabular export.
 - Recommendations are advisory and must be reviewed by you.
 - The default insulin action curve is an approximation, not physiology ground truth.
 - The Bayesian model is intentionally conservative because personal data can be sparse and irregular.
