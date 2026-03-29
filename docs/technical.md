@@ -49,6 +49,21 @@ This is the gating artifact for downstream modeling. If the manifest shows incom
 
 The downstream ingest manifest, which is derived after normalization, still checks for gaps, overlaps, duplicates, and out-of-order windows across the parsed tables.
 
+### Selector Discovery and Page Map
+
+Browser automation uses a Tandem page map stored in the cloud archive area:
+
+- `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/archive/tandem_page_map.json`
+
+The `discover` command writes this page map by inspecting the live Tandem Source pages through Playwright and capturing:
+
+- login selectors
+- Daily Timeline navigation selectors
+- date range input selectors
+- CSV export selectors
+
+Collect/backfill reuse the saved page map automatically. The runtime keeps traces, screenshots, HTML, accessibility snapshots, and control inventories in `~/ProjectsRuntime/bayesian-t1dm/` so failed browser steps can be inspected without touching the raw export store.
+
 ## Insulin Action Kernel
 
 We approximate insulin exposure using a fixed-duration action curve inspired by LoopKit-style insulin dynamics.

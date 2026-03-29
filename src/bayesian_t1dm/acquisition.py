@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import shutil
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Protocol, Sequence
@@ -13,8 +13,18 @@ import pandas as pd
 
 from .io import read_table
 from .paths import ProjectPaths
-
-DEFAULT_LOGIN_URL = 'https://source.tandemdiabetes.com/'
+from .tandem_browser import (
+    DEFAULT_LOGIN_URL,
+    LocatorSpec,
+    PageDiagnostics,
+    TandemPageMap,
+    capture_accessibility_snapshot,
+    capture_control_inventory,
+    capture_page_diagnostics,
+    discover_login_controls_from_controls,
+    discover_timeline_controls_from_controls,
+    discover_tandem_page_map_from_controls,
+)
 
 
 @dataclass(frozen=True)
@@ -62,37 +72,18 @@ class AcquisitionRecord:
     notes: str = ''
 
 
-@dataclass(frozen=True)
-class SelectorConfig:
-    login_email_labels: tuple[str, ...] = ('Email', 'Email address', 'Username')
-    login_password_labels: tuple[str, ...] = ('Password',)
-    login_submit_texts: tuple[str, ...] = ('Log In', 'Login', 'Sign In', 'Continue')
-    signed_in_texts: tuple[str, ...] = ('Daily Timeline', 'Reports', 'Dashboard')
-    daily_timeline_texts: tuple[str, ...] = ('Daily Timeline', 'Daily timeline', 'Timeline')
-    export_csv_texts: tuple[str, ...] = ('Export CSV', 'CSV', 'Download CSV')
-    start_date_labels: tuple[str, ...] = ('Start Date', 'Start', 'From')
-    end_date_labels: tuple[str, ...] = ('End Date', 'End', 'To')
-    date_input_selectors: tuple[str, ...] = (
-        "input[type='date']",
-        "input[name*='date']",
-        "input[placeholder*='Date']",
-    )
-
-
 class AcquisitionError(RuntimeError):
     pass
 
 
 class TandemSourceClient(Protocol):
-    def login(self, credentials: TandemCredentials, step_log: StepLogger | None = None, *, allow_manual_login: bool = True) -> None: ...
+    def login(self, credentials: TandemCredentials, step_log: StepLogger | None = None) -> None: ...
 
     def export_daily_timeline_window(
         self,
         window: ExportWindow,
         download_dir: Path,
         step_log: StepLogger | None = None,
-        *,
-        allow_manual_export: bool = True,
     ) -> Path: ...
 
     def capture_screenshot(self, path: Path) -> Path: ...
@@ -100,6 +91,8 @@ class TandemSourceClient(Protocol):
     def start_trace(self) -> None: ...
 
     def stop_trace(self, path: Path) -> Path: ...
+
+    def capture_page_diagnostics(self, stem: str) -> PageDiagnostics: ...
 
 
 class StepLogger:
@@ -264,6 +257,41 @@ def _manifest_path(workspace: ProjectPaths) -> Path:
     return workspace.cloud_raw / 'tandem_export_manifest.csv'
 
 
+def _page_map_path(workspace: ProjectPaths) -> Path:
+    return workspace.cloud_archive / 'tandem_page_map.json'
+
+
+def _page_map_login_complete(page_map: TandemPageMap | None) -> bool:
+    return bool(
+        page_map
+        and page_map.login_email is not None
+        and page_map.login_password is not None
+        and page_map.login_submit is not None
+    )
+
+
+def _login_controls_ready_from_inventory(inventory: Sequence[dict[str, object]]) -> bool:
+    visible = [entry for entry in inventory if bool(entry.get('visible', True))]
+    has_text_like = False
+    has_password = False
+    has_submit = False
+    for entry in visible:
+        tag = str(entry.get('tag') or '').lower()
+        entry_type = str(entry.get('type') or '').lower()
+        role = str(entry.get('role') or '').lower()
+        autocomplete = str(entry.get('autocomplete') or '').lower()
+        if entry_type == 'password' or 'password' in autocomplete:
+            has_password = True
+        if role in {'button', 'link'} or tag in {'button', 'a'} or entry_type in {'submit', 'button'}:
+            has_submit = True
+        if tag in {'textarea'} or role in {'textbox', 'combobox'}:
+            if entry_type != 'password':
+                has_text_like = True
+        elif tag == 'input' and entry_type in {'text', 'email', 'search', 'tel', 'url', 'number', 'date'}:
+            has_text_like = True
+    return has_text_like and (has_password or has_submit)
+
+
 def _load_existing_manifest(path: Path) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
@@ -358,12 +386,10 @@ def login_tandem_source(
     client: TandemSourceClient,
     credentials: TandemCredentials,
     step_log: StepLogger | None = None,
-    *,
-    allow_manual_login: bool = True,
 ) -> None:
     if step_log is not None:
         step_log.write('login.start', email=credentials.email)
-    client.login(credentials, step_log, allow_manual_login=allow_manual_login)
+    client.login(credentials, step_log)
     if step_log is not None:
         step_log.write('login.complete', email=credentials.email)
 
@@ -373,8 +399,6 @@ def export_daily_timeline_window(
     window: ExportWindow,
     workspace: ProjectPaths,
     step_log: StepLogger | None = None,
-    *,
-    allow_manual_export: bool = True,
     resume: bool = True,
     strict: bool = True,
 ) -> AcquisitionRecord:
@@ -392,27 +416,21 @@ def export_daily_timeline_window(
 
     client.start_trace()
     try:
-        downloaded_path = client.export_daily_timeline_window(
-            window,
-            workspace.runtime_downloads,
-            step_log,
-            allow_manual_export=allow_manual_export,
+        downloaded_path = Path(client.export_daily_timeline_window(window, workspace.runtime_downloads, step_log))
+        if not downloaded_path.exists():
+            raise AcquisitionError(f'Download step did not create an export file for {window.window_id}')
+        temp_download = downloaded_path
+        validation = _infer_export_span(temp_download)
+        observed_first = validation.get('observed_first_timestamp')
+        observed_last = validation.get('observed_last_timestamp')
+        validation['is_complete_window'] = bool(
+            isinstance(observed_first, pd.Timestamp)
+            and isinstance(observed_last, pd.Timestamp)
+            and observed_first.date() <= window.start_date
+            and observed_last.date() >= window.end_date,
         )
-        if downloaded_path != temp_download:
-            temp_download = Path(downloaded_path)
-            if not temp_download.exists():
-                raise AcquisitionError(f'Download step did not create an export file for {window.window_id}')
-            validation = _infer_export_span(temp_download)
-            observed_first = validation.get('observed_first_timestamp')
-            observed_last = validation.get('observed_last_timestamp')
-            validation['is_complete_window'] = bool(
-                isinstance(observed_first, pd.Timestamp)
-                and isinstance(observed_last, pd.Timestamp)
-                and observed_first.date() <= window.start_date
-                and observed_last.date() >= window.end_date,
-            )
-            cloud_file = workspace.cloud_raw / _canonical_export_name(window, temp_download)
-            shutil.copy2(temp_download, cloud_file)
+        cloud_file = workspace.cloud_raw / _canonical_export_name(window, temp_download)
+        shutil.copy2(temp_download, cloud_file)
         record = _record_from_download(
             window=window,
             source_file=temp_download,
@@ -435,9 +453,9 @@ def export_daily_timeline_window(
             )
         return record
     except Exception as exc:
-        if hasattr(client, 'capture_screenshot'):
+        if hasattr(client, 'capture_page_diagnostics'):
             try:
-                client.capture_screenshot(screenshot_path)
+                client.capture_page_diagnostics(f"{window.window_id}.failed")
             except Exception:
                 pass
         if step_log is not None:
@@ -461,8 +479,6 @@ def collect_tandem_exports(
     manifest_path: str | Path | None = None,
     report_path: str | Path | None = None,
     resume: bool = True,
-    allow_manual_login: bool = True,
-    allow_manual_export: bool = True,
     strict: bool = True,
     step_log: StepLogger | None = None,
 ) -> list[AcquisitionRecord]:
@@ -499,7 +515,7 @@ def collect_tandem_exports(
                     ),
                 )
 
-    login_tandem_source(client, credentials, step_log, allow_manual_login=allow_manual_login)
+    login_tandem_source(client, credentials, step_log)
     for window in windows:
         if resume and window.window_id in completed_ids:
             if step_log is not None:
@@ -510,7 +526,6 @@ def collect_tandem_exports(
             window,
             workspace,
             step_log,
-            allow_manual_export=allow_manual_export,
             strict=strict,
         )
         records.append(record)
@@ -532,8 +547,6 @@ def backfill_tandem_exports(
     manifest_path: str | Path | None = None,
     report_path: str | Path | None = None,
     resume: bool = True,
-    allow_manual_login: bool = True,
-    allow_manual_export: bool = True,
     strict: bool = True,
     step_log: StepLogger | None = None,
 ) -> list[AcquisitionRecord]:
@@ -546,8 +559,6 @@ def backfill_tandem_exports(
         manifest_path=manifest_path,
         report_path=report_path,
         resume=resume,
-        allow_manual_login=allow_manual_login,
-        allow_manual_export=allow_manual_export,
         strict=strict,
         step_log=step_log,
     )
@@ -558,20 +569,22 @@ class PlaywrightTandemSourceClient:
         self,
         workspace: ProjectPaths,
         *,
+        page_map_path: str | Path | None = None,
         login_url: str = DEFAULT_LOGIN_URL,
         headless: bool = False,
         slow_mo: int = 0,
         timeout_ms: int = 60_000,
         daily_timeline_url: str | None = None,
-        selectors: SelectorConfig | None = None,
+        page_map: TandemPageMap | None = None,
     ) -> None:
         self.workspace = workspace
+        self.page_map_path = Path(page_map_path) if page_map_path is not None else _page_map_path(workspace)
         self.login_url = login_url
         self.daily_timeline_url = daily_timeline_url
         self.headless = headless
         self.slow_mo = slow_mo
         self.timeout_ms = timeout_ms
-        self.selectors = selectors or SelectorConfig()
+        self.page_map = page_map
         self._playwright = None
         self._context = None
         self._page = None
@@ -587,12 +600,36 @@ class PlaywrightTandemSourceClient:
         self.workspace.runtime_downloads.mkdir(parents=True, exist_ok=True)
         self.workspace.runtime_traces.mkdir(parents=True, exist_ok=True)
         self.workspace.runtime_logs.mkdir(parents=True, exist_ok=True)
+        if self.page_map is None and self.page_map_path.exists():
+            self.page_map = TandemPageMap.load(self.page_map_path)
         self._playwright = sync_playwright().start()
+        browser_home = self.workspace.runtime_browser_home
+        browser_cache = browser_home / "Library" / "Caches"
+        browser_support = browser_home / "Library" / "Application Support"
+        browser_tmp = self.workspace.runtime / "tmp"
+        browser_home.mkdir(parents=True, exist_ok=True)
+        browser_cache.mkdir(parents=True, exist_ok=True)
+        browser_support.mkdir(parents=True, exist_ok=True)
+        browser_tmp.mkdir(parents=True, exist_ok=True)
+        browser_env = dict(os.environ)
+        browser_env.update(
+            {
+                "HOME": str(browser_home),
+                "USERPROFILE": str(browser_home),
+                "TMPDIR": str(browser_tmp),
+                "TEMP": str(browser_tmp),
+                "TMP": str(browser_tmp),
+                "XDG_CONFIG_HOME": str(browser_home / ".config"),
+                "XDG_CACHE_HOME": str(browser_cache),
+                "XDG_STATE_HOME": str(browser_home / ".local" / "state"),
+            }
+        )
         self._context = self._playwright.chromium.launch_persistent_context(
             user_data_dir=str(self.workspace.runtime_browser),
             headless=self.headless,
             slow_mo=self.slow_mo,
             accept_downloads=True,
+            env=browser_env,
         )
         if self._context.pages:
             self._page = self._context.pages[0]
@@ -607,93 +644,17 @@ class PlaywrightTandemSourceClient:
         if self._playwright is not None:
             self._playwright.stop()
 
-    def _locator_for_text(self, text: str):
-        page = self._page
-        assert page is not None
-        return page.get_by_role('button', name=text), page.get_by_text(text)
-
-    def _first_existing_locator(self, locators):
-        for locator in locators:
-            try:
-                if locator.count() > 0:
-                    return locator
-            except Exception:
-                try:
-                    locator.click()
-                    return locator
-                except Exception:
-                    continue
-        return None
-
-    def _click_text_candidates(self, candidates: Sequence[str]) -> None:
-        page = self._page
-        assert page is not None
-        for text in candidates:
-            for locator in [
-                page.get_by_role('button', name=text),
-                page.get_by_role('link', name=text),
-                page.get_by_text(text),
-            ]:
-                try:
-                    locator.first.click()
-                    return
-                except Exception:
-                    try:
-                        locator.click()
-                        return
-                    except Exception:
-                        continue
-        raise AcquisitionError(f"Could not click any of the candidate texts: {', '.join(candidates)}")
-
-    def _fill_candidate(self, candidates: Sequence[str], value: str) -> None:
-        page = self._page
-        assert page is not None
-        for candidate in candidates:
-            for accessor in (
-                lambda: page.get_by_label(candidate),
-                lambda: page.locator(candidate),
-            ):
-                try:
-                    locator = accessor()
-                    locator.first.fill(value)
-                    return
-                except Exception:
-                    try:
-                        locator.fill(value)
-                        return
-                    except Exception:
-                        continue
-        raise AcquisitionError(f"Could not fill any of the candidate selectors: {', '.join(candidates)}")
-
-    def _fill_nth_input(self, selectors: Sequence[str], index: int, value: str) -> bool:
-        page = self._page
-        assert page is not None
-        for selector in selectors:
-            try:
-                locator = page.locator(selector)
-                if locator.count() > index:
-                    locator.nth(index).fill(value)
-                    return True
-            except Exception:
-                continue
-        return False
-
-    def _wait_for_signed_in(self) -> None:
-        page = self._page
-        assert page is not None
-        for text in self.selectors.signed_in_texts:
-            try:
-                page.get_by_text(text).first.wait_for(timeout=self.timeout_ms)
-                return
-            except Exception:
-                continue
-
     def capture_screenshot(self, path: Path) -> Path:
         page = self._page
         assert page is not None
         path.parent.mkdir(parents=True, exist_ok=True)
         page.screenshot(path=str(path), full_page=True)
         return path
+
+    def capture_page_diagnostics(self, stem: str) -> PageDiagnostics:
+        page = self._page
+        assert page is not None
+        return capture_page_diagnostics(page, self.workspace.runtime_logs, stem)
 
     def start_trace(self) -> None:
         if self._context is None or self._tracing_active:
@@ -709,57 +670,256 @@ class PlaywrightTandemSourceClient:
         self._tracing_active = False
         return path
 
-    def login(self, credentials: TandemCredentials, step_log: StepLogger | None = None, *, allow_manual_login: bool = True) -> None:
-        page = self._page
-        assert page is not None
-        if step_log is not None:
-            step_log.write('browser.login.goto', url=self.login_url)
-        page.goto(self.login_url, wait_until='domcontentloaded')
-        try:
-            self._wait_for_signed_in()
-            return
-        except Exception:
-            pass
-        self._fill_candidate(self.selectors.login_email_labels, credentials.email)
-        self._fill_candidate(self.selectors.login_password_labels, credentials.password)
-        self._click_text_candidates(self.selectors.login_submit_texts)
-        try:
-            page.wait_for_load_state('networkidle', timeout=self.timeout_ms)
-        except Exception:
-            pass
-        try:
-            self._wait_for_signed_in()
-            return
-        except Exception:
-            if not allow_manual_login:
-                raise AcquisitionError('Tandem login did not complete automatically')
-            if step_log is not None:
-                step_log.write('browser.login.manual_step', reason='awaiting_mfa_or_ui_confirmation')
-            self.capture_screenshot(self.workspace.runtime_logs / 'login-pending.png')
-            input('Complete Tandem Source login in the browser, then press Enter to continue...')
-            self._wait_for_signed_in()
+    def load_page_map(self, path: str | Path | None = None, *, validate: bool = False) -> TandemPageMap:
+        page_map_path = Path(path) if path is not None else self.page_map_path
+        if not page_map_path.exists():
+            raise AcquisitionError(
+                f'No Tandem page map found at {page_map_path}. Run `bayesian-t1dm discover` first.',
+            )
+        self.page_map = TandemPageMap.load(page_map_path)
+        if validate and not self.page_map.is_complete():
+            raise AcquisitionError(
+                f'Loaded Tandem page map at {page_map_path} is partial; run `bayesian-t1dm discover` to complete it.',
+            )
+        return self.page_map
 
-    def _open_daily_timeline(self) -> None:
+    def save_page_map(self, page_map: TandemPageMap, path: str | Path | None = None, *, validate: bool = True) -> Path:
+        destination = Path(path) if path is not None else self.page_map_path
+        self.page_map = page_map
+        return page_map.save(destination, validate=validate)
+
+    def ensure_page_map(self, credentials: TandemCredentials | None = None, *, step_log: StepLogger | None = None, bootstrap: bool = False) -> TandemPageMap:
+        if self.page_map is not None:
+            if self.page_map.is_complete() or bootstrap:
+                return self.page_map
+            raise AcquisitionError(
+                f'Loaded Tandem page map at {self.page_map_path} is partial; run `bayesian-t1dm discover` to complete it.',
+            )
+        if self.page_map_path.exists():
+            return self.load_page_map(self.page_map_path, validate=not bootstrap)
+        if bootstrap:
+            if credentials is None:
+                raise AcquisitionError('Credentials are required to discover the Tandem page map')
+            return self.discover_page_map(credentials, step_log=step_log)
+        raise AcquisitionError(
+            f'No Tandem page map found at {self.page_map_path}. Run `bayesian-t1dm discover` first.',
+        )
+
+    def _wait_for_login_controls(self, step_log: StepLogger | None = None) -> list[dict[str, object]]:
         page = self._page
         assert page is not None
+        deadline = datetime.utcnow() + timedelta(milliseconds=self.timeout_ms)
+        if step_log is not None:
+            step_log.write('browser.discover.login_wait_start', timeout_ms=self.timeout_ms, poll_ms=500)
+        while datetime.utcnow() <= deadline:
+            inventory = capture_control_inventory(page)
+            if _login_controls_ready_from_inventory(inventory):
+                if step_log is not None:
+                    step_log.write('browser.discover.login_ready', control_count=len(inventory))
+                return inventory
+            page.wait_for_timeout(500)
+        try:
+            self.capture_page_diagnostics('discover-login-timeout')
+        except Exception:
+            pass
+        if step_log is not None:
+            step_log.write('browser.discover.login_wait_timeout', timeout_ms=self.timeout_ms)
+        raise AcquisitionError(
+            'Tandem Source login never exposed interactive controls after hydration; '
+            'the SPA may still be loading or the page structure may have changed.',
+        )
+
+    def _bootstrap_login_locators(self, page_map: TandemPageMap | None, step_log: StepLogger | None = None) -> TandemPageMap | None:
+        if not _page_map_login_complete(page_map):
+            return None
+        if step_log is not None and page_map is not None:
+            step_log.write(
+                'browser.discover.bootstrap_login_locators',
+                login_email=page_map.login_email.describe() if page_map.login_email else '',
+                login_password=page_map.login_password.describe() if page_map.login_password else '',
+                login_submit=page_map.login_submit.describe() if page_map.login_submit else '',
+            )
+        return page_map
+
+    def _discover_or_bootstrap_login_map(self, credentials: TandemCredentials, step_log: StepLogger | None = None) -> TandemPageMap:
+        page = self._page
+        assert page is not None
+        bootstrap_map = self._bootstrap_login_locators(self.page_map, step_log=step_log)
+        if bootstrap_map is not None:
+            page_map = replace(bootstrap_map, daily_timeline_url=bootstrap_map.daily_timeline_url or self.daily_timeline_url)
+            self._login_using_page_map(credentials, page_map, step_log=step_log)
+            return page_map
+        login_snapshot = capture_accessibility_snapshot(page)
+        login_inventory = capture_control_inventory(page)
+        login_email, login_password, login_submit = discover_login_controls_from_controls(
+            accessibility_snapshot=login_snapshot,
+            control_inventory=login_inventory,
+        )
+        if step_log is not None:
+            step_log.write(
+                'browser.discover.bootstrap_login_locators',
+                login_email=login_email.describe(),
+                login_password=login_password.describe(),
+                login_submit=login_submit.describe(),
+            )
+        page_map = TandemPageMap(
+            login_url=self.login_url,
+            daily_timeline_url=self.daily_timeline_url,
+            login_email=login_email,
+            login_password=login_password,
+            login_submit=login_submit,
+            generated_at=datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+            source='playwright-discovery',
+        )
+        self._login_using_page_map(credentials, page_map, step_log=step_log)
+        return page_map
+
+    def _login_using_page_map(self, credentials: TandemCredentials, page_map: TandemPageMap, step_log: StepLogger | None = None) -> None:
+        page = self._page
+        assert page is not None
+        try:
+            if step_log is not None:
+                step_log.write('browser.login.goto', url=self.login_url)
+            page.goto(self.login_url, wait_until='domcontentloaded')
+            page_map.login_email.locate(page).first.fill(credentials.email)
+            page_map.login_password.locate(page).first.fill(credentials.password)
+            page_map.login_submit.locate(page).first.click()
+            try:
+                page.wait_for_load_state('networkidle', timeout=self.timeout_ms)
+            except Exception:
+                pass
+            if page_map.daily_timeline_nav is not None:
+                page_map.daily_timeline_nav.locate(page).first.wait_for(timeout=self.timeout_ms)
+            else:
+                page.wait_for_timeout(min(self.timeout_ms, 1_500))
+        except Exception as exc:
+            try:
+                self.capture_page_diagnostics('login-error')
+            except Exception:
+                pass
+            raise AcquisitionError('Tandem login did not expose the Daily Timeline navigation after submit') from exc
+
+    def discover_page_map(self, credentials: TandemCredentials, step_log: StepLogger | None = None) -> TandemPageMap:
+        page = self._page
+        assert page is not None
+        try:
+            if step_log is not None:
+                step_log.write('browser.discover.start', login_url=self.login_url)
+            page.goto(self.login_url, wait_until='domcontentloaded')
+            login_inventory = self._wait_for_login_controls(step_log=step_log)
+            login_diagnostics = self.capture_page_diagnostics('discover-login')
+            if step_log is not None:
+                step_log.write('browser.discover.login_page', **{k: str(v) for k, v in asdict(login_diagnostics).items()})
+            page_map = self._discover_or_bootstrap_login_map(credentials, step_log=step_log)
+            if step_log is not None:
+                step_log.write('browser.discover.logged_in')
+            post_login_diagnostics = self.capture_page_diagnostics('discover-post-login')
+            if step_log is not None:
+                step_log.write('browser.discover.post_login_page', **{k: str(v) for k, v in asdict(post_login_diagnostics).items()})
+            daily_timeline_nav, derived_daily_url = self._discover_daily_timeline_control(page)
+            if derived_daily_url and not page_map.daily_timeline_url:
+                page_map = replace(page_map, daily_timeline_url=derived_daily_url)
+            page_map = replace(page_map, daily_timeline_nav=daily_timeline_nav)
+            self._open_daily_timeline(page_map)
+            timeline_diagnostics = self.capture_page_diagnostics('discover-daily-timeline')
+            if step_log is not None:
+                step_log.write('browser.discover.timeline_page', **{k: str(v) for k, v in asdict(timeline_diagnostics).items()})
+            timeline_snapshot = capture_accessibility_snapshot(page)
+            timeline_inventory = capture_control_inventory(page)
+            start_date, end_date, export_csv = self._discover_timeline_controls(timeline_snapshot, timeline_inventory)
+            page_map = TandemPageMap(
+                login_url=page_map.login_url,
+                daily_timeline_url=page_map.daily_timeline_url,
+                login_email=page_map.login_email,
+                login_password=page_map.login_password,
+                login_submit=page_map.login_submit,
+                daily_timeline_nav=page_map.daily_timeline_nav,
+                start_date=start_date,
+                end_date=end_date,
+                export_csv=export_csv,
+                generated_at=page_map.generated_at,
+                source=page_map.source,
+            )
+            page_map.validate()
+            self.save_page_map(page_map, validate=True)
+            if step_log is not None:
+                step_log.write('browser.discover.complete', page_map_path=str(self.page_map_path))
+            return page_map
+        except Exception as exc:
+            try:
+                self.capture_page_diagnostics('discover-error')
+            except Exception:
+                pass
+            if isinstance(exc, AcquisitionError):
+                raise
+            raise AcquisitionError(f'Could not discover the Tandem page map: {exc}') from exc
+
+    def _discover_login_controls(self, snapshot, inventory) -> tuple[LocatorSpec, LocatorSpec, LocatorSpec]:
+        from .tandem_browser import discover_login_controls_from_controls
+
+        return discover_login_controls_from_controls(accessibility_snapshot=snapshot, control_inventory=inventory)
+
+    def _discover_daily_timeline_control(self, page) -> tuple[LocatorSpec, str | None]:
+        page_snapshot = capture_accessibility_snapshot(page)
+        page_inventory = capture_control_inventory(page)
+        from .tandem_browser import discover_timeline_controls_from_controls
+
+        daily_timeline_nav, *_rest = discover_timeline_controls_from_controls(
+            accessibility_snapshot=page_snapshot,
+            control_inventory=page_inventory,
+        )
+        derived_url: str | None = None
+        try:
+            locator = daily_timeline_nav.locate(page).first
+            if locator.count() > 0:
+                href = locator.get_attribute('href')
+                if href:
+                    from urllib.parse import urljoin
+
+                    derived_url = urljoin(page.url, href)
+        except Exception:
+            pass
+        return daily_timeline_nav, derived_url
+
+    def _discover_timeline_controls(self, snapshot, inventory) -> tuple[LocatorSpec, LocatorSpec, LocatorSpec]:
+        from .tandem_browser import discover_timeline_controls_from_controls
+
+        _daily_nav, start_date, end_date, export_csv = discover_timeline_controls_from_controls(
+            accessibility_snapshot=snapshot,
+            control_inventory=inventory,
+        )
+        return start_date, end_date, export_csv
+
+    def login(self, credentials: TandemCredentials, step_log: StepLogger | None = None) -> None:
+        if self.page_map is None and not self.page_map_path.exists():
+            self.discover_page_map(credentials, step_log=step_log)
+            if step_log is not None:
+                step_log.write('browser.login.complete', page_map_path=str(self.page_map_path), mode='discovered')
+            return
+        page_map = self.ensure_page_map(credentials, step_log=step_log, bootstrap=False)
+        self._login_using_page_map(credentials, page_map, step_log=step_log)
+        if step_log is not None:
+            step_log.write('browser.login.complete', page_map_path=str(self.page_map_path))
+
+    def _open_daily_timeline(self, page_map: TandemPageMap) -> None:
+        page = self._page
+        assert page is not None
+        if page_map.daily_timeline_url:
+            page.goto(page_map.daily_timeline_url, wait_until='domcontentloaded')
+            return
         if self.daily_timeline_url:
             page.goto(self.daily_timeline_url, wait_until='domcontentloaded')
             return
-        self._click_text_candidates(self.selectors.daily_timeline_texts)
+        page_map.daily_timeline_nav.locate(page).first.click()
 
     def _fill_window_dates(self, window: ExportWindow) -> None:
         page = self._page
         assert page is not None
         start_value = window.start_date.isoformat()
         end_value = window.end_date.isoformat()
-        try:
-            self._fill_candidate(self.selectors.start_date_labels, start_value)
-            self._fill_candidate(self.selectors.end_date_labels, end_value)
-        except AcquisitionError:
-            if not self._fill_nth_input(self.selectors.date_input_selectors, 0, start_value):
-                raise
-            if not self._fill_nth_input(self.selectors.date_input_selectors, 1, end_value):
-                raise AcquisitionError('Could not locate both Tandem Source date inputs')
+        page_map = self.ensure_page_map()
+        page_map.start_date.locate(page).first.fill(start_value)
+        page_map.end_date.locate(page).first.fill(end_value)
         try:
             page.keyboard.press('Tab')
         except Exception:
@@ -770,19 +930,18 @@ class PlaywrightTandemSourceClient:
         window: ExportWindow,
         download_dir: Path,
         step_log: StepLogger | None = None,
-        *,
-        allow_manual_export: bool = True,
     ) -> Path:
         page = self._page
         assert page is not None
         download_dir.mkdir(parents=True, exist_ok=True)
         if step_log is not None:
             step_log.write('browser.export.goto', window_id=window.window_id)
-        self._open_daily_timeline()
+        page_map = self.ensure_page_map()
+        self._open_daily_timeline(page_map)
         try:
             self._fill_window_dates(window)
             with page.expect_download(timeout=self.timeout_ms) as download_info:
-                self._click_text_candidates(self.selectors.export_csv_texts)
+                page_map.export_csv.locate(page).first.click()
             download = download_info.value
             destination = download_dir / f"{window.window_id}{Path(download.suggested_filename).suffix or '.csv'}"
             download.save_as(str(destination))
@@ -790,22 +949,10 @@ class PlaywrightTandemSourceClient:
                 step_log.write('browser.export.downloaded', window_id=window.window_id, destination=str(destination))
             return destination
         except Exception as exc:
-            if not allow_manual_export:
-                raise AcquisitionError(f'Could not export Tandem window {window.window_id}: {exc}') from exc
+            self.capture_page_diagnostics(f'{window.window_id}.export-error')
             if step_log is not None:
-                step_log.write('browser.export.manual_step', window_id=window.window_id, reason=str(exc))
-            self.capture_screenshot(self.workspace.runtime_logs / f'{window.window_id}-export-pending.png')
-            input(
-                f'Complete the Tandem Source export for {window.label} in the browser, then press Enter to continue...',
-            )
-            with page.expect_download(timeout=self.timeout_ms) as download_info:
-                self._click_text_candidates(self.selectors.export_csv_texts)
-            download = download_info.value
-            destination = download_dir / f"{window.window_id}{Path(download.suggested_filename).suffix or '.csv'}"
-            download.save_as(str(destination))
-            if step_log is not None:
-                step_log.write('browser.export.downloaded', window_id=window.window_id, destination=str(destination))
-            return destination
+                step_log.write('browser.export.error', window_id=window.window_id, reason=str(exc))
+            raise AcquisitionError(f'Could not export Tandem window {window.window_id}: {exc}') from exc
 
 
 __all__ = [
@@ -813,13 +960,17 @@ __all__ = [
     'AcquisitionError',
     'AcquisitionRecord',
     'ExportWindow',
+    'LocatorSpec',
     'PlaywrightTandemSourceClient',
-    'SelectorConfig',
+    'TandemPageMap',
     'StepLogger',
     'TandemCredentials',
     'TandemSourceClient',
     'backfill_tandem_exports',
     'collect_tandem_exports',
+    'capture_page_diagnostics',
+    'discover_login_controls_from_controls',
+    'discover_timeline_controls_from_controls',
     'export_daily_timeline_window',
     'generate_export_windows',
     'load_local_env_file',

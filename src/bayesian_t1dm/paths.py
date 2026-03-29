@@ -58,13 +58,23 @@ class ProjectPaths:
             self.cloud_archive,
         ]:
             path.mkdir(parents=True, exist_ok=True)
-        for path in [self.runtime_browser, self.runtime_downloads, self.runtime_traces, self.runtime_logs]:
+        for path in [
+            self.runtime_browser,
+            self.runtime_browser_home,
+            self.runtime_downloads,
+            self.runtime_traces,
+            self.runtime_logs,
+        ]:
             path.mkdir(parents=True, exist_ok=True)
         return self
 
     @property
     def runtime_browser(self) -> Path:
         return self.runtime / "browser-profile"
+
+    @property
+    def runtime_browser_home(self) -> Path:
+        return self.runtime / "browser-home"
 
     @property
     def runtime_downloads(self) -> Path:

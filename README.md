@@ -19,6 +19,7 @@ This repo has moved from scratchpad stage to a structured pipeline, but it is st
 What is in place:
 
 - Tandem Source cloud-sync ingest backed by raw file exports
+- selector discovery for Tandem Source browser automation
 - export manifest generation and coverage checks
 - browser automation for Tandem Source export collection
 - 5-minute time-grid construction
@@ -67,6 +68,7 @@ Credentials should live in a root-level `.env` file that is never committed:
 3. Export the relevant Tandem Source report as CSV and save it under `data/raw/`.
 4. Run the ingest command to generate `data/raw/tandem_export_manifest.csv` and a coverage report.
 5. Check the manifest for gaps, overlaps, duplicate windows, or incomplete exports before trusting downstream model results.
+6. Use the discovery command to record a Tandem page map, then let collect/backfill reuse it automatically.
 
 ## Browser Collection
 
@@ -105,6 +107,16 @@ Backfill a range:
 bayesian-t1dm backfill --start-date 2023-01-01 --end-date 2024-01-30
 ```
 
+Discover and save the Tandem browser selectors:
+
+```bash
+bayesian-t1dm discover
+```
+
+The selector map is stored in the cloud archive area by default:
+
+- `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/archive/tandem_page_map.json`
+
 ## Repo Layout
 
 - `src/bayesian_t1dm/` - importable Python package for ingest, browser acquisition, features, modeling, recommendation, evaluation, and reporting
@@ -118,7 +130,7 @@ bayesian-t1dm backfill --start-date 2023-01-01 --end-date 2024-01-30
 Install in editable mode:
 
 ```bash
-python -m pip install -e .[dev,automation]
+python -m pip install -e '.[dev,automation]'
 ```
 
 Inspect Tandem data coverage:

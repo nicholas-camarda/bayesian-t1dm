@@ -11,6 +11,7 @@ from .acquisition import (
     backfill_tandem_exports,
     collect_tandem_exports,
     load_tandem_credentials,
+    StepLogger,
 )
 from .features import FeatureConfig, build_feature_frame
 from .ingest import build_export_manifest, load_tandem_exports, summarize_coverage, write_export_manifest
@@ -41,12 +42,11 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--end-date", default=None, help="Requested window end date (YYYY-MM-DD)")
     collect.add_argument("--manifest", default=None)
     collect.add_argument("--report", default=None)
+    collect.add_argument("--page-map", default=None)
     collect.add_argument("--env-file", default=None, help="Optional .env file with Tandem credentials")
     collect.add_argument("--login-url", default=None)
     collect.add_argument("--daily-timeline-url", default=None)
     collect.add_argument("--headless", action=argparse.BooleanOptionalAction, default=False)
-    collect.add_argument("--manual-login", action=argparse.BooleanOptionalAction, default=True)
-    collect.add_argument("--manual-export", action=argparse.BooleanOptionalAction, default=True)
     collect.add_argument("--strict", action=argparse.BooleanOptionalAction, default=True)
 
     backfill = subparsers.add_parser("backfill", help="Backfill Tandem Source export windows through the browser")
@@ -56,14 +56,22 @@ def build_parser() -> argparse.ArgumentParser:
     backfill.add_argument("--direction", choices=["backward", "forward"], default="backward")
     backfill.add_argument("--manifest", default=None)
     backfill.add_argument("--report", default=None)
+    backfill.add_argument("--page-map", default=None)
     backfill.add_argument("--env-file", default=None, help="Optional .env file with Tandem credentials")
     backfill.add_argument("--login-url", default=None)
     backfill.add_argument("--daily-timeline-url", default=None)
     backfill.add_argument("--headless", action=argparse.BooleanOptionalAction, default=False)
-    backfill.add_argument("--manual-login", action=argparse.BooleanOptionalAction, default=True)
-    backfill.add_argument("--manual-export", action=argparse.BooleanOptionalAction, default=True)
     backfill.add_argument("--strict", action=argparse.BooleanOptionalAction, default=True)
     backfill.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+
+    discover = subparsers.add_parser("discover", help="Discover and save Tandem Source selectors")
+    discover.add_argument("--manifest", default=None)
+    discover.add_argument("--report", default=None)
+    discover.add_argument("--page-map", default=None)
+    discover.add_argument("--env-file", default=None, help="Optional .env file with Tandem credentials")
+    discover.add_argument("--login-url", default=None)
+    discover.add_argument("--daily-timeline-url", default=None)
+    discover.add_argument("--headless", action=argparse.BooleanOptionalAction, default=False)
 
     return parser
 
@@ -109,8 +117,10 @@ def main(argv: list[str] | None = None) -> int:
         credentials = load_tandem_credentials(args.root, args.env_file)
         manifest_path = args.manifest or str(paths.cloud_raw / "tandem_export_manifest.csv")
         report_path = args.report or str(paths.cloud_output / "tandem_acquisition_summary.md")
+        page_map_path = args.page_map or str(paths.cloud_archive / "tandem_page_map.json")
         with PlaywrightTandemSourceClient(
             paths,
+            page_map_path=page_map_path,
             login_url=args.login_url or "https://source.tandemdiabetes.com/",
             daily_timeline_url=args.daily_timeline_url,
             headless=args.headless,
@@ -129,8 +139,6 @@ def main(argv: list[str] | None = None) -> int:
                     manifest_path=manifest_path,
                     report_path=report_path,
                     resume=True,
-                    allow_manual_login=args.manual_login,
-                    allow_manual_export=args.manual_export,
                     strict=args.strict,
                 )
                 return 0
@@ -145,11 +153,38 @@ def main(argv: list[str] | None = None) -> int:
                 manifest_path=manifest_path,
                 report_path=report_path,
                 resume=args.resume,
-                allow_manual_login=args.manual_login,
-                allow_manual_export=args.manual_export,
                 strict=args.strict,
             )
             return 0
+
+    if args.command == "discover":
+        credentials = load_tandem_credentials(args.root, args.env_file)
+        manifest_path = args.manifest or str(paths.cloud_raw / "tandem_export_manifest.csv")
+        report_path = args.report or str(paths.cloud_output / "tandem_discovery_summary.md")
+        page_map_path = args.page_map or str(paths.cloud_archive / "tandem_page_map.json")
+        step_log = StepLogger(paths.runtime_logs / "tandem_discovery.log")
+        with PlaywrightTandemSourceClient(
+            paths,
+            page_map_path=page_map_path,
+            login_url=args.login_url or "https://source.tandemdiabetes.com/",
+            daily_timeline_url=args.daily_timeline_url,
+            headless=args.headless,
+        ) as client:
+            page_map = client.discover_page_map(credentials, step_log=step_log)
+            client.save_page_map(page_map, page_map_path)
+            manifest_status = f"selector_map_written: {page_map_path}"
+            report_lines = [
+                "# Tandem Source Discovery Summary",
+                "",
+                f"- page_map_path: {page_map_path}",
+                f"- login_url: {page_map.login_url}",
+                f"- daily_timeline_url: {page_map.daily_timeline_url or 'NA'}",
+                f"- manifest_path: {manifest_path}",
+                f"- status: {manifest_status}",
+            ]
+            Path(report_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(report_path).write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+        return 0
 
     parser.error(f"Unknown command: {args.command}")
     return 2
