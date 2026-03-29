@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date
 from pathlib import Path
 
@@ -7,7 +8,7 @@ import pandas as pd
 import pytest
 
 import bayesian_t1dm.acquisition as acquisition
-from bayesian_t1dm.acquisition import AcquisitionError, AcquisitionRecord, ExportWindow, StepLogger, TandemCredentials, backfill_tandem_exports, collect_tandem_exports, PlaywrightTandemSourceClient
+from bayesian_t1dm.acquisition import AcquisitionError, AcquisitionRecord, ExportArtifact, ExportWindow, StepLogger, TandemCredentials, backfill_tandem_exports, collect_tandem_exports, PlaywrightTandemSourceClient
 from bayesian_t1dm.tandem_browser import LocatorSpec, TandemPageMap
 from bayesian_t1dm.paths import ProjectPaths
 
@@ -52,12 +53,128 @@ class FakeTandemClient:
 class FakePage:
     def __init__(self) -> None:
         self.waits: list[int] = []
+        self.listeners: dict[str, list[object]] = {"response": [], "download": []}
+        self.modal_opened = False
+        self.mode = "download"
+        self.launcher_clicks = 0
+        self.confirm_clicks = 0
 
     def goto(self, url: str, wait_until: str | None = None) -> None:
         return None
 
     def wait_for_timeout(self, ms: int) -> None:
         self.waits.append(ms)
+
+    def on(self, event: str, handler) -> None:
+        self.listeners.setdefault(event, []).append(handler)
+
+    def remove_listener(self, event: str, handler) -> None:
+        if event in self.listeners and handler in self.listeners[event]:
+            self.listeners[event].remove(handler)
+
+    def emit(self, event: str, payload) -> None:
+        for handler in list(self.listeners.get(event, [])):
+            handler(payload)
+
+    @property
+    def main_frame(self):
+        return FakeFrame(self)
+
+    @property
+    def frames(self):
+        return [self.main_frame]
+
+
+class FakeFrame:
+    def __init__(self, page: FakePage) -> None:
+        self.page = page
+        self.name = ""
+        self.url = "https://source.tandemdiabetes.com/reports/timeline"
+
+    def get_by_role(self, role: str, name: str | None = None, exact: bool = True):
+        return FakeLocator(self.page, role=role, name=name)
+
+    def locator(self, selector: str):
+        return FakeLocator(self.page, selector=selector)
+
+
+class FakeLocator:
+    def __init__(self, page: FakePage, role: str | None = None, name: str | None = None, selector: str | None = None) -> None:
+        self.page = page
+        self.role = role
+        self.name = name
+        self.selector = selector
+
+    @property
+    def first(self):
+        return self
+
+    def click(self) -> None:
+        if self.name == "Export CSV":
+            self.page.launcher_clicks += 1
+            self.page.modal_opened = True
+            return
+        if self.name == "Export":
+            self.page.confirm_clicks += 1
+            if self.page.mode == "download":
+                self.page.emit(
+                    "response",
+                    FakeResponse(
+                        url="https://source.tandemdiabetes.com/api/reports/export",
+                        content_type="text/csv; charset=utf-8",
+                        body=b"timestamp,glucose\n2024-01-01,100\n",
+                    ),
+                )
+                self.page.emit("download", FakeDownload("tandem-export.csv", b"timestamp,glucose\n2024-01-01,100\n"))
+            elif self.page.mode == "response-csv":
+                self.page.emit(
+                    "response",
+                    FakeResponse(
+                        url="https://source.tandemdiabetes.com/api/reports/export",
+                        content_type="text/csv; charset=utf-8",
+                        body=b"timestamp,glucose\n2024-01-01,100\n",
+                    ),
+                )
+            elif self.page.mode == "response-json":
+                self.page.emit(
+                    "response",
+                    FakeResponse(
+                        url="https://source.tandemdiabetes.com/api/reports/export",
+                        content_type="application/json; charset=utf-8",
+                        body=b'{"rows":[{"timestamp":"2024-01-01","glucose":100}]}',
+                    ),
+                )
+            return
+        if self.selector == "#export":
+            self.page.confirm_clicks += 1
+            return
+
+
+class FakeDownload:
+    def __init__(self, suggested_filename: str, body: bytes) -> None:
+        self.suggested_filename = suggested_filename
+        self.body = body
+
+    def save_as(self, path: str) -> None:
+        Path(path).write_bytes(self.body)
+
+
+class FakeRequest:
+    def __init__(self, method: str = "GET", resource_type: str = "xhr") -> None:
+        self.method = method
+        self.resource_type = resource_type
+
+
+class FakeResponse:
+    def __init__(self, *, url: str, content_type: str, body: bytes, method: str = "POST", status: int = 200, resource_type: str = "xhr") -> None:
+        self.url = url
+        self._body = body
+        self.status = status
+        self.headers = {"content-type": content_type, "content-length": str(len(body))}
+        self.request = FakeRequest(method=method, resource_type=resource_type)
+
+    def body(self) -> bytes:
+        return self._body
 
 
 def _workspace(tmp_path: Path) -> ProjectPaths:
@@ -66,6 +183,39 @@ def _workspace(tmp_path: Path) -> ProjectPaths:
     runtime_root = tmp_path / "runtime"
     cloud_root = tmp_path / "cloud"
     return ProjectPaths.from_root(root, runtime_root=runtime_root, cloud_root=cloud_root).ensure()
+
+
+def _export_dialog_snapshot() -> dict[str, object]:
+    return {
+        "role": "document",
+        "children": [
+            {
+                "role": "dialog",
+                "name": "Export to CSV",
+                "children": [
+                    {"role": "button", "name": "Cancel"},
+                    {"role": "button", "name": "Export"},
+                ],
+            }
+        ],
+    }
+
+
+def _export_dialog_inventory(*, include_launcher: bool = True, include_confirm: bool = True) -> list[dict[str, object]]:
+    inventory = []
+    if include_launcher:
+        inventory.append(
+            {"tag": "button", "role": None, "id": "export-launcher", "name": None, "type": "button", "aria_label": None, "placeholder": None, "autocomplete": None, "text": "Export CSV", "title": None, "href": None, "data_testid": None, "visible": True},
+        )
+    inventory.extend([
+        {"tag": "div", "role": "dialog", "id": "export-dialog", "name": None, "type": None, "aria_label": None, "placeholder": None, "autocomplete": None, "text": "Export to CSV Cancel", "title": None, "href": None, "data_testid": None, "visible": True},
+        {"tag": "button", "role": None, "id": "cancel", "name": None, "type": "button", "aria_label": None, "placeholder": None, "autocomplete": None, "text": "Cancel", "title": None, "href": None, "data_testid": None, "visible": True},
+    ])
+    if include_confirm:
+        inventory.append(
+            {"tag": "button", "role": None, "id": "confirm", "name": None, "type": "button", "aria_label": None, "placeholder": None, "autocomplete": None, "text": "Export", "title": None, "href": None, "data_testid": None, "visible": True},
+        )
+    return inventory
 
 
 def test_collect_tandem_exports_writes_cloud_manifest_and_artifacts(tmp_path):
@@ -232,13 +382,14 @@ def test_discover_accepts_partial_page_map_and_merges_bootstrap(tmp_path, monkey
     monkeypatch.setattr(acquisition, "capture_control_inventory", lambda page: [{"tag": "button", "type": "button", "text": "Export CSV", "visible": True}])
     monkeypatch.setattr(client, "_login_using_page_map", lambda credentials, page_map, step_log=None: None)
     monkeypatch.setattr(client, "_discover_daily_timeline_control", lambda page: (LocatorSpec(kind="css", selector="#daily"), "https://source.tandemdiabetes.com/daily"))
+    monkeypatch.setattr(client, "_discover_report_timeline_tab", lambda page: (LocatorSpec(kind="css", selector="#timeline"), "https://source.tandemdiabetes.com/reports/timeline"))
     monkeypatch.setattr(client, "_open_daily_timeline", lambda page_map: None)
     monkeypatch.setattr(
         client,
         "_discover_timeline_controls",
         lambda snapshot, inventory: (
-            LocatorSpec(kind="css", selector="#start"),
-            LocatorSpec(kind="css", selector="#end"),
+            LocatorSpec(kind="css", selector="#range"),
+            LocatorSpec(kind="css", selector="#select"),
             LocatorSpec(kind="css", selector="#export"),
         ),
     )
@@ -247,6 +398,120 @@ def test_discover_accepts_partial_page_map_and_merges_bootstrap(tmp_path, monkey
 
     assert result.is_complete()
     assert result.login_email.selector == 'input[type="email"]'
-    assert result.start_date.selector == "#start"
+    assert result.start_date.selector == "#range"
+    assert result.end_date.selector == "#select"
     assert page_map_path.exists()
     assert TandemPageMap.load(page_map_path).is_complete()
+
+
+def test_playwright_export_clicks_launcher_then_confirm_and_downloads_csv(tmp_path, monkeypatch):
+    workspace = _workspace(tmp_path)
+    client = PlaywrightTandemSourceClient(workspace, page_map_path=workspace.cloud_archive / "tandem_page_map.json")
+    client._page = FakePage()
+    client._page.mode = "download"
+    client.page_map = TandemPageMap(
+        login_url="https://source.tandemdiabetes.com/",
+        export_csv_launcher=LocatorSpec(kind="role", role="button", name="Export CSV"),
+    )
+    monkeypatch.setattr(client, "_open_daily_timeline", lambda page_map: None)
+    monkeypatch.setattr(client, "_set_custom_date_range", lambda window, page_map: None)
+    monkeypatch.setattr(client, "ensure_page_map", lambda credentials=None, step_log=None, bootstrap=False: client.page_map)
+    monkeypatch.setattr(acquisition, "capture_accessibility_snapshot", lambda page: _export_dialog_snapshot())
+    monkeypatch.setattr(acquisition, "capture_control_inventory", lambda page: _export_dialog_inventory(include_launcher=False, include_confirm=True))
+    monkeypatch.setattr(client, "capture_page_diagnostics", lambda stem: None)
+
+    window = ExportWindow(date(2024, 1, 1), date(2024, 1, 30))
+    exported = client.export_daily_timeline_window(window, workspace.runtime_downloads)
+
+    assert exported.exists()
+    assert client._page.launcher_clicks == 1
+    assert client._page.confirm_clicks == 1
+    assert exported.read_text(encoding="utf-8").startswith("timestamp,glucose")
+    assert client.page_map.export_csv_confirm is not None
+
+
+def test_playwright_export_writes_raw_response_artifact_for_api_payload(tmp_path, monkeypatch):
+    workspace = _workspace(tmp_path)
+    client = PlaywrightTandemSourceClient(workspace, page_map_path=workspace.cloud_archive / "tandem_page_map.json")
+    client._page = FakePage()
+    client._page.mode = "response-json"
+    client.page_map = TandemPageMap(
+        login_url="https://source.tandemdiabetes.com/",
+        export_csv_launcher=LocatorSpec(kind="role", role="button", name="Export CSV"),
+    )
+    monkeypatch.setattr(client, "_open_daily_timeline", lambda page_map: None)
+    monkeypatch.setattr(client, "_set_custom_date_range", lambda window, page_map: None)
+    monkeypatch.setattr(client, "ensure_page_map", lambda credentials=None, step_log=None, bootstrap=False: client.page_map)
+    monkeypatch.setattr(acquisition, "capture_accessibility_snapshot", lambda page: _export_dialog_snapshot())
+    monkeypatch.setattr(acquisition, "capture_control_inventory", lambda page: _export_dialog_inventory(include_launcher=False, include_confirm=True))
+    monkeypatch.setattr(client, "capture_page_diagnostics", lambda stem: None)
+
+    window = ExportWindow(date(2024, 2, 1), date(2024, 2, 29))
+    with pytest.raises(AcquisitionError, match="non-CSV payload"):
+        client.export_daily_timeline_window(window, workspace.runtime_downloads)
+
+    body_path = workspace.runtime_downloads / f"{window.window_id}.export-response.json"
+    meta_path = workspace.runtime_downloads / f"{window.window_id}.export-response.meta.json"
+    assert body_path.exists()
+    assert meta_path.exists()
+    assert json.loads(meta_path.read_text(encoding="utf-8"))["content_type"].startswith("application/json")
+    assert "rows" in body_path.read_text(encoding="utf-8")
+
+
+def test_playwright_export_reports_incomplete_dialog_when_confirm_is_missing(tmp_path, monkeypatch):
+    workspace = _workspace(tmp_path)
+    client = PlaywrightTandemSourceClient(workspace, page_map_path=workspace.cloud_archive / "tandem_page_map.json")
+    client._page = FakePage()
+    client.page_map = TandemPageMap(
+        login_url="https://source.tandemdiabetes.com/",
+        export_csv_launcher=LocatorSpec(kind="role", role="button", name="Export CSV"),
+    )
+    monkeypatch.setattr(client, "_open_daily_timeline", lambda page_map: None)
+    monkeypatch.setattr(client, "_set_custom_date_range", lambda window, page_map: None)
+    monkeypatch.setattr(client, "ensure_page_map", lambda credentials=None, step_log=None, bootstrap=False: client.page_map)
+    monkeypatch.setattr(acquisition, "capture_accessibility_snapshot", lambda page: {"role": "document", "children": [{"role": "dialog", "name": "Export to CSV", "children": [{"role": "button", "name": "Cancel"}]}]})
+    monkeypatch.setattr(acquisition, "capture_control_inventory", lambda page: _export_dialog_inventory(include_launcher=False, include_confirm=False))
+    monkeypatch.setattr(client, "capture_page_diagnostics", lambda stem: None)
+
+    window = ExportWindow(date(2024, 3, 1), date(2024, 3, 29))
+    with pytest.raises(AcquisitionError, match="Export dialog was incomplete"):
+        client.export_daily_timeline_window(window, workspace.runtime_downloads)
+
+    assert client._page.launcher_clicks == 1
+    assert client._page.confirm_clicks == 0
+
+
+def test_playwright_export_accepts_legacy_export_csv_page_map(tmp_path, monkeypatch):
+    workspace = _workspace(tmp_path)
+    client = PlaywrightTandemSourceClient(workspace, page_map_path=workspace.cloud_archive / "tandem_page_map.json")
+    client._page = FakePage()
+    client._page.mode = "download"
+    legacy_map = TandemPageMap.from_dict(
+        {
+            "login_url": "https://source.tandemdiabetes.com/",
+            "daily_timeline_url": "https://source.tandemdiabetes.com/reports/timeline",
+            "login_email": {"kind": "css", "selector": "#email"},
+            "login_password": {"kind": "css", "selector": "#password"},
+            "login_submit": {"kind": "css", "selector": "#submit"},
+            "daily_timeline_nav": {"kind": "role", "role": "link", "name": "Daily Timeline"},
+            "start_date": {"kind": "role", "role": "combobox", "name": "Custom"},
+            "end_date": {"kind": "role", "role": "button", "name": "Select"},
+            "export_csv": {"kind": "role", "role": "button", "name": "Export CSV"},
+        }
+    )
+    client.page_map = legacy_map
+    monkeypatch.setattr(client, "_open_daily_timeline", lambda page_map: None)
+    monkeypatch.setattr(client, "_set_custom_date_range", lambda window, page_map: None)
+    monkeypatch.setattr(client, "ensure_page_map", lambda credentials=None, step_log=None, bootstrap=False: client.page_map)
+    monkeypatch.setattr(acquisition, "capture_accessibility_snapshot", lambda page: _export_dialog_snapshot())
+    monkeypatch.setattr(acquisition, "capture_control_inventory", lambda page: _export_dialog_inventory(include_launcher=False, include_confirm=True))
+    monkeypatch.setattr(client, "capture_page_diagnostics", lambda stem: None)
+
+    window = ExportWindow(date(2024, 4, 1), date(2024, 4, 30))
+    exported = client.export_daily_timeline_window(window, workspace.runtime_downloads)
+
+    assert exported.exists()
+    assert client._page.launcher_clicks == 1
+    assert client._page.confirm_clicks == 1
+    assert client.page_map.export_csv_launcher is not None
+    assert client.page_map.export_csv_confirm is not None

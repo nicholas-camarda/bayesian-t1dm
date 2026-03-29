@@ -90,7 +90,8 @@ class TandemPageMap:
     daily_timeline_nav: LocatorSpec | None = None
     start_date: LocatorSpec | None = None
     end_date: LocatorSpec | None = None
-    export_csv: LocatorSpec | None = None
+    export_csv_launcher: LocatorSpec | None = None
+    export_csv_confirm: LocatorSpec | None = None
     generated_at: str | None = None
     source: str = "playwright-discovery"
 
@@ -114,7 +115,7 @@ class TandemPageMap:
             "daily_timeline_nav": self.daily_timeline_nav,
             "start_date": self.start_date,
             "end_date": self.end_date,
-            "export_csv": self.export_csv,
+            "export_csv_launcher": self.export_csv_launcher,
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -127,7 +128,9 @@ class TandemPageMap:
             "daily_timeline_nav": self.daily_timeline_nav.to_dict() if self.daily_timeline_nav else None,
             "start_date": self.start_date.to_dict() if self.start_date else None,
             "end_date": self.end_date.to_dict() if self.end_date else None,
-            "export_csv": self.export_csv.to_dict() if self.export_csv else None,
+            "export_csv_launcher": self.export_csv_launcher.to_dict() if self.export_csv_launcher else None,
+            "export_csv_confirm": self.export_csv_confirm.to_dict() if self.export_csv_confirm else None,
+            "export_csv": self.export_csv_launcher.to_dict() if self.export_csv_launcher else None,
             "generated_at": self.generated_at,
             "source": self.source,
         }
@@ -149,10 +152,15 @@ class TandemPageMap:
             daily_timeline_nav=load_spec("daily_timeline_nav"),
             start_date=load_spec("start_date"),
             end_date=load_spec("end_date"),
-            export_csv=load_spec("export_csv"),
+            export_csv_launcher=load_spec("export_csv_launcher") or load_spec("export_csv"),
+            export_csv_confirm=load_spec("export_csv_confirm"),
             generated_at=data.get("generated_at"),
             source=str(data.get("source", "playwright-discovery")),
         )
+
+    @property
+    def export_csv(self) -> LocatorSpec | None:
+        return self.export_csv_launcher
 
     def save(self, path: str | Path, *, validate: bool = True) -> Path:
         if validate:
@@ -186,7 +194,7 @@ def _normalize_text(value: str | None) -> str:
 def _capture_frame_control_inventory(frame, *, frame_index: int, is_main: bool) -> list[dict[str, Any]]:
     js = """
 () => {
-  const controls = Array.from(document.querySelectorAll('input, button, a, textarea, select, [role]'));
+  const controls = Array.from(document.querySelectorAll('input, button, a, textarea, select, [role], [data-testid]'));
   return controls.map((el, index) => {
     const rect = el.getBoundingClientRect();
     return {
@@ -363,6 +371,8 @@ def _find_inventory_entry(inventory: Sequence[dict[str, Any]], *, keywords: Sequ
                 derived_role = "link"
             elif tag in {"button"}:
                 derived_role = "button"
+            elif tag == "div" and entry.get("data_testid"):
+                derived_role = "button"
             elif tag in {"input", "textarea"}:
                 derived_role = "textbox"
             elif tag in {"select"}:
@@ -372,12 +382,13 @@ def _find_inventory_entry(inventory: Sequence[dict[str, Any]], *, keywords: Sequ
         texts = [
             str(entry.get("aria_label") or ""),
             str(entry.get("placeholder") or ""),
-            str(entry.get("text") or ""),
-            str(entry.get("name") or ""),
-            str(entry.get("title") or ""),
-            str(entry.get("id") or ""),
-            str(entry.get("autocomplete") or ""),
-            entry_type,
+        str(entry.get("text") or ""),
+        str(entry.get("name") or ""),
+        str(entry.get("title") or ""),
+        str(entry.get("id") or ""),
+        str(entry.get("data_testid") or ""),
+        str(entry.get("autocomplete") or ""),
+        entry_type,
         ]
         haystack = " ".join(texts).lower()
         if any(keyword in haystack for keyword in lowered):
@@ -386,6 +397,8 @@ def _find_inventory_entry(inventory: Sequence[dict[str, Any]], *, keywords: Sequ
 
 
 def _spec_from_inventory_entry(entry: dict[str, Any]) -> LocatorSpec:
+    frame_name = entry.get("frame_name")
+    frame_url = entry.get("frame_url")
     role = str(entry.get("role") or "").strip()
     text = _normalize_text(
         entry.get("aria_label")
@@ -397,8 +410,12 @@ def _spec_from_inventory_entry(entry: dict[str, Any]) -> LocatorSpec:
     )
     if role and text:
         return LocatorSpec(kind="role", role=role, name=text, exact=True)
+    if text:
+        return LocatorSpec(kind="text", selector=text, exact=True, frame_name=frame_name, frame_url=frame_url)
     if entry.get("id"):
         return LocatorSpec(kind="css", selector=f"#{entry['id']}")
+    if entry.get("data_testid"):
+        return LocatorSpec(kind="css", selector=f'[data-testid="{entry["data_testid"]}"]')
     if entry.get("name"):
         tag = str(entry.get("tag") or "input").lower()
         return LocatorSpec(kind="css", selector=f'{tag}[name="{entry["name"]}"]')
@@ -438,6 +455,7 @@ def _entry_text_haystack(entry: dict[str, Any]) -> str:
             str(entry.get("name") or ""),
             str(entry.get("title") or ""),
             str(entry.get("id") or ""),
+            str(entry.get("data_testid") or ""),
             str(entry.get("autocomplete") or ""),
             str(entry.get("type") or ""),
         ]
@@ -493,6 +511,8 @@ def _entry_as_locator_spec(entry: dict[str, Any]) -> LocatorSpec:
     autocomplete = str(entry.get("autocomplete") or "").lower()
     if entry.get("id"):
         return LocatorSpec(kind="css", selector=f"#{entry['id']}", frame_name=frame_name, frame_url=frame_url)
+    if entry.get("data_testid"):
+        return LocatorSpec(kind="css", selector=f'[data-testid="{entry["data_testid"]}"]', frame_name=frame_name, frame_url=frame_url)
     if tag == "input" and entry_type == "email":
         return LocatorSpec(kind="css", selector='input[type="email"]', frame_name=frame_name, frame_url=frame_url)
     if tag == "input" and entry_type == "password":
@@ -611,25 +631,41 @@ def discover_timeline_controls_from_controls(
     accessibility_snapshot: dict[str, Any] | None,
     control_inventory: Sequence[dict[str, Any]],
 ) -> tuple[LocatorSpec, LocatorSpec, LocatorSpec, LocatorSpec]:
-    return (
-        _discover_spec(
+    try:
+        select_button = _discover_spec(
             snapshot=accessibility_snapshot,
             inventory=control_inventory,
-            roles=("button", "link"),
+            roles=("button",),
+            keywords=("select",),
+        )
+    except ValueError:
+        select_button = LocatorSpec(kind="role", role="button", name="Select", exact=True)
+    try:
+        timeline_nav = _discover_spec(
+            snapshot=accessibility_snapshot,
+            inventory=control_inventory,
+            roles=("button", "link", "tab"),
             keywords=("daily timeline", "timeline"),
-        ),
-        _discover_spec(
+        )
+    except ValueError:
+        timeline_nav = LocatorSpec(kind="role", role="tab", name="Daily Timeline", exact=True)
+    range_combo_spec = _discover_spec(
             snapshot=accessibility_snapshot,
             inventory=control_inventory,
-            roles=("textbox", "spinbutton", "combobox"),
-            keywords=("start", "from"),
-        ),
-        _discover_spec(
-            snapshot=accessibility_snapshot,
-            inventory=control_inventory,
-            roles=("textbox", "spinbutton", "combobox"),
-            keywords=("end", "to"),
-        ),
+            roles=("combobox",),
+            keywords=("week", "custom", "range"),
+        )
+    range_combo = LocatorSpec(
+        kind="role",
+        role="combobox",
+        exact=False,
+        frame_name=range_combo_spec.frame_name,
+        frame_url=range_combo_spec.frame_url,
+    )
+    return (
+        timeline_nav,
+        range_combo,
+        select_button,
         _discover_spec(
             snapshot=accessibility_snapshot,
             inventory=control_inventory,
@@ -637,6 +673,83 @@ def discover_timeline_controls_from_controls(
             keywords=("export csv", "csv", "download csv"),
         ),
     )
+
+
+def _dialog_subtrees(snapshot: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not snapshot:
+        return []
+    dialogs: list[dict[str, Any]] = []
+
+    def walk(node: dict[str, Any]) -> None:
+        role = str(node.get("role") or "").lower()
+        if role in {"dialog", "alertdialog"}:
+            dialogs.append(node)
+        for child in node.get("children") or []:
+            if isinstance(child, dict):
+                walk(child)
+
+    walk(snapshot)
+    return dialogs
+
+
+def _dialog_has_keyword_button(node: dict[str, Any], keyword: str) -> bool:
+    lowered = keyword.lower()
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        role = str(current.get("role") or "").lower()
+        name = _normalize_text(current.get("name") if isinstance(current.get("name"), str) else None).lower()
+        if role in {"button", "link"} and lowered in name:
+            return True
+        for child in current.get("children") or []:
+            if isinstance(child, dict):
+                stack.append(child)
+    return False
+
+
+def discover_export_confirm_from_controls(
+    *,
+    accessibility_snapshot: dict[str, Any] | None,
+    control_inventory: Sequence[dict[str, Any]],
+) -> LocatorSpec:
+    visible_inventory = _visible_inventory(control_inventory)
+    dialog_nodes = _dialog_subtrees(accessibility_snapshot)
+    for dialog in dialog_nodes:
+        if _dialog_has_keyword_button(dialog, "export") and _dialog_has_keyword_button(dialog, "cancel"):
+            export_node = _find_node(dialog, roles=("button",), keywords=("export",))
+            if export_node and _normalize_text(export_node.get("name") if isinstance(export_node.get("name"), str) else None):
+                return LocatorSpec(kind="role", role="button", name=_normalize_text(export_node["name"]), exact=True)
+    dialog_entries = [entry for entry in visible_inventory if str(entry.get("role") or "").lower() == "dialog" and _entry_matches_keywords(entry, ("export", "cancel"))]
+    if dialog_entries:
+        frame_name = dialog_entries[0].get("frame_name")
+        frame_url = dialog_entries[0].get("frame_url")
+        for entry in visible_inventory:
+            tag = str(entry.get("tag") or "").lower()
+            entry_role = str(entry.get("role") or "").lower()
+            derived_role = entry_role or ("button" if tag == "button" else "link" if tag == "a" else "textbox" if tag in {"input", "textarea"} else "combobox" if tag == "select" else "")
+            if derived_role != "button":
+                continue
+            if str(entry.get("frame_name") or "") != str(frame_name or ""):
+                continue
+            if str(entry.get("frame_url") or "") != str(frame_url or ""):
+                continue
+            text = _normalize_text(entry.get("text") or entry.get("name") or entry.get("title") or entry.get("id"))
+            if text.lower() == "export":
+                return LocatorSpec(kind="role", role="button", name="Export", exact=True, frame_name=frame_name, frame_url=frame_url)
+    try:
+        return _discover_spec(
+            snapshot=accessibility_snapshot,
+            inventory=control_inventory,
+            roles=("button",),
+            keywords=("export",),
+        )
+    except ValueError:
+        return _discover_spec(
+            snapshot=accessibility_snapshot,
+            inventory=control_inventory,
+            roles=("button", "link"),
+            keywords=("export to csv", "export"),
+        )
 
 
 def discover_tandem_page_map_from_controls(
@@ -665,25 +778,38 @@ def discover_tandem_page_map_from_controls(
         roles=("button", "link"),
         keywords=("sign in", "log in", "login", "continue"),
     )
-    daily_timeline_nav = _discover_spec(
-        snapshot=accessibility_snapshot,
-        inventory=control_inventory,
-        roles=("button", "link"),
-        keywords=("daily timeline", "timeline"),
-    )
+    try:
+        daily_timeline_nav = _discover_spec(
+            snapshot=accessibility_snapshot,
+            inventory=control_inventory,
+            roles=("button", "link"),
+            keywords=("daily timeline", "timeline", "reports", "report"),
+        )
+    except ValueError:
+        daily_timeline_nav = LocatorSpec(kind="role", role="tab", name="Daily Timeline", exact=True)
     start_date = _discover_spec(
         snapshot=accessibility_snapshot,
         inventory=control_inventory,
-        roles=("textbox", "spinbutton", "combobox"),
-        keywords=("start", "from"),
+        roles=("combobox",),
+        keywords=("week", "custom", "range"),
     )
-    end_date = _discover_spec(
-        snapshot=accessibility_snapshot,
-        inventory=control_inventory,
-        roles=("textbox", "spinbutton", "combobox"),
-        keywords=("end", "to"),
+    start_date = LocatorSpec(
+        kind="role",
+        role="combobox",
+        exact=False,
+        frame_name=start_date.frame_name,
+        frame_url=start_date.frame_url,
     )
-    export_csv = _discover_spec(
+    try:
+        end_date = _discover_spec(
+            snapshot=accessibility_snapshot,
+            inventory=control_inventory,
+            roles=("button",),
+            keywords=("select",),
+        )
+    except ValueError:
+        end_date = LocatorSpec(kind="role", role="button", name="Select", exact=True)
+    export_csv_launcher = _discover_spec(
         snapshot=accessibility_snapshot,
         inventory=control_inventory,
         roles=("button", "link"),
@@ -698,7 +824,7 @@ def discover_tandem_page_map_from_controls(
         daily_timeline_nav=daily_timeline_nav,
         start_date=start_date,
         end_date=end_date,
-        export_csv=export_csv,
+        export_csv_launcher=export_csv_launcher,
         generated_at=generated_at or datetime.utcnow().isoformat(timespec="seconds") + "Z",
         source="playwright-discovery",
     )

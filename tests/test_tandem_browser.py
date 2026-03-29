@@ -3,6 +3,7 @@ from __future__ import annotations
 from bayesian_t1dm.tandem_browser import (
     LocatorSpec,
     TandemPageMap,
+    discover_export_confirm_from_controls,
     discover_login_controls_from_controls,
     discover_tandem_page_map_from_controls,
     discover_timeline_controls_from_controls,
@@ -17,8 +18,8 @@ def _snapshot() -> dict[str, object]:
             {"role": "textbox", "name": "Password"},
             {"role": "button", "name": "Sign In"},
             {"role": "link", "name": "Daily Timeline"},
-            {"role": "textbox", "name": "Start Date"},
-            {"role": "textbox", "name": "End Date"},
+            {"role": "combobox", "name": "2 Weeks (Mar 16 - 29, 2026)"},
+            {"role": "button", "name": "Select"},
             {"role": "button", "name": "Export CSV"},
         ],
     }
@@ -30,9 +31,33 @@ def _inventory() -> list[dict[str, object]]:
         {"tag": "input", "role": None, "id": "password", "name": "password", "type": "password", "aria_label": "Password", "placeholder": None, "autocomplete": "current-password", "text": "", "title": None, "href": None, "data_testid": None, "visible": True},
         {"tag": "button", "role": None, "id": "submit", "name": None, "type": "submit", "aria_label": None, "placeholder": None, "autocomplete": None, "text": "Sign In", "title": None, "href": None, "data_testid": None, "visible": True},
         {"tag": "a", "role": None, "id": "timeline", "name": None, "type": None, "aria_label": None, "placeholder": None, "autocomplete": None, "text": "Daily Timeline", "title": None, "href": "/daily", "data_testid": None, "visible": True},
-        {"tag": "input", "role": None, "id": "start-date", "name": "startDate", "type": "text", "aria_label": "Start Date", "placeholder": None, "autocomplete": None, "text": "", "title": None, "href": None, "data_testid": None, "visible": True},
-        {"tag": "input", "role": None, "id": "end-date", "name": "endDate", "type": "text", "aria_label": "End Date", "placeholder": None, "autocomplete": None, "text": "", "title": None, "href": None, "data_testid": None, "visible": True},
+        {"tag": "div", "role": "combobox", "id": "range", "name": None, "type": None, "aria_label": None, "placeholder": None, "autocomplete": None, "text": "2 Weeks (Mar 16 - 29, 2026)", "title": None, "href": None, "data_testid": None, "visible": True},
+        {"tag": "button", "role": None, "id": "select", "name": None, "type": "button", "aria_label": None, "placeholder": None, "autocomplete": None, "text": "Select", "title": None, "href": None, "data_testid": None, "visible": True},
         {"tag": "button", "role": None, "id": "export", "name": None, "type": "button", "aria_label": None, "placeholder": None, "autocomplete": None, "text": "Export CSV", "title": None, "href": None, "data_testid": None, "visible": True},
+    ]
+
+
+def _export_modal_snapshot() -> dict[str, object]:
+    return {
+        "role": "document",
+        "children": [
+            {
+                "role": "dialog",
+                "name": "Export to CSV",
+                "children": [
+                    {"role": "button", "name": "Cancel"},
+                    {"role": "button", "name": "Export"},
+                ],
+            }
+        ],
+    }
+
+
+def _export_modal_inventory() -> list[dict[str, object]]:
+    return [
+        {"tag": "div", "role": "dialog", "id": "export-modal", "name": None, "type": None, "aria_label": None, "placeholder": None, "autocomplete": None, "text": "Export to CSV Cancel Export", "title": None, "href": None, "data_testid": None, "visible": True},
+        {"tag": "button", "role": None, "id": "cancel", "name": None, "type": "button", "aria_label": None, "placeholder": None, "autocomplete": None, "text": "Cancel", "title": None, "href": None, "data_testid": None, "visible": True},
+        {"tag": "button", "role": None, "id": "confirm", "name": None, "type": "button", "aria_label": None, "placeholder": None, "autocomplete": None, "text": "Export", "title": None, "href": None, "data_testid": None, "visible": True},
     ]
 
 
@@ -56,14 +81,24 @@ def test_discover_login_and_timeline_controls_from_controls():
     assert daily_timeline_nav.role == "link"
     assert daily_timeline_nav.name == "Daily Timeline"
     assert start_date.kind == "role"
-    assert start_date.role == "textbox"
-    assert start_date.name == "Start Date"
+    assert start_date.role == "combobox"
     assert end_date.kind == "role"
-    assert end_date.role == "textbox"
-    assert end_date.name == "End Date"
+    assert end_date.role == "button"
+    assert end_date.name == "Select"
     assert export_csv.kind == "role"
     assert export_csv.role == "button"
     assert export_csv.name == "Export CSV"
+
+
+def test_discover_export_confirm_prefers_modal_dialog():
+    confirm = discover_export_confirm_from_controls(
+        accessibility_snapshot=_export_modal_snapshot(),
+        control_inventory=_export_modal_inventory(),
+    )
+
+    assert confirm.kind == "role"
+    assert confirm.role == "button"
+    assert confirm.name == "Export"
 
 
 def test_locator_spec_frame_roundtrip():
@@ -87,3 +122,22 @@ def test_discover_tandem_page_map_roundtrip(tmp_path):
     assert loaded == page_map
     assert loaded.export_csv.role == "button"
     assert loaded.daily_timeline_nav.name == "Daily Timeline"
+
+
+def test_legacy_page_map_uses_export_csv_as_launcher():
+    legacy = TandemPageMap.from_dict(
+        {
+            "login_url": "https://source.tandemdiabetes.com/",
+            "login_email": {"kind": "css", "selector": "#email"},
+            "login_password": {"kind": "css", "selector": "#password"},
+            "login_submit": {"kind": "css", "selector": "#submit"},
+            "daily_timeline_nav": {"kind": "role", "role": "link", "name": "Daily Timeline"},
+            "start_date": {"kind": "role", "role": "combobox", "name": "Custom"},
+            "end_date": {"kind": "role", "role": "button", "name": "Select"},
+            "export_csv": {"kind": "role", "role": "button", "name": "Export CSV"},
+        }
+    )
+
+    assert legacy.export_csv_launcher is not None
+    assert legacy.export_csv_launcher.name == "Export CSV"
+    assert legacy.export_csv_confirm is None

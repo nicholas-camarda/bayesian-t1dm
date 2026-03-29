@@ -171,7 +171,7 @@ def main(argv: list[str] | None = None) -> int:
             headless=args.headless,
         ) as client:
             page_map = client.discover_page_map(credentials, step_log=step_log)
-            client.save_page_map(page_map, page_map_path)
+            client.save_page_map(page_map, page_map_path, validate=page_map.is_complete())
             manifest_status = f"selector_map_written: {page_map_path}"
             report_lines = [
                 "# Tandem Source Discovery Summary",

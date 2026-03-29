@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
+from calendar import month_abbr, monthrange
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Protocol, Sequence
@@ -21,7 +23,9 @@ from .tandem_browser import (
     capture_accessibility_snapshot,
     capture_control_inventory,
     capture_page_diagnostics,
+    discover_export_confirm_from_controls,
     discover_login_controls_from_controls,
+    _discover_spec,
     discover_timeline_controls_from_controls,
     discover_tandem_page_map_from_controls,
 )
@@ -72,6 +76,14 @@ class AcquisitionRecord:
     notes: str = ''
 
 
+@dataclass(frozen=True)
+class ExportArtifact:
+    kind: str
+    path: Path
+    metadata_path: Path | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
 class AcquisitionError(RuntimeError):
     pass
 
@@ -84,7 +96,7 @@ class TandemSourceClient(Protocol):
         window: ExportWindow,
         download_dir: Path,
         step_log: StepLogger | None = None,
-    ) -> Path: ...
+    ) -> Path | ExportArtifact: ...
 
     def capture_screenshot(self, path: Path) -> Path: ...
 
@@ -253,6 +265,103 @@ def _canonical_export_name(window: ExportWindow, source_path: Path) -> str:
     return f'tandem_daily_timeline_{window.window_id}{source_path.suffix.lower()}'
 
 
+def _coerce_export_artifact(result: Path | str | ExportArtifact) -> ExportArtifact:
+    if isinstance(result, ExportArtifact):
+        return result
+    return ExportArtifact(kind='download', path=Path(result))
+
+
+def _response_metadata(response, body: bytes | None = None) -> dict[str, object]:
+    headers = {str(key).lower(): str(value) for key, value in response.headers.items()}
+    content_type = headers.get('content-type')
+    content_length = headers.get('content-length')
+    if body is None:
+        try:
+            body = response.body()
+        except Exception:
+            body = b''
+    if body is None:
+        body = b''
+    metadata: dict[str, object] = {
+        'url': response.url,
+        'method': response.request.method,
+        'status': response.status,
+        'content_type': content_type,
+        'content_length': int(content_length) if content_length and content_length.isdigit() else None,
+        'headers': headers,
+        'body_size': len(body),
+        'body_sha256': hashlib.sha256(body).hexdigest() if body else None,
+    }
+    if body:
+        try:
+            metadata['body_text_preview'] = body.decode('utf-8')[:500]
+        except Exception:
+            metadata['body_text_preview'] = None
+    else:
+        metadata['body_text_preview'] = None
+    return metadata
+
+
+def _response_suffix(metadata: dict[str, object], body: bytes) -> str:
+    content_type = str(metadata.get('content_type') or '').lower()
+    if 'csv' in content_type:
+        return '.csv'
+    if 'json' in content_type:
+        return '.json'
+    if 'text/' in content_type:
+        try:
+            decoded = body.decode('utf-8')
+        except Exception:
+            return '.txt'
+        first_line = next((line for line in decoded.splitlines() if line.strip()), '')
+        if ',' in first_line and len(first_line.split(',')) > 1:
+            return '.csv'
+        return '.txt'
+    return '.bin'
+
+
+def _write_response_artifact(
+    download_dir: Path,
+    window: ExportWindow,
+    response,
+) -> ExportArtifact:
+    try:
+        body = response.body()
+    except Exception:
+        body = b''
+    metadata = _response_metadata(response, body)
+    suffix = _response_suffix(metadata, body)
+    body_path = download_dir / f'{window.window_id}.export-response{suffix}'
+    body_path.write_bytes(body)
+    metadata['body_path'] = str(body_path)
+    metadata['kind'] = 'response'
+    metadata_path = download_dir / f'{window.window_id}.export-response.meta.json'
+    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+    return ExportArtifact(kind='response', path=body_path, metadata_path=metadata_path, metadata=metadata)
+
+
+def _export_artifact_is_tabular(artifact: ExportArtifact) -> bool:
+    return artifact.path.suffix.lower() in {'.csv', '.xlsx', '.xlsm', '.xls', '.parquet', '.pq'}
+
+
+def _export_artifact_error_message(
+    *,
+    window: ExportWindow,
+    artifact: ExportArtifact | None,
+    observed_responses: int,
+    confirm_clicked: bool,
+) -> str:
+    if artifact is None:
+        if confirm_clicked:
+            return f'No export response observed for {window.window_id} after confirm click (responses seen: {observed_responses})'
+        return f'Export dialog was incomplete for {window.window_id}; no confirm button was available'
+    metadata = artifact.metadata
+    return (
+        f'Export returned non-CSV payload for {window.window_id}: '
+        f"{artifact.path.name} ({metadata.get('content_type') or 'unknown content-type'})"
+    )
+
+
 def _manifest_path(workspace: ProjectPaths) -> Path:
     return workspace.cloud_raw / 'tandem_export_manifest.csv'
 
@@ -290,6 +399,27 @@ def _login_controls_ready_from_inventory(inventory: Sequence[dict[str, object]])
         elif tag == 'input' and entry_type in {'text', 'email', 'search', 'tel', 'url', 'number', 'date'}:
             has_text_like = True
     return has_text_like and (has_password or has_submit)
+
+
+def _page_looks_authenticated(inventory: Sequence[dict[str, object]]) -> bool:
+    visible = [entry for entry in inventory if bool(entry.get('visible', True))]
+    keywords = ('account settings', 'upload pump', 'reports', 'my pump', 'welcome')
+    for entry in visible:
+        haystack = ' '.join(
+            [
+                str(entry.get('aria_label') or ''),
+                str(entry.get('placeholder') or ''),
+                str(entry.get('text') or ''),
+                str(entry.get('name') or ''),
+                str(entry.get('title') or ''),
+                str(entry.get('id') or ''),
+                str(entry.get('autocomplete') or ''),
+                str(entry.get('type') or ''),
+            ]
+        ).lower()
+        if any(keyword in haystack for keyword in keywords):
+            return True
+    return False
 
 
 def _load_existing_manifest(path: Path) -> pd.DataFrame:
@@ -416,10 +546,19 @@ def export_daily_timeline_window(
 
     client.start_trace()
     try:
-        downloaded_path = Path(client.export_daily_timeline_window(window, workspace.runtime_downloads, step_log))
-        if not downloaded_path.exists():
+        exported = _coerce_export_artifact(client.export_daily_timeline_window(window, workspace.runtime_downloads, step_log))
+        if not exported.path.exists():
             raise AcquisitionError(f'Download step did not create an export file for {window.window_id}')
-        temp_download = downloaded_path
+        if not _export_artifact_is_tabular(exported):
+            raise AcquisitionError(
+                _export_artifact_error_message(
+                    window=window,
+                    artifact=exported,
+                    observed_responses=0,
+                    confirm_clicked=True,
+                ),
+            )
+        temp_download = exported.path
         validation = _infer_export_span(temp_download)
         observed_first = validation.get('observed_first_timestamp')
         observed_last = validation.get('observed_last_timestamp')
@@ -692,6 +831,11 @@ class PlaywrightTandemSourceClient:
         if self.page_map is not None:
             if self.page_map.is_complete() or bootstrap:
                 return self.page_map
+            page = self._page
+            if page is not None and _page_looks_authenticated(capture_control_inventory(page)):
+                if step_log is not None:
+                    step_log.write('browser.page_map.partial_authenticated', page_map_path=str(self.page_map_path))
+                return self.page_map
             raise AcquisitionError(
                 f'Loaded Tandem page map at {self.page_map_path} is partial; run `bayesian-t1dm discover` to complete it.',
             )
@@ -713,6 +857,10 @@ class PlaywrightTandemSourceClient:
             step_log.write('browser.discover.login_wait_start', timeout_ms=self.timeout_ms, poll_ms=500)
         while datetime.utcnow() <= deadline:
             inventory = capture_control_inventory(page)
+            if _page_looks_authenticated(inventory):
+                if step_log is not None:
+                    step_log.write('browser.discover.authenticated_ready', control_count=len(inventory))
+                return inventory
             if _login_controls_ready_from_inventory(inventory):
                 if step_log is not None:
                     step_log.write('browser.discover.login_ready', control_count=len(inventory))
@@ -728,6 +876,22 @@ class PlaywrightTandemSourceClient:
             'Tandem Source login never exposed interactive controls after hydration; '
             'the SPA may still be loading or the page structure may have changed.',
         )
+
+    def _authenticated_page_map(self, *, step_log: StepLogger | None = None) -> TandemPageMap:
+        page_map = self.page_map
+        if page_map is not None:
+            if step_log is not None:
+                step_log.write('browser.discover.authenticated_page_map_existing', page_map_path=str(self.page_map_path))
+            return page_map
+        page_map = TandemPageMap(
+            login_url=self.login_url,
+            daily_timeline_url=self.daily_timeline_url,
+            generated_at=datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+            source='playwright-discovery-authenticated',
+        )
+        if step_log is not None:
+            step_log.write('browser.discover.authenticated_page_map_created', login_url=self.login_url)
+        return page_map
 
     def _bootstrap_login_locators(self, page_map: TandemPageMap | None, step_log: StepLogger | None = None) -> TandemPageMap | None:
         if not _page_map_login_complete(page_map):
@@ -810,7 +974,10 @@ class PlaywrightTandemSourceClient:
             login_diagnostics = self.capture_page_diagnostics('discover-login')
             if step_log is not None:
                 step_log.write('browser.discover.login_page', **{k: str(v) for k, v in asdict(login_diagnostics).items()})
-            page_map = self._discover_or_bootstrap_login_map(credentials, step_log=step_log)
+            if _page_looks_authenticated(login_inventory):
+                page_map = self._authenticated_page_map(step_log=step_log)
+            else:
+                page_map = self._discover_or_bootstrap_login_map(credentials, step_log=step_log)
             if step_log is not None:
                 step_log.write('browser.discover.logged_in')
             post_login_diagnostics = self.capture_page_diagnostics('discover-post-login')
@@ -820,6 +987,11 @@ class PlaywrightTandemSourceClient:
             if derived_daily_url and not page_map.daily_timeline_url:
                 page_map = replace(page_map, daily_timeline_url=derived_daily_url)
             page_map = replace(page_map, daily_timeline_nav=daily_timeline_nav)
+            self._open_daily_timeline(page_map)
+            report_tab, report_tab_url = self._discover_report_timeline_tab(page)
+            if report_tab_url:
+                page_map = replace(page_map, daily_timeline_url=report_tab_url)
+            page_map = replace(page_map, daily_timeline_nav=report_tab)
             self._open_daily_timeline(page_map)
             timeline_diagnostics = self.capture_page_diagnostics('discover-daily-timeline')
             if step_log is not None:
@@ -836,12 +1008,15 @@ class PlaywrightTandemSourceClient:
                 daily_timeline_nav=page_map.daily_timeline_nav,
                 start_date=start_date,
                 end_date=end_date,
-                export_csv=export_csv,
+                export_csv_launcher=export_csv,
                 generated_at=page_map.generated_at,
                 source=page_map.source,
             )
-            page_map.validate()
-            self.save_page_map(page_map, validate=True)
+            if page_map.is_complete():
+                page_map.validate()
+                self.save_page_map(page_map, validate=True)
+            else:
+                self.save_page_map(page_map, validate=False)
             if step_log is not None:
                 step_log.write('browser.discover.complete', page_map_path=str(self.page_map_path))
             return page_map
@@ -862,11 +1037,11 @@ class PlaywrightTandemSourceClient:
     def _discover_daily_timeline_control(self, page) -> tuple[LocatorSpec, str | None]:
         page_snapshot = capture_accessibility_snapshot(page)
         page_inventory = capture_control_inventory(page)
-        from .tandem_browser import discover_timeline_controls_from_controls
-
-        daily_timeline_nav, *_rest = discover_timeline_controls_from_controls(
-            accessibility_snapshot=page_snapshot,
-            control_inventory=page_inventory,
+        daily_timeline_nav = _discover_spec(
+            snapshot=page_snapshot,
+            inventory=page_inventory,
+            roles=("button", "link", "tab"),
+            keywords=("view my reports", "reports", "daily timeline", "timeline"),
         )
         derived_url: str | None = None
         try:
@@ -881,16 +1056,245 @@ class PlaywrightTandemSourceClient:
             pass
         return daily_timeline_nav, derived_url
 
+    def _discover_report_timeline_tab(self, page) -> tuple[LocatorSpec, str | None]:
+        page_snapshot = capture_accessibility_snapshot(page)
+        page_inventory = capture_control_inventory(page)
+        timeline_tab = _discover_spec(
+            snapshot=page_snapshot,
+            inventory=page_inventory,
+            roles=("button", "link", "tab"),
+            keywords=("daily timeline", "timeline"),
+        )
+        derived_url: str | None = None
+        try:
+            locator = timeline_tab.locate(page).first
+            if locator.count() > 0:
+                href = locator.get_attribute('href')
+                if href:
+                    from urllib.parse import urljoin
+
+                    derived_url = urljoin(page.url, href)
+        except Exception:
+            pass
+        return timeline_tab, derived_url
+
     def _discover_timeline_controls(self, snapshot, inventory) -> tuple[LocatorSpec, LocatorSpec, LocatorSpec]:
         from .tandem_browser import discover_timeline_controls_from_controls
 
-        _daily_nav, start_date, end_date, export_csv = discover_timeline_controls_from_controls(
+        _daily_nav, range_combo, select_button, export_csv = discover_timeline_controls_from_controls(
             accessibility_snapshot=snapshot,
             control_inventory=inventory,
         )
-        return start_date, end_date, export_csv
+        return range_combo, select_button, export_csv
+
+    def _export_launcher_spec(self, page_map: TandemPageMap) -> LocatorSpec:
+        launcher = page_map.export_csv_launcher or page_map.export_csv
+        if launcher is None:
+            raise AcquisitionError('Tandem page map does not include an export launcher locator')
+        return launcher
+
+    def _discover_export_confirm(self, page, step_log: StepLogger | None = None) -> LocatorSpec:
+        snapshot = capture_accessibility_snapshot(page)
+        inventory = capture_control_inventory(page)
+        confirm = discover_export_confirm_from_controls(
+            accessibility_snapshot=snapshot,
+            control_inventory=inventory,
+        )
+        if step_log is not None:
+            step_log.write('browser.export.confirm_discovered', confirm=confirm.describe(), control_count=len(inventory))
+        return confirm
+
+    @staticmethod
+    def _response_is_candidate(response) -> bool:
+        content_type = str(response.headers.get('content-type') or '').lower()
+        resource_type = str(getattr(response.request, 'resource_type', '') or '').lower()
+        url = str(response.url or '').lower()
+        if resource_type in {'image', 'stylesheet', 'font', 'script', 'media'}:
+            return False
+        if content_type.startswith('text/html'):
+            return False
+        if any(token in url for token in ('export', 'csv', 'report', 'timeline')):
+            return True
+        if any(token in content_type for token in ('csv', 'json', 'octet-stream', 'text/plain')):
+            return True
+        return resource_type in {'xhr', 'fetch', 'document'}
+
+    def _capture_export_candidate(
+        self,
+        responses: Sequence[object],
+        *,
+        download_dir: Path,
+        window: ExportWindow,
+    ) -> ExportArtifact | None:
+        matched = [response for response in responses if self._response_is_candidate(response)]
+        if not matched:
+            return None
+        # Prefer the most export-like response we saw after the confirm click.
+        def score(response) -> tuple[int, int]:
+            content_type = str(response.headers.get('content-type') or '').lower()
+            url = str(response.url or '').lower()
+            kind_score = 0
+            if 'csv' in content_type:
+                kind_score = 4
+            elif 'json' in content_type:
+                kind_score = 3
+            elif 'octet-stream' in content_type:
+                kind_score = 2
+            elif 'text/plain' in content_type:
+                kind_score = 1
+            url_score = sum(1 for token in ('export', 'csv', 'report', 'timeline') if token in url)
+            return kind_score, url_score
+
+        chosen = sorted(matched, key=score, reverse=True)[0]
+        return _write_response_artifact(download_dir, window, chosen)
+
+    def _dismiss_browser_warning(self) -> None:
+        page = self._page
+        assert page is not None
+        try:
+            inventory = capture_control_inventory(page)
+        except Exception:
+            return
+        warning_present = False
+        continue_present = False
+        for entry in inventory:
+            haystack = ' '.join(
+                [
+                    str(entry.get('aria_label') or ''),
+                    str(entry.get('placeholder') or ''),
+                    str(entry.get('text') or ''),
+                    str(entry.get('name') or ''),
+                    str(entry.get('title') or ''),
+                    str(entry.get('id') or ''),
+                ]
+            ).lower()
+            if 'browser not supported' in haystack:
+                warning_present = True
+            if entry.get('visible', True) and 'continue' in haystack:
+                continue_present = True
+        if warning_present and continue_present:
+            try:
+                page.get_by_role('button', name='Continue').click()
+                page.wait_for_timeout(500)
+            except Exception:
+                pass
+
+    def _update_page_map_with_export_confirm(self, page_map: TandemPageMap, confirm: LocatorSpec, *, step_log: StepLogger | None = None) -> TandemPageMap:
+        if page_map.export_csv_confirm == confirm:
+            return page_map
+        updated = replace(page_map, export_csv_confirm=confirm)
+        if step_log is not None:
+            step_log.write('browser.export.confirm_saved', page_map_path=str(self.page_map_path), confirm=confirm.describe())
+        try:
+            self.save_page_map(updated, validate=False)
+        except Exception:
+            pass
+        return updated
+
+    @staticmethod
+    def _parse_report_range_label(label: str | None) -> tuple[date | None, date | None]:
+        if not label:
+            return None, None
+        text = " ".join(str(label).split())
+        match = re.search(
+            r"\((?P<start_month>[A-Za-z]{3})\s+(?P<start_day>\d{1,2})\s+-\s+(?:(?P<end_month>[A-Za-z]{3})\s+)?(?P<end_day>\d{1,2}),\s+(?P<year>\d{4})\)",
+            text,
+        )
+        if not match:
+            return None, None
+        start_month = match.group("start_month")
+        end_month = match.group("end_month") or start_month
+        try:
+            start_month_num = list(month_abbr).index(start_month)
+            end_month_num = list(month_abbr).index(end_month)
+        except ValueError:
+            return None, None
+        year = int(match.group("year"))
+        start = date(year, start_month_num, int(match.group("start_day")))
+        end = date(year, end_month_num, int(match.group("end_day")))
+        return start, end
+
+    def _navigate_picker_months(self, month_delta: int) -> None:
+        page = self._page
+        assert page is not None
+        if month_delta > 0:
+            for _ in range(month_delta):
+                page.get_by_role('button', name='Next month').click()
+                page.wait_for_timeout(200)
+        elif month_delta < 0:
+            for _ in range(-month_delta):
+                page.get_by_role('button', name='Previous month').click()
+                page.wait_for_timeout(200)
+
+    def _select_picker_day(self, day: int, *, occurrence: int = 0) -> None:
+        page = self._page
+        assert page is not None
+        page.get_by_role('gridcell', name=str(day)).nth(occurrence).click()
+        page.wait_for_timeout(200)
+
+    def _set_custom_date_range(self, window: ExportWindow, page_map: TandemPageMap) -> None:
+        page = self._page
+        assert page is not None
+        current_label = None
+        try:
+            inventory = capture_control_inventory(page)
+        except Exception:
+            inventory = []
+        combobox_entries = [entry for entry in inventory if str(entry.get('role') or '').lower() == 'combobox' and bool(entry.get('visible', True))]
+        preferred_entries = [
+            entry
+            for entry in combobox_entries
+            if any(token in ' '.join(str(entry.get(key) or '') for key in ('text', 'aria_label', 'title', 'name')).lower() for token in ('week', 'custom', 'range', '('))
+        ]
+        if preferred_entries:
+            current_label = ' '.join(str(preferred_entries[0].get(key) or '') for key in ('text', 'aria_label', 'title', 'name'))
+        elif combobox_entries:
+            current_label = ' '.join(str(combobox_entries[0].get(key) or '') for key in ('text', 'aria_label', 'title', 'name'))
+        if not current_label:
+            try:
+                current_label = page_map.start_date.locate(page).first.text_content(timeout=min(self.timeout_ms, 5_000))
+            except Exception:
+                current_label = None
+        current_start, _current_end = self._parse_report_range_label(current_label)
+        if current_start is None:
+            current_start = window.start_date
+        month_delta = (window.start_date.year - current_start.year) * 12 + (window.start_date.month - current_start.month)
+        page_map.start_date.locate(page).first.click()
+        page.wait_for_timeout(250)
+        page.get_by_role('option', name='Custom').click()
+        page.wait_for_timeout(500)
+        self._navigate_picker_months(month_delta)
+        self._select_picker_day(window.start_date.day, occurrence=0)
+        start_month_days = monthrange(window.start_date.year, window.start_date.month)[1]
+        end_occurrence = 1 if window.start_date.month != window.end_date.month and window.end_date.day <= start_month_days else 0
+        self._select_picker_day(window.end_date.day, occurrence=end_occurrence)
+        try:
+            page_map.end_date.locate(page).first.click()
+        except Exception:
+            page.get_by_role('button', name='Select').click()
+        page.wait_for_timeout(500)
 
     def login(self, credentials: TandemCredentials, step_log: StepLogger | None = None) -> None:
+        page = self._page
+        assert page is not None
+        current_inventory = capture_control_inventory(page)
+        if _page_looks_authenticated(current_inventory):
+            if self.page_map is None and self.page_map_path.exists():
+                self.load_page_map(self.page_map_path, validate=False)
+            elif self.page_map is None:
+                self.page_map = self._authenticated_page_map(step_log=step_log)
+            if step_log is not None:
+                step_log.write('browser.login.complete', page_map_path=str(self.page_map_path), mode='authenticated-session')
+            return
+        if self.page_map is not None and not self.page_map.is_complete():
+            if credentials is None:
+                raise AcquisitionError(
+                    f'Loaded Tandem page map at {self.page_map_path} is partial; run `bayesian-t1dm discover` to complete it.',
+                )
+            self.discover_page_map(credentials, step_log=step_log)
+            if step_log is not None:
+                step_log.write('browser.login.complete', page_map_path=str(self.page_map_path), mode='bootstrapped-partial-map')
+            return
         if self.page_map is None and not self.page_map_path.exists():
             self.discover_page_map(credentials, step_log=step_log)
             if step_log is not None:
@@ -906,24 +1310,29 @@ class PlaywrightTandemSourceClient:
         assert page is not None
         if page_map.daily_timeline_url:
             page.goto(page_map.daily_timeline_url, wait_until='domcontentloaded')
+            try:
+                page.wait_for_load_state('networkidle', timeout=self.timeout_ms)
+            except Exception:
+                pass
+            page.wait_for_timeout(min(self.timeout_ms, 1_500))
+            self._dismiss_browser_warning()
             return
         if self.daily_timeline_url:
             page.goto(self.daily_timeline_url, wait_until='domcontentloaded')
+            try:
+                page.wait_for_load_state('networkidle', timeout=self.timeout_ms)
+            except Exception:
+                pass
+            page.wait_for_timeout(min(self.timeout_ms, 1_500))
+            self._dismiss_browser_warning()
             return
         page_map.daily_timeline_nav.locate(page).first.click()
-
-    def _fill_window_dates(self, window: ExportWindow) -> None:
-        page = self._page
-        assert page is not None
-        start_value = window.start_date.isoformat()
-        end_value = window.end_date.isoformat()
-        page_map = self.ensure_page_map()
-        page_map.start_date.locate(page).first.fill(start_value)
-        page_map.end_date.locate(page).first.fill(end_value)
         try:
-            page.keyboard.press('Tab')
+            page.wait_for_load_state('networkidle', timeout=self.timeout_ms)
         except Exception:
             pass
+        page.wait_for_timeout(min(self.timeout_ms, 1_500))
+        self._dismiss_browser_warning()
 
     def export_daily_timeline_window(
         self,
@@ -939,15 +1348,107 @@ class PlaywrightTandemSourceClient:
         page_map = self.ensure_page_map()
         self._open_daily_timeline(page_map)
         try:
-            self._fill_window_dates(window)
-            with page.expect_download(timeout=self.timeout_ms) as download_info:
-                page_map.export_csv.locate(page).first.click()
-            download = download_info.value
-            destination = download_dir / f"{window.window_id}{Path(download.suggested_filename).suffix or '.csv'}"
-            download.save_as(str(destination))
-            if step_log is not None:
-                step_log.write('browser.export.downloaded', window_id=window.window_id, destination=str(destination))
-            return destination
+            self._set_custom_date_range(window, page_map)
+            launcher = self._export_launcher_spec(page_map)
+            launcher.locate(page).first.click()
+            page.wait_for_timeout(min(self.timeout_ms, 1_500))
+            try:
+                confirm = page_map.export_csv_confirm or self._discover_export_confirm(page, step_log=step_log)
+            except Exception as exc:
+                try:
+                    self.capture_page_diagnostics(f'{window.window_id}.export-dialog-incomplete')
+                except Exception:
+                    pass
+                raise AcquisitionError(f'Export dialog was incomplete for {window.window_id}: {exc}') from exc
+            page_map = self._update_page_map_with_export_confirm(page_map, confirm, step_log=step_log)
+            responses: list[object] = []
+            downloads: list[object] = []
+            collecting = True
+
+            def on_response(response) -> None:
+                if collecting:
+                    responses.append(response)
+
+            def on_download(download) -> None:
+                if collecting:
+                    downloads.append(download)
+
+            page.on('response', on_response)
+            page.on('download', on_download)
+            try:
+                try:
+                    confirm.locate(page).first.click()
+                except Exception as exc:
+                    try:
+                        self.capture_page_diagnostics(f'{window.window_id}.export-confirm-error')
+                    except Exception:
+                        pass
+                    raise AcquisitionError(f'Could not click export confirm for {window.window_id}: {exc}') from exc
+                page.wait_for_timeout(min(self.timeout_ms, 3_000))
+            finally:
+                collecting = False
+                remove_listener = getattr(page, 'remove_listener', None) or getattr(page, 'off', None)
+                if callable(remove_listener):
+                    try:
+                        remove_listener('response', on_response)
+                    except Exception:
+                        pass
+                    try:
+                        remove_listener('download', on_download)
+                    except Exception:
+                        pass
+
+            artifact: ExportArtifact | None = None
+            if downloads:
+                download = downloads[0]
+                suggested_filename = getattr(download, 'suggested_filename', '') or ''
+                suffix = Path(suggested_filename).suffix or '.csv'
+                destination = download_dir / f'{window.window_id}{suffix}'
+                download.save_as(str(destination))
+                artifact = ExportArtifact(kind='download', path=destination, metadata={'suggested_filename': suggested_filename})
+                if step_log is not None:
+                    step_log.write('browser.export.downloaded', window_id=window.window_id, destination=str(destination))
+            else:
+                artifact = self._capture_export_candidate(responses, download_dir=download_dir, window=window)
+                if artifact is not None and step_log is not None:
+                    step_log.write(
+                        'browser.export.response_captured',
+                        window_id=window.window_id,
+                        path=str(artifact.path),
+                        metadata_path=str(artifact.metadata_path) if artifact.metadata_path else None,
+                        content_type=artifact.metadata.get('content_type'),
+                        status=artifact.metadata.get('status'),
+                    )
+
+            if artifact is None:
+                try:
+                    self.capture_page_diagnostics(f'{window.window_id}.export-missing-response')
+                except Exception:
+                    pass
+                raise AcquisitionError(
+                    _export_artifact_error_message(
+                        window=window,
+                        artifact=None,
+                        observed_responses=len(responses),
+                        confirm_clicked=True,
+                    ),
+                )
+
+            if not _export_artifact_is_tabular(artifact):
+                try:
+                    self.capture_page_diagnostics(f'{window.window_id}.export-non-csv-response')
+                except Exception:
+                    pass
+                raise AcquisitionError(
+                    _export_artifact_error_message(
+                        window=window,
+                        artifact=artifact,
+                        observed_responses=len(responses),
+                        confirm_clicked=True,
+                    ),
+                )
+
+            return artifact.path
         except Exception as exc:
             self.capture_page_diagnostics(f'{window.window_id}.export-error')
             if step_log is not None:
@@ -959,6 +1460,7 @@ __all__ = [
     'DEFAULT_LOGIN_URL',
     'AcquisitionError',
     'AcquisitionRecord',
+    'ExportArtifact',
     'ExportWindow',
     'LocatorSpec',
     'PlaywrightTandemSourceClient',
@@ -969,6 +1471,7 @@ __all__ = [
     'backfill_tandem_exports',
     'collect_tandem_exports',
     'capture_page_diagnostics',
+    'discover_export_confirm_from_controls',
     'discover_login_controls_from_controls',
     'discover_timeline_controls_from_controls',
     'export_daily_timeline_window',
