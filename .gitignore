@@ -17,3 +17,5 @@ old
 __pycache__/
 *.pyc
 bayesian-t1dm/
+
+AGENTS.md
