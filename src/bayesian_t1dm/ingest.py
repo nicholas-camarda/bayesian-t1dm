@@ -10,10 +10,11 @@ import pandas as pd
 from .io import coalesce_columns, read_table
 
 
-CGM_COLUMNS = ["dateTime", "timestamp", "datetime", "eventdatetime", "date time"]
+BROAD_CGM_COLUMNS = ["dateTime", "timestamp", "datetime", "eventdatetime", "date time"]
 BOLUS_COLUMNS = ["completiondatetime", "datetime", "timestamp", "dateTime"]
-GLUCOSE_COLUMNS = ["bg", "glucose", "readings (cgm / bgm)", "value"]
-BOLUS_UNITS_COLUMNS = ["actualtotalbolusrequested", "bolus", "insulin", "units"]
+CGM_GLUCOSE_COLUMNS = ["egv_estimatedGlucoseValue", "bg", "glucose", "readings (cgm / bgm)"]
+CGM_GENERIC_GLUCOSE_COLUMNS = ["value"]
+BOLUS_UNITS_COLUMNS = ["actualtotalbolusrequested", "bolus", "bolus_units", "insulin", "units"]
 CARB_COLUMNS = ["carbsize", "carbs", "carbohydrates", "guessedcarbohydrate"]
 BASAL_RATE_COLUMNS = ["basalrate", "rate", "units_per_hour", "units/hour"]
 ACTIVITY_COLUMNS = ["value", "steps", "activity", "count"]
@@ -56,6 +57,13 @@ class IngestedData:
         }
 
 
+def _first_non_null(series: pd.Series) -> object:
+    non_null = series.dropna()
+    if non_null.empty:
+        return np.nan
+    return non_null.iloc[0]
+
+
 def discover_source_files(raw_dir: str | Path) -> list[Path]:
     raw_path = Path(raw_dir)
     if not raw_path.exists():
@@ -76,6 +84,11 @@ def _parse_datetime(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors="coerce", utc=False)
 
 
+def _match_column(columns: Iterable[str], candidate: str) -> str | None:
+    normalized = {str(col).strip().lower(): col for col in columns}
+    return normalized.get(candidate.strip().lower())
+
+
 def _infer_timestamp_series(kind: str, frame: pd.DataFrame) -> pd.Series:
     if kind == "basal":
         timestamps: list[pd.Series] = []
@@ -89,6 +102,27 @@ def _infer_timestamp_series(kind: str, frame: pd.DataFrame) -> pd.Series:
     if "timestamp" not in frame.columns:
         return pd.Series(dtype="datetime64[ns]")
     return pd.to_datetime(frame["timestamp"], errors="coerce")
+
+
+def _coerce_glucose_columns(columns: Iterable[str], *, allow_generic_value: bool = True) -> list[tuple[str, str]]:
+    candidates = list(CGM_GLUCOSE_COLUMNS)
+    selected: list[tuple[str, str]] = []
+    for candidate in candidates:
+        matched = _match_column(columns, candidate)
+        if matched is not None and candidate not in {canonical for _, canonical in selected}:
+            selected.append((matched, candidate))
+    if allow_generic_value and not selected:
+        generic_value = _match_column(columns, "value")
+        event_hints = [
+            "type",
+            "description",
+            "eventHistoryReportEventDesc",
+            "eventTypeId",
+            "deviceType",
+        ]
+        if generic_value is not None and any(_match_column(columns, hint) is not None for hint in event_hints):
+            selected.append((generic_value, "value"))
+    return selected
 
 
 def _build_manifest_row(kind: str, frame: pd.DataFrame, source_order: int, source_file: str, source_sheet: str | None = None) -> dict[str, object]:
@@ -166,6 +200,61 @@ def build_export_manifest(data: IngestedData) -> pd.DataFrame:
     return manifest.sort_values(["source_order", "kind", "source_sheet", "first_timestamp"], na_position="last").reset_index(drop=True)
 
 
+def _manifest_declared_source_files(raw_dir: str | Path) -> list[Path]:
+    raw_path = Path(raw_dir)
+    if not raw_path.exists():
+        return []
+
+    discovered: list[Path] = []
+    manifest_files = sorted(
+        path
+        for path in raw_path.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() in {".csv", ".json"}
+        and any(token in path.name.lower() for token in ("window_manifest", "normalized_manifest", "tconnectsync_manifest"))
+    )
+    for manifest in manifest_files:
+        try:
+            if manifest.suffix.lower() == ".csv":
+                frame = pd.read_csv(manifest)
+                if "normalized_path" in frame.columns:
+                    candidates = frame["normalized_path"].dropna().astype(str).tolist()
+                elif "normalized_paths" in frame.columns:
+                    candidates = []
+                    for value in frame["normalized_paths"].dropna().astype(str):
+                        candidates.extend([part.strip() for part in value.split(",") if part.strip()])
+                else:
+                    candidates = []
+            else:
+                payload = json.loads(manifest.read_text(encoding="utf-8"))
+                candidates = []
+                if isinstance(payload, dict):
+                    for key in ("normalized_path", "normalized_paths"):
+                        value = payload.get(key)
+                        if isinstance(value, str):
+                            candidates.append(value)
+                        elif isinstance(value, list):
+                            candidates.extend([str(item) for item in value])
+                    windows = payload.get("windows")
+                    if isinstance(windows, list):
+                        for window in windows:
+                            if not isinstance(window, dict):
+                                continue
+                            normalized_paths = window.get("normalized_paths")
+                            if isinstance(normalized_paths, dict):
+                                candidates.extend([str(path) for path in normalized_paths.values() if path])
+                            normalized_path = window.get("normalized_path")
+                            if isinstance(normalized_path, str):
+                                candidates.append(normalized_path)
+            for candidate in candidates:
+                candidate_path = Path(candidate).expanduser()
+                if candidate_path.exists():
+                    discovered.append(candidate_path)
+        except Exception:
+            continue
+    return sorted({path.resolve() for path in discovered})
+
+
 def summarize_export_manifest(manifest: pd.DataFrame, *, required_kinds: Iterable[str] = ("cgm", "bolus")) -> dict[str, object]:
     if manifest.empty:
         return {
@@ -237,21 +326,147 @@ def write_export_manifest(manifest: pd.DataFrame, path: str | Path) -> Path:
     return out_path
 
 
-def _standardize_cgm(df: pd.DataFrame, source: Path, sheet: str | None = None) -> pd.DataFrame:
-    ts_col = coalesce_columns(df.columns, CGM_COLUMNS)
-    glucose_col = coalesce_columns(df.columns, GLUCOSE_COLUMNS)
-    if ts_col is None or glucose_col is None:
+def _standardize_cgm(df: pd.DataFrame, source: Path, sheet: str | None = None, *, allow_generic_value: bool = True) -> pd.DataFrame:
+    ts_col = coalesce_columns(df.columns, BROAD_CGM_COLUMNS)
+    glucose_cols = _coerce_glucose_columns(df.columns, allow_generic_value=allow_generic_value)
+    if ts_col is None or not glucose_cols:
         return pd.DataFrame()
-    out = df.loc[:, [ts_col, glucose_col]].copy()
-    out.columns = ["timestamp", "glucose"]
+    selected_cols = [ts_col, *[column for column, _ in glucose_cols]]
+    rename_map = {ts_col: "timestamp"}
+    for column, canonical in glucose_cols:
+        rename_map[column] = canonical
+    out = df.loc[:, selected_cols].copy()
+    out = out.rename(columns=rename_map)
     out["timestamp"] = _parse_datetime(out["timestamp"])
-    out["glucose"] = pd.to_numeric(out["glucose"], errors="coerce")
+    for _, column in glucose_cols:
+        out[column] = pd.to_numeric(out[column], errors="coerce")
+    out["glucose"] = out[[column for _, column in glucose_cols]].bfill(axis=1).iloc[:, 0]
+    source_priority = {
+        "egv_estimatedGlucoseValue": 0,
+        "bg": 1,
+        "glucose": 2,
+        "readings (cgm / bgm)": 3,
+        "value": 4,
+    }
+    glucose_source = pd.Series(pd.NA, index=out.index, dtype="object")
+    for _, column in glucose_cols:
+        mask = glucose_source.isna() & out[column].notna()
+        glucose_source.loc[mask] = column
+    out["glucose_source"] = glucose_source
+    out["_glucose_priority"] = out["glucose_source"].map(source_priority).fillna(len(source_priority)).astype(int)
     out = out.dropna(subset=["timestamp", "glucose"])
     out["timestamp"] = out["timestamp"].dt.floor("5min")
     out["source_file"] = source.name
     if sheet is not None:
         out["source_sheet"] = sheet
-    return out.groupby("timestamp", as_index=False).agg(glucose=("glucose", "mean"), source_file=("source_file", "first"), **({"source_sheet": ("source_sheet", "first")} if sheet is not None else {}))
+    group_cols = ["timestamp"]
+    agg: dict[str, tuple[str, object]] = {
+        "glucose": ("glucose", "first"),
+        "source_file": ("source_file", "first"),
+        "glucose_source": ("glucose_source", "first"),
+    }
+    for _, column in glucose_cols:
+        agg[column] = (column, _first_non_null)
+    if sheet is not None:
+        agg["source_sheet"] = ("source_sheet", "first")
+    out = out.sort_values(["timestamp", "_glucose_priority"])
+    out = out.drop(columns=["_glucose_priority"])
+    return out.groupby(group_cols, as_index=False).agg(**agg)
+
+
+def summarize_tandem_raw_source(source: str | Path, *, allow_generic_value: bool = False) -> dict[str, object]:
+    path = Path(source)
+    frames = _load_frames(path)
+    cgm_frames: list[pd.DataFrame] = []
+    glucose_columns: list[str] = []
+    sheet_names: list[str] = []
+    for frame, sheet in frames:
+        parsed = _standardize_cgm(frame, path, sheet, allow_generic_value=allow_generic_value)
+        if parsed.empty:
+            continue
+        cgm_frames.append(parsed)
+        if sheet is not None:
+            sheet_names.append(sheet)
+        for column in parsed.columns:
+            if column in {"timestamp", "glucose", "glucose_source", "source_file", "source_sheet"}:
+                continue
+            if column not in glucose_columns:
+                glucose_columns.append(column)
+
+    if cgm_frames:
+        combined = pd.concat(cgm_frames, ignore_index=True)
+        priority_map = {
+            "egv_estimatedGlucoseValue": 0,
+            "bg": 1,
+            "glucose": 2,
+            "readings (cgm / bgm)": 3,
+            "value": 4,
+        }
+        combined["_glucose_priority"] = combined["glucose_source"].map(priority_map).fillna(len(priority_map)).astype(int)
+        combined = combined.sort_values(["timestamp", "_glucose_priority"], na_position="last")
+        combined = combined.drop_duplicates(subset=["timestamp"], keep="first").reset_index(drop=True)
+        combined = combined.drop(columns=["_glucose_priority"])
+        primary_stream = combined.loc[combined["glucose_source"] == "egv_estimatedGlucoseValue"].copy()
+        if primary_stream.empty:
+            primary_stream = combined
+        timestamps = primary_stream["timestamp"].dropna().sort_values().drop_duplicates()
+        deltas = timestamps.diff().dropna().dt.total_seconds().div(60.0) if len(timestamps) > 1 else pd.Series(dtype=float)
+        median_spacing = float(deltas.median()) if not deltas.empty else np.nan
+        first_timestamp = timestamps.iloc[0] if not timestamps.empty else pd.NaT
+        last_timestamp = timestamps.iloc[-1] if not timestamps.empty else pd.NaT
+    else:
+        combined = pd.DataFrame()
+        primary_stream = combined
+        median_spacing = np.nan
+        first_timestamp = pd.NaT
+        last_timestamp = pd.NaT
+
+    has_dense_cgm_stream = bool(
+        not primary_stream.empty and len(primary_stream) >= 3 and np.isfinite(median_spacing) and median_spacing <= 10.0
+    )
+    return {
+        "source_file": path.name,
+        "source_path": str(path),
+        "source_suffix": path.suffix.lower(),
+        "sheet_count": len(frames),
+        "cgm_sheet_count": len(cgm_frames),
+        "cgm_rows": int(len(primary_stream)),
+        "all_cgm_rows": int(len(combined)),
+        "first_timestamp": first_timestamp,
+        "last_timestamp": last_timestamp,
+        "duration_minutes": float((last_timestamp - first_timestamp).total_seconds() / 60.0) if pd.notna(first_timestamp) and pd.notna(last_timestamp) else np.nan,
+        "median_spacing_minutes": median_spacing,
+        "has_dense_cgm_stream": has_dense_cgm_stream,
+        "recognized_glucose_columns": tuple(glucose_columns),
+        "recognized_sheets": tuple(sheet_names),
+    }
+
+
+def summarize_tandem_raw_dir(raw_dir: str | Path, *, allow_generic_value: bool = False) -> pd.DataFrame:
+    raw_path = Path(raw_dir)
+    sources = discover_source_files(raw_path)
+    summaries = [summarize_tandem_raw_source(source, allow_generic_value=allow_generic_value) for source in sources]
+    if not summaries:
+        return pd.DataFrame(
+            columns=[
+                "source_file",
+                "source_path",
+                "source_suffix",
+                "sheet_count",
+                "cgm_sheet_count",
+                "cgm_rows",
+                "all_cgm_rows",
+                "first_timestamp",
+                "last_timestamp",
+                "duration_minutes",
+                "median_spacing_minutes",
+                "has_dense_cgm_stream",
+                "recognized_glucose_columns",
+                "recognized_sheets",
+            ]
+        )
+    frame = pd.DataFrame(summaries)
+    return frame.sort_values(["has_dense_cgm_stream", "cgm_rows", "source_file"], ascending=[False, False, True]).reset_index(drop=True)
 
 
 def _standardize_bolus(df: pd.DataFrame, source: Path, sheet: str | None = None) -> pd.DataFrame:
@@ -346,7 +561,7 @@ def _load_frames(path: Path) -> list[tuple[pd.DataFrame, str | None]]:
 
 def load_tandem_exports(raw_dir: str | Path) -> IngestedData:
     raw_path = Path(raw_dir)
-    source_files = discover_source_files(raw_path)
+    source_files = sorted({path.resolve() for path in [*discover_source_files(raw_path), *_manifest_declared_source_files(raw_path)]})
     cgm_frames: list[pd.DataFrame] = []
     bolus_frames: list[pd.DataFrame] = []
     basal_frames: list[pd.DataFrame] = []
@@ -357,19 +572,18 @@ def load_tandem_exports(raw_dir: str | Path) -> IngestedData:
             if frame.empty:
                 continue
             normalized = frame.copy()
-            if any(col.lower() in {"bg", "glucose", "readings (cgm / bgm)"} for col in normalized.columns.astype(str)):
-                parsed = _standardize_cgm(normalized, source, sheet)
-                if not parsed.empty:
-                    cgm_frames.append(parsed)
-            if any(col.lower() in {"actualtotalbolusrequested", "bolus", "units"} for col in normalized.columns.astype(str)) or any(col.lower() in {"carbsize", "carbs"} for col in normalized.columns.astype(str)):
+            parsed = _standardize_cgm(normalized, source, sheet)
+            if not parsed.empty:
+                cgm_frames.append(parsed)
+            if any(col.lower() in {"actualtotalbolusrequested", "bolus", "bolus_units", "insulin", "units"} for col in normalized.columns.astype(str)) or any(col.lower() in {"carbsize", "carbs"} for col in normalized.columns.astype(str)):
                 parsed = _standardize_bolus(normalized, source, sheet)
                 if not parsed.empty:
                     bolus_frames.append(parsed)
-            if any(col.lower() in {"basalrate", "units_per_hour", "rate"} for col in normalized.columns.astype(str)):
+            if any(col.lower() in {"basalrate", "basal_units_per_hour", "units_per_hour", "rate"} for col in normalized.columns.astype(str)):
                 parsed = _standardize_basal(normalized, source, sheet)
                 if not parsed.empty:
                     basal_frames.append(parsed)
-            if any(col.lower() in {"steps", "activity", "value"} for col in normalized.columns.astype(str)) and ("step" in source.name.lower() or "activity" in source.name.lower()):
+            if any(col.lower() in {"steps", "activity", "activity_value", "value"} for col in normalized.columns.astype(str)) and ("step" in source.name.lower() or "activity" in source.name.lower() or "normalized" in source.name.lower()):
                 parsed = _standardize_activity(normalized, source, sheet)
                 if not parsed.empty:
                     activity_frames.append(parsed)

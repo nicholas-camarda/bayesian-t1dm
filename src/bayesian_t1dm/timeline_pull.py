@@ -1,3 +1,10 @@
+"""Experimental Daily Timeline fallback.
+
+This module only recovers rendered Daily Timeline summary rows from Tandem
+Source. It is useful when browser export is blocked, but it is not a substitute
+for a tabular 5-minute CGM export carrying `eventDateTime` plus EGV fields.
+"""
+
 from __future__ import annotations
 
 import json

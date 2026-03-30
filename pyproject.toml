@@ -22,8 +22,8 @@ dependencies = [
 dev = [
   "pytest>=8.0",
 ]
-automation = [
-  "playwright>=1.40",
+tconnectsync = [
+  "tconnectsync",
 ]
 
 [project.scripts]

@@ -5,11 +5,11 @@
 The active pipeline is:
 
 1. Tandem Mobi syncs to Tandem Source through the mobile app
-2. Tandem Source browser automation exports CSVs for explicit 30-day windows
-3. raw exports are stored in `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/`
-4. local browser session state, traces, and screenshots live in `~/ProjectsRuntime/bayesian-t1dm/`
-5. a raw acquisition manifest records file coverage and window completeness
-6. normalized CGM, bolus, basal, and activity tables are derived from the raw exports
+2. `tconnectsync` logs in to Tandem Source and queries API windows directly
+3. raw API responses are archived under `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/tconnectsync/<window_id>/raw/`
+4. normalized CGM, bolus, basal, and activity tables are written beside the raw responses
+5. a per-window manifest records coverage, hashes, timestamps, and pump identity
+6. the repo can also ingest manual CSV exports that you place in `data/raw/`
 7. 5-minute canonical time grid
 8. derived insulin exposure and IOB
 9. lagged, rolling, and calendar features
@@ -18,51 +18,46 @@ The active pipeline is:
 
 ## Tandem Source Acquisition
 
-The implementation assumes Tandem Source is the authoritative cloud system for the Mobi data. The pipeline does not require a public Tandem API.
+The implementation assumes Tandem Source is the authoritative cloud system for the Mobi data. The active pipeline now uses `tconnectsync` as an API adapter.
 
 Operational assumptions:
 
 - the Mobi app is already linked to Tandem Source
-- Tandem Source uploads are complete enough to support export windows
-- browser automation runs against a local Playwright profile
-- raw reports are saved to the cloud side-project folder before modeling
+- Tandem Source uploads are complete enough to support API windows
+- raw API payload archives are saved to the cloud side-project folder before modeling
 - credentials are loaded from a local `.env` or shell environment only
+- `TCONNECT_REGION` or `TANDEM_SOURCE_REGION` should be set for non-US accounts
+- manual CSV exports can be added as supplemental raw inputs
+
+Recommended environment variables:
+
+- `TCONNECT_EMAIL`
+- `TCONNECT_PASSWORD`
+- `TCONNECT_REGION`
+- `TIMEZONE_NAME`
+- `PUMP_SERIAL_NUMBER` when required
 
 Storage convention:
 
 - code: `~/Projects/bayesian-t1dm`
 - runtime scratch: `~/ProjectsRuntime/bayesian-t1dm`
-- cloud raw data and manifest: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw`
+- cloud raw data, raw API payloads, and manifest: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw`
 - cloud published outputs: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/output`
 
 The acquisition manifest captures:
 
-- source file name
+- source file name or raw artifact path
+- endpoint family
 - requested window start and end dates
 - observed first and last timestamps in the downloaded file
 - number of rows parsed from the file
 - whether the window appears complete
-- the browser trace and screenshot paths used for debugging
-- a content hash and file size for the raw export
+- raw payload hashes and file sizes
+- timezone and pump identity used for the request
 
 This is the gating artifact for downstream modeling. If the manifest shows incomplete coverage, the forecast and recommendation outputs should be treated as provisional.
 
 The downstream ingest manifest, which is derived after normalization, still checks for gaps, overlaps, duplicates, and out-of-order windows across the parsed tables.
-
-### Selector Discovery and Page Map
-
-Browser automation uses a Tandem page map stored in the cloud archive area:
-
-- `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/archive/tandem_page_map.json`
-
-The `discover` command writes this page map by inspecting the live Tandem Source pages through Playwright and capturing:
-
-- login selectors
-- Daily Timeline navigation selectors
-- date range input selectors
-- CSV export selectors
-
-Collect/backfill reuse the saved page map automatically. The runtime keeps traces, screenshots, HTML, accessibility snapshots, and control inventories in `~/ProjectsRuntime/bayesian-t1dm/` so failed browser steps can be inspected without touching the raw export store.
 
 ## Insulin Action Kernel
 
@@ -119,6 +114,8 @@ Key features:
 - insulin activity and IOB derived from bolus expansion
 - basal rate carried forward across the current bin
 - activity summary variables
+- missingness and gap indicators should be added explicitly as the API layer matures
+- carb and meal features should be added if Tandem Source exposes them in the payloads
 - calendar features: sine/cosine hour-of-day, sine/cosine day-of-week, weekend indicator
 
 Target:
@@ -220,6 +217,7 @@ Assumptions:
 - Tandem export timestamps are trustworthy after normalization
 - a 5-hour insulin action approximation is acceptable as a first-order model
 - current CGM, bolus, and activity history carries signal for short-horizon prediction
+- API payloads are stable enough to support windowed backfill
 
 Known failure modes:
 
@@ -228,17 +226,13 @@ Known failure modes:
 - basal schedule changes not captured in the chosen export
 - poor calibration if the insulin action kernel is badly misspecified
 - overconfident recommendations if validation is not walk-forward based
+- silent API drift if Tandem changes undocumented endpoints
 
 ## Acquisition and Manifest Design Decisions
 
 - Tandem Source cloud sync is treated as the source of truth because it is the supported path for Mobi uploads.
-- The pipeline is file-based because there is no public Tandem API in the implementation.
-- A raw export manifest is required so export completeness is checked before modeling rather than after the fact.
+- The pipeline is API-first because `tconnectsync` can query Tandem Source directly.
+- Manual CSV exports are still accepted as supplemental raw inputs.
+- There is no supported Playwright/browser fallback in the active acquisition path.
+- A raw acquisition manifest is required so export completeness is checked before modeling rather than after the fact.
 - Coverage completeness is defined on the acquisition manifest, while cross-file gap checks live in the normalized ingest manifest.
-
-## Design Decisions
-
-- Python is the active pipeline language because it supports a cleaner package structure and better notebook-to-production migration.
-- Notebooks remain for exploration, but they are not the source of truth.
-- R is archived because the previous R scripts were not runnable as a standalone workflow.
-- Recommendations are human-reviewable rather than automatic because the repo is meant to support personal diabetes decisions, not control the pump directly.

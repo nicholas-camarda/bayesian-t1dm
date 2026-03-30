@@ -4,17 +4,19 @@ import argparse
 from datetime import date, timedelta
 from pathlib import Path
 
+import pandas as pd
+
 from .evaluate import calibration_summary
 from .acquisition import (
     ExportWindow,
-    PlaywrightTandemSourceClient,
     backfill_tandem_exports,
     collect_tandem_exports,
     load_tandem_credentials,
     StepLogger,
+    TConnectSyncSourceClient,
 )
 from .features import FeatureConfig, build_feature_frame
-from .ingest import build_export_manifest, load_tandem_exports, summarize_coverage, write_export_manifest
+from .ingest import build_export_manifest, load_tandem_exports, summarize_coverage, summarize_tandem_raw_dir, write_export_manifest
 from .model import BayesianGlucoseModel
 from .paths import ProjectPaths
 from .recommend import recommend_setting_changes
@@ -31,47 +33,34 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--report", default=None)
     ingest.add_argument("--manifest", default=None)
 
+    validate_raw = subparsers.add_parser("validate-raw", help="Classify Tandem raw files as dense CGM or summary-only")
+    validate_raw.add_argument("--raw", default=None)
+    validate_raw.add_argument("--report", default=None)
+
     run = subparsers.add_parser("run", help="Run the full forecasting and recommendation pipeline")
     run.add_argument("--raw", default=None)
     run.add_argument("--report", default=None)
     run.add_argument("--manifest", default=None)
     run.add_argument("--horizon", type=int, default=30)
 
-    collect = subparsers.add_parser("collect", help="Export one Tandem Source window through the browser")
+    collect = subparsers.add_parser("collect", help="Fetch one Tandem Source window through tconnectsync")
     collect.add_argument("--start-date", default=None, help="Requested window start date (YYYY-MM-DD)")
     collect.add_argument("--end-date", default=None, help="Requested window end date (YYYY-MM-DD)")
     collect.add_argument("--manifest", default=None)
     collect.add_argument("--report", default=None)
-    collect.add_argument("--page-map", default=None)
     collect.add_argument("--env-file", default=None, help="Optional .env file with Tandem credentials")
-    collect.add_argument("--login-url", default=None)
-    collect.add_argument("--daily-timeline-url", default=None)
-    collect.add_argument("--headless", action=argparse.BooleanOptionalAction, default=False)
     collect.add_argument("--strict", action=argparse.BooleanOptionalAction, default=True)
 
-    backfill = subparsers.add_parser("backfill", help="Backfill Tandem Source export windows through the browser")
+    backfill = subparsers.add_parser("backfill", help="Backfill Tandem Source windows through tconnectsync")
     backfill.add_argument("--start-date", required=True, help="Earliest requested date (YYYY-MM-DD)")
     backfill.add_argument("--end-date", required=True, help="Latest requested date (YYYY-MM-DD)")
     backfill.add_argument("--window-days", type=int, default=30)
     backfill.add_argument("--direction", choices=["backward", "forward"], default="backward")
     backfill.add_argument("--manifest", default=None)
     backfill.add_argument("--report", default=None)
-    backfill.add_argument("--page-map", default=None)
     backfill.add_argument("--env-file", default=None, help="Optional .env file with Tandem credentials")
-    backfill.add_argument("--login-url", default=None)
-    backfill.add_argument("--daily-timeline-url", default=None)
-    backfill.add_argument("--headless", action=argparse.BooleanOptionalAction, default=False)
     backfill.add_argument("--strict", action=argparse.BooleanOptionalAction, default=True)
     backfill.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
-
-    discover = subparsers.add_parser("discover", help="Discover and save Tandem Source selectors")
-    discover.add_argument("--manifest", default=None)
-    discover.add_argument("--report", default=None)
-    discover.add_argument("--page-map", default=None)
-    discover.add_argument("--env-file", default=None, help="Optional .env file with Tandem credentials")
-    discover.add_argument("--login-url", default=None)
-    discover.add_argument("--daily-timeline-url", default=None)
-    discover.add_argument("--headless", action=argparse.BooleanOptionalAction, default=False)
 
     return parser
 
@@ -113,18 +102,61 @@ def main(argv: list[str] | None = None) -> int:
         write_markdown_report(summary, args.report)
         return 0
 
+    if args.command == "validate-raw":
+        args.raw = args.raw or str(paths.cloud_raw)
+        args.report = args.report or str(paths.cloud_output / "tandem_raw_validation.md")
+        summary = summarize_tandem_raw_dir(args.raw)
+        report_lines = [
+            "# Tandem Raw Validation",
+            "",
+            f"- raw_dir: {args.raw}",
+            f"- file_count: {len(summary)}",
+        ]
+        if summary.empty:
+            report_lines.extend(["", "No Tandem raw files were found."])
+        else:
+            report_lines.extend(
+                [
+                    "",
+                    "| file | dense_cgm | cgm_rows | all_cgm_rows | median_spacing_minutes | first_timestamp | last_timestamp |",
+                    "| --- | --- | ---: | ---: | ---: | --- | --- |",
+                ]
+            )
+            for row in summary.itertuples(index=False):
+                report_lines.append(
+                    "| {file} | {dense} | {cgm_rows} | {all_rows} | {spacing} | {first} | {last} |".format(
+                        file=row.source_file,
+                        dense="yes" if bool(row.has_dense_cgm_stream) else "no",
+                        cgm_rows=int(row.cgm_rows),
+                        all_rows=int(row.all_cgm_rows),
+                        spacing="NA" if pd.isna(row.median_spacing_minutes) else f"{float(row.median_spacing_minutes):.1f}",
+                        first="" if pd.isna(row.first_timestamp) else str(pd.Timestamp(row.first_timestamp)),
+                        last="" if pd.isna(row.last_timestamp) else str(pd.Timestamp(row.last_timestamp)),
+                    )
+                )
+            dense = summary.loc[summary["has_dense_cgm_stream"].fillna(False)]
+            report_lines.extend(
+                [
+                    "",
+                    f"- dense_cgm_files: {len(dense)}",
+                    f"- dense_cgm_rows_total: {int(dense['cgm_rows'].sum()) if not dense.empty else 0}",
+                ]
+            )
+        Path(args.report).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.report).write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+        return 0
+
     if args.command in {"collect", "backfill"}:
         credentials = load_tandem_credentials(args.root, args.env_file)
         manifest_path = args.manifest or str(paths.cloud_raw / "tandem_export_manifest.csv")
         report_path = args.report or str(paths.cloud_output / "tandem_acquisition_summary.md")
-        page_map_path = args.page_map or str(paths.cloud_archive / "tandem_page_map.json")
-        with PlaywrightTandemSourceClient(
-            paths,
-            page_map_path=page_map_path,
-            login_url=args.login_url or "https://source.tandemdiabetes.com/",
-            daily_timeline_url=args.daily_timeline_url,
-            headless=args.headless,
-        ) as client:
+        client_kwargs = {
+            "region": credentials.region,
+            "timezone": credentials.timezone,
+            "pump_serial": credentials.pump_serial,
+        }
+        client_cm = TConnectSyncSourceClient(paths, **client_kwargs)
+        with client_cm as client:
             if args.command == "collect":
                 start_date = date.fromisoformat(args.start_date) if args.start_date else date.today() - timedelta(days=29)
                 end_date = date.fromisoformat(args.end_date) if args.end_date else date.today()
@@ -156,35 +188,6 @@ def main(argv: list[str] | None = None) -> int:
                 strict=args.strict,
             )
             return 0
-
-    if args.command == "discover":
-        credentials = load_tandem_credentials(args.root, args.env_file)
-        manifest_path = args.manifest or str(paths.cloud_raw / "tandem_export_manifest.csv")
-        report_path = args.report or str(paths.cloud_output / "tandem_discovery_summary.md")
-        page_map_path = args.page_map or str(paths.cloud_archive / "tandem_page_map.json")
-        step_log = StepLogger(paths.runtime_logs / "tandem_discovery.log")
-        with PlaywrightTandemSourceClient(
-            paths,
-            page_map_path=page_map_path,
-            login_url=args.login_url or "https://source.tandemdiabetes.com/",
-            daily_timeline_url=args.daily_timeline_url,
-            headless=args.headless,
-        ) as client:
-            page_map = client.discover_page_map(credentials, step_log=step_log)
-            client.save_page_map(page_map, page_map_path, validate=page_map.is_complete())
-            manifest_status = f"selector_map_written: {page_map_path}"
-            report_lines = [
-                "# Tandem Source Discovery Summary",
-                "",
-                f"- page_map_path: {page_map_path}",
-                f"- login_url: {page_map.login_url}",
-                f"- daily_timeline_url: {page_map.daily_timeline_url or 'NA'}",
-                f"- manifest_path: {manifest_path}",
-                f"- status: {manifest_status}",
-            ]
-            Path(report_path).parent.mkdir(parents=True, exist_ok=True)
-            Path(report_path).write_text("\n".join(report_lines) + "\n", encoding="utf-8")
-        return 0
 
     parser.error(f"Unknown command: {args.command}")
     return 2
