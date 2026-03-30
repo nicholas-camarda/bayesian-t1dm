@@ -23,6 +23,7 @@ def test_load_tandem_exports_normalizes_fixture_data(tandem_fixture_dir):
     assert len(data.source_files) == 4
     assert {"timestamp", "glucose", "source_file"}.issubset(data.cgm.columns)
     assert {"timestamp", "bolus_units", "source_file"}.issubset(data.bolus.columns)
+    assert {"timestamp", "carb_grams", "source_file"}.issubset(data.carbs.columns)
     assert {"start_timestamp", "end_timestamp", "basal_units_per_hour"}.issubset(data.basal.columns)
     assert {"timestamp", "activity_value", "source_file"}.issubset(data.activity.columns)
     assert {"kind", "first_timestamp", "last_timestamp", "is_complete_window"}.issubset(manifest.columns)
@@ -32,6 +33,7 @@ def test_load_tandem_exports_normalizes_fixture_data(tandem_fixture_dir):
     assert coverage.manifest_rows == len(manifest)
     assert coverage.cgm_rows == 7
     assert coverage.bolus_rows == 2
+    assert len(data.carbs) == 2
     assert coverage.basal_rows == 1
     assert coverage.activity_rows == 2
     assert str(coverage.first_timestamp) == "2023-06-01 00:00:00"

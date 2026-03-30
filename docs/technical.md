@@ -233,6 +233,6 @@ Known failure modes:
 - Tandem Source cloud sync is treated as the source of truth because it is the supported path for Mobi uploads.
 - The pipeline is API-first because `tconnectsync` can query Tandem Source directly.
 - Manual CSV exports are still accepted as supplemental raw inputs.
-- There is no supported Playwright/browser fallback in the active acquisition path.
+- There is no supported Playwright/browser fallback in the active acquisition path; the browser code has been retired.
 - A raw acquisition manifest is required so export completeness is checked before modeling rather than after the fact.
 - Coverage completeness is defined on the acquisition manifest, while cross-file gap checks live in the normalized ingest manifest.

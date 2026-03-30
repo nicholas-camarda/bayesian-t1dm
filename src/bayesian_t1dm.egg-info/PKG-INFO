@@ -11,10 +11,9 @@ Requires-Dist: openpyxl>=3.1
 Requires-Dist: pyarrow>=15
 Requires-Dist: arviz>=0.16
 Requires-Dist: pymc>=5.0
+Requires-Dist: tconnectsync
 Provides-Extra: dev
 Requires-Dist: pytest>=8.0; extra == "dev"
-Provides-Extra: automation
-Requires-Dist: playwright>=1.40; extra == "automation"
 
 # Bayesian T1DM
 
@@ -38,7 +37,7 @@ What is in place:
 
 - Tandem Source cloud-sync ingest backed by raw file exports
 - export manifest generation and coverage checks
-- browser automation for Tandem Source export collection
+- API acquisition backed by `tconnectsync` payload archives
 - 5-minute time-grid construction
 - insulin activity and IOB expansion from bolus events
 - Bayesian forecasting model scaffolding in PyMC
@@ -86,15 +85,15 @@ Credentials should live in a root-level `.env` file that is never committed:
 4. Run the ingest command to generate `data/raw/tandem_export_manifest.csv` and a coverage report.
 5. Check the manifest for gaps, overlaps, duplicate windows, or incomplete exports before trusting downstream model results.
 
-## Browser Collection
+## API Acquisition
 
-Install the automation extras if you want browser-based collection:
+Install the package into a virtual environment named `bayesian-t1dm`:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv bayesian-t1dm
+source bayesian-t1dm/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e '.[dev,automation]'
+python -m pip install -e .
 ```
 
 Copy `.env.example` to `.env` and fill in your Tandem credentials locally. Do not commit `.env`.
@@ -113,7 +112,7 @@ bayesian-t1dm backfill --start-date 2023-01-01 --end-date 2024-01-30
 
 ## Repo Layout
 
-- `src/bayesian_t1dm/` - importable Python package for ingest, browser acquisition, features, modeling, recommendation, evaluation, and reporting
+- `src/bayesian_t1dm/` - importable Python package for ingest, acquisition, features, modeling, recommendation, evaluation, and reporting
 - `notebooks/` - exploratory notebooks and experiments
 - `archive/r/` - archived R prototypes and scratch code
 - `docs/` - technical documentation
@@ -124,7 +123,7 @@ bayesian-t1dm backfill --start-date 2023-01-01 --end-date 2024-01-30
 Install in editable mode:
 
 ```bash
-python -m pip install -e .[dev,automation]
+python -m pip install -e '.[dev]'
 ```
 
 Inspect Tandem data coverage:
@@ -167,7 +166,7 @@ The pipeline produces:
 
 ## Limitations
 
-- The repo uses browser automation for Tandem Source collection, but the export files themselves are still the source of truth.
+- The repo acquires Tandem Source data through `tconnectsync`; the raw API payloads themselves are the source of truth.
 - Recommendations are advisory and must be reviewed by you.
 - The default insulin action curve is an approximation, not physiology ground truth.
 - The Bayesian model is intentionally conservative because personal data can be sparse and irregular.
@@ -178,7 +177,7 @@ The pipeline produces:
 - Notebooks stay because they are still useful for exploratory analysis and visual debugging.
 - R was archived because the active R scripts were broken and incomplete as standalone entrypoints.
 - Recommendations are human-reviewable rather than automated because the goal is decision support with uncertainty, not automatic pump control.
-- Credentials belong in a local `.env` so browser automation can run without exposing secrets in Git or cloud sync.
+- Credentials belong in a local `.env` so API acquisition can run without exposing secrets in Git or cloud sync.
 
 ## Technical Details
 

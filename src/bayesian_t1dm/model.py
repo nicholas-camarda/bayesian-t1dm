@@ -55,7 +55,7 @@ class BayesianGlucoseModel:
     def _standardize(frame: pd.DataFrame, columns: Sequence[str]) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
         features = frame.loc[:, list(columns)].astype(float)
         means = features.mean(axis=0)
-        scales = features.std(axis=0).replace(0, 1.0)
+        scales = features.std(axis=0, ddof=0).replace(0, 1.0).fillna(1.0)
         standardized = (features - means) / scales
         return standardized, means, scales
 
@@ -70,7 +70,9 @@ class BayesianGlucoseModel:
         standardized, means, scales = self._standardize(data, frame.feature_columns)
         y = data[frame.target_column].astype(float)
         target_mean = float(y.mean())
-        target_scale = float(y.std() or 1.0)
+        target_scale = float(y.std(ddof=0))
+        if not np.isfinite(target_scale) or target_scale == 0.0:
+            target_scale = 1.0
         y_std = (y - target_mean) / target_scale
 
         X = standardized.to_numpy(dtype=float)

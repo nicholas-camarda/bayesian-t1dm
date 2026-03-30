@@ -16,14 +16,12 @@ dependencies = [
   "pyarrow>=15",
   "arviz>=0.16",
   "pymc>=5.0",
+  "tconnectsync",
 ]
 
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
-]
-tconnectsync = [
-  "tconnectsync",
 ]
 
 [project.scripts]

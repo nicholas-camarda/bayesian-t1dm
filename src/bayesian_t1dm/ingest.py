@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -43,6 +44,7 @@ class TandemCoverage:
 class IngestedData:
     cgm: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
     bolus: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
+    carbs: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
     basal: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
     activity: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
     manifest: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
@@ -52,6 +54,7 @@ class IngestedData:
         return {
             "cgm": self.cgm,
             "bolus": self.bolus,
+            "carbs": self.carbs,
             "basal": self.basal,
             "activity": self.activity,
         }
@@ -501,6 +504,49 @@ def _standardize_bolus(df: pd.DataFrame, source: Path, sheet: str | None = None)
     return out.groupby(group_cols, as_index=False).agg(**agg)
 
 
+def _standardize_carbs(df: pd.DataFrame, source: Path, sheet: str | None = None, *, source_label: str | None = None) -> pd.DataFrame:
+    timestamp_candidates = [
+        "completiondatetime",
+        "eventdatetime",
+        "startdatetime",
+        "datetime",
+        "timestamp",
+        "dateTime",
+        "date time",
+        "time",
+        "startdate",
+        "date",
+    ]
+    ts_col = coalesce_columns(df.columns, timestamp_candidates)
+    carb_col = coalesce_columns(df.columns, CARB_COLUMNS)
+    if ts_col is None or carb_col is None:
+        return pd.DataFrame()
+    out = df.loc[:, [ts_col, carb_col]].copy()
+    out = out.rename(columns={ts_col: "timestamp", carb_col: "carb_grams"})
+    out["timestamp"] = _parse_datetime(out["timestamp"])
+    out["carb_grams"] = pd.to_numeric(out["carb_grams"], errors="coerce")
+    out = out.dropna(subset=["timestamp", "carb_grams"])
+    out["timestamp"] = out["timestamp"].dt.floor("5min")
+    out["source_file"] = source.name
+    if sheet is not None:
+        out["source_sheet"] = sheet
+    if source_label is not None:
+        out["source_label"] = source_label
+    group_cols = ["timestamp", "source_file"]
+    if sheet is not None:
+        group_cols.append("source_sheet")
+    if source_label is not None:
+        group_cols.append("source_label")
+    agg: dict[str, tuple[str, object]] = {
+        "carb_grams": ("carb_grams", "sum"),
+    }
+    if sheet is not None:
+        agg["source_sheet"] = ("source_sheet", "first")
+    if source_label is not None:
+        agg["source_label"] = ("source_label", "first")
+    return out.groupby(group_cols, as_index=False).agg(**agg)
+
+
 def _standardize_basal(df: pd.DataFrame, source: Path, sheet: str | None = None) -> pd.DataFrame:
     start_col = coalesce_columns(df.columns, ["startdatetime", "startdate", "start"])
     end_col = coalesce_columns(df.columns, ["enddatetime", "enddate", "end"])
@@ -564,6 +610,7 @@ def load_tandem_exports(raw_dir: str | Path) -> IngestedData:
     source_files = sorted({path.resolve() for path in [*discover_source_files(raw_path), *_manifest_declared_source_files(raw_path)]})
     cgm_frames: list[pd.DataFrame] = []
     bolus_frames: list[pd.DataFrame] = []
+    carb_frames: list[pd.DataFrame] = []
     basal_frames: list[pd.DataFrame] = []
     activity_frames: list[pd.DataFrame] = []
 
@@ -579,6 +626,16 @@ def load_tandem_exports(raw_dir: str | Path) -> IngestedData:
                 parsed = _standardize_bolus(normalized, source, sheet)
                 if not parsed.empty:
                     bolus_frames.append(parsed)
+                    if "carb_grams" in parsed.columns:
+                        carb_frame = parsed.loc[:, [column for column in ["timestamp", "carb_grams", "source_file", "source_sheet"] if column in parsed.columns]].copy()
+                        carb_frame["source_label"] = "bolus"
+                        carb_frame["_carb_source_priority"] = 1
+                        carb_frames.append(carb_frame)
+            if any(col.lower() in {"carbsize", "carbs", "carbohydrates", "guessedcarbohydrate", "carb_grams"} for col in normalized.columns.astype(str)):
+                parsed = _standardize_carbs(normalized, source, sheet, source_label=sheet or source.name)
+                if not parsed.empty:
+                    parsed["_carb_source_priority"] = 0
+                    carb_frames.append(parsed)
             if any(col.lower() in {"basalrate", "basal_units_per_hour", "units_per_hour", "rate"} for col in normalized.columns.astype(str)):
                 parsed = _standardize_basal(normalized, source, sheet)
                 if not parsed.empty:
@@ -591,10 +648,25 @@ def load_tandem_exports(raw_dir: str | Path) -> IngestedData:
     ingested = IngestedData(
         cgm=pd.concat(cgm_frames, ignore_index=True) if cgm_frames else pd.DataFrame(columns=["timestamp", "glucose", "source_file"]),
         bolus=pd.concat(bolus_frames, ignore_index=True) if bolus_frames else pd.DataFrame(columns=["timestamp", "bolus_units", "source_file"]),
+        carbs=pd.DataFrame(columns=["timestamp", "carb_grams", "source_file"]),
         basal=pd.concat(basal_frames, ignore_index=True) if basal_frames else pd.DataFrame(columns=["start_timestamp", "end_timestamp", "basal_units_per_hour", "source_file"]),
         activity=pd.concat(activity_frames, ignore_index=True) if activity_frames else pd.DataFrame(columns=["timestamp", "activity_value", "source_file"]),
         source_files=source_files,
     )
+    if carb_frames:
+        carbs = pd.concat(carb_frames, ignore_index=True, sort=False)
+        if "timestamp" in carbs.columns:
+            carbs["timestamp"] = pd.to_datetime(carbs["timestamp"], errors="coerce")
+        if "carb_grams" in carbs.columns:
+            carbs["carb_grams"] = pd.to_numeric(carbs["carb_grams"], errors="coerce")
+        sort_columns = [column for column in ["timestamp", "_carb_source_priority", "source_file", "source_label"] if column in carbs.columns]
+        if sort_columns:
+            carbs = carbs.sort_values(sort_columns, na_position="last")
+        dedupe_subset = [column for column in ["timestamp", "carb_grams"] if column in carbs.columns]
+        if dedupe_subset:
+            carbs = carbs.drop_duplicates(subset=dedupe_subset, keep="first")
+        carbs = carbs.drop(columns=[column for column in ["_carb_source_priority"] if column in carbs.columns])
+        ingested.carbs = carbs.reset_index(drop=True)
     ingested.manifest = build_export_manifest(ingested)
     return ingested
 

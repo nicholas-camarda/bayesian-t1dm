@@ -489,6 +489,49 @@ def _normalize_bolus_records(
     return frame.groupby(group_cols, as_index=False).agg(**aggregations)
 
 
+def _normalize_carb_records(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    source_label: str,
+    endpoint_family: str,
+    timezone: str | None,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    timestamp_candidates = [
+        'completionDateTime',
+        'completiondatetime',
+        'eventDateTime',
+        'dateTime',
+        'datetime',
+        'timestamp',
+        'time',
+        'startDateTime',
+        'startdatetime',
+    ]
+    carb_candidates = ['carbSize', 'carbs', 'carbohydrates', 'guessedCarbohydrate', 'carb_grams']
+    for record in records:
+        ts_key = _first_existing_key(record, timestamp_candidates)
+        carb_key = _first_existing_key(record, carb_candidates)
+        if ts_key is None or carb_key is None:
+            continue
+        timestamp = _ensure_datetime(record.get(ts_key), timezone=timezone)
+        carb_value = pd.to_numeric(pd.Series([record.get(carb_key)]), errors='coerce').iloc[0]
+        if pd.isna(timestamp) or pd.isna(carb_value):
+            continue
+        rows.append(
+            {
+                'timestamp': timestamp.floor('5min'),
+                'carb_grams': float(carb_value),
+                'source_file': source_label,
+                'source_label': endpoint_family,
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=['timestamp', 'carb_grams', 'source_file', 'source_label'])
+    frame = pd.DataFrame(rows)
+    return frame.groupby(['timestamp', 'source_file', 'source_label'], as_index=False).agg(carb_grams=('carb_grams', 'sum'))
+
+
 def _normalize_basal_records(
     records: Sequence[Mapping[str, Any]],
     *,
@@ -580,20 +623,48 @@ def normalize_tconnectsync_payloads(
     source_label = _source_label_for_window(window, endpoint_family)
     cgm_records = _payload_records(payloads.get('cgm'))
     bolus_records = _payload_records(payloads.get('bolus'))
+    carb_frames: list[pd.DataFrame] = []
+    for family, payload in payloads.items():
+        family_name = str(family).lower()
+        if family_name == 'bolus':
+            continue
+        if 'carb' in family_name or 'meal' in family_name:
+            family_records = _payload_records(payload)
+            if family_records:
+                carb_frame = _normalize_carb_records(family_records, source_label=source_label, endpoint_family=family_name, timezone=timezone)
+                if not carb_frame.empty:
+                    carb_frame['_carb_source_priority'] = 0
+                    carb_frames.append(carb_frame)
     basal_records = _payload_records(payloads.get('basal'))
     activity_records = _payload_records(payloads.get('activity'))
 
     cgm = _normalize_cgm_records(cgm_records, source_label=source_label, endpoint_family=endpoint_family, timezone=timezone)
     bolus = _normalize_bolus_records(bolus_records, source_label=source_label, endpoint_family=endpoint_family, timezone=timezone)
+    carb_from_bolus = bolus.loc[bolus['carb_grams'].notna(), ['timestamp', 'carb_grams', 'source_file']].copy() if not bolus.empty and 'carb_grams' in bolus.columns else pd.DataFrame(columns=['timestamp', 'carb_grams', 'source_file'])
+    if not carb_from_bolus.empty:
+        carb_from_bolus['source_label'] = 'bolus'
+        carb_from_bolus['_carb_source_priority'] = 1
+    carb_frames = [frame for frame in [*carb_frames, carb_from_bolus] if not frame.empty]
+    if carb_frames:
+        carbs = pd.concat(carb_frames, ignore_index=True, sort=False)
+        carbs['timestamp'] = pd.to_datetime(carbs['timestamp'], errors='coerce')
+        carbs['carb_grams'] = pd.to_numeric(carbs['carb_grams'], errors='coerce')
+        sort_columns = [column for column in ['timestamp', '_carb_source_priority', 'source_file', 'source_label'] if column in carbs.columns]
+        if sort_columns:
+            carbs = carbs.sort_values(sort_columns, na_position='last')
+        carbs = carbs.drop_duplicates(subset=['timestamp', 'carb_grams'], keep='first')
+        carbs = carbs.drop(columns=[column for column in ['_carb_source_priority'] if column in carbs.columns])
+    else:
+        carbs = pd.DataFrame(columns=['timestamp', 'carb_grams', 'source_file'])
     basal = _normalize_basal_records(basal_records, source_label=source_label, endpoint_family=endpoint_family, timezone=timezone, window=window)
     activity = _normalize_activity_records(activity_records, source_label=source_label, endpoint_family=endpoint_family, timezone=timezone)
     if activity.empty:
         activity = pd.DataFrame(columns=['timestamp', 'activity_value', 'source_file', 'source_label'])
 
-    ingested = IngestedData(cgm=cgm, bolus=bolus, basal=basal, activity=activity)
+    ingested = IngestedData(cgm=cgm, bolus=bolus, carbs=carbs.reset_index(drop=True), basal=basal, activity=activity)
     ingested.manifest = build_export_manifest(ingested)
     timestamps: list[pd.Series] = []
-    for frame, column in [(cgm, 'timestamp'), (bolus, 'timestamp'), (activity, 'timestamp')]:
+    for frame, column in [(cgm, 'timestamp'), (bolus, 'timestamp'), (carbs, 'timestamp'), (activity, 'timestamp')]:
         if column in frame.columns and not frame.empty:
             timestamps.append(pd.to_datetime(frame[column], errors='coerce'))
     if not basal.empty:
@@ -620,6 +691,7 @@ def normalize_tconnectsync_payloads(
         'row_counts': {
             'cgm': int(len(cgm)),
             'bolus': int(len(bolus)),
+            'carbs': int(len(carbs)),
             'basal': int(len(basal)),
             'activity': int(len(activity)),
         },
@@ -1614,759 +1686,6 @@ class TConnectSyncSourceClient:
                 is_complete_window=result.is_complete_window,
             )
         return result
-
-
-class PlaywrightTandemSourceClient:
-    def __init__(
-        self,
-        workspace: ProjectPaths,
-        *,
-        page_map_path: str | Path | None = None,
-        login_url: str = DEFAULT_LOGIN_URL,
-        headless: bool = False,
-        slow_mo: int = 0,
-        timeout_ms: int = 60_000,
-        daily_timeline_url: str | None = None,
-        page_map: TandemPageMap | None = None,
-    ) -> None:
-        self.workspace = workspace
-        self.page_map_path = Path(page_map_path) if page_map_path is not None else _page_map_path(workspace)
-        self.login_url = login_url
-        self.daily_timeline_url = daily_timeline_url
-        self.headless = headless
-        self.slow_mo = slow_mo
-        self.timeout_ms = timeout_ms
-        self.page_map = page_map
-        self._playwright = None
-        self._context = None
-        self._page = None
-        self._tracing_active = False
-
-    def __enter__(self) -> PlaywrightTandemSourceClient:
-        try:
-            from playwright.sync_api import sync_playwright
-        except Exception as exc:  # pragma: no cover - dependency guard
-            raise AcquisitionError("Install Playwright to use Tandem web automation: pip install -e '.[automation]'") from exc
-
-        self.workspace.runtime_browser.mkdir(parents=True, exist_ok=True)
-        self.workspace.runtime_downloads.mkdir(parents=True, exist_ok=True)
-        self.workspace.runtime_traces.mkdir(parents=True, exist_ok=True)
-        self.workspace.runtime_logs.mkdir(parents=True, exist_ok=True)
-        if self.page_map is None and self.page_map_path.exists():
-            self.page_map = TandemPageMap.load(self.page_map_path)
-        self._playwright = sync_playwright().start()
-        browser_home = self.workspace.runtime_browser_home
-        browser_cache = browser_home / "Library" / "Caches"
-        browser_support = browser_home / "Library" / "Application Support"
-        browser_tmp = self.workspace.runtime / "tmp"
-        browser_home.mkdir(parents=True, exist_ok=True)
-        browser_cache.mkdir(parents=True, exist_ok=True)
-        browser_support.mkdir(parents=True, exist_ok=True)
-        browser_tmp.mkdir(parents=True, exist_ok=True)
-        browser_env = dict(os.environ)
-        browser_env.update(
-            {
-                "HOME": str(browser_home),
-                "USERPROFILE": str(browser_home),
-                "TMPDIR": str(browser_tmp),
-                "TEMP": str(browser_tmp),
-                "TMP": str(browser_tmp),
-                "XDG_CONFIG_HOME": str(browser_home / ".config"),
-                "XDG_CACHE_HOME": str(browser_cache),
-                "XDG_STATE_HOME": str(browser_home / ".local" / "state"),
-            }
-        )
-        self._context = self._playwright.chromium.launch_persistent_context(
-            user_data_dir=str(self.workspace.runtime_browser),
-            headless=self.headless,
-            slow_mo=self.slow_mo,
-            accept_downloads=True,
-            env=browser_env,
-        )
-        if self._context.pages:
-            self._page = self._context.pages[0]
-        else:
-            self._page = self._context.new_page()
-        self._page.set_default_timeout(self.timeout_ms)
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if self._context is not None:
-            self._context.close()
-        if self._playwright is not None:
-            self._playwright.stop()
-
-    def capture_screenshot(self, path: Path) -> Path:
-        page = self._page
-        assert page is not None
-        path.parent.mkdir(parents=True, exist_ok=True)
-        page.screenshot(path=str(path), full_page=True)
-        return path
-
-    def capture_page_diagnostics(self, stem: str) -> PageDiagnostics:
-        page = self._page
-        assert page is not None
-        return capture_page_diagnostics(page, self.workspace.runtime_logs, stem)
-
-    def start_trace(self) -> None:
-        if self._context is None or self._tracing_active:
-            return
-        self._context.tracing.start(screenshots=True, snapshots=True, sources=True)
-        self._tracing_active = True
-
-    def stop_trace(self, path: Path) -> Path:
-        if self._context is None or not self._tracing_active:
-            return path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._context.tracing.stop(path=str(path))
-        self._tracing_active = False
-        return path
-
-    def load_page_map(self, path: str | Path | None = None, *, validate: bool = False) -> TandemPageMap:
-        page_map_path = Path(path) if path is not None else self.page_map_path
-        if not page_map_path.exists():
-            raise AcquisitionError(
-                f'No Tandem page map found at {page_map_path}. Run `bayesian-t1dm discover` first.',
-            )
-        self.page_map = TandemPageMap.load(page_map_path)
-        if validate and not self.page_map.is_complete():
-            raise AcquisitionError(
-                f'Loaded Tandem page map at {page_map_path} is partial; run `bayesian-t1dm discover` to complete it.',
-            )
-        return self.page_map
-
-    def save_page_map(self, page_map: TandemPageMap, path: str | Path | None = None, *, validate: bool = True) -> Path:
-        destination = Path(path) if path is not None else self.page_map_path
-        self.page_map = page_map
-        return page_map.save(destination, validate=validate)
-
-    def ensure_page_map(self, credentials: TandemCredentials | None = None, *, step_log: StepLogger | None = None, bootstrap: bool = False) -> TandemPageMap:
-        if self.page_map is not None:
-            if self.page_map.is_complete() or bootstrap:
-                return self.page_map
-            page = self._page
-            if page is not None and _page_looks_authenticated(capture_control_inventory(page)):
-                if step_log is not None:
-                    step_log.write('browser.page_map.partial_authenticated', page_map_path=str(self.page_map_path))
-                return self.page_map
-            raise AcquisitionError(
-                f'Loaded Tandem page map at {self.page_map_path} is partial; run `bayesian-t1dm discover` to complete it.',
-            )
-        if self.page_map_path.exists():
-            return self.load_page_map(self.page_map_path, validate=not bootstrap)
-        if bootstrap:
-            if credentials is None:
-                raise AcquisitionError('Credentials are required to discover the Tandem page map')
-            return self.discover_page_map(credentials, step_log=step_log)
-        raise AcquisitionError(
-            f'No Tandem page map found at {self.page_map_path}. Run `bayesian-t1dm discover` first.',
-        )
-
-    def _wait_for_login_controls(self, step_log: StepLogger | None = None) -> list[dict[str, object]]:
-        page = self._page
-        assert page is not None
-        deadline = datetime.utcnow() + timedelta(milliseconds=self.timeout_ms)
-        if step_log is not None:
-            step_log.write('browser.discover.login_wait_start', timeout_ms=self.timeout_ms, poll_ms=500)
-        while datetime.utcnow() <= deadline:
-            inventory = capture_control_inventory(page)
-            if _page_looks_authenticated(inventory):
-                if step_log is not None:
-                    step_log.write('browser.discover.authenticated_ready', control_count=len(inventory))
-                return inventory
-            if _login_controls_ready_from_inventory(inventory):
-                if step_log is not None:
-                    step_log.write('browser.discover.login_ready', control_count=len(inventory))
-                return inventory
-            page.wait_for_timeout(500)
-        try:
-            self.capture_page_diagnostics('discover-login-timeout')
-        except Exception:
-            pass
-        if step_log is not None:
-            step_log.write('browser.discover.login_wait_timeout', timeout_ms=self.timeout_ms)
-        raise AcquisitionError(
-            'Tandem Source login never exposed interactive controls after hydration; '
-            'the SPA may still be loading or the page structure may have changed.',
-        )
-
-    def _authenticated_page_map(self, *, step_log: StepLogger | None = None) -> TandemPageMap:
-        page_map = self.page_map
-        if page_map is not None:
-            if step_log is not None:
-                step_log.write('browser.discover.authenticated_page_map_existing', page_map_path=str(self.page_map_path))
-            return page_map
-        page_map = TandemPageMap(
-            login_url=self.login_url,
-            daily_timeline_url=self.daily_timeline_url,
-            generated_at=datetime.utcnow().isoformat(timespec='seconds') + 'Z',
-            source='playwright-discovery-authenticated',
-        )
-        if step_log is not None:
-            step_log.write('browser.discover.authenticated_page_map_created', login_url=self.login_url)
-        return page_map
-
-    def _bootstrap_login_locators(self, page_map: TandemPageMap | None, step_log: StepLogger | None = None) -> TandemPageMap | None:
-        if not _page_map_login_complete(page_map):
-            return None
-        if step_log is not None and page_map is not None:
-            step_log.write(
-                'browser.discover.bootstrap_login_locators',
-                login_email=page_map.login_email.describe() if page_map.login_email else '',
-                login_password=page_map.login_password.describe() if page_map.login_password else '',
-                login_submit=page_map.login_submit.describe() if page_map.login_submit else '',
-            )
-        return page_map
-
-    def _discover_or_bootstrap_login_map(self, credentials: TandemCredentials, step_log: StepLogger | None = None) -> TandemPageMap:
-        page = self._page
-        assert page is not None
-        bootstrap_map = self._bootstrap_login_locators(self.page_map, step_log=step_log)
-        if bootstrap_map is not None:
-            page_map = replace(bootstrap_map, daily_timeline_url=bootstrap_map.daily_timeline_url or self.daily_timeline_url)
-            self._login_using_page_map(credentials, page_map, step_log=step_log)
-            return page_map
-        login_snapshot = capture_accessibility_snapshot(page)
-        login_inventory = capture_control_inventory(page)
-        login_email, login_password, login_submit = discover_login_controls_from_controls(
-            accessibility_snapshot=login_snapshot,
-            control_inventory=login_inventory,
-        )
-        if step_log is not None:
-            step_log.write(
-                'browser.discover.bootstrap_login_locators',
-                login_email=login_email.describe(),
-                login_password=login_password.describe(),
-                login_submit=login_submit.describe(),
-            )
-        page_map = TandemPageMap(
-            login_url=self.login_url,
-            daily_timeline_url=self.daily_timeline_url,
-            login_email=login_email,
-            login_password=login_password,
-            login_submit=login_submit,
-            generated_at=datetime.utcnow().isoformat(timespec='seconds') + 'Z',
-            source='playwright-discovery',
-        )
-        self._login_using_page_map(credentials, page_map, step_log=step_log)
-        return page_map
-
-    def _login_using_page_map(self, credentials: TandemCredentials, page_map: TandemPageMap, step_log: StepLogger | None = None) -> None:
-        page = self._page
-        assert page is not None
-        try:
-            if step_log is not None:
-                step_log.write('browser.login.goto', url=self.login_url)
-            page.goto(self.login_url, wait_until='domcontentloaded')
-            page_map.login_email.locate(page).first.fill(credentials.email)
-            page_map.login_password.locate(page).first.fill(credentials.password)
-            page_map.login_submit.locate(page).first.click()
-            try:
-                page.wait_for_load_state('networkidle', timeout=self.timeout_ms)
-            except Exception:
-                pass
-            if page_map.daily_timeline_nav is not None:
-                page_map.daily_timeline_nav.locate(page).first.wait_for(timeout=self.timeout_ms)
-            else:
-                page.wait_for_timeout(min(self.timeout_ms, 1_500))
-        except Exception as exc:
-            try:
-                self.capture_page_diagnostics('login-error')
-            except Exception:
-                pass
-            raise AcquisitionError('Tandem login did not expose the Daily Timeline navigation after submit') from exc
-
-    def discover_page_map(self, credentials: TandemCredentials, step_log: StepLogger | None = None) -> TandemPageMap:
-        page = self._page
-        assert page is not None
-        try:
-            if step_log is not None:
-                step_log.write('browser.discover.start', login_url=self.login_url)
-            page.goto(self.login_url, wait_until='domcontentloaded')
-            login_inventory = self._wait_for_login_controls(step_log=step_log)
-            login_diagnostics = self.capture_page_diagnostics('discover-login')
-            if step_log is not None:
-                step_log.write('browser.discover.login_page', **{k: str(v) for k, v in asdict(login_diagnostics).items()})
-            if _page_looks_authenticated(login_inventory):
-                page_map = self._authenticated_page_map(step_log=step_log)
-            else:
-                page_map = self._discover_or_bootstrap_login_map(credentials, step_log=step_log)
-            if step_log is not None:
-                step_log.write('browser.discover.logged_in')
-            post_login_diagnostics = self.capture_page_diagnostics('discover-post-login')
-            if step_log is not None:
-                step_log.write('browser.discover.post_login_page', **{k: str(v) for k, v in asdict(post_login_diagnostics).items()})
-            daily_timeline_nav, derived_daily_url = self._discover_daily_timeline_control(page)
-            if derived_daily_url and not page_map.daily_timeline_url:
-                page_map = replace(page_map, daily_timeline_url=derived_daily_url)
-            page_map = replace(page_map, daily_timeline_nav=daily_timeline_nav)
-            self._open_daily_timeline(page_map)
-            report_tab, report_tab_url = self._discover_report_timeline_tab(page)
-            if report_tab_url:
-                page_map = replace(page_map, daily_timeline_url=report_tab_url)
-            page_map = replace(page_map, daily_timeline_nav=report_tab)
-            self._open_daily_timeline(page_map)
-            timeline_diagnostics = self.capture_page_diagnostics('discover-daily-timeline')
-            if step_log is not None:
-                step_log.write('browser.discover.timeline_page', **{k: str(v) for k, v in asdict(timeline_diagnostics).items()})
-            timeline_snapshot = capture_accessibility_snapshot(page)
-            timeline_inventory = capture_control_inventory(page)
-            start_date, end_date, export_csv = self._discover_timeline_controls(timeline_snapshot, timeline_inventory)
-            page_map = TandemPageMap(
-                login_url=page_map.login_url,
-                daily_timeline_url=page_map.daily_timeline_url,
-                login_email=page_map.login_email,
-                login_password=page_map.login_password,
-                login_submit=page_map.login_submit,
-                daily_timeline_nav=page_map.daily_timeline_nav,
-                start_date=start_date,
-                end_date=end_date,
-                export_csv_launcher=export_csv,
-                generated_at=page_map.generated_at,
-                source=page_map.source,
-            )
-            if page_map.is_complete():
-                page_map.validate()
-                self.save_page_map(page_map, validate=True)
-            else:
-                self.save_page_map(page_map, validate=False)
-            if step_log is not None:
-                step_log.write('browser.discover.complete', page_map_path=str(self.page_map_path))
-            return page_map
-        except Exception as exc:
-            try:
-                self.capture_page_diagnostics('discover-error')
-            except Exception:
-                pass
-            if isinstance(exc, AcquisitionError):
-                raise
-            raise AcquisitionError(f'Could not discover the Tandem page map: {exc}') from exc
-
-    def _discover_login_controls(self, snapshot, inventory) -> tuple[LocatorSpec, LocatorSpec, LocatorSpec]:
-        from .tandem_browser import discover_login_controls_from_controls
-
-        return discover_login_controls_from_controls(accessibility_snapshot=snapshot, control_inventory=inventory)
-
-    def _discover_daily_timeline_control(self, page) -> tuple[LocatorSpec, str | None]:
-        page_snapshot = capture_accessibility_snapshot(page)
-        page_inventory = capture_control_inventory(page)
-        daily_timeline_nav = _discover_spec(
-            snapshot=page_snapshot,
-            inventory=page_inventory,
-            roles=("button", "link", "tab"),
-            keywords=("view my reports", "reports", "daily timeline", "timeline"),
-        )
-        derived_url: str | None = None
-        try:
-            locator = daily_timeline_nav.locate(page).first
-            if locator.count() > 0:
-                href = locator.get_attribute('href')
-                if href:
-                    from urllib.parse import urljoin
-
-                    derived_url = urljoin(page.url, href)
-        except Exception:
-            pass
-        return daily_timeline_nav, derived_url
-
-    def _discover_report_timeline_tab(self, page) -> tuple[LocatorSpec, str | None]:
-        page_snapshot = capture_accessibility_snapshot(page)
-        page_inventory = capture_control_inventory(page)
-        timeline_tab = _discover_spec(
-            snapshot=page_snapshot,
-            inventory=page_inventory,
-            roles=("button", "link", "tab"),
-            keywords=("daily timeline", "timeline"),
-        )
-        derived_url: str | None = None
-        try:
-            locator = timeline_tab.locate(page).first
-            if locator.count() > 0:
-                href = locator.get_attribute('href')
-                if href:
-                    from urllib.parse import urljoin
-
-                    derived_url = urljoin(page.url, href)
-        except Exception:
-            pass
-        return timeline_tab, derived_url
-
-    def _discover_timeline_controls(self, snapshot, inventory) -> tuple[LocatorSpec, LocatorSpec, LocatorSpec]:
-        from .tandem_browser import discover_timeline_controls_from_controls
-
-        _daily_nav, range_combo, select_button, export_csv = discover_timeline_controls_from_controls(
-            accessibility_snapshot=snapshot,
-            control_inventory=inventory,
-        )
-        return range_combo, select_button, export_csv
-
-    def _export_launcher_spec(self, page_map: TandemPageMap) -> LocatorSpec:
-        launcher = page_map.export_csv_launcher or page_map.export_csv
-        if launcher is None:
-            raise AcquisitionError('Tandem page map does not include an export launcher locator')
-        return launcher
-
-    def _discover_export_confirm(self, page, step_log: StepLogger | None = None) -> LocatorSpec:
-        snapshot = capture_accessibility_snapshot(page)
-        inventory = capture_control_inventory(page)
-        confirm = discover_export_confirm_from_controls(
-            accessibility_snapshot=snapshot,
-            control_inventory=inventory,
-        )
-        if step_log is not None:
-            step_log.write('browser.export.confirm_discovered', confirm=confirm.describe(), control_count=len(inventory))
-        return confirm
-
-    @staticmethod
-    def _response_is_candidate(response) -> bool:
-        content_type = str(response.headers.get('content-type') or '').lower()
-        resource_type = str(getattr(response.request, 'resource_type', '') or '').lower()
-        url = str(response.url or '').lower()
-        if resource_type in {'image', 'stylesheet', 'font', 'script', 'media'}:
-            return False
-        if content_type.startswith('text/html'):
-            return False
-        if any(token in url for token in ('export', 'csv', 'report', 'timeline')):
-            return True
-        if any(token in content_type for token in ('csv', 'json', 'octet-stream', 'text/plain')):
-            return True
-        return resource_type in {'xhr', 'fetch', 'document'}
-
-    def _capture_export_candidate(
-        self,
-        responses: Sequence[object],
-        *,
-        download_dir: Path,
-        window: ExportWindow,
-    ) -> ExportArtifact | None:
-        matched = [response for response in responses if self._response_is_candidate(response)]
-        if not matched:
-            return None
-        # Prefer the most export-like response we saw after the confirm click.
-        def score(response) -> tuple[int, int]:
-            content_type = str(response.headers.get('content-type') or '').lower()
-            url = str(response.url or '').lower()
-            kind_score = 0
-            if 'csv' in content_type:
-                kind_score = 4
-            elif 'json' in content_type:
-                kind_score = 3
-            elif 'octet-stream' in content_type:
-                kind_score = 2
-            elif 'text/plain' in content_type:
-                kind_score = 1
-            url_score = sum(1 for token in ('export', 'csv', 'report', 'timeline') if token in url)
-            return kind_score, url_score
-
-        chosen = sorted(matched, key=score, reverse=True)[0]
-        return _write_response_artifact(download_dir, window, chosen)
-
-    def _dismiss_browser_warning(self) -> None:
-        page = self._page
-        assert page is not None
-        try:
-            inventory = capture_control_inventory(page)
-        except Exception:
-            return
-        warning_present = False
-        continue_present = False
-        for entry in inventory:
-            haystack = ' '.join(
-                [
-                    str(entry.get('aria_label') or ''),
-                    str(entry.get('placeholder') or ''),
-                    str(entry.get('text') or ''),
-                    str(entry.get('name') or ''),
-                    str(entry.get('title') or ''),
-                    str(entry.get('id') or ''),
-                ]
-            ).lower()
-            if 'browser not supported' in haystack:
-                warning_present = True
-            if entry.get('visible', True) and 'continue' in haystack:
-                continue_present = True
-        if warning_present and continue_present:
-            try:
-                page.get_by_role('button', name='Continue').click()
-                page.wait_for_timeout(500)
-            except Exception:
-                pass
-
-    def _update_page_map_with_export_confirm(self, page_map: TandemPageMap, confirm: LocatorSpec, *, step_log: StepLogger | None = None) -> TandemPageMap:
-        if page_map.export_csv_confirm == confirm:
-            return page_map
-        updated = replace(page_map, export_csv_confirm=confirm)
-        if step_log is not None:
-            step_log.write('browser.export.confirm_saved', page_map_path=str(self.page_map_path), confirm=confirm.describe())
-        try:
-            self.save_page_map(updated, validate=False)
-        except Exception:
-            pass
-        return updated
-
-    @staticmethod
-    def _parse_report_range_label(label: str | None) -> tuple[date | None, date | None]:
-        if not label:
-            return None, None
-        text = " ".join(str(label).split())
-        match = re.search(
-            r"\((?P<start_month>[A-Za-z]{3})\s+(?P<start_day>\d{1,2})\s+-\s+(?:(?P<end_month>[A-Za-z]{3})\s+)?(?P<end_day>\d{1,2}),\s+(?P<year>\d{4})\)",
-            text,
-        )
-        if not match:
-            return None, None
-        start_month = match.group("start_month")
-        end_month = match.group("end_month") or start_month
-        try:
-            start_month_num = list(month_abbr).index(start_month)
-            end_month_num = list(month_abbr).index(end_month)
-        except ValueError:
-            return None, None
-        year = int(match.group("year"))
-        start = date(year, start_month_num, int(match.group("start_day")))
-        end = date(year, end_month_num, int(match.group("end_day")))
-        return start, end
-
-    def _navigate_picker_months(self, month_delta: int) -> None:
-        page = self._page
-        assert page is not None
-        if month_delta > 0:
-            for _ in range(month_delta):
-                page.get_by_role('button', name='Next month').click()
-                page.wait_for_timeout(200)
-        elif month_delta < 0:
-            for _ in range(-month_delta):
-                page.get_by_role('button', name='Previous month').click()
-                page.wait_for_timeout(200)
-
-    def _select_picker_day(self, day: int, *, occurrence: int = 0) -> None:
-        page = self._page
-        assert page is not None
-        page.get_by_role('gridcell', name=str(day)).nth(occurrence).click()
-        page.wait_for_timeout(200)
-
-    def _set_custom_date_range(self, window: ExportWindow, page_map: TandemPageMap) -> None:
-        page = self._page
-        assert page is not None
-        current_label = None
-        try:
-            inventory = capture_control_inventory(page)
-        except Exception:
-            inventory = []
-        combobox_entries = [entry for entry in inventory if str(entry.get('role') or '').lower() == 'combobox' and bool(entry.get('visible', True))]
-        preferred_entries = [
-            entry
-            for entry in combobox_entries
-            if any(token in ' '.join(str(entry.get(key) or '') for key in ('text', 'aria_label', 'title', 'name')).lower() for token in ('week', 'custom', 'range', '('))
-        ]
-        if preferred_entries:
-            current_label = ' '.join(str(preferred_entries[0].get(key) or '') for key in ('text', 'aria_label', 'title', 'name'))
-        elif combobox_entries:
-            current_label = ' '.join(str(combobox_entries[0].get(key) or '') for key in ('text', 'aria_label', 'title', 'name'))
-        if not current_label:
-            try:
-                current_label = page_map.start_date.locate(page).first.text_content(timeout=min(self.timeout_ms, 5_000))
-            except Exception:
-                current_label = None
-        current_start, _current_end = self._parse_report_range_label(current_label)
-        if current_start is None:
-            current_start = window.start_date
-        month_delta = (window.start_date.year - current_start.year) * 12 + (window.start_date.month - current_start.month)
-        page_map.start_date.locate(page).first.click()
-        page.wait_for_timeout(250)
-        page.get_by_role('option', name='Custom').click()
-        page.wait_for_timeout(500)
-        self._navigate_picker_months(month_delta)
-        self._select_picker_day(window.start_date.day, occurrence=0)
-        start_month_days = monthrange(window.start_date.year, window.start_date.month)[1]
-        end_occurrence = 1 if window.start_date.month != window.end_date.month and window.end_date.day <= start_month_days else 0
-        self._select_picker_day(window.end_date.day, occurrence=end_occurrence)
-        try:
-            page_map.end_date.locate(page).first.click()
-        except Exception:
-            page.get_by_role('button', name='Select').click()
-        page.wait_for_timeout(500)
-
-    def login(self, credentials: TandemCredentials, step_log: StepLogger | None = None) -> None:
-        page = self._page
-        assert page is not None
-        current_inventory = capture_control_inventory(page)
-        if _page_looks_authenticated(current_inventory):
-            if self.page_map is None and self.page_map_path.exists():
-                self.load_page_map(self.page_map_path, validate=False)
-            elif self.page_map is None:
-                self.page_map = self._authenticated_page_map(step_log=step_log)
-            if step_log is not None:
-                step_log.write('browser.login.complete', page_map_path=str(self.page_map_path), mode='authenticated-session')
-            return
-        if self.page_map is not None and not self.page_map.is_complete():
-            if credentials is None:
-                raise AcquisitionError(
-                    f'Loaded Tandem page map at {self.page_map_path} is partial; run `bayesian-t1dm discover` to complete it.',
-                )
-            self.discover_page_map(credentials, step_log=step_log)
-            if step_log is not None:
-                step_log.write('browser.login.complete', page_map_path=str(self.page_map_path), mode='bootstrapped-partial-map')
-            return
-        if self.page_map is None and not self.page_map_path.exists():
-            self.discover_page_map(credentials, step_log=step_log)
-            if step_log is not None:
-                step_log.write('browser.login.complete', page_map_path=str(self.page_map_path), mode='discovered')
-            return
-        page_map = self.ensure_page_map(credentials, step_log=step_log, bootstrap=False)
-        self._login_using_page_map(credentials, page_map, step_log=step_log)
-        if step_log is not None:
-            step_log.write('browser.login.complete', page_map_path=str(self.page_map_path))
-
-    def _open_daily_timeline(self, page_map: TandemPageMap) -> None:
-        page = self._page
-        assert page is not None
-        if page_map.daily_timeline_url:
-            page.goto(page_map.daily_timeline_url, wait_until='domcontentloaded')
-            try:
-                page.wait_for_load_state('networkidle', timeout=self.timeout_ms)
-            except Exception:
-                pass
-            page.wait_for_timeout(min(self.timeout_ms, 1_500))
-            self._dismiss_browser_warning()
-            return
-        if self.daily_timeline_url:
-            page.goto(self.daily_timeline_url, wait_until='domcontentloaded')
-            try:
-                page.wait_for_load_state('networkidle', timeout=self.timeout_ms)
-            except Exception:
-                pass
-            page.wait_for_timeout(min(self.timeout_ms, 1_500))
-            self._dismiss_browser_warning()
-            return
-        page_map.daily_timeline_nav.locate(page).first.click()
-        try:
-            page.wait_for_load_state('networkidle', timeout=self.timeout_ms)
-        except Exception:
-            pass
-        page.wait_for_timeout(min(self.timeout_ms, 1_500))
-        self._dismiss_browser_warning()
-
-    def export_daily_timeline_window(
-        self,
-        window: ExportWindow,
-        download_dir: Path,
-        step_log: StepLogger | None = None,
-    ) -> Path:
-        page = self._page
-        assert page is not None
-        download_dir.mkdir(parents=True, exist_ok=True)
-        if step_log is not None:
-            step_log.write('browser.export.goto', window_id=window.window_id)
-        page_map = self.ensure_page_map()
-        self._open_daily_timeline(page_map)
-        try:
-            self._set_custom_date_range(window, page_map)
-            launcher = self._export_launcher_spec(page_map)
-            launcher.locate(page).first.click()
-            page.wait_for_timeout(min(self.timeout_ms, 1_500))
-            try:
-                confirm = page_map.export_csv_confirm or self._discover_export_confirm(page, step_log=step_log)
-            except Exception as exc:
-                try:
-                    self.capture_page_diagnostics(f'{window.window_id}.export-dialog-incomplete')
-                except Exception:
-                    pass
-                raise AcquisitionError(f'Export dialog was incomplete for {window.window_id}: {exc}') from exc
-            page_map = self._update_page_map_with_export_confirm(page_map, confirm, step_log=step_log)
-            responses: list[object] = []
-            downloads: list[object] = []
-            collecting = True
-
-            def on_response(response) -> None:
-                if collecting:
-                    responses.append(response)
-
-            def on_download(download) -> None:
-                if collecting:
-                    downloads.append(download)
-
-            page.on('response', on_response)
-            page.on('download', on_download)
-            try:
-                try:
-                    confirm.locate(page).first.click()
-                except Exception as exc:
-                    try:
-                        self.capture_page_diagnostics(f'{window.window_id}.export-confirm-error')
-                    except Exception:
-                        pass
-                    raise AcquisitionError(f'Could not click export confirm for {window.window_id}: {exc}') from exc
-                page.wait_for_timeout(min(self.timeout_ms, 3_000))
-            finally:
-                collecting = False
-                remove_listener = getattr(page, 'remove_listener', None) or getattr(page, 'off', None)
-                if callable(remove_listener):
-                    try:
-                        remove_listener('response', on_response)
-                    except Exception:
-                        pass
-                    try:
-                        remove_listener('download', on_download)
-                    except Exception:
-                        pass
-
-            artifact: ExportArtifact | None = None
-            if downloads:
-                download = downloads[0]
-                suggested_filename = getattr(download, 'suggested_filename', '') or ''
-                suffix = Path(suggested_filename).suffix or '.csv'
-                destination = download_dir / f'{window.window_id}{suffix}'
-                download.save_as(str(destination))
-                artifact = ExportArtifact(kind='download', path=destination, metadata={'suggested_filename': suggested_filename})
-                if step_log is not None:
-                    step_log.write('browser.export.downloaded', window_id=window.window_id, destination=str(destination))
-            else:
-                artifact = self._capture_export_candidate(responses, download_dir=download_dir, window=window)
-                if artifact is not None and step_log is not None:
-                    step_log.write(
-                        'browser.export.response_captured',
-                        window_id=window.window_id,
-                        path=str(artifact.path),
-                        metadata_path=str(artifact.metadata_path) if artifact.metadata_path else None,
-                        content_type=artifact.metadata.get('content_type'),
-                        status=artifact.metadata.get('status'),
-                    )
-
-            if artifact is None:
-                try:
-                    self.capture_page_diagnostics(f'{window.window_id}.export-missing-response')
-                except Exception:
-                    pass
-                raise AcquisitionError(
-                    _export_artifact_error_message(
-                        window=window,
-                        artifact=None,
-                        observed_responses=len(responses),
-                        confirm_clicked=True,
-                    ),
-                )
-
-            if not _export_artifact_is_tabular(artifact):
-                try:
-                    self.capture_page_diagnostics(f'{window.window_id}.export-non-csv-response')
-                except Exception:
-                    pass
-                raise AcquisitionError(
-                    _export_artifact_error_message(
-                        window=window,
-                        artifact=artifact,
-                        observed_responses=len(responses),
-                        confirm_clicked=True,
-                    ),
-                )
-
-            return artifact.path
-        except Exception as exc:
-            self.capture_page_diagnostics(f'{window.window_id}.export-error')
-            if step_log is not None:
-                step_log.write('browser.export.error', window_id=window.window_id, reason=str(exc))
-            raise AcquisitionError(f'Could not export Tandem window {window.window_id}: {exc}') from exc
 
 
 __all__ = [

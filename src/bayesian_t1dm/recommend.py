@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from .model import BayesianGlucoseModel, ModelFit, ScenarioForecast
+from .features import recompute_scenario_features
 
 
 @dataclass(frozen=True)
@@ -32,15 +33,13 @@ def _apply_scenario(frame: pd.DataFrame, scenario: Scenario) -> pd.DataFrame:
     out = frame.copy()
     if "basal_units_per_hour" in out.columns:
         out["basal_units_per_hour"] = out["basal_units_per_hour"] * scenario.basal_multiplier
+    if "basal_units_delivered" in out.columns:
+        out["basal_units_delivered"] = out["basal_units_delivered"] * scenario.basal_multiplier
     if "bolus_units" in out.columns:
         out["bolus_units"] = out["bolus_units"] * scenario.bolus_multiplier
-    if "iob_units" in out.columns:
-        out["iob_units"] = out["iob_units"] * ((scenario.basal_multiplier + scenario.bolus_multiplier) / 2.0)
-    if "insulin_activity_units" in out.columns:
-        out["insulin_activity_units"] = out["insulin_activity_units"] * ((scenario.basal_multiplier + scenario.bolus_multiplier) / 2.0)
-    if "carb_grams" in out.columns and scenario.icr_multiplier != 1.0:
-        out["bolus_units"] = out["bolus_units"] * scenario.icr_multiplier
-    return out
+        if scenario.icr_multiplier != 1.0:
+            out["bolus_units"] = out["bolus_units"] * scenario.icr_multiplier
+    return recompute_scenario_features(out)
 
 
 def recommend_setting_changes(

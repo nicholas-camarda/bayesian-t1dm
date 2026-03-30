@@ -39,6 +39,7 @@ What remains to be refined:
 - meal and carb features if Tandem Source exposes them through `tconnectsync`
 - broader backtesting and comparison against simpler baselines
 - if you add manual CSV exports yourself, they will be treated as normal raw inputs alongside API payloads
+- the browser/Playwright acquisition path has been retired from the supported workflow
 
 Known statuses:
 
@@ -116,10 +117,10 @@ The `validate-raw` step is the quickest way to tell whether a Tandem file is a u
 ## API Acquisition
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv bayesian-t1dm
+source bayesian-t1dm/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e '.[dev,tconnectsync]'
+python -m pip install -e '.[dev]'
 ```
 
 Verify that the cli exists:
@@ -137,12 +138,13 @@ bayesian-t1dm backfill --start-date 2023-01-01 --end-date 2024-01-30
 
 The acquisition flow is:
 
-1. Install with `.[dev,tconnectsync]`
-2. Create `.env` with `TCONNECT_EMAIL`, `TCONNECT_PASSWORD`, `TIMEZONE_NAME`, and optionally `PUMP_SERIAL_NUMBER`
+1. Create and activate a virtual environment named `bayesian-t1dm`
+2. Install with `.[dev]` if you want the test tooling too; `tconnectsync` is now part of the core install
+3. Create `.env` with `TCONNECT_EMAIL`, `TCONNECT_PASSWORD`, `TIMEZONE_NAME`, and optionally `PUMP_SERIAL_NUMBER`
    - `TCONNECT_REGION` defaults to `US` unless your account needs `EU`
-3. Run `bayesian-t1dm collect` or `bayesian-t1dm backfill`
-4. Inspect the raw payload archive and normalized CSVs under `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/tconnectsync/`
-5. Run `bayesian-t1dm ingest` to build the coverage report and model inputs
+4. Run `bayesian-t1dm collect` or `bayesian-t1dm backfill`
+5. Inspect the raw payload archive and normalized CSVs under `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/tconnectsync/`
+6. Run `bayesian-t1dm ingest` to build the coverage report and model inputs
 
 What gets written where:
 
@@ -177,7 +179,7 @@ Primary collection contract:
 Install in editable mode:
 
 ```bash
-python -m pip install -e '.[dev,tconnectsync]'
+python -m pip install -e '.[dev]'
 ```
 
 Inspect Tandem data coverage:

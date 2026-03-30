@@ -92,3 +92,55 @@ def expand_bolus_to_grid(
         merged["bolus_units"] = merged[timestamp_col].map(bolus_by_time).fillna(0.0)
     merged = merged.rename(columns={"ia_units": "insulin_activity_units"})
     return merged
+
+
+def expand_bolus_series_to_grid(
+    time_grid: pd.DataFrame,
+    *,
+    timestamp_col: str = "timestamp",
+    dose_col: str = "bolus_units",
+    duration_minutes: int = 300,
+    step_minutes: int = 5,
+    peak_minutes: int = 75,
+) -> pd.DataFrame:
+    if time_grid.empty:
+        out = time_grid.copy()
+        out["insulin_activity_units"] = 0.0
+        out["iob_units"] = 0.0
+        return out
+
+    grid = time_grid.copy()
+    grid[timestamp_col] = pd.to_datetime(grid[timestamp_col])
+    if dose_col not in grid.columns:
+        grid[dose_col] = 0.0
+    grid[dose_col] = pd.to_numeric(grid[dose_col], errors="coerce").fillna(0.0)
+
+    contributions: list[pd.DataFrame] = []
+    for row in grid[[timestamp_col, dose_col]].itertuples(index=False):
+        event_ts = pd.Timestamp(getattr(row, timestamp_col))
+        dose = float(getattr(row, dose_col))
+        if pd.isna(event_ts) or dose <= 0:
+            continue
+        curve = insulin_action_curve(
+            dose_units=dose,
+            duration_minutes=duration_minutes,
+            step_minutes=step_minutes,
+            peak_minutes=peak_minutes,
+        )
+        curve["timestamp"] = event_ts + pd.to_timedelta(curve["minutes"], unit="m")
+        contributions.append(curve[["timestamp", "ia_units", "iob_units"]])
+
+    if contributions:
+        exposure = pd.concat(contributions, ignore_index=True)
+        exposure["timestamp"] = exposure["timestamp"].dt.floor(f"{step_minutes}min")
+        exposure = exposure.groupby("timestamp", as_index=False).sum(numeric_only=True)
+    else:
+        exposure = pd.DataFrame(columns=["timestamp", "ia_units", "iob_units"])
+
+    merged = grid[[timestamp_col, dose_col]].copy()
+    merged = merged.rename(columns={timestamp_col: "timestamp"})
+    merged = merged.merge(exposure, on="timestamp", how="left")
+    merged["ia_units"] = merged["ia_units"].fillna(0.0)
+    merged["iob_units"] = merged["iob_units"].fillna(0.0)
+    merged = merged.rename(columns={"ia_units": "insulin_activity_units"})
+    return merged

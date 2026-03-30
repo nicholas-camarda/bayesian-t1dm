@@ -16,3 +16,4 @@ old
 *.Rproj.user/
 __pycache__/
 *.pyc
+bayesian-t1dm/
