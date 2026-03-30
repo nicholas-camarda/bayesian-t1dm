@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+from importlib import metadata as importlib_metadata
+from importlib import util as importlib_util
 import json
 import os
 import shutil
@@ -839,24 +841,23 @@ def _write_tconnectsync_window_artifacts(
 
 
 def _ensure_pkg_resources_module() -> None:
-    try:
-        import pkg_resources  # noqa: F401
-    except Exception:
-        import importlib.metadata
-        import sys
-        import types
+    if importlib_util.find_spec('pkg_resources') is not None:
+        return
 
-        module = types.ModuleType('pkg_resources')
+    import sys
+    import types
 
-        class _Distribution:
-            def __init__(self, name: str) -> None:
-                self.version = importlib.metadata.version(name)
+    module = types.ModuleType('pkg_resources')
 
-        def require(name: str) -> list[_Distribution]:
-            return [_Distribution(name)]
+    class _Distribution:
+        def __init__(self, name: str) -> None:
+            self.version = importlib_metadata.version(name)
 
-        module.require = require  # type: ignore[attr-defined]
-        sys.modules['pkg_resources'] = module
+    def require(name: str) -> list[_Distribution]:
+        return [_Distribution(name)]
+
+    module.require = require  # type: ignore[attr-defined]
+    sys.modules['pkg_resources'] = module
 
 
 def _select_tconnectsync_pump(metadata: Sequence[Mapping[str, Any]], pump_serial: str | None) -> Mapping[str, Any]:

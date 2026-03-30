@@ -68,6 +68,7 @@ class _FakeApiClient:
         self.calls.append(("export", window.window_id))
         window_dir = self.workspace.cloud_raw / "tconnectsync" / window.window_id / "normalized"
         window_dir.mkdir(parents=True, exist_ok=True)
+        is_complete_window = not window.window_id.endswith("2024-02-29")
         pd.DataFrame(
             {
                 "timestamp": pd.date_range(window.start_date, periods=2, freq="5min"),
@@ -93,9 +94,9 @@ class _FakeApiClient:
             normalized_paths={"cgm": str(window_dir / "cgm.csv")},
             row_counts={"cgm": 2},
             observed_first_timestamp=pd.Timestamp(window.start_date).isoformat(),
-            observed_last_timestamp=pd.Timestamp(window.start_date).isoformat(),
-            observed_window_days=1,
-            is_complete_window=True,
+            observed_last_timestamp=pd.Timestamp(window.end_date if is_complete_window else window.start_date).isoformat(),
+            observed_window_days=1 if is_complete_window else 10,
+            is_complete_window=is_complete_window,
             activity_present=False,
             manifest_path=self.workspace.cloud_raw / "tconnectsync" / window.window_id / "window_manifest.csv",
         )
@@ -128,3 +129,34 @@ def test_collect_command_uses_api_client_by_default(tmp_path, monkeypatch):
     assert any(call[0] == "export" for call in client.calls)
     assert (client.workspace.cloud_raw / "tconnectsync").exists()
     assert (client.workspace.cloud_raw / "tconnectsync" / "2024-01-01__2024-01-01" / "window_manifest.csv").exists()
+
+
+def test_backfill_command_continues_on_partial_window(tmp_path, monkeypatch):
+    workspace_root = tmp_path / "repo"
+    workspace_root.mkdir()
+    monkeypatch.setenv("TANDEM_SOURCE_EMAIL", "me@example.com")
+    monkeypatch.setenv("TANDEM_SOURCE_PASSWORD", "secret")
+    monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(tmp_path / "cloud"))
+    monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(tmp_path / "runtime"))
+    monkeypatch.setattr(cli, "TConnectSyncSourceClient", lambda paths, **kwargs: _FakeApiClient(paths, **kwargs))
+
+    exit_code = main(
+        [
+            "--root",
+            str(workspace_root),
+            "backfill",
+            "--start-date",
+            "2024-01-01",
+            "--end-date",
+            "2024-02-29",
+            "--window-days",
+            "30",
+        ]
+    )
+
+    assert exit_code == 0
+    client = _FakeApiClient.last_instance
+    assert client is not None
+    export_calls = [call for call in client.calls if call[0] == "export"]
+    assert len(export_calls) == 2
+    assert (client.workspace.cloud_raw / "tandem_export_manifest.csv").exists()

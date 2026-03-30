@@ -59,7 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     backfill.add_argument("--manifest", default=None)
     backfill.add_argument("--report", default=None)
     backfill.add_argument("--env-file", default=None, help="Optional .env file with Tandem credentials")
-    backfill.add_argument("--strict", action=argparse.BooleanOptionalAction, default=True)
+    backfill.add_argument("--strict", action=argparse.BooleanOptionalAction, default=False)
     backfill.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
 
     return parser
