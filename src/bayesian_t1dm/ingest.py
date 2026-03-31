@@ -29,6 +29,10 @@ class TandemCoverage:
     bolus_rows: int
     basal_rows: int
     activity_rows: int
+    health_activity_rows: int
+    health_measurement_rows: int
+    sleep_rows: int
+    workout_rows: int
     first_timestamp: pd.Timestamp | None
     last_timestamp: pd.Timestamp | None
     complete_windows: int
@@ -47,6 +51,10 @@ class IngestedData:
     carbs: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
     basal: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
     activity: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
+    health_activity: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
+    health_measurements: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
+    sleep: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
+    workouts: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
     manifest: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
     source_files: list[Path] = field(default_factory=list)
 
@@ -57,6 +65,10 @@ class IngestedData:
             "carbs": self.carbs,
             "basal": self.basal,
             "activity": self.activity,
+            "health_activity": self.health_activity,
+            "health_measurements": self.health_measurements,
+            "sleep": self.sleep,
+            "workouts": self.workouts,
         }
 
 
@@ -80,6 +92,7 @@ def discover_source_files(raw_dir: str | Path) -> list[Path]:
         and "manifest" not in path.name.lower()
         and "coverage" not in path.name.lower()
         and "summary" not in path.name.lower()
+        and "health_auto_export" not in path.parts
     )
 
 
@@ -160,15 +173,27 @@ def _match_column(columns: Iterable[str], candidate: str) -> str | None:
 
 
 def _infer_timestamp_series(kind: str, frame: pd.DataFrame) -> pd.Series:
-    if kind == "basal":
+    if kind in {"basal", "sleep", "workouts"}:
         timestamps: list[pd.Series] = []
-        if "start_timestamp" in frame.columns:
-            timestamps.append(pd.to_datetime(frame["start_timestamp"], errors="coerce"))
-        if "end_timestamp" in frame.columns:
-            timestamps.append(pd.to_datetime(frame["end_timestamp"], errors="coerce"))
+        start_candidates = ["start_timestamp", "sleep_start"]
+        end_candidates = ["end_timestamp", "sleep_end"]
+        for column in start_candidates:
+            if column in frame.columns:
+                timestamps.append(pd.to_datetime(frame[column], errors="coerce"))
+        for column in end_candidates:
+            if column in frame.columns:
+                timestamps.append(pd.to_datetime(frame[column], errors="coerce"))
         if not timestamps:
             return pd.Series(dtype="datetime64[ns]")
         return pd.concat(timestamps, ignore_index=True)
+    if kind == "health_measurements":
+        if "timestamp" not in frame.columns:
+            return pd.Series(dtype="datetime64[ns]")
+        return pd.to_datetime(frame["timestamp"], errors="coerce")
+    if kind == "health_activity":
+        if "timestamp" not in frame.columns:
+            return pd.Series(dtype="datetime64[ns]")
+        return pd.to_datetime(frame["timestamp"], errors="coerce")
     if "timestamp" not in frame.columns:
         return pd.Series(dtype="datetime64[ns]")
     return pd.to_datetime(frame["timestamp"], errors="coerce")
@@ -672,7 +697,7 @@ def _load_frames(path: Path) -> list[tuple[pd.DataFrame, str | None]]:
     return []
 
 
-def load_tandem_exports(raw_dir: str | Path) -> IngestedData:
+def load_tandem_exports(raw_dir: str | Path, *, include_health_auto_export: bool = False) -> IngestedData:
     raw_path = Path(raw_dir)
     source_files = sorted({path.resolve() for path in [*discover_source_files(raw_path), *_manifest_declared_source_files(raw_path)]})
     cgm_frames: list[pd.DataFrame] = []
@@ -718,6 +743,41 @@ def load_tandem_exports(raw_dir: str | Path) -> IngestedData:
         carbs=pd.DataFrame(columns=["timestamp", "carb_grams", "source_file"]),
         basal=pd.concat(basal_frames, ignore_index=True) if basal_frames else pd.DataFrame(columns=["start_timestamp", "end_timestamp", "basal_units_per_hour", "source_file"]),
         activity=pd.concat(activity_frames, ignore_index=True) if activity_frames else pd.DataFrame(columns=["timestamp", "activity_value", "source_file"]),
+        health_activity=pd.DataFrame(columns=["timestamp", "activity_value", "source_file", "source_device"]),
+        health_measurements=pd.DataFrame(columns=["timestamp", "metric", "stat", "value", "unit", "source_file", "source_device"]),
+        sleep=pd.DataFrame(
+            columns=[
+                "date",
+                "sleep_start",
+                "sleep_end",
+                "in_bed_start",
+                "in_bed_end",
+                "total_sleep_hours",
+                "in_bed_hours",
+                "core_hours",
+                "deep_hours",
+                "rem_hours",
+                "awake_hours",
+                "source_file",
+                "source_device",
+            ]
+        ),
+        workouts=pd.DataFrame(
+            columns=[
+                "workout_id",
+                "workout_type",
+                "start_timestamp",
+                "end_timestamp",
+                "duration_seconds",
+                "distance_value",
+                "distance_unit",
+                "active_energy_value",
+                "active_energy_unit",
+                "avg_heart_rate",
+                "max_heart_rate",
+                "source_file",
+            ]
+        ),
         source_files=source_files,
     )
     if carb_frames:
@@ -734,6 +794,14 @@ def load_tandem_exports(raw_dir: str | Path) -> IngestedData:
             carbs = carbs.drop_duplicates(subset=dedupe_subset, keep="first")
         carbs = carbs.drop(columns=[column for column in ["_carb_source_priority"] if column in carbs.columns])
         ingested.carbs = carbs.reset_index(drop=True)
+    if include_health_auto_export:
+        from .health_auto_export import load_health_auto_export_tables
+
+        health_tables = load_health_auto_export_tables(raw_path)
+        ingested.health_activity = health_tables["health_activity"]
+        ingested.health_measurements = health_tables["health_measurements"]
+        ingested.sleep = health_tables["sleep"]
+        ingested.workouts = health_tables["workouts"]
     ingested.manifest = build_export_manifest(ingested)
     return ingested
 
@@ -742,13 +810,28 @@ def summarize_coverage(data: IngestedData) -> TandemCoverage:
     manifest = data.manifest if not data.manifest.empty else build_export_manifest(data)
     manifest_summary = summarize_export_manifest(manifest)
     timestamps: list[pd.Series] = []
-    for frame, column in [(data.cgm, "timestamp"), (data.bolus, "timestamp"), (data.activity, "timestamp")]:
+    for frame, column in [
+        (data.cgm, "timestamp"),
+        (data.bolus, "timestamp"),
+        (data.activity, "timestamp"),
+        (data.health_activity, "timestamp"),
+        (data.health_measurements, "timestamp"),
+    ]:
         if column in frame.columns and not frame.empty:
             timestamps.append(frame[column])
     if "start_timestamp" in data.basal.columns and not data.basal.empty:
         timestamps.append(data.basal["start_timestamp"])
     if "end_timestamp" in data.basal.columns and not data.basal.empty:
         timestamps.append(data.basal["end_timestamp"])
+    for frame in [data.sleep, data.workouts]:
+        if "sleep_start" in frame.columns and not frame.empty:
+            timestamps.append(frame["sleep_start"])
+        if "sleep_end" in frame.columns and not frame.empty:
+            timestamps.append(frame["sleep_end"])
+        if "start_timestamp" in frame.columns and not frame.empty:
+            timestamps.append(frame["start_timestamp"])
+        if "end_timestamp" in frame.columns and not frame.empty:
+            timestamps.append(frame["end_timestamp"])
     combined = pd.concat(timestamps, ignore_index=True) if timestamps else pd.Series(dtype="datetime64[ns]")
     combined = pd.to_datetime(combined, errors="coerce").dropna()
     return TandemCoverage(
@@ -758,6 +841,10 @@ def summarize_coverage(data: IngestedData) -> TandemCoverage:
         bolus_rows=int(len(data.bolus)),
         basal_rows=int(len(data.basal)),
         activity_rows=int(len(data.activity)),
+        health_activity_rows=int(len(data.health_activity)),
+        health_measurement_rows=int(len(data.health_measurements)),
+        sleep_rows=int(len(data.sleep)),
+        workout_rows=int(len(data.workouts)),
         first_timestamp=combined.min() if not combined.empty else None,
         last_timestamp=combined.max() if not combined.empty else None,
         complete_windows=int(manifest_summary["complete_windows"]),

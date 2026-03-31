@@ -19,6 +19,7 @@ from .acquisition import (
     TConnectSyncSourceClient,
 )
 from .features import FeatureConfig, build_feature_frame
+from .health_auto_export import import_health_auto_export, screen_health_features, write_health_screening_report
 from .ingest import build_export_manifest, load_tandem_exports, summarize_coverage, summarize_tandem_raw_dir, write_export_manifest
 from .model import BayesianGlucoseModel
 from .paths import ProjectPaths
@@ -48,6 +49,15 @@ def build_parser() -> argparse.ArgumentParser:
     validate_raw = subparsers.add_parser("validate-raw", help="Classify Tandem raw files as dense CGM or summary-only")
     validate_raw.add_argument("--raw", default=None)
     validate_raw.add_argument("--report", default=None)
+
+    import_health = subparsers.add_parser("import-health-auto-export", help="Archive and normalize a Health Auto Export JSON bundle")
+    import_health.add_argument("--input", required=True, help="Path to the exported Health Auto Export directory")
+
+    screen_health = subparsers.add_parser("screen-health-features", help="Screen imported Apple Health context features against Tandem glucose targets")
+    screen_health.add_argument("--raw", default=None)
+    screen_health.add_argument("--report", default=None)
+    screen_health.add_argument("--scores", default=None)
+    screen_health.add_argument("--horizon", type=int, default=30)
 
     run = subparsers.add_parser("run", help="Run the full forecasting and recommendation pipeline")
     run.add_argument("--raw", default=None)
@@ -89,17 +99,24 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     paths = ProjectPaths.from_root(args.root).ensure()
 
-    if args.command in {"ingest", "run"}:
+    if args.command in {"ingest", "run", "screen-health-features"}:
         args.raw = args.raw or str(paths.cloud_raw)
-        args.report = args.report or str(paths.reports / ("coverage.md" if args.command == "ingest" else "run_summary.md"))
-        args.manifest = args.manifest or str(paths.cloud_raw / "tandem_export_manifest.csv")
+        if args.command == "ingest":
+            args.report = args.report or str(paths.reports / "coverage.md")
+            args.manifest = args.manifest or str(paths.cloud_raw / "tandem_export_manifest.csv")
+        elif args.command == "run":
+            args.report = args.report or str(paths.reports / "run_summary.md")
+            args.manifest = args.manifest or str(paths.cloud_raw / "tandem_export_manifest.csv")
+        else:
+            args.report = args.report or str(paths.reports / "health_feature_screening.md")
+            args.scores = args.scores or str(paths.reports / "health_feature_scores.csv")
     if args.command == "normalize-raw":
         args.raw = args.raw or str(paths.cloud_raw / "tconnectsync")
         args.report = args.report or str(paths.reports / "normalize_raw_summary.md")
         args.manifest = args.manifest or str(paths.cloud_raw / "tandem_export_manifest.csv")
 
     if args.command == "ingest":
-        data = load_tandem_exports(args.raw)
+        data = load_tandem_exports(args.raw, include_health_auto_export=True)
         export_manifest = build_export_manifest(data)
         write_export_manifest(export_manifest, args.manifest)
         coverage = summarize_coverage(data)
@@ -125,8 +142,21 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    if args.command == "import-health-auto-export":
+        import_health_auto_export(args.input, paths.ensure())
+        return 0
+
+    if args.command == "screen-health-features":
+        tandem_data = load_tandem_exports(args.raw, include_health_auto_export=False)
+        health_data = load_tandem_exports(args.raw, include_health_auto_export=True)
+        screening = screen_health_features(tandem_data=tandem_data, health_data=health_data, horizon_minutes=args.horizon)
+        Path(args.scores).parent.mkdir(parents=True, exist_ok=True)
+        screening.scores.to_csv(args.scores, index=False)
+        write_health_screening_report(screening, args.report)
+        return 0
+
     if args.command == "run":
-        data = load_tandem_exports(args.raw)
+        data = load_tandem_exports(args.raw, include_health_auto_export=True)
         export_manifest = build_export_manifest(data)
         write_export_manifest(export_manifest, args.manifest)
         coverage = summarize_coverage(data)

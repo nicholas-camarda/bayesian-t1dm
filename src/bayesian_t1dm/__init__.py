@@ -21,6 +21,17 @@ from .acquisition import (
 )
 from .evaluate import CalibrationSummary, FoldResult, WalkForwardReport, WalkForwardSplit, calibration_summary, run_walk_forward, walk_forward_splits
 from .features import FeatureConfig, FeatureFrame, build_feature_frame
+from .health_auto_export import (
+    HealthAutoExportBundle,
+    HealthAutoExportImportResult,
+    HealthFeatureScreeningResult,
+    build_health_context_frame,
+    discover_health_auto_export_bundle,
+    import_health_auto_export,
+    load_health_auto_export_tables,
+    screen_health_features,
+    write_health_screening_report,
+)
 from .ingest import IngestedData, TandemCoverage, build_export_manifest, load_tandem_exports, summarize_coverage, summarize_export_manifest, summarize_tandem_raw_dir, summarize_tandem_raw_source, write_export_manifest
 from .insulin import insulin_action_curve, expand_bolus_to_grid
 from .model import BayesianGlucoseModel, FitDiagnostics, ModelFit, ScenarioForecast, extract_fit_diagnostics
@@ -36,6 +47,9 @@ __all__ = [
     "CalibrationSummary",
     "FeatureConfig",
     "FeatureFrame",
+    "HealthAutoExportBundle",
+    "HealthAutoExportImportResult",
+    "HealthFeatureScreeningResult",
     "ExportWindow",
     "FitDiagnostics",
     "FoldResult",
@@ -56,18 +70,22 @@ __all__ = [
     "backfill_tandem_exports",
     "collect_tandem_exports",
     "build_feature_frame",
+    "build_health_context_frame",
     "build_export_manifest",
     "build_run_summary",
     "export_daily_timeline_window",
     "calibration_summary",
     "extract_fit_diagnostics",
     "generate_export_windows",
+    "discover_health_auto_export_bundle",
     "expand_bolus_to_grid",
     "build_recommendation_policy",
+    "import_health_auto_export",
     "load_local_env_file",
     "insulin_action_curve",
     "load_tandem_exports",
     "load_tandem_credentials",
+    "load_health_auto_export_tables",
     "login_tandem_source",
     "normalize_tconnectsync_archive",
     "normalize_tconnectsync_payloads",
@@ -78,9 +96,11 @@ __all__ = [
     "summarize_tandem_raw_dir",
     "summarize_tandem_raw_source",
     "run_walk_forward",
+    "screen_health_features",
     "walk_forward_splits",
     "WalkForwardReport",
     "write_coverage_review_html",
+    "write_health_screening_report",
     "write_json_report",
     "write_markdown_report",
     "write_run_review_html",
