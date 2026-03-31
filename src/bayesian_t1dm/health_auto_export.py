@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,8 @@ SUPPORTED_POINT_METRICS = {
 SUPPORTED_INTERVAL_METRICS = {"sleep_analysis"}
 SUPPORTED_METRICS = SUPPORTED_POINT_METRICS | SUPPORTED_INTERVAL_METRICS | {"heart_rate"}
 IGNORED_GLUCOSE_METRICS = {"blood_glucose"}
+EXPORT_ID_PATTERN = re.compile(r"HealthAutoExport_(\d{14})$")
+EXPORT_JSON_PATTERN = re.compile(r"HealthAutoExport-(\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2})\.json$")
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,10 @@ class HealthAutoExportBundle:
     input_dir: Path
     json_path: Path
     gpx_paths: tuple[Path, ...]
+    bundle_timestamp: pd.Timestamp | None
+    source_json_filename: str
+    covered_start_date: pd.Timestamp | None
+    covered_end_date: pd.Timestamp | None
 
 
 @dataclass(frozen=True)
@@ -46,6 +53,19 @@ class HealthAutoExportImportResult:
     ignored_metrics: tuple[str, ...]
     glucose_present: bool
     manifest_path: Path
+    bundle_timestamp: pd.Timestamp | None
+    source_json_filename: str
+    covered_start_date: pd.Timestamp | None
+    covered_end_date: pd.Timestamp | None
+
+
+@dataclass(frozen=True)
+class AnalysisReadyHealthDataset:
+    frame: pd.DataFrame
+    tandem_feature_columns: list[str]
+    health_feature_columns: list[str]
+    target_column: str
+    config: FeatureConfig
 
 
 @dataclass(frozen=True)
@@ -81,24 +101,75 @@ def _safe_float(value: Any) -> float | None:
     return float(numeric)
 
 
-def discover_health_auto_export_bundle(path: str | Path) -> HealthAutoExportBundle:
-    input_dir = Path(path).expanduser().resolve()
-    if input_dir.is_file():
-        input_dir = input_dir.parent
-    if not input_dir.exists() or not input_dir.is_dir():
-        raise ValueError(f"Health Auto Export input directory does not exist: {input_dir}")
+def _infer_bundle_timestamp(export_id: str) -> pd.Timestamp | None:
+    match = EXPORT_ID_PATTERN.fullmatch(export_id)
+    if not match:
+        return None
+    parsed = pd.to_datetime(match.group(1), format="%Y%m%d%H%M%S", errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return pd.Timestamp(parsed)
 
+
+def _infer_covered_range(source_json_filename: str) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    match = EXPORT_JSON_PATTERN.fullmatch(source_json_filename)
+    if not match:
+        return None, None
+    start = pd.to_datetime(match.group(1), errors="coerce")
+    end = pd.to_datetime(match.group(2), errors="coerce")
+    start_value = None if pd.isna(start) else pd.Timestamp(start)
+    end_value = None if pd.isna(end) else pd.Timestamp(end)
+    return start_value, end_value
+
+
+def _discover_bundle_dirs(path: str | Path) -> list[Path]:
+    input_path = Path(path).expanduser().resolve()
+    if input_path.is_file():
+        input_path = input_path.parent
+    if not input_path.exists() or not input_path.is_dir():
+        raise ValueError(f"Health Auto Export input directory does not exist: {input_path}")
+
+    direct_json_paths = sorted(input_path.glob("HealthAutoExport-*.json"))
+    if direct_json_paths:
+        return [input_path]
+
+    child_dirs = sorted(
+        child
+        for child in input_path.iterdir()
+        if child.is_dir() and child.name.startswith("HealthAutoExport_") and any(child.glob("HealthAutoExport-*.json"))
+    )
+    if child_dirs:
+        return child_dirs
+    raise ValueError(f"No HealthAutoExport bundle directories were found under {input_path}")
+
+
+def discover_health_auto_export_bundle(path: str | Path) -> HealthAutoExportBundle:
+    bundle_dirs = _discover_bundle_dirs(path)
+    if len(bundle_dirs) != 1:
+        raise ValueError(f"Expected exactly one Health Auto Export bundle directory, found {len(bundle_dirs)} under {path}")
+
+    input_dir = bundle_dirs[0]
     json_paths = sorted(input_dir.glob("HealthAutoExport-*.json"))
     if len(json_paths) != 1:
         raise ValueError(f"Expected exactly one HealthAutoExport-*.json file in {input_dir}, found {len(json_paths)}")
 
     gpx_paths = tuple(sorted(input_dir.glob("*.gpx")))
+    source_json_filename = json_paths[0].name
+    covered_start_date, covered_end_date = _infer_covered_range(source_json_filename)
     return HealthAutoExportBundle(
         export_id=input_dir.name,
         input_dir=input_dir,
         json_path=json_paths[0],
         gpx_paths=gpx_paths,
+        bundle_timestamp=_infer_bundle_timestamp(input_dir.name),
+        source_json_filename=source_json_filename,
+        covered_start_date=covered_start_date,
+        covered_end_date=covered_end_date,
     )
+
+
+def discover_health_auto_export_bundles(path: str | Path) -> tuple[HealthAutoExportBundle, ...]:
+    return tuple(discover_health_auto_export_bundle(bundle_dir) for bundle_dir in _discover_bundle_dirs(path))
 
 
 def _copy_artifact(source: Path, destination: Path) -> Path:
@@ -229,10 +300,23 @@ def _normalize_workouts(rows: Iterable[dict[str, Any]], *, source_file: str) -> 
     return pd.DataFrame(records)
 
 
+def _bundle_metadata_columns() -> list[str]:
+    return [
+        "export_id",
+        "export_timestamp",
+        "source_json_filename",
+        "covered_start_date",
+        "covered_end_date",
+    ]
+
+
 def _empty_health_tables() -> dict[str, pd.DataFrame]:
+    metadata_columns = _bundle_metadata_columns()
     return {
-        "health_activity": pd.DataFrame(columns=["timestamp", "activity_value", "source_file", "source_device"]),
-        "health_measurements": pd.DataFrame(columns=["timestamp", "metric", "stat", "value", "unit", "source_file", "source_device"]),
+        "health_activity": pd.DataFrame(columns=["timestamp", "activity_value", "source_file", "source_device", *metadata_columns]),
+        "health_measurements": pd.DataFrame(
+            columns=["timestamp", "metric", "stat", "value", "unit", "source_file", "source_device", *metadata_columns]
+        ),
         "sleep": pd.DataFrame(
             columns=[
                 "date",
@@ -248,6 +332,7 @@ def _empty_health_tables() -> dict[str, pd.DataFrame]:
                 "awake_hours",
                 "source_file",
                 "source_device",
+                *metadata_columns,
             ]
         ),
         "workouts": pd.DataFrame(
@@ -264,6 +349,7 @@ def _empty_health_tables() -> dict[str, pd.DataFrame]:
                 "avg_heart_rate",
                 "max_heart_rate",
                 "source_file",
+                *metadata_columns,
             ]
         ),
     }
@@ -272,6 +358,18 @@ def _empty_health_tables() -> dict[str, pd.DataFrame]:
 def _load_payload(json_path: Path) -> dict[str, Any]:
     with json_path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def _attach_bundle_metadata(frame: pd.DataFrame, bundle: HealthAutoExportBundle) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    out = frame.copy()
+    out["export_id"] = bundle.export_id
+    out["export_timestamp"] = bundle.bundle_timestamp
+    out["source_json_filename"] = bundle.source_json_filename
+    out["covered_start_date"] = bundle.covered_start_date
+    out["covered_end_date"] = bundle.covered_end_date
+    return out
 
 
 def _normalize_health_payload(payload: dict[str, Any], *, source_file: str) -> tuple[dict[str, pd.DataFrame], tuple[str, ...], bool]:
@@ -344,6 +442,7 @@ def import_health_auto_export(path: str | Path, workspace: ProjectPaths) -> Heal
 
     payload = _load_payload(bundle.json_path)
     tables, ignored_metrics, glucose_present = _normalize_health_payload(payload, source_file=bundle.json_path.name)
+    tables = {kind: _attach_bundle_metadata(frame, bundle) for kind, frame in tables.items()}
 
     normalized_paths: dict[str, str] = {}
     row_counts: dict[str, int] = {}
@@ -365,6 +464,10 @@ def import_health_auto_export(path: str | Path, workspace: ProjectPaths) -> Heal
             "row_count": 0,
             "ignored_metrics": json.dumps(list(ignored_metrics)),
             "glucose_present": glucose_present,
+            "bundle_timestamp": bundle.bundle_timestamp,
+            "source_json_filename": bundle.source_json_filename,
+            "covered_start_date": bundle.covered_start_date,
+            "covered_end_date": bundle.covered_end_date,
         }
     ]
     manifest_rows.extend(
@@ -376,6 +479,10 @@ def import_health_auto_export(path: str | Path, workspace: ProjectPaths) -> Heal
             "row_count": 0,
             "ignored_metrics": json.dumps(list(ignored_metrics)),
             "glucose_present": glucose_present,
+            "bundle_timestamp": bundle.bundle_timestamp,
+            "source_json_filename": bundle.source_json_filename,
+            "covered_start_date": bundle.covered_start_date,
+            "covered_end_date": bundle.covered_end_date,
         }
         for path in raw_gpx_paths
     )
@@ -388,6 +495,10 @@ def import_health_auto_export(path: str | Path, workspace: ProjectPaths) -> Heal
             "row_count": row_counts[kind],
             "ignored_metrics": json.dumps(list(ignored_metrics)),
             "glucose_present": glucose_present,
+            "bundle_timestamp": bundle.bundle_timestamp,
+            "source_json_filename": bundle.source_json_filename,
+            "covered_start_date": bundle.covered_start_date,
+            "covered_end_date": bundle.covered_end_date,
         }
         for kind, normalized_path in normalized_paths.items()
     )
@@ -403,10 +514,114 @@ def import_health_auto_export(path: str | Path, workspace: ProjectPaths) -> Heal
         ignored_metrics=ignored_metrics,
         glucose_present=glucose_present,
         manifest_path=manifest_path,
+        bundle_timestamp=bundle.bundle_timestamp,
+        source_json_filename=bundle.source_json_filename,
+        covered_start_date=bundle.covered_start_date,
+        covered_end_date=bundle.covered_end_date,
     )
 
 
-def load_health_auto_export_tables(raw_dir: str | Path) -> dict[str, pd.DataFrame]:
+def import_health_auto_export_batch(path: str | Path, workspace: ProjectPaths) -> tuple[HealthAutoExportImportResult, ...]:
+    return tuple(import_health_auto_export(bundle.input_dir, workspace) for bundle in discover_health_auto_export_bundles(path))
+
+
+def _coerce_manifest_timestamp(value: Any) -> pd.Timestamp | None:
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    if isinstance(parsed, pd.Timestamp) and parsed.tzinfo is not None:
+        parsed = parsed.tz_localize(None)
+    return pd.Timestamp(parsed)
+
+
+def _attach_manifest_metadata(frame: pd.DataFrame, row: dict[str, Any]) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    out = frame.copy()
+    metadata_defaults = {
+        "export_id": str(row.get("export_id") or ""),
+        "export_timestamp": _coerce_manifest_timestamp(row.get("bundle_timestamp")),
+        "source_json_filename": str(row.get("source_json_filename") or ""),
+        "covered_start_date": _coerce_manifest_timestamp(row.get("covered_start_date")),
+        "covered_end_date": _coerce_manifest_timestamp(row.get("covered_end_date")),
+    }
+    for column, value in metadata_defaults.items():
+        if column not in out.columns:
+            out[column] = value
+        else:
+            out[column] = out[column].where(out[column].notna(), value)
+    return out
+
+
+def _canonicalize_health_table_types(kind: str, frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    out = frame.copy()
+    for column in ["timestamp", "date", "sleep_start", "sleep_end", "in_bed_start", "in_bed_end", "start_timestamp", "end_timestamp", "export_timestamp", "covered_start_date", "covered_end_date"]:
+        if column in out.columns:
+            out[column] = _parse_series(out[column])
+    for column in [
+        "activity_value",
+        "value",
+        "total_sleep_hours",
+        "in_bed_hours",
+        "core_hours",
+        "deep_hours",
+        "rem_hours",
+        "awake_hours",
+        "duration_seconds",
+        "distance_value",
+        "active_energy_value",
+        "avg_heart_rate",
+        "max_heart_rate",
+    ]:
+        if column in out.columns:
+            out[column] = pd.to_numeric(out[column], errors="coerce")
+    return out
+
+
+def _dedupe_workouts(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    out = frame.copy()
+    out["_workout_dedupe_key"] = np.where(
+        out["workout_id"].astype(str).str.strip().ne(""),
+        "id::" + out["workout_id"].astype(str),
+        "fallback::"
+        + out["start_timestamp"].astype(str)
+        + "::"
+        + out["workout_type"].astype(str)
+        + "::"
+        + out["source_file"].astype(str),
+    )
+    out = out.drop_duplicates(subset=["_workout_dedupe_key"], keep="last")
+    return out.drop(columns=["_workout_dedupe_key"])
+
+
+def _dedupe_canonical_health_table(kind: str, frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    out = frame.copy()
+    if "export_timestamp" in out.columns:
+        out["export_timestamp"] = _parse_series(out["export_timestamp"])
+    sort_columns = [column for column in ["export_timestamp", "export_id", "source_json_filename", "source_file"] if column in out.columns]
+    if sort_columns:
+        out = out.sort_values(sort_columns, kind="stable", na_position="first")
+    if kind == "health_measurements":
+        subset = ["timestamp", "metric", "stat", "source_device"]
+        return out.drop_duplicates(subset=subset, keep="last").reset_index(drop=True)
+    if kind == "health_activity":
+        subset = ["timestamp", "source_device"]
+        return out.drop_duplicates(subset=subset, keep="last").reset_index(drop=True)
+    if kind == "sleep":
+        subset = ["date", "source_device"]
+        return out.drop_duplicates(subset=subset, keep="last").reset_index(drop=True)
+    if kind == "workouts":
+        return _dedupe_workouts(out).reset_index(drop=True)
+    return out.reset_index(drop=True)
+
+
+def load_unified_health_auto_export_tables(raw_dir: str | Path) -> dict[str, pd.DataFrame]:
     raw_path = Path(raw_dir)
     tables = _empty_health_tables()
     if not raw_path.exists():
@@ -427,12 +642,20 @@ def load_health_auto_export_tables(raw_dir: str | Path) -> dict[str, pd.DataFram
             if not candidate.exists():
                 continue
             frame = read_table(candidate)
+            frame = _attach_manifest_metadata(frame, row)
+            frame = _canonicalize_health_table_types(kind, frame)
             collected[kind].append(frame)
 
     for kind, frames in collected.items():
-        if frames:
-            tables[kind] = pd.concat(frames, ignore_index=True, sort=False)
+        if not frames:
+            continue
+        combined = pd.concat(frames, ignore_index=True, sort=False)
+        tables[kind] = _dedupe_canonical_health_table(kind, combined)
     return tables
+
+
+def load_health_auto_export_tables(raw_dir: str | Path) -> dict[str, pd.DataFrame]:
+    return load_unified_health_auto_export_tables(raw_dir)
 
 
 def build_health_context_frame(base_frame: pd.DataFrame, data: IngestedData, *, freq: str = "5min") -> tuple[pd.DataFrame, list[str]]:
@@ -440,6 +663,7 @@ def build_health_context_frame(base_frame: pd.DataFrame, data: IngestedData, *, 
     out["timestamp"] = _parse_series(out["timestamp"])
 
     feature_columns: list[str] = []
+    step_minutes = max(int(pd.Timedelta(freq).total_seconds() // 60), 1)
 
     if not data.health_activity.empty:
         activity = data.health_activity.copy()
@@ -450,7 +674,6 @@ def build_health_context_frame(base_frame: pd.DataFrame, data: IngestedData, *, 
             activity = activity.groupby("timestamp", as_index=False).agg(health_activity_value=("activity_value", "sum"))
             out = out.merge(activity, on="timestamp", how="left")
             out["health_activity_value"] = out["health_activity_value"].fillna(0.0)
-            step_minutes = max(int(pd.Timedelta(freq).total_seconds() // 60), 1)
             for window in (30, 60, 120):
                 periods = max(int(window / step_minutes), 1)
                 column = f"health_activity_roll_sum_{window}m"
@@ -461,18 +684,23 @@ def build_health_context_frame(base_frame: pd.DataFrame, data: IngestedData, *, 
     if not data.sleep.empty:
         sleep = data.sleep.copy()
         sleep["date"] = _parse_series(sleep["date"]).dt.normalize()
+        sleep["sleep_start"] = _parse_series(sleep["sleep_start"])
+        sleep["sleep_end"] = _parse_series(sleep["sleep_end"])
+        sleep["projection_date"] = sleep["sleep_end"].dt.normalize()
+        sleep["projection_date"] = sleep["projection_date"].where(sleep["projection_date"].notna(), sleep["date"])
         out["date"] = out["timestamp"].dt.normalize()
         sleep_daily = sleep.loc[:, [
-            "date",
+            "projection_date",
             "total_sleep_hours",
             "in_bed_hours",
             "core_hours",
             "deep_hours",
             "rem_hours",
             "awake_hours",
-        ]].drop_duplicates(subset=["date"], keep="last")
+        ]].drop_duplicates(subset=["projection_date"], keep="last")
         sleep_daily = sleep_daily.rename(
             columns={
+                "projection_date": "date",
                 "total_sleep_hours": "prior_night_total_sleep_hours",
                 "in_bed_hours": "prior_night_in_bed_hours",
                 "core_hours": "prior_night_core_hours",
@@ -483,8 +711,6 @@ def build_health_context_frame(base_frame: pd.DataFrame, data: IngestedData, *, 
         )
         out = out.merge(sleep_daily, on="date", how="left")
         intervals = sleep.loc[:, ["sleep_start", "sleep_end"]].copy()
-        intervals["sleep_start"] = _parse_series(intervals["sleep_start"])
-        intervals["sleep_end"] = _parse_series(intervals["sleep_end"])
         out["in_sleep"] = 0
         for row in intervals.dropna(subset=["sleep_start", "sleep_end"]).itertuples(index=False):
             mask = (out["timestamp"] >= row.sleep_start) & (out["timestamp"] < row.sleep_end)
@@ -507,13 +733,19 @@ def build_health_context_frame(base_frame: pd.DataFrame, data: IngestedData, *, 
         workouts["start_timestamp"] = _parse_series(workouts["start_timestamp"])
         workouts["end_timestamp"] = _parse_series(workouts["end_timestamp"])
         workouts["duration_seconds"] = pd.to_numeric(workouts["duration_seconds"], errors="coerce")
+        workouts["distance_value"] = pd.to_numeric(workouts["distance_value"], errors="coerce")
         workouts["active_energy_value"] = pd.to_numeric(workouts["active_energy_value"], errors="coerce")
+        workouts["avg_heart_rate"] = pd.to_numeric(workouts["avg_heart_rate"], errors="coerce")
+        workouts["max_heart_rate"] = pd.to_numeric(workouts["max_heart_rate"], errors="coerce")
         workouts = workouts.dropna(subset=["end_timestamp"]).sort_values("end_timestamp")
         workout_times = workouts["end_timestamp"].to_numpy(dtype="datetime64[ns]")
         grid_times = out["timestamp"].to_numpy(dtype="datetime64[ns]")
         indices = np.searchsorted(workout_times, grid_times, side="right") - 1
         out["last_workout_duration_seconds"] = 0.0
         out["last_workout_active_energy_value"] = 0.0
+        out["last_workout_distance_value"] = 0.0
+        out["last_workout_avg_heart_rate"] = 0.0
+        out["last_workout_max_heart_rate"] = 0.0
         out["minutes_since_last_workout"] = np.nan
         valid = indices >= 0
         if np.any(valid):
@@ -521,16 +753,57 @@ def build_health_context_frame(base_frame: pd.DataFrame, data: IngestedData, *, 
             matched = workouts.iloc[valid_indices]
             out.loc[valid, "last_workout_duration_seconds"] = matched["duration_seconds"].fillna(0.0).to_numpy()
             out.loc[valid, "last_workout_active_energy_value"] = matched["active_energy_value"].fillna(0.0).to_numpy()
+            out.loc[valid, "last_workout_distance_value"] = matched["distance_value"].fillna(0.0).to_numpy()
+            out.loc[valid, "last_workout_avg_heart_rate"] = matched["avg_heart_rate"].fillna(0.0).to_numpy()
+            out.loc[valid, "last_workout_max_heart_rate"] = matched["max_heart_rate"].fillna(0.0).to_numpy()
             deltas = (out.loc[valid, "timestamp"].to_numpy(dtype="datetime64[ns]") - matched["end_timestamp"].to_numpy(dtype="datetime64[ns]")) / np.timedelta64(1, "m")
             out.loc[valid, "minutes_since_last_workout"] = deltas
+
+        end_minutes = workouts["end_timestamp"].astype("int64").to_numpy()
+        duration_values = workouts["duration_seconds"].fillna(0.0).to_numpy(dtype=float)
+        energy_values = workouts["active_energy_value"].fillna(0.0).to_numpy(dtype=float)
+        grid_minutes = out["timestamp"].astype("int64").to_numpy()
+        if len(end_minutes):
+            cumulative_duration = np.cumsum(duration_values)
+            cumulative_energy = np.cumsum(energy_values)
+            idx_6h = np.searchsorted(end_minutes, grid_minutes - int(pd.Timedelta(hours=6).value), side="left")
+            idx_12h = np.searchsorted(end_minutes, grid_minutes - int(pd.Timedelta(hours=12).value), side="left")
+            idx_24h = np.searchsorted(end_minutes, grid_minutes - int(pd.Timedelta(hours=24).value), side="left")
+            current_idx = np.searchsorted(end_minutes, grid_minutes, side="right") - 1
+            counts_6h = np.maximum(current_idx - idx_6h + 1, 0)
+            counts_12h = np.maximum(current_idx - idx_12h + 1, 0)
+            counts_24h = np.maximum(current_idx - idx_24h + 1, 0)
+            out["recent_workout_6h"] = (counts_6h > 0).astype(int)
+            out["recent_workout_12h"] = (counts_12h > 0).astype(int)
+            out["workout_count_24h"] = counts_24h.astype(float)
+
+            duration_before_24h = np.where(idx_24h > 0, cumulative_duration[idx_24h - 1], 0.0)
+            energy_before_24h = np.where(idx_24h > 0, cumulative_energy[idx_24h - 1], 0.0)
+            duration_up_to_current = np.where(current_idx >= 0, cumulative_duration[current_idx], 0.0)
+            energy_up_to_current = np.where(current_idx >= 0, cumulative_energy[current_idx], 0.0)
+            out["workout_duration_sum_24h"] = duration_up_to_current - duration_before_24h
+            out["workout_active_energy_sum_24h"] = energy_up_to_current - energy_before_24h
+        else:
+            out["recent_workout_6h"] = 0
+            out["recent_workout_12h"] = 0
+            out["workout_count_24h"] = 0.0
+            out["workout_duration_sum_24h"] = 0.0
+            out["workout_active_energy_sum_24h"] = 0.0
         out["recent_workout_12h"] = out["minutes_since_last_workout"].le(12 * 60).fillna(False).astype(int)
         out["minutes_since_last_workout"] = out["minutes_since_last_workout"].fillna(1e6)
         feature_columns.extend(
             [
                 "last_workout_duration_seconds",
                 "last_workout_active_energy_value",
+                "last_workout_distance_value",
+                "last_workout_avg_heart_rate",
+                "last_workout_max_heart_rate",
                 "minutes_since_last_workout",
+                "recent_workout_6h",
                 "recent_workout_12h",
+                "workout_count_24h",
+                "workout_duration_sum_24h",
+                "workout_active_energy_sum_24h",
             ]
         )
 
@@ -540,35 +813,52 @@ def build_health_context_frame(base_frame: pd.DataFrame, data: IngestedData, *, 
         measurements["value"] = pd.to_numeric(measurements["value"], errors="coerce")
         measurements = measurements.dropna(subset=["timestamp", "metric", "stat", "value"])
         if not measurements.empty:
-            pivot = (
-                measurements.assign(column=measurements["metric"].astype(str) + "__" + measurements["stat"].astype(str))
+            heart_rate = measurements.loc[measurements["metric"] == "heart_rate"].copy()
+            if not heart_rate.empty:
+                heart_rate_pivot = (
+                    heart_rate.assign(column=heart_rate["metric"].astype(str) + "__" + heart_rate["stat"].astype(str))
+                    .pivot_table(index="timestamp", columns="column", values="value", aggfunc="mean")
+                    .reset_index()
+                )
+                out = out.merge(heart_rate_pivot, on="timestamp", how="left")
+                for stat in ["avg", "min", "max"]:
+                    source_column = f"heart_rate__{stat}"
+                    if source_column not in out.columns:
+                        continue
+                    latest_column = f"heart_rate_{stat}_latest"
+                    out[latest_column] = out[source_column]
+                    feature_columns.append(latest_column)
+                    for window in (30, 60):
+                        periods = max(int(window / step_minutes), 1)
+                        roll_column = f"heart_rate_{stat}_roll_mean_{window}m"
+                        out[roll_column] = out[source_column].rolling(periods, min_periods=1).mean()
+                        feature_columns.append(roll_column)
+
+            sparse = measurements.loc[
+                measurements["metric"].isin(
+                    ["heart_rate_variability", "respiratory_rate", "resting_heart_rate", "weight_body_mass"]
+                )
+            ].copy()
+            if not sparse.empty:
+                pivot = (
+                    sparse.assign(column=sparse["metric"].astype(str) + "__" + sparse["stat"].astype(str))
                 .pivot_table(index="timestamp", columns="column", values="value", aggfunc="mean")
                 .reset_index()
-            )
-            out = out.merge(pivot, on="timestamp", how="left")
-            fill_forward_columns = [column for column in out.columns if "__" in column]
-            if fill_forward_columns:
-                out[fill_forward_columns] = out[fill_forward_columns].ffill()
+                )
+                out = out.merge(pivot, on="timestamp", how="left")
+                fill_forward_columns = [column for column in out.columns if "__" in column and not column.startswith("heart_rate__")]
+                if fill_forward_columns:
+                    out[fill_forward_columns] = out[fill_forward_columns].ffill()
 
-            derived_columns: list[str] = []
-            if "heart_rate__avg" in out.columns:
-                out["heart_rate_avg_latest"] = out["heart_rate__avg"]
-                out["heart_rate_avg_roll_mean_30m"] = out["heart_rate__avg"].rolling(6, min_periods=1).mean()
-                out["heart_rate_avg_roll_mean_60m"] = out["heart_rate__avg"].rolling(12, min_periods=1).mean()
-                derived_columns.extend(["heart_rate_avg_latest", "heart_rate_avg_roll_mean_30m", "heart_rate_avg_roll_mean_60m"])
-            if "heart_rate__min" in out.columns:
-                out["heart_rate_min_latest"] = out["heart_rate__min"]
-                derived_columns.append("heart_rate_min_latest")
-            if "heart_rate__max" in out.columns:
-                out["heart_rate_max_latest"] = out["heart_rate__max"]
-                derived_columns.append("heart_rate_max_latest")
             for source_column, target_column, periods in [
                 ("heart_rate_variability__value", "hrv_latest", None),
                 ("heart_rate_variability__value", "hrv_roll_mean_24h", 288),
                 ("respiratory_rate__value", "respiratory_rate_latest", None),
                 ("respiratory_rate__value", "respiratory_rate_roll_mean_24h", 288),
                 ("resting_heart_rate__value", "resting_heart_rate_latest", None),
+                ("resting_heart_rate__value", "resting_heart_rate_roll_mean_24h", 288),
                 ("weight_body_mass__value", "weight_latest", None),
+                ("weight_body_mass__value", "weight_roll_mean_24h", 288),
             ]:
                 if source_column not in out.columns:
                     continue
@@ -576,13 +866,49 @@ def build_health_context_frame(base_frame: pd.DataFrame, data: IngestedData, *, 
                     out[target_column] = out[source_column]
                 else:
                     out[target_column] = out[source_column].rolling(periods, min_periods=1).mean()
-                derived_columns.append(target_column)
-            feature_columns.extend(derived_columns)
+                feature_columns.append(target_column)
+
+    raw_measurement_columns = [column for column in out.columns if "__" in column]
+    if raw_measurement_columns:
+        out = out.drop(columns=raw_measurement_columns)
 
     feature_columns = [column for column in dict.fromkeys(feature_columns) if column in out.columns]
     if feature_columns:
-        out[feature_columns] = out[feature_columns].apply(pd.to_numeric, errors="coerce")
+        out[feature_columns] = out[feature_columns].apply(pd.to_numeric, errors="coerce").fillna(0.0)
     return out, feature_columns
+
+
+def build_analysis_ready_health_dataset(
+    *,
+    tandem_data: IngestedData,
+    health_data: IngestedData,
+    config: FeatureConfig | None = None,
+) -> AnalysisReadyHealthDataset:
+    feature_frame = build_feature_frame(tandem_data, config or FeatureConfig())
+    if feature_frame.frame.empty:
+        return AnalysisReadyHealthDataset(
+            frame=feature_frame.frame.copy(),
+            tandem_feature_columns=list(feature_frame.feature_columns),
+            health_feature_columns=[],
+            target_column=feature_frame.target_column,
+            config=feature_frame.config,
+        )
+    context_frame, health_feature_columns = build_health_context_frame(
+        feature_frame.frame,
+        health_data,
+        freq=feature_frame.config.freq,
+    )
+    combined = feature_frame.frame.merge(context_frame, on="timestamp", how="left")
+    health_feature_columns = [column for column in dict.fromkeys(health_feature_columns) if column in combined.columns]
+    if health_feature_columns:
+        combined[health_feature_columns] = combined[health_feature_columns].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    return AnalysisReadyHealthDataset(
+        frame=combined,
+        tandem_feature_columns=list(feature_frame.feature_columns),
+        health_feature_columns=health_feature_columns,
+        target_column=feature_frame.target_column,
+        config=feature_frame.config,
+    )
 
 
 def _ridge_fit(
@@ -622,21 +948,18 @@ def screen_health_features(
     horizon_minutes: int = 30,
     alpha: float = 1.0,
 ) -> HealthFeatureScreeningResult:
-    base_feature_frame = build_feature_frame(tandem_data, FeatureConfig(horizon_minutes=horizon_minutes))
-    if base_feature_frame.frame.empty:
+    analysis_ready = build_analysis_ready_health_dataset(
+        tandem_data=tandem_data,
+        health_data=health_data,
+        config=FeatureConfig(horizon_minutes=horizon_minutes),
+    )
+    if analysis_ready.frame.empty:
         raise ValueError("No Tandem feature rows are available for health feature screening")
 
-    context_frame, health_feature_columns = build_health_context_frame(base_feature_frame.frame, health_data, freq=base_feature_frame.config.freq)
-    combined = base_feature_frame.frame.merge(context_frame, on="timestamp", how="left")
-    for column in health_feature_columns:
-        combined[column] = pd.to_numeric(combined[column], errors="coerce")
-
-    baseline_columns = list(base_feature_frame.feature_columns)
-    combined_health_columns = [column for column in health_feature_columns if column in combined.columns]
+    combined = analysis_ready.frame.copy()
+    baseline_columns = list(analysis_ready.tandem_feature_columns)
+    combined_health_columns = [column for column in analysis_ready.health_feature_columns if column in combined.columns]
     augmented_columns = baseline_columns + combined_health_columns
-    fill_columns = [column for column in combined_health_columns if column in combined.columns]
-    if fill_columns:
-        combined[fill_columns] = combined[fill_columns].ffill().fillna(0.0)
     combined = combined.dropna(subset=["target_glucose"]).reset_index(drop=True)
     if combined.empty:
         raise ValueError("No overlapping Tandem target rows are available for health feature screening")

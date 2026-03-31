@@ -19,7 +19,12 @@ from .acquisition import (
     TConnectSyncSourceClient,
 )
 from .features import FeatureConfig, build_feature_frame
-from .health_auto_export import import_health_auto_export, screen_health_features, write_health_screening_report
+from .health_auto_export import (
+    build_analysis_ready_health_dataset,
+    import_health_auto_export_batch,
+    screen_health_features,
+    write_health_screening_report,
+)
 from .ingest import build_export_manifest, load_tandem_exports, summarize_coverage, summarize_tandem_raw_dir, write_export_manifest
 from .model import BayesianGlucoseModel
 from .paths import ProjectPaths
@@ -52,6 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     import_health = subparsers.add_parser("import-health-auto-export", help="Archive and normalize a Health Auto Export JSON bundle")
     import_health.add_argument("--input", required=True, help="Path to the exported Health Auto Export directory")
+
+    analysis_ready = subparsers.add_parser("build-health-analysis-ready", help="Build a Tandem-aligned 5-minute analysis-ready dataset with unified Apple Health context")
+    analysis_ready.add_argument("--raw", default=None)
+    analysis_ready.add_argument("--output", default=None)
+    analysis_ready.add_argument("--horizon", type=int, default=30)
 
     screen_health = subparsers.add_parser("screen-health-features", help="Screen imported Apple Health context features against Tandem glucose targets")
     screen_health.add_argument("--raw", default=None)
@@ -99,7 +109,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     paths = ProjectPaths.from_root(args.root).ensure()
 
-    if args.command in {"ingest", "run", "screen-health-features"}:
+    if args.command in {"ingest", "run", "screen-health-features", "build-health-analysis-ready"}:
         args.raw = args.raw or str(paths.cloud_raw)
         if args.command == "ingest":
             args.report = args.report or str(paths.reports / "coverage.md")
@@ -107,6 +117,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "run":
             args.report = args.report or str(paths.reports / "run_summary.md")
             args.manifest = args.manifest or str(paths.cloud_raw / "tandem_export_manifest.csv")
+        elif args.command == "build-health-analysis-ready":
+            args.output = args.output or str(paths.reports / "analysis_ready_health_5min.csv")
         else:
             args.report = args.report or str(paths.reports / "health_feature_screening.md")
             args.scores = args.scores or str(paths.reports / "health_feature_scores.csv")
@@ -143,7 +155,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "import-health-auto-export":
-        import_health_auto_export(args.input, paths.ensure())
+        import_health_auto_export_batch(args.input, paths.ensure())
+        return 0
+
+    if args.command == "build-health-analysis-ready":
+        tandem_data = load_tandem_exports(args.raw, include_health_auto_export=False)
+        health_data = load_tandem_exports(args.raw, include_health_auto_export=True)
+        analysis_ready = build_analysis_ready_health_dataset(
+            tandem_data=tandem_data,
+            health_data=health_data,
+            config=FeatureConfig(horizon_minutes=args.horizon),
+        )
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        analysis_ready.frame.to_csv(args.output, index=False)
         return 0
 
     if args.command == "screen-health-features":

@@ -743,8 +743,35 @@ def load_tandem_exports(raw_dir: str | Path, *, include_health_auto_export: bool
         carbs=pd.DataFrame(columns=["timestamp", "carb_grams", "source_file"]),
         basal=pd.concat(basal_frames, ignore_index=True) if basal_frames else pd.DataFrame(columns=["start_timestamp", "end_timestamp", "basal_units_per_hour", "source_file"]),
         activity=pd.concat(activity_frames, ignore_index=True) if activity_frames else pd.DataFrame(columns=["timestamp", "activity_value", "source_file"]),
-        health_activity=pd.DataFrame(columns=["timestamp", "activity_value", "source_file", "source_device"]),
-        health_measurements=pd.DataFrame(columns=["timestamp", "metric", "stat", "value", "unit", "source_file", "source_device"]),
+        health_measurements=pd.DataFrame(
+            columns=[
+                "timestamp",
+                "metric",
+                "stat",
+                "value",
+                "unit",
+                "source_file",
+                "source_device",
+                "export_id",
+                "export_timestamp",
+                "source_json_filename",
+                "covered_start_date",
+                "covered_end_date",
+            ]
+        ),
+        health_activity=pd.DataFrame(
+            columns=[
+                "timestamp",
+                "activity_value",
+                "source_file",
+                "source_device",
+                "export_id",
+                "export_timestamp",
+                "source_json_filename",
+                "covered_start_date",
+                "covered_end_date",
+            ]
+        ),
         sleep=pd.DataFrame(
             columns=[
                 "date",
@@ -760,6 +787,11 @@ def load_tandem_exports(raw_dir: str | Path, *, include_health_auto_export: bool
                 "awake_hours",
                 "source_file",
                 "source_device",
+                "export_id",
+                "export_timestamp",
+                "source_json_filename",
+                "covered_start_date",
+                "covered_end_date",
             ]
         ),
         workouts=pd.DataFrame(
@@ -776,6 +808,11 @@ def load_tandem_exports(raw_dir: str | Path, *, include_health_auto_export: bool
                 "avg_heart_rate",
                 "max_heart_rate",
                 "source_file",
+                "export_id",
+                "export_timestamp",
+                "source_json_filename",
+                "covered_start_date",
+                "covered_end_date",
             ]
         ),
         source_files=source_files,
