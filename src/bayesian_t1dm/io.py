@@ -10,11 +10,13 @@ def read_table(path: str | Path, sheet_name: str | int | None = None) -> pd.Data
     path = Path(path)
     suffix = path.suffix.lower()
     if suffix == ".csv":
-        return pd.read_csv(path)
+        return pd.read_csv(path, low_memory=False)
     if suffix in {".xlsx", ".xlsm", ".xls"}:
         if sheet_name is None:
             return pd.read_excel(path)
         return pd.read_excel(path, sheet_name=sheet_name)
+    if suffix in {".parquet", ".pq"}:
+        return pd.read_parquet(path)
     raise ValueError(f"Unsupported file type: {path.suffix}")
 
 

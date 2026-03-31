@@ -7,7 +7,7 @@ import json
 import os
 import shutil
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Protocol, Sequence
 
@@ -16,6 +16,7 @@ import pandas as pd
 from .io import read_table
 from .ingest import IngestedData, build_export_manifest, load_tandem_exports, summarize_export_manifest
 from .paths import ProjectPaths
+from .quality import REQUIRED_WINDOW_KINDS, build_window_quality_row
 
 
 @dataclass(frozen=True)
@@ -64,7 +65,7 @@ class AcquisitionRecord:
     trace_path: str
     screenshot_path: str
     endpoint_family: str | None = None
-    source_type: str = "browser"
+    source_type: str = "api"
     source_label: str | None = None
     raw_artifact_paths_json: str = ""
     normalized_paths_json: str = ""
@@ -108,6 +109,8 @@ class NormalizedWindowResult:
     has_internal_gap: bool = False
     has_overlap: bool = False
     has_duplicates: bool = False
+    completeness_reasons: tuple[str, ...] = field(default_factory=tuple)
+    coverage_fraction: float | None = None
     activity_present: bool = False
     notes: str = ''
     manifest_path: Path | None = None
@@ -144,7 +147,7 @@ class StepLogger:
 
     def write(self, event: str, **fields: object) -> None:
         record = {
-            'timestamp': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+            'timestamp': datetime.now(UTC).isoformat(timespec='seconds').replace('+00:00', 'Z'),
             'event': event,
             **fields,
         }
@@ -319,6 +322,44 @@ def _ensure_datetime(value: Any, *, timezone: str | None = None) -> pd.Timestamp
     return pd.Timestamp(timestamp)
 
 
+def _storage_timezone_name(timezone: str | None = None) -> str:
+    return timezone or os.getenv("TIMEZONE_NAME") or "UTC"
+
+
+def _canonicalize_timestamp_series_for_storage(
+    series: pd.Series,
+    *,
+    timezone: str | None,
+) -> pd.Series:
+    target_timezone = _storage_timezone_name(timezone)
+    normalized: list[pd.Timestamp] = []
+    for value in series.tolist():
+        if value is None or (isinstance(value, float) and pd.isna(value)) or pd.isna(value):
+            normalized.append(pd.NaT)
+            continue
+        timestamp = _ensure_datetime(value, timezone=target_timezone)
+        if pd.isna(timestamp):
+            normalized.append(pd.NaT)
+            continue
+        stamp = pd.Timestamp(timestamp)
+        if stamp.tzinfo is not None:
+            try:
+                stamp = stamp.tz_convert(target_timezone).tz_localize(None)
+            except Exception:
+                stamp = stamp.tz_localize(None)
+        normalized.append(stamp)
+    return pd.Series(normalized, index=series.index, dtype="datetime64[ns]")
+
+
+def _canonicalize_frame_for_storage(frame: pd.DataFrame, *, timezone: str | None) -> pd.DataFrame:
+    out = frame.copy()
+    for column in out.columns:
+        if "timestamp" not in str(column).lower():
+            continue
+        out[column] = _canonicalize_timestamp_series_for_storage(out[column], timezone=timezone)
+    return out
+
+
 def _first_existing_key(mapping: Mapping[str, Any], candidates: Sequence[str]) -> str | None:
     normalized = {str(key).strip().lower(): str(key) for key in mapping.keys()}
     for candidate in candidates:
@@ -426,6 +467,7 @@ def _normalize_cgm_records(
     if not rows:
         return pd.DataFrame(columns=['timestamp', 'glucose', 'glucose_source', 'source_file', 'source_label'])
     frame = pd.DataFrame(rows)
+    frame['timestamp'] = _canonicalize_timestamp_series_for_storage(frame['timestamp'], timezone=timezone)
     frame = frame.sort_values(['timestamp', 'glucose_source']).drop_duplicates(subset=['timestamp'], keep='first').reset_index(drop=True)
     return frame
 
@@ -482,6 +524,7 @@ def _normalize_bolus_records(
     if not rows:
         return pd.DataFrame(columns=['timestamp', 'bolus_units', 'source_file', 'source_label'])
     frame = pd.DataFrame(rows)
+    frame['timestamp'] = _canonicalize_timestamp_series_for_storage(frame['timestamp'], timezone=timezone)
     group_cols = ['timestamp', 'source_file', 'source_label']
     aggregations: dict[str, tuple[str, Any]] = {
         'bolus_units': ('bolus_units', 'sum'),
@@ -531,6 +574,7 @@ def _normalize_carb_records(
     if not rows:
         return pd.DataFrame(columns=['timestamp', 'carb_grams', 'source_file', 'source_label'])
     frame = pd.DataFrame(rows)
+    frame['timestamp'] = _canonicalize_timestamp_series_for_storage(frame['timestamp'], timezone=timezone)
     return frame.groupby(['timestamp', 'source_file', 'source_label'], as_index=False).agg(carb_grams=('carb_grams', 'sum'))
 
 
@@ -569,8 +613,8 @@ def _normalize_basal_records(
     if not rows:
         return pd.DataFrame(columns=['start_timestamp', 'end_timestamp', 'basal_units_per_hour', 'source_file', 'source_label'])
     frame = pd.DataFrame(rows)
-    frame['start_timestamp'] = pd.to_datetime(frame['start_timestamp'], errors='coerce')
-    frame['end_timestamp'] = pd.to_datetime(frame['end_timestamp'], errors='coerce')
+    frame['start_timestamp'] = _canonicalize_timestamp_series_for_storage(frame['start_timestamp'], timezone=timezone)
+    frame['end_timestamp'] = _canonicalize_timestamp_series_for_storage(frame['end_timestamp'], timezone=timezone)
     frame = frame.sort_values(['start_timestamp', 'end_timestamp']).reset_index(drop=True)
     if frame['start_timestamp'].notna().any():
         next_starts = frame['start_timestamp'].shift(-1)
@@ -611,6 +655,7 @@ def _normalize_activity_records(
     if not rows:
         return pd.DataFrame(columns=['timestamp', 'activity_value', 'source_file', 'source_label'])
     frame = pd.DataFrame(rows)
+    frame['timestamp'] = _canonicalize_timestamp_series_for_storage(frame['timestamp'], timezone=timezone)
     return frame.groupby(['timestamp', 'source_file', 'source_label'], as_index=False).agg(activity_value=('activity_value', 'sum'))
 
 
@@ -649,7 +694,7 @@ def normalize_tconnectsync_payloads(
     carb_frames = [frame for frame in [*carb_frames, carb_from_bolus] if not frame.empty]
     if carb_frames:
         carbs = pd.concat(carb_frames, ignore_index=True, sort=False)
-        carbs['timestamp'] = pd.to_datetime(carbs['timestamp'], errors='coerce')
+        carbs['timestamp'] = _canonicalize_timestamp_series_for_storage(carbs['timestamp'], timezone=timezone)
         carbs['carb_grams'] = pd.to_numeric(carbs['carb_grams'], errors='coerce')
         sort_columns = [column for column in ['timestamp', '_carb_source_priority', 'source_file', 'source_label'] if column in carbs.columns]
         if sort_columns:
@@ -750,7 +795,7 @@ def _write_tconnectsync_window_artifacts(
             'pump_serial': pump_serial,
             'payload_sha256': _hash_json_value(payload),
             'record_count': len(_payload_records(payload)),
-            'created_at': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+            'created_at': datetime.now(UTC).isoformat(timespec='seconds').replace('+00:00', 'Z'),
             'path': str(body_path),
         }
         _write_json(metadata_path, metadata)
@@ -770,52 +815,72 @@ def _write_tconnectsync_window_artifacts(
         raw_artifacts.append(artifact)
 
     normalized_paths: dict[str, str] = {}
+    storage_frames: dict[str, pd.DataFrame] = {}
     for kind, frame in ingested.all_tables().items():
         if frame.empty:
             continue
+        storage_frame = _canonicalize_frame_for_storage(frame, timezone=timezone)
         path = normalized_root / f'{kind}.csv'
-        frame.to_csv(path, index=False)
+        storage_frame.to_csv(path, index=False, date_format="%Y-%m-%dT%H:%M:%S")
         normalized_paths[kind] = str(path)
+        storage_frames[kind] = storage_frame
 
     manifest_path = _window_manifest_path(workspace, window)
     manifest_rows: list[dict[str, Any]] = []
-    for kind, frame in ingested.all_tables().items():
-        if frame.empty:
-            continue
+    manifest_rows_by_kind: dict[str, dict[str, Any]] = {}
+    for row in ingested.manifest.to_dict(orient='records'):
+        manifest_rows_by_kind[str(row.get('kind') or '')] = row
+    expected_kinds = [*REQUIRED_WINDOW_KINDS]
+    for kind in ingested.all_tables():
+        if kind not in expected_kinds and kind in storage_frames:
+            expected_kinds.append(kind)
+    for kind in expected_kinds:
+        frame = ingested.all_tables().get(kind, pd.DataFrame())
+        manifest_row = manifest_rows_by_kind.get(kind, {})
         if 'timestamp' in frame.columns:
-            series = pd.to_datetime(frame['timestamp'], errors='coerce').dropna()
+            series = pd.to_datetime(frame['timestamp'], errors='coerce', utc=True).dropna()
             first_ts = series.min() if not series.empty else pd.NaT
             last_ts = series.max() if not series.empty else pd.NaT
         elif 'start_timestamp' in frame.columns or 'end_timestamp' in frame.columns:
-            start_series = pd.to_datetime(frame['start_timestamp'], errors='coerce').dropna() if 'start_timestamp' in frame.columns else pd.Series(dtype='datetime64[ns]')
-            end_series = pd.to_datetime(frame['end_timestamp'], errors='coerce').dropna() if 'end_timestamp' in frame.columns else pd.Series(dtype='datetime64[ns]')
+            start_series = pd.to_datetime(frame['start_timestamp'], errors='coerce', utc=True).dropna() if 'start_timestamp' in frame.columns else pd.Series(dtype='datetime64[ns, UTC]')
+            end_series = pd.to_datetime(frame['end_timestamp'], errors='coerce', utc=True).dropna() if 'end_timestamp' in frame.columns else pd.Series(dtype='datetime64[ns, UTC]')
             first_ts = start_series.min() if not start_series.empty else end_series.min() if not end_series.empty else pd.NaT
             last_ts = end_series.max() if not end_series.empty else start_series.max() if not start_series.empty else pd.NaT
         else:
             first_ts = pd.NaT
             last_ts = pd.NaT
-        manifest_rows.append(
-            {
-                'window_id': window.window_id,
-                'requested_start': window.start_date.isoformat(),
-                'requested_end': window.end_date.isoformat(),
-                'endpoint_family': endpoint_family,
-                'kind': kind,
-                'source_label': source_label,
-                'raw_path': str(raw_root / f'{kind}.json'),
-                'normalized_path': normalized_paths.get(kind),
-                'row_count': int(len(frame)),
-                'first_timestamp': None if pd.isna(first_ts) else pd.Timestamp(first_ts).isoformat(),
-                'last_timestamp': None if pd.isna(last_ts) else pd.Timestamp(last_ts).isoformat(),
-                'is_complete_window': bool(summary['manifest_summary'].get('is_complete', False)),
-                'has_internal_gap': bool(summary['manifest_summary'].get('gap_count', 0)),
-                'has_overlap': bool(summary['manifest_summary'].get('overlap_count', 0)),
-                'has_duplicates': bool(summary['manifest_summary'].get('duplicate_windows', 0)),
-                'activity_present': bool(summary['activity_present']),
-                'payload_sha256': summary['payload_hash'],
-            }
+        quality_row = build_window_quality_row(
+            window_id=window.window_id,
+            kind=kind,
+            requested_start=window.start_date.isoformat(),
+            requested_end=window.end_date.isoformat(),
+            endpoint_family=endpoint_family,
+            source_label=source_label,
+            raw_path=str(raw_root / f'{kind}.json'),
+            normalized_path=normalized_paths.get(kind),
+            row_count=int(len(frame)),
+            observed_first_timestamp=None if pd.isna(first_ts) else pd.Timestamp(first_ts).isoformat(),
+            observed_last_timestamp=None if pd.isna(last_ts) else pd.Timestamp(last_ts).isoformat(),
+            has_internal_gap=bool(manifest_row.get('has_internal_gap', False)),
+            has_duplicates=bool(manifest_row.get('has_duplicates', False)),
+            has_overlap=bool(summary['manifest_summary'].get('overlap_count', 0)),
+            payload_sha256=summary['payload_hash'],
+            required=kind in REQUIRED_WINDOW_KINDS,
+            extra_fields={'activity_present': bool(summary['activity_present'])},
         )
+        manifest_rows.append(quality_row)
     pd.DataFrame(manifest_rows).to_csv(manifest_path, index=False)
+
+    window_reasons: list[str] = []
+    for row in manifest_rows:
+        reasons_value = row.get('completeness_reasons')
+        try:
+            reasons = json.loads(reasons_value) if isinstance(reasons_value, str) else list(reasons_value or [])
+        except Exception:
+            reasons = []
+        for reason in reasons:
+            if reason not in window_reasons:
+                window_reasons.append(reason)
 
     return NormalizedWindowResult(
         window_id=window.window_id,
@@ -829,10 +894,12 @@ def _write_tconnectsync_window_artifacts(
         observed_first_timestamp=summary['observed_first_timestamp'],
         observed_last_timestamp=summary['observed_last_timestamp'],
         observed_window_days=summary['observed_window_days'],
-        is_complete_window=bool(summary['manifest_summary'].get('is_complete', False)),
+        is_complete_window=not window_reasons,
         has_internal_gap=bool(summary['manifest_summary'].get('gap_count', 0)),
         has_overlap=bool(summary['manifest_summary'].get('overlap_count', 0)),
         has_duplicates=bool(summary['manifest_summary'].get('duplicate_windows', 0)),
+        completeness_reasons=tuple(window_reasons),
+        coverage_fraction=max((float(row.get('coverage_fraction', 0.0) or 0.0) for row in manifest_rows if row.get('kind') == 'cgm'), default=0.0),
         activity_present=bool(summary['activity_present']),
         notes='raw API payloads archived and normalized',
         manifest_path=manifest_path,
@@ -1080,6 +1147,7 @@ def _write_report(report_path: Path, workspace: ProjectPaths, records: Sequence[
         '',
         f'- code_root: {workspace.root}',
         f'- runtime_root: {workspace.runtime}',
+        f'- runtime_output: {workspace.reports}',
         f'- cloud_raw: {workspace.cloud_raw}',
         f'- cloud_output: {workspace.cloud_output}',
         f'- windows_collected: {len(records)}',
@@ -1155,6 +1223,8 @@ def _record_from_normalized_result(
         'has_internal_gap': bool(result.has_internal_gap),
         'has_overlap': bool(result.has_overlap),
         'has_duplicates': bool(result.has_duplicates),
+        'coverage_fraction': result.coverage_fraction,
+        'completeness_reasons': list(result.completeness_reasons),
         'activity_present': bool(result.activity_present),
         'observed_window_days': result.observed_window_days,
     }
@@ -1208,21 +1278,24 @@ def export_daily_timeline_window(
     resume: bool = True,
     strict: bool = True,
 ) -> AcquisitionRecord:
-    workspace.runtime_downloads.mkdir(parents=True, exist_ok=True)
-    workspace.runtime_traces.mkdir(parents=True, exist_ok=True)
-    workspace.runtime_logs.mkdir(parents=True, exist_ok=True)
+    downloads_dir = workspace.runtime / "downloads"
+    traces_dir = workspace.runtime / "traces"
+    logs_dir = workspace.runtime / "logs"
+    downloads_dir.mkdir(parents=True, exist_ok=True)
+    traces_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir.mkdir(parents=True, exist_ok=True)
     workspace.cloud_raw.mkdir(parents=True, exist_ok=True)
 
-    temp_download = workspace.runtime_downloads / f'{window.window_id}.download'
-    trace_path = workspace.runtime_traces / f'{window.window_id}.trace.zip'
-    screenshot_path = workspace.runtime_logs / f'{window.window_id}.png'
+    temp_download = downloads_dir / f"{window.window_id}.download"
+    trace_path = traces_dir / f"{window.window_id}.trace.zip"
+    screenshot_path = logs_dir / f"{window.window_id}.png"
 
     if step_log is not None:
         step_log.write('window.start', window_id=window.window_id, requested_start=window.start_date.isoformat(), requested_end=window.end_date.isoformat())
 
     client.start_trace()
     try:
-        exported = client.export_daily_timeline_window(window, workspace.runtime_downloads, step_log)
+        exported = client.export_daily_timeline_window(window, downloads_dir, step_log)
         if isinstance(exported, NormalizedWindowResult):
             try:
                 client.capture_screenshot(screenshot_path)
@@ -1320,7 +1393,7 @@ def collect_tandem_exports(
     step_log: StepLogger | None = None,
 ) -> list[AcquisitionRecord]:
     manifest_path = Path(manifest_path or _manifest_path(workspace))
-    report_path = Path(report_path or (workspace.cloud_output / 'tandem_acquisition_summary.md'))
+    report_path = Path(report_path or (workspace.reports / 'tandem_acquisition_summary.md'))
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1401,6 +1474,98 @@ def backfill_tandem_exports(
     )
 
 
+def _window_from_id(window_id: str) -> ExportWindow:
+    start_text, end_text = window_id.split("__", 1)
+    return ExportWindow(start_date=date.fromisoformat(start_text), end_date=date.fromisoformat(end_text))
+
+
+def _load_archived_window_payloads(window_dir: Path) -> dict[str, Any]:
+    raw_dir = window_dir / "raw"
+    if not raw_dir.exists():
+        raise AcquisitionError(f"No raw payload directory found for window {window_dir.name}")
+    payloads: dict[str, Any] = {}
+    for path in sorted(raw_dir.glob("*.json")):
+        if path.name.endswith(".meta.json"):
+            continue
+        payloads[path.stem] = json.loads(path.read_text(encoding="utf-8"))
+    if not payloads:
+        raise AcquisitionError(f"No archived JSON payloads found under {raw_dir}")
+    return payloads
+
+
+def normalize_tconnectsync_archive(
+    workspace: ProjectPaths,
+    *,
+    raw_root: str | Path | None = None,
+    window_id: str | None = None,
+    force: bool = False,
+    report_path: str | Path | None = None,
+    manifest_path: str | Path | None = None,
+    timezone: str | None = None,
+    pump_serial: str | None = None,
+) -> list[NormalizedWindowResult]:
+    root = Path(raw_root or (workspace.cloud_raw / "tconnectsync")).expanduser().resolve()
+    if not root.exists():
+        raise AcquisitionError(f"Raw archive root does not exist: {root}")
+
+    if window_id is not None:
+        window_dirs = [root / window_id]
+    elif (root / "raw").exists():
+        window_dirs = [root]
+    else:
+        window_dirs = sorted(path for path in root.iterdir() if path.is_dir() and (path / "raw").exists())
+
+    results: list[NormalizedWindowResult] = []
+    report_lines = [
+        "# Tandem Raw Normalization Summary",
+        "",
+        f"- archive_root: {root}",
+        f"- manifest_path: {manifest_path or (workspace.cloud_raw / 'tandem_export_manifest.csv')}",
+        f"- force: {force}",
+        "",
+        "## Windows",
+    ]
+
+    for window_dir in window_dirs:
+        if not window_dir.exists():
+            raise AcquisitionError(f"Window directory does not exist: {window_dir}")
+        existing_manifest = window_dir / "window_manifest.csv"
+        normalized_dir = window_dir / "normalized"
+        if not force and existing_manifest.exists() and normalized_dir.exists() and any(normalized_dir.glob("*.csv")):
+            report_lines.append(f"- {window_dir.name}: skipped (existing normalized artifacts present)")
+            continue
+
+        payloads = _load_archived_window_payloads(window_dir)
+        result = _write_tconnectsync_window_artifacts(
+            workspace=workspace,
+            window=_window_from_id(window_dir.name),
+            endpoint_family="tconnectsync",
+            payloads=payloads,
+            timezone=timezone,
+            pump_serial=pump_serial,
+            payload_hash_source=payloads,
+        )
+        results.append(result)
+        report_lines.append(
+            f"- {window_dir.name}: normalized ({'complete' if result.is_complete_window else 'incomplete'}), "
+            f"reasons={','.join(result.completeness_reasons) if result.completeness_reasons else 'none'}"
+        )
+
+    global_manifest_path = Path(manifest_path or (workspace.cloud_raw / "tandem_export_manifest.csv"))
+    try:
+        data = load_tandem_exports(workspace.cloud_raw)
+        _write_manifest_path = global_manifest_path
+        _write_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        build_export_manifest(data).to_csv(_write_manifest_path, index=False, date_format="%Y-%m-%dT%H:%M:%S")
+    except Exception as exc:
+        report_lines.extend(["", f"- manifest_refresh_error: {exc}"])
+
+    summary_path = Path(report_path or (workspace.reports / "normalize_raw_summary.md"))
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+    return results
+
+
 class TConnectSyncSourceClient:
     def __init__(
         self,
@@ -1425,9 +1590,9 @@ class TConnectSyncSourceClient:
 
     def __enter__(self) -> TConnectSyncSourceClient:
         self.workspace.cloud_raw.mkdir(parents=True, exist_ok=True)
-        self.workspace.runtime_downloads.mkdir(parents=True, exist_ok=True)
-        self.workspace.runtime_traces.mkdir(parents=True, exist_ok=True)
-        self.workspace.runtime_logs.mkdir(parents=True, exist_ok=True)
+        (self.workspace.runtime / "downloads").mkdir(parents=True, exist_ok=True)
+        (self.workspace.runtime / "traces").mkdir(parents=True, exist_ok=True)
+        (self.workspace.runtime / "logs").mkdir(parents=True, exist_ok=True)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -1538,7 +1703,7 @@ class TConnectSyncSourceClient:
         return path
 
     def capture_page_diagnostics(self, stem: str) -> None:
-        diagnostics_dir = self.workspace.runtime_logs / 'tconnectsync'
+        diagnostics_dir = (self.workspace.runtime / "logs") / "tconnectsync"
         diagnostics_dir.mkdir(parents=True, exist_ok=True)
         (diagnostics_dir / f'{stem}.json').write_text(
             _stable_json_dumps(
@@ -1546,7 +1711,7 @@ class TConnectSyncSourceClient:
                     'stem': stem,
                     'timezone': self.timezone,
                     'pump_serial': self.pump_serial,
-                    'created_at': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+                    'created_at': datetime.now(UTC).isoformat(timespec='seconds').replace('+00:00', 'Z'),
                 }
             )
             + '\n',
@@ -1589,7 +1754,7 @@ class TConnectSyncSourceClient:
                 'requested_end': requested_end,
                 'endpoint_family': 'pump_event_metadata',
                 'selected_pump': pump,
-                'created_at': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+                'created_at': datetime.now(UTC).isoformat(timespec='seconds').replace('+00:00', 'Z'),
             }
             raw_events_payload = adapter.pump_events_raw(device_id, min_date=requested_start, max_date=requested_end)
             decoded_events = list(adapter.pump_events(device_id, min_date=requested_start, max_date=requested_end, fetch_all_event_types=True))
@@ -1618,7 +1783,7 @@ class TConnectSyncSourceClient:
                         'pump_device_id': str(device_id),
                         'payload_sha256': hashlib.sha256(raw_events_payload.encode('utf-8')).hexdigest(),
                         'record_count': len(decoded_events),
-                        'created_at': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+                        'created_at': datetime.now(UTC).isoformat(timespec='seconds').replace('+00:00', 'Z'),
                     },
                 ),
             )
@@ -1708,5 +1873,6 @@ __all__ = [
     'load_tandem_exports',
     'load_tandem_credentials',
     'login_tandem_source',
+    'normalize_tconnectsync_archive',
     'normalize_tconnectsync_payloads',
 ]

@@ -9,7 +9,7 @@ The active pipeline is:
 3. raw API responses are archived under `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/tconnectsync/<window_id>/raw/`
 4. normalized CGM, bolus, basal, and activity tables are written beside the raw responses
 5. a per-window manifest records coverage, hashes, timestamps, and pump identity
-6. the repo can also ingest manual CSV exports that you place in `data/raw/`
+6. the repo can also ingest manual CSV exports staged locally, but the canonical scraped-data home is the cloud project folder
 7. 5-minute canonical time grid
 8. derived insulin exposure and IOB
 9. lagged, rolling, and calendar features
@@ -31,18 +31,20 @@ Operational assumptions:
 
 Recommended environment variables:
 
-- `TCONNECT_EMAIL`
-- `TCONNECT_PASSWORD`
-- `TCONNECT_REGION`
+- `TANDEM_SOURCE_EMAIL` or `TCONNECT_EMAIL`
+- `TANDEM_SOURCE_PASSWORD` or `TCONNECT_PASSWORD`
+- `TANDEM_SOURCE_REGION` or `TCONNECT_REGION`
 - `TIMEZONE_NAME`
-- `PUMP_SERIAL_NUMBER` when required
+- `TANDEM_SOURCE_PUMP_SERIAL`, `TANDEM_PUMP_SERIAL`, or `PUMP_SERIAL_NUMBER` when required
 
 Storage convention:
 
 - code: `~/Projects/bayesian-t1dm`
-- runtime scratch: `~/ProjectsRuntime/bayesian-t1dm`
-- cloud raw data, raw API payloads, and manifest: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw`
-- cloud published outputs: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/output`
+- runtime outputs, scratch space, and intermediate artifacts: `~/ProjectsRuntime/bayesian-t1dm`
+- cloud project home: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm`
+- scraped/raw acquisition data: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw`
+- final published outputs: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/output`
+- default working summaries: `~/ProjectsRuntime/bayesian-t1dm/output`
 
 The acquisition manifest captures:
 
@@ -58,6 +60,35 @@ The acquisition manifest captures:
 This is the gating artifact for downstream modeling. If the manifest shows incomplete coverage, the forecast and recommendation outputs should be treated as provisional.
 
 The downstream ingest manifest, which is derived after normalization, still checks for gaps, overlaps, duplicates, and out-of-order windows across the parsed tables.
+
+### Raw Repair and Canonical Timestamp Contract
+
+`bayesian-t1dm normalize-raw` rebuilds `normalized/*.csv` and `window_manifest.csv` from archived `raw/*.json` payloads without refetching.
+
+Normalized CSV contract:
+
+- timestamps are stored as timezone-naive local timestamps in `TIMEZONE_NAME`
+- source/raw metadata may still retain offsets
+- mixed tz-aware and tz-naive raw payload timestamps are normalized elementwise before manifest building and CSV write-out
+
+Per-window manifest fields now include:
+
+- `requested_start`, `requested_end`
+- `observed_first_timestamp`, `observed_last_timestamp`
+- `observed_duration_days`
+- `coverage_fraction`
+- `completeness_reasons`
+
+Standard completeness reason codes:
+
+- `starts_late`
+- `ends_early`
+- `internal_gap`
+- `duplicates`
+- `overlap`
+- `missing_kind`
+
+Incomplete windows remain usable for review, but they are not recommendation-eligible by default.
 
 ## Insulin Action Kernel
 
@@ -114,8 +145,8 @@ Key features:
 - insulin activity and IOB derived from bolus expansion
 - basal rate carried forward across the current bin
 - activity summary variables
-- missingness and gap indicators should be added explicitly as the API layer matures
-- carb and meal features should be added if Tandem Source exposes them in the payloads
+- CGM missingness and gap indicators
+- carb and meal-derived features when carbohydrate records are available
 - calendar features: sine/cosine hour-of-day, sine/cosine day-of-week, weekend indicator
 
 Target:
@@ -209,6 +240,49 @@ Recommended checks:
 - calibration of posterior predictive intervals
 - posterior predictive checks
 - scenario comparison against a naive baseline
+
+Operational notes:
+
+- `bayesian-t1dm run` may perform multiple fits because walk-forward validation refits over chronological folds before any final recommendation fit.
+- `bayesian-t1dm run --skip-recommendations` is the preferred fast path when validating real data because it avoids the final full-data recommendation fit.
+- Modest MAE improvement over persistence is not enough for recommendation use if interval coverage is poor.
+
+Canonical real-data review flow:
+
+1. `bayesian-t1dm normalize-raw`
+2. `bayesian-t1dm ingest`
+3. `bayesian-t1dm run --skip-recommendations`
+
+## Output Contract
+
+`run_summary.json` includes:
+
+- `data_quality` with `good`, `degraded`, or `broken` source status
+- `walk_forward` aggregate and per-fold metrics
+- per-fold `fit_diagnostics`
+- top-level `fit_diagnostics` for the final fit, or `null` if recommendations were skipped
+- `recommendation_policy` showing whether recommendations were `generated`, `suppressed`, or `skipped`
+- `review_artifacts` pointing at the runtime HTML review pages
+- recommendation records with per-item `confidence` and `flags`
+
+Sampler diagnostics currently include:
+
+- `draws`, `tune`, `chains`, `target_accept`, `max_treedepth`
+- `wall_time_seconds`
+- `divergences`
+- `max_tree_depth_observed`
+- `max_tree_depth_hits`
+- `rhat_max` when multiple chains are available
+- `ess_bulk_min` and `ess_tail_min` when available
+
+Recommendation output is policy-gated. The pipeline suppresses recommendations when predictive validation, sampler health, or available signal are not strong enough to support them.
+
+In addition to markdown and JSON summaries, the active pipeline writes self-contained interactive HTML review artifacts:
+
+- `coverage_review.html` from `ingest`
+- `run_review.html` from `run`
+
+These are the primary visual inspection surfaces for active-pipeline review. They combine source completeness, walk-forward behavior, baseline comparison, and sampler diagnostics in one place.
 
 ## Assumptions and Failure Modes
 

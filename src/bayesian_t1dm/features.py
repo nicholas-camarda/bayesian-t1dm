@@ -281,7 +281,15 @@ def recompute_scenario_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_feature_frame(data: IngestedData, config: FeatureConfig | None = None) -> FeatureFrame:
+    import warnings
     config = config or FeatureConfig()
+    if data.carbs.empty:
+        warnings.warn(
+            "Carb data is empty — carb_grams will be 0 everywhere. "
+            "If you expect carb data, check that your Tandem export includes carbohydrate records.",
+            UserWarning,
+            stacklevel=2,
+        )
     grid = build_time_grid(data, freq=config.freq)
     if grid.empty:
         frame = pd.DataFrame(columns=["timestamp"])

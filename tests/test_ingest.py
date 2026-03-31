@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -81,8 +82,29 @@ def test_summarize_tandem_raw_source_ignores_summary_only_value_table(tmp_path):
     assert report["recognized_glucose_columns"] == ()
 
 
-def test_summarize_tandem_raw_source_reports_dense_egv_stream():
-    report = summarize_tandem_raw_source(Path("data/cgm_and_bolus/therapy_events_2023-02.xlsx"))
+def _write_dense_therapy_events_workbook(tmp_path: Path) -> Path:
+    workbook = tmp_path / "therapy_events_2023-02.xlsx"
+    timestamps = pd.date_range("2023-02-04 00:00:00", periods=1488, freq="5min")
+    bg = [pd.NA] * len(timestamps)
+    # Sparse fingersticks sprinkled through the dense CGM stream.
+    for idx, value in [(0, 210.0), (250, 185.0), (900, 160.0), (1200, 140.0)]:
+        if 0 <= idx < len(bg):
+            bg[idx] = value
+    frame = pd.DataFrame(
+        {
+            "eventDateTime": timestamps,
+            "egv_estimatedGlucoseValue": np.linspace(110, 140, num=len(timestamps)),
+            "bg": bg,
+        }
+    )
+    with pd.ExcelWriter(workbook) as writer:
+        frame.to_excel(writer, index=False)
+    return workbook
+
+
+def test_summarize_tandem_raw_source_reports_dense_egv_stream(tmp_path):
+    workbook = _write_dense_therapy_events_workbook(tmp_path)
+    report = summarize_tandem_raw_source(workbook)
 
     assert report["cgm_rows"] == 1488
     assert report["has_dense_cgm_stream"]
@@ -90,17 +112,42 @@ def test_summarize_tandem_raw_source_reports_dense_egv_stream():
     assert "egv_estimatedGlucoseValue" in report["recognized_glucose_columns"]
 
 
-def test_load_tandem_exports_raw_subtree_recovers_dense_cgm():
-    raw_dir = Path("data/cgm_and_bolus")
-    data = load_tandem_exports(raw_dir)
-    summary = summarize_tandem_raw_dir(raw_dir)
+def test_load_tandem_exports_raw_subtree_recovers_dense_cgm(tmp_path):
+    workbook = _write_dense_therapy_events_workbook(tmp_path)
+    data = load_tandem_exports(tmp_path)
+    summary = summarize_tandem_raw_dir(tmp_path)
 
-    therapy = summary.loc[summary["source_file"] == "therapy_events_2023-02.xlsx"].iloc[0]
+    therapy = summary.loc[summary["source_file"] == workbook.name].iloc[0]
 
     assert data.cgm.shape[0] > 1000
     assert therapy["has_dense_cgm_stream"]
     assert therapy["cgm_rows"] == 1488
     assert therapy["median_spacing_minutes"] == pytest.approx(5.0)
+
+
+def test_parse_datetime_mixed_tz_and_naive_normalizes_to_local(monkeypatch):
+    from bayesian_t1dm.ingest import _parse_datetime
+
+    monkeypatch.setenv("TIMEZONE_NAME", "America/New_York")
+    series = pd.Series(["2024-05-01T00:00:00-04:00", "2024-05-01 00:05:00"])
+    with pytest.warns(UserWarning, match="Mixed timezone-aware"):
+        parsed = _parse_datetime(series)
+
+    assert str(parsed.dtype) == "datetime64[ns]"
+    assert parsed.iloc[0].hour == 0
+    assert parsed.iloc[1].hour == 0
+    assert (parsed.iloc[1] - parsed.iloc[0]) == pd.Timedelta(minutes=5)
+
+
+def test_load_tandem_exports_discovers_parquet(tmp_path):
+    pytest.importorskip("pyarrow")
+    workbook = _write_dense_therapy_events_workbook(tmp_path)
+    cgm = pd.read_excel(workbook)
+    parquet_path = tmp_path / "therapy_events_2023-02.parquet"
+    cgm.to_parquet(parquet_path, index=False)
+
+    data = load_tandem_exports(tmp_path)
+    assert data.cgm.shape[0] >= 1488
 
 
 def test_export_manifest_detects_gap_duplicate_and_out_of_order(tandem_fixture_dir):

@@ -6,12 +6,15 @@ from pathlib import Path
 
 import pandas as pd
 
-from .evaluate import calibration_summary
+import warnings
+
+from .evaluate import run_walk_forward
 from .acquisition import (
     ExportWindow,
     backfill_tandem_exports,
     collect_tandem_exports,
     load_tandem_credentials,
+    normalize_tconnectsync_archive,
     StepLogger,
     TConnectSyncSourceClient,
 )
@@ -19,8 +22,10 @@ from .features import FeatureConfig, build_feature_frame
 from .ingest import build_export_manifest, load_tandem_exports, summarize_coverage, summarize_tandem_raw_dir, write_export_manifest
 from .model import BayesianGlucoseModel
 from .paths import ProjectPaths
-from .recommend import recommend_setting_changes
-from .report import build_run_summary, write_markdown_report
+from .quality import assess_data_quality
+from .recommend import RecommendationPolicy, recommend_setting_changes
+from .report import build_run_summary, write_json_report, write_markdown_report
+from .review import write_coverage_review_html, write_run_review_html
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,6 +38,13 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--report", default=None)
     ingest.add_argument("--manifest", default=None)
 
+    normalize_raw = subparsers.add_parser("normalize-raw", help="Rebuild normalized tconnectsync windows from archived raw payloads")
+    normalize_raw.add_argument("--raw", default=None)
+    normalize_raw.add_argument("--window-id", default=None)
+    normalize_raw.add_argument("--force", action=argparse.BooleanOptionalAction, default=False)
+    normalize_raw.add_argument("--report", default=None)
+    normalize_raw.add_argument("--manifest", default=None)
+
     validate_raw = subparsers.add_parser("validate-raw", help="Classify Tandem raw files as dense CGM or summary-only")
     validate_raw.add_argument("--raw", default=None)
     validate_raw.add_argument("--report", default=None)
@@ -42,6 +54,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--report", default=None)
     run.add_argument("--manifest", default=None)
     run.add_argument("--horizon", type=int, default=30)
+    run.add_argument("--eval-folds", type=int, default=4)
+    run.add_argument("--draws", type=int, default=1000)
+    run.add_argument("--tune", type=int, default=1000)
+    run.add_argument("--chains", type=int, default=2)
+    run.add_argument("--target-accept", type=float, default=0.95)
+    run.add_argument("--max-treedepth", type=int, default=12)
+    run.add_argument("--skip-recommendations", action=argparse.BooleanOptionalAction, default=False)
 
     collect = subparsers.add_parser("collect", help="Fetch one Tandem Source window through tconnectsync")
     collect.add_argument("--start-date", default=None, help="Requested window start date (YYYY-MM-DD)")
@@ -72,39 +91,102 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command in {"ingest", "run"}:
         args.raw = args.raw or str(paths.cloud_raw)
-        args.report = args.report or str(paths.cloud_output / ("coverage.md" if args.command == "ingest" else "run_summary.md"))
+        args.report = args.report or str(paths.reports / ("coverage.md" if args.command == "ingest" else "run_summary.md"))
+        args.manifest = args.manifest or str(paths.cloud_raw / "tandem_export_manifest.csv")
+    if args.command == "normalize-raw":
+        args.raw = args.raw or str(paths.cloud_raw / "tconnectsync")
+        args.report = args.report or str(paths.reports / "normalize_raw_summary.md")
         args.manifest = args.manifest or str(paths.cloud_raw / "tandem_export_manifest.csv")
 
     if args.command == "ingest":
         data = load_tandem_exports(args.raw)
-        write_export_manifest(build_export_manifest(data), args.manifest)
+        export_manifest = build_export_manifest(data)
+        write_export_manifest(export_manifest, args.manifest)
         coverage = summarize_coverage(data)
-        summary = build_run_summary(coverage=coverage)
+        data_quality, quality_rows = assess_data_quality(args.raw, export_manifest=export_manifest)
+        review_path = str(Path(args.report).with_name("coverage_review.html"))
+        summary = build_run_summary(
+            coverage=coverage,
+            data_quality=data_quality,
+            review_artifacts={"coverage_review_html": review_path},
+        )
         write_markdown_report(summary, args.report)
+        write_coverage_review_html(summary, quality_rows, review_path)
+        return 0
+
+    if args.command == "normalize-raw":
+        normalize_tconnectsync_archive(
+            paths,
+            raw_root=args.raw,
+            window_id=args.window_id,
+            force=args.force,
+            report_path=args.report,
+            manifest_path=args.manifest,
+        )
         return 0
 
     if args.command == "run":
         data = load_tandem_exports(args.raw)
-        write_export_manifest(build_export_manifest(data), args.manifest)
+        export_manifest = build_export_manifest(data)
+        write_export_manifest(export_manifest, args.manifest)
         coverage = summarize_coverage(data)
+        data_quality, quality_rows = assess_data_quality(args.raw, export_manifest=export_manifest)
         features = build_feature_frame(data, FeatureConfig(horizon_minutes=args.horizon))
-        model = BayesianGlucoseModel(draws=250, tune=250, chains=1)
-        fit = model.fit(features)
-        predictions = model.predict(fit, features.frame)
-        calibration = calibration_summary(
-            features.frame[features.target_column].to_numpy(),
-            predictions["mean"].to_numpy(),
-            predictions["lower"].to_numpy(),
-            predictions["upper"].to_numpy(),
+        if args.chains < 2:
+            warnings.warn(
+                f"--chains={args.chains} may produce unreliable diagnostics; use at least 2 chains for MCMC.",
+                UserWarning,
+                stacklevel=2,
+            )
+        model = BayesianGlucoseModel(
+            draws=args.draws,
+            tune=args.tune,
+            chains=args.chains,
+            target_accept=args.target_accept,
+            max_treedepth=args.max_treedepth,
         )
-        recommendations, _ = recommend_setting_changes(model, fit, features.frame)
-        summary = build_run_summary(coverage=coverage, calibration=calibration, recommendations=recommendations)
+        walk_forward = run_walk_forward(features, model, n_folds=args.eval_folds)
+        fit_diagnostics = None
+        recommendations = []
+        if args.skip_recommendations:
+            recommendation_policy = RecommendationPolicy(
+                status="skipped",
+                reasons=["skipped_by_flag"],
+                validation_passed=False,
+                sampler_passed=False,
+                signal_passed=False,
+            )
+        else:
+            fit = model.fit(features)
+            fit_diagnostics = fit.diagnostics
+            recommendations, _, recommendation_policy = recommend_setting_changes(
+                model,
+                fit,
+                features.frame,
+                walk_forward=walk_forward,
+                data_quality=data_quality,
+                carbs_present=not data.carbs.empty,
+                activity_present=not data.activity.empty,
+            )
+        review_path = str(Path(args.report).with_name("run_review.html"))
+        summary = build_run_summary(
+            coverage=coverage,
+            walk_forward=walk_forward,
+            recommendations=recommendations,
+            fit_diagnostics=fit_diagnostics,
+            data_quality=data_quality,
+            recommendation_policy=recommendation_policy,
+            review_artifacts={"run_review_html": review_path},
+        )
         write_markdown_report(summary, args.report)
+        json_path = Path(args.report).with_suffix(".json")
+        write_json_report(summary, json_path)
+        write_run_review_html(summary, review_path)
         return 0
 
     if args.command == "validate-raw":
         args.raw = args.raw or str(paths.cloud_raw)
-        args.report = args.report or str(paths.cloud_output / "tandem_raw_validation.md")
+        args.report = args.report or str(paths.reports / "tandem_raw_validation.md")
         summary = summarize_tandem_raw_dir(args.raw)
         report_lines = [
             "# Tandem Raw Validation",
@@ -149,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command in {"collect", "backfill"}:
         credentials = load_tandem_credentials(args.root, args.env_file)
         manifest_path = args.manifest or str(paths.cloud_raw / "tandem_export_manifest.csv")
-        report_path = args.report or str(paths.cloud_output / "tandem_acquisition_summary.md")
+        report_path = args.report or str(paths.reports / "tandem_acquisition_summary.md")
         client_kwargs = {
             "region": credentials.region,
             "timezone": credentials.timezone,

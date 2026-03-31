@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 import tempfile
 from dataclasses import dataclass
 from typing import Iterable, Sequence
@@ -23,6 +24,7 @@ class ModelFit:
     target_mean: float
     target_scale: float
     horizon_minutes: int
+    diagnostics: "FitDiagnostics | None" = None
     model: object | None = None
 
 
@@ -35,6 +37,101 @@ class ScenarioForecast:
     expected_loss: float
 
 
+@dataclass(frozen=True)
+class FitDiagnostics:
+    draws: int
+    tune: int
+    chains: int
+    target_accept: float
+    max_treedepth: int
+    wall_time_seconds: float
+    divergences: int
+    max_tree_depth_observed: int | None
+    max_tree_depth_hits: int
+    rhat_max: float | None
+    ess_bulk_min: float | None
+    ess_tail_min: float | None
+
+
+def _finite_stat(values: np.ndarray, reducer) -> float | None:
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return None
+    return float(reducer(finite))
+
+
+def extract_fit_diagnostics(
+    posterior: object,
+    *,
+    draws: int,
+    tune: int,
+    chains: int,
+    target_accept: float,
+    max_treedepth: int,
+    wall_time_seconds: float,
+) -> FitDiagnostics:
+    try:
+        import arviz as az
+    except Exception:  # pragma: no cover - dependency guard
+        az = None
+
+    sample_stats = getattr(posterior, "sample_stats", None)
+    divergences = 0
+    max_tree_depth_observed: int | None = None
+    max_tree_depth_hits = 0
+
+    if sample_stats is not None:
+        if "diverging" in sample_stats:
+            divergences = int(np.asarray(sample_stats["diverging"]).sum())
+        elif "divergences" in sample_stats:
+            divergences = int(np.asarray(sample_stats["divergences"]).sum())
+        if "tree_depth" in sample_stats:
+            tree_depth = np.asarray(sample_stats["tree_depth"], dtype=float)
+            max_depth = _finite_stat(tree_depth, np.max)
+            max_tree_depth_observed = None if max_depth is None else int(max_depth)
+            if "reached_max_treedepth" in sample_stats:
+                max_tree_depth_hits = int(np.asarray(sample_stats["reached_max_treedepth"]).sum())
+            elif max_tree_depth_observed is not None:
+                max_tree_depth_hits = int(np.sum(tree_depth >= max_treedepth))
+        elif "reached_max_treedepth" in sample_stats:
+            max_tree_depth_hits = int(np.asarray(sample_stats["reached_max_treedepth"]).sum())
+
+    rhat_max: float | None = None
+    ess_bulk_min: float | None = None
+    ess_tail_min: float | None = None
+    if az is not None and chains >= 2:
+        try:
+            rhat_dataset = az.rhat(posterior)
+            rhat_max = _finite_stat(np.asarray(rhat_dataset.to_array()), np.max)
+        except Exception:
+            rhat_max = None
+        try:
+            ess_bulk_dataset = az.ess(posterior, method="bulk")
+            ess_bulk_min = _finite_stat(np.asarray(ess_bulk_dataset.to_array()), np.min)
+        except Exception:
+            ess_bulk_min = None
+        try:
+            ess_tail_dataset = az.ess(posterior, method="tail")
+            ess_tail_min = _finite_stat(np.asarray(ess_tail_dataset.to_array()), np.min)
+        except Exception:
+            ess_tail_min = None
+
+    return FitDiagnostics(
+        draws=draws,
+        tune=tune,
+        chains=chains,
+        target_accept=target_accept,
+        max_treedepth=max_treedepth,
+        wall_time_seconds=float(wall_time_seconds),
+        divergences=divergences,
+        max_tree_depth_observed=max_tree_depth_observed,
+        max_tree_depth_hits=max_tree_depth_hits,
+        rhat_max=rhat_max,
+        ess_bulk_min=ess_bulk_min,
+        ess_tail_min=ess_tail_min,
+    )
+
+
 class BayesianGlucoseModel:
     def __init__(
         self,
@@ -43,12 +140,16 @@ class BayesianGlucoseModel:
         tune: int = 1000,
         chains: int = 2,
         target_quantiles: tuple[float, float] = (0.1, 0.9),
+        target_accept: float = 0.95,
+        max_treedepth: int = 12,
         random_seed: int = 7,
     ) -> None:
         self.draws = draws
         self.tune = tune
         self.chains = chains
         self.target_quantiles = target_quantiles
+        self.target_accept = target_accept
+        self.max_treedepth = max_treedepth
         self.random_seed = random_seed
 
     @staticmethod
@@ -84,19 +185,40 @@ class BayesianGlucoseModel:
             rho = pm.Beta("rho", alpha=2.0, beta=2.0)
             sigma_state = pm.Exponential("sigma_state", 1.0)
             sigma_obs = pm.Exponential("sigma_obs", 1.0)
-            latent = pm.AR("latent", rho=rho, sigma=sigma_state, constant=False, ar_order=1, shape=len(y_values))
+            latent = pm.AR(
+                "latent",
+                rho=rho,
+                sigma=sigma_state,
+                constant=False,
+                ar_order=1,
+                shape=len(y_values),
+                init_dist=pm.Normal.dist(0.0, 1.0),
+            )
             mu = intercept + pm.math.dot(X, beta) + latent
             pm.StudentT("obs", nu=5.0, mu=mu, sigma=sigma_obs, observed=y_values)
+            sample_started = time.perf_counter()
             posterior = pm.sample(
                 draws=self.draws,
                 tune=self.tune,
                 chains=self.chains,
                 cores=1,
-                target_accept=0.9,
+                target_accept=self.target_accept,
                 random_seed=self.random_seed,
                 progressbar=False,
                 return_inferencedata=True,
+                nuts_sampler_kwargs={"max_treedepth": self.max_treedepth},
             )
+            wall_time_seconds = time.perf_counter() - sample_started
+
+        diagnostics = extract_fit_diagnostics(
+            posterior,
+            draws=self.draws,
+            tune=self.tune,
+            chains=self.chains,
+            target_accept=self.target_accept,
+            max_treedepth=self.max_treedepth,
+            wall_time_seconds=wall_time_seconds,
+        )
 
         return ModelFit(
             posterior=posterior,
@@ -106,6 +228,7 @@ class BayesianGlucoseModel:
             target_mean=target_mean,
             target_scale=target_scale,
             horizon_minutes=frame.horizon_minutes,
+            diagnostics=diagnostics,
             model=model,
         )
 
@@ -135,6 +258,8 @@ class BayesianGlucoseModel:
                 f"Prediction matrix has {X.shape[1]} features but posterior beta expects {beta.shape[1]}"
             )
 
+        sigma_obs = self._stack_draws(posterior, "sigma_obs")  # shape (n_samples,)
+        rng = np.random.default_rng(self.random_seed)
         n_samples = intercept.shape[0]
         n_obs = X.shape[0]
         mean = np.zeros((n_samples, n_obs), dtype=float)
@@ -144,9 +269,13 @@ class BayesianGlucoseModel:
             linear = intercept + (X[t] @ beta.T)
             state = rho * state
             mean[:, t] = (linear + state) * fit.target_scale + fit.target_mean
+        # Add observation noise to each posterior draw before computing quantiles,
+        # so that predictive intervals reflect full posterior predictive uncertainty.
+        noise = rng.normal(0.0, sigma_obs[:, np.newaxis] * fit.target_scale, size=mean.shape)
+        predictive = mean + noise
         lower_q, upper_q = self.target_quantiles
-        lower = np.quantile(mean, lower_q, axis=0)
-        upper = np.quantile(mean, upper_q, axis=0)
+        lower = np.quantile(predictive, lower_q, axis=0)
+        upper = np.quantile(predictive, upper_q, axis=0)
         central = np.mean(mean, axis=0)
         return pd.DataFrame({
             "mean": central,
@@ -165,7 +294,12 @@ class BayesianGlucoseModel:
             mean = prediction["mean"].to_numpy()
             lower = prediction["lower"].to_numpy()
             upper = prediction["upper"].to_numpy()
-            expected_loss = float(np.mean(np.abs(mean - scenario_frame.get("target_glucose", mean))))
+            if "target_glucose" not in scenario_frame.columns:
+                raise ValueError(
+                    f"Scenario '{name}' frame is missing 'target_glucose' column. "
+                    "Pass the full feature frame (including target) to scenario_forecasts."
+                )
+            expected_loss = float(np.mean(np.abs(mean - scenario_frame["target_glucose"].to_numpy())))
             results.append(
                 ScenarioForecast(
                     scenario_name=name,

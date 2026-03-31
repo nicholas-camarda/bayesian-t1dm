@@ -24,3 +24,8 @@ os.environ.setdefault("PYTENSOR_FLAGS", f"compiledir={tempfile.gettempdir()}/bay
 @pytest.fixture(scope="session")
 def tandem_fixture_dir() -> Path:
     return Path(__file__).parent / "fixtures" / "tandem"
+
+
+@pytest.fixture(scope="session")
+def tandem_realistic_fixture_dir() -> Path:
+    return Path(__file__).parent / "fixtures" / "tandem_realistic_14d"

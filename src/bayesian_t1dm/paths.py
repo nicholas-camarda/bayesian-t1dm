@@ -36,7 +36,7 @@ class ProjectPaths:
             root=root_path,
             raw=root_path / "data" / "raw",
             processed=root_path / "data" / "processed",
-            reports=root_path / "output",
+            reports=runtime_path / "output",
             archive=root_path / "archive",
             runtime=runtime_path,
             cloud_root=cloud_path,
@@ -47,10 +47,7 @@ class ProjectPaths:
 
     def ensure(self) -> "ProjectPaths":
         for path in [
-            self.raw,
-            self.processed,
             self.reports,
-            self.archive,
             self.runtime,
             self.cloud_root,
             self.cloud_raw,
@@ -58,32 +55,4 @@ class ProjectPaths:
             self.cloud_archive,
         ]:
             path.mkdir(parents=True, exist_ok=True)
-        for path in [
-            self.runtime_browser,
-            self.runtime_browser_home,
-            self.runtime_downloads,
-            self.runtime_traces,
-            self.runtime_logs,
-        ]:
-            path.mkdir(parents=True, exist_ok=True)
         return self
-
-    @property
-    def runtime_browser(self) -> Path:
-        return self.runtime / "browser-profile"
-
-    @property
-    def runtime_browser_home(self) -> Path:
-        return self.runtime / "browser-home"
-
-    @property
-    def runtime_downloads(self) -> Path:
-        return self.runtime / "downloads"
-
-    @property
-    def runtime_traces(self) -> Path:
-        return self.runtime / "traces"
-
-    @property
-    def runtime_logs(self) -> Path:
-        return self.runtime / "logs"

@@ -16,15 +16,18 @@ from .acquisition import (
     load_local_env_file,
     load_tandem_credentials,
     login_tandem_source,
+    normalize_tconnectsync_archive,
     normalize_tconnectsync_payloads,
 )
-from .evaluate import CalibrationSummary, WalkForwardSplit, calibration_summary, walk_forward_splits
+from .evaluate import CalibrationSummary, FoldResult, WalkForwardReport, WalkForwardSplit, calibration_summary, run_walk_forward, walk_forward_splits
 from .features import FeatureConfig, FeatureFrame, build_feature_frame
 from .ingest import IngestedData, TandemCoverage, build_export_manifest, load_tandem_exports, summarize_coverage, summarize_export_manifest, summarize_tandem_raw_dir, summarize_tandem_raw_source, write_export_manifest
 from .insulin import insulin_action_curve, expand_bolus_to_grid
-from .model import BayesianGlucoseModel, ModelFit, ScenarioForecast
-from .recommend import Recommendation, Scenario, recommend_setting_changes
-from .report import build_run_summary, write_markdown_report
+from .model import BayesianGlucoseModel, FitDiagnostics, ModelFit, ScenarioForecast, extract_fit_diagnostics
+from .quality import DataQualitySummary, assess_data_quality
+from .recommend import Recommendation, RecommendationPolicy, Scenario, build_recommendation_policy, recommend_setting_changes
+from .report import build_run_summary, write_json_report, write_markdown_report
+from .review import write_coverage_review_html, write_run_review_html
 
 __all__ = [
     "BayesianGlucoseModel",
@@ -34,11 +37,15 @@ __all__ = [
     "FeatureConfig",
     "FeatureFrame",
     "ExportWindow",
+    "FitDiagnostics",
+    "FoldResult",
     "NormalizedWindowResult",
     "IngestedData",
+    "DataQualitySummary",
     "ModelFit",
     "RawApiArtifact",
     "Recommendation",
+    "RecommendationPolicy",
     "StepLogger",
     "Scenario",
     "ScenarioForecast",
@@ -53,20 +60,29 @@ __all__ = [
     "build_run_summary",
     "export_daily_timeline_window",
     "calibration_summary",
+    "extract_fit_diagnostics",
     "generate_export_windows",
     "expand_bolus_to_grid",
+    "build_recommendation_policy",
     "load_local_env_file",
     "insulin_action_curve",
     "load_tandem_exports",
     "load_tandem_credentials",
     "login_tandem_source",
+    "normalize_tconnectsync_archive",
     "normalize_tconnectsync_payloads",
     "recommend_setting_changes",
+    "assess_data_quality",
     "summarize_coverage",
     "summarize_export_manifest",
     "summarize_tandem_raw_dir",
     "summarize_tandem_raw_source",
+    "run_walk_forward",
     "walk_forward_splits",
+    "WalkForwardReport",
+    "write_coverage_review_html",
+    "write_json_report",
     "write_markdown_report",
+    "write_run_review_html",
     "write_export_manifest",
 ]

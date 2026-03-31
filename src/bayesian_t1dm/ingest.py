@@ -84,8 +84,75 @@ def discover_source_files(raw_dir: str | Path) -> list[Path]:
 
 
 def _parse_datetime(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, errors="coerce", utc=False)
+    import os
+    import re
+    import warnings
+    from zoneinfo import ZoneInfo
 
+    raw_values = series.tolist()
+    tz_offset_re = re.compile(r"(Z|[+-]\d{2}:?\d{2})$", re.IGNORECASE)
+    has_tz_hint = False
+    has_naive_hint = False
+    parsed_values: list[pd.Timestamp | pd.NaT] = []
+    for value in raw_values:
+        if value is None or (isinstance(value, float) and np.isnan(value)) or pd.isna(value):
+            parsed_values.append(pd.NaT)
+            continue
+        try:
+            ts = pd.to_datetime(value, errors="coerce", utc=False)
+        except Exception:
+            ts = pd.NaT
+        if pd.isna(ts):
+            parsed_values.append(pd.NaT)
+            continue
+        stamp = pd.Timestamp(ts)
+        if isinstance(value, str):
+            if tz_offset_re.search(value.strip()):
+                has_tz_hint = True
+            else:
+                has_naive_hint = True
+        elif stamp.tzinfo is None:
+            has_naive_hint = True
+        else:
+            has_tz_hint = True
+        parsed_values.append(stamp)
+
+    timezone_name = os.getenv("TIMEZONE_NAME") or "UTC"
+    try:
+        target_tz = ZoneInfo(timezone_name)
+    except Exception:  # pragma: no cover - defensive guard
+        warnings.warn(
+            f"Invalid TIMEZONE_NAME='{timezone_name}'. Falling back to UTC.",
+            UserWarning,
+            stacklevel=2,
+        )
+        target_tz = ZoneInfo("UTC")
+        timezone_name = "UTC"
+
+    if has_tz_hint:
+        if has_naive_hint:
+            warnings.warn(
+                "Mixed timezone-aware and timezone-naive timestamps detected. "
+                f"Assuming naive timestamps are in TIMEZONE_NAME='{timezone_name}' and converting all timestamps "
+                "to that timezone before dropping timezone info.",
+                UserWarning,
+                stacklevel=2,
+            )
+        normalized: list[pd.Timestamp] = []
+        for stamp in parsed_values:
+            if stamp is pd.NaT or pd.isna(stamp):
+                normalized.append(pd.NaT)
+                continue
+            if stamp.tzinfo is None:
+                stamp = stamp.tz_localize(target_tz)
+            else:
+                stamp = stamp.tz_convert(target_tz)
+            normalized.append(stamp.tz_localize(None))
+        return pd.Series(normalized, index=series.index, dtype="datetime64[ns]")
+
+    parsed = pd.Series(parsed_values, index=series.index)
+    naive = pd.to_datetime(parsed, errors="coerce")
+    return pd.Series(naive.to_numpy(dtype="datetime64[ns]"), index=series.index)
 
 def _match_column(columns: Iterable[str], candidate: str) -> str | None:
     normalized = {str(col).strip().lower(): col for col in columns}

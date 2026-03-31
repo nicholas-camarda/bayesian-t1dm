@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import date
+import json
 from pathlib import Path
 
 import pandas as pd
 
 import bayesian_t1dm.cli as cli
+from bayesian_t1dm.evaluate import CalibrationSummary, WalkForwardReport
 from bayesian_t1dm.cli import main
 from bayesian_t1dm.acquisition import ExportWindow, NormalizedWindowResult
 
@@ -129,6 +131,7 @@ def test_collect_command_uses_api_client_by_default(tmp_path, monkeypatch):
     assert any(call[0] == "export" for call in client.calls)
     assert (client.workspace.cloud_raw / "tconnectsync").exists()
     assert (client.workspace.cloud_raw / "tconnectsync" / "2024-01-01__2024-01-01" / "window_manifest.csv").exists()
+    assert (client.workspace.reports / "tandem_acquisition_summary.md").exists()
 
 
 def test_backfill_command_continues_on_partial_window(tmp_path, monkeypatch):
@@ -160,3 +163,102 @@ def test_backfill_command_continues_on_partial_window(tmp_path, monkeypatch):
     export_calls = [call for call in client.calls if call[0] == "export"]
     assert len(export_calls) == 2
     assert (client.workspace.cloud_raw / "tandem_export_manifest.csv").exists()
+    assert (client.workspace.reports / "tandem_acquisition_summary.md").exists()
+
+
+def test_ingest_command_defaults_report_to_runtime_output(tmp_path, tandem_fixture_dir, monkeypatch):
+    workspace_root = tmp_path / "repo"
+    workspace_root.mkdir()
+    cloud_root = tmp_path / "cloud"
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(cloud_root))
+    monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
+
+    exit_code = main(
+        [
+            "--root",
+            str(workspace_root),
+            "ingest",
+            "--raw",
+            str(tandem_fixture_dir),
+        ]
+    )
+
+    assert exit_code == 0
+    assert (runtime_root / "output" / "coverage.md").exists()
+    assert (runtime_root / "output" / "coverage_review.html").exists()
+    assert (cloud_root / "data" / "raw" / "tandem_export_manifest.csv").exists()
+    coverage_text = (runtime_root / "output" / "coverage.md").read_text(encoding="utf-8")
+    assert "[coverage_review_html](coverage_review.html)" in coverage_text
+
+
+def test_normalize_raw_command_rebuilds_archived_window(tmp_path, monkeypatch):
+    workspace_root = tmp_path / "repo"
+    workspace_root.mkdir()
+    cloud_root = tmp_path / "cloud"
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(cloud_root))
+    monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
+
+    raw_dir = cloud_root / "data" / "raw" / "tconnectsync" / "2024-05-01__2024-05-03" / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    for kind, payload in {
+        "cgm": [{"eventDateTime": "2024-05-01T00:00:00-04:00", "egv_estimatedGlucoseValue": 110}],
+        "bolus": [{"completionDateTime": "2024-05-01T08:00:00-04:00", "actualTotalBolusRequested": 2.5}],
+        "basal": [{"startDateTime": "2024-05-01T00:00:00-04:00", "endDateTime": "2024-05-02 00:00:00", "basalRate": 0.7}],
+        "activity": [],
+    }.items():
+        (raw_dir / f"{kind}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    exit_code = main(["--root", str(workspace_root), "normalize-raw"])
+
+    assert exit_code == 0
+    assert (cloud_root / "data" / "raw" / "tconnectsync" / "2024-05-01__2024-05-03" / "window_manifest.csv").exists()
+    assert (runtime_root / "output" / "normalize_raw_summary.md").exists()
+
+
+class _FailIfFitModel:
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+
+    def fit(self, feature_frame):
+        raise AssertionError("final fit should be skipped when --skip-recommendations is set")
+
+
+def test_run_skip_recommendations_writes_skipped_policy(tmp_path, tandem_fixture_dir, monkeypatch):
+    workspace_root = tmp_path / "repo"
+    workspace_root.mkdir()
+    monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(tmp_path / "cloud"))
+    monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(tmp_path / "runtime"))
+    monkeypatch.setattr(cli, "BayesianGlucoseModel", _FailIfFitModel)
+    monkeypatch.setattr(
+        cli,
+        "run_walk_forward",
+        lambda features, model, n_folds=4: WalkForwardReport(
+            folds=[],
+            aggregate=CalibrationSummary(mae=10.0, rmse=12.0, coverage=0.8, interval_width=30.0),
+            aggregate_persistence_mae=14.0,
+        ),
+    )
+
+    exit_code = main(
+        [
+            "--root",
+            str(workspace_root),
+            "run",
+            "--raw",
+            str(tandem_fixture_dir),
+            "--skip-recommendations",
+        ]
+    )
+
+    assert exit_code == 0
+    report_json = tmp_path / "runtime" / "output" / "run_summary.json"
+    payload = json.loads(report_json.read_text(encoding="utf-8"))
+    assert payload["fit_diagnostics"] is None
+    assert payload["data_quality"]["status"] in {"good", "degraded"}
+    assert payload["recommendation_policy"]["status"] == "skipped"
+    assert payload["recommendation_policy"]["reasons"] == ["skipped_by_flag"]
+    assert (tmp_path / "runtime" / "output" / "run_review.html").exists()
+    report_text = (tmp_path / "runtime" / "output" / "run_summary.md").read_text(encoding="utf-8")
+    assert "[run_review_html](run_review.html)" in report_text

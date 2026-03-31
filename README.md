@@ -27,6 +27,8 @@ What is currently in place:
 - insulin activity and IOB expansion from bolus events
 - Bayesian forecasting model scaffolding in PyMC
 - recommendation scoring for candidate pump-setting changes
+- sampler diagnostics in run outputs
+- recommendation suppression policy tied to validation quality and signal availability
 - test fixtures and validation checks
 - technical documentation with equations and definitions
 
@@ -35,15 +37,14 @@ What still needs refinement:
 - stronger validation on long real-world exports
 - prior and threshold calibration against your own data
 - richer basal schedule handling
-- explicit CGM gap and missingness indicators
-- meal and carb features if Tandem Source exposes them
 - broader backtesting against simpler baselines
+- potential simplification or reparameterization of the latent residual model after more real-data diagnostics
 
 Supported collection path:
 
 - API-first acquisition through `tconnectsync`
 - browser or Playwright acquisition is not part of the active workflow
-- manual CSV exports can still be dropped into `data/raw/` and ingested
+- manual CSV exports can still be staged locally and ingested, but repo-local `data/raw/` is not the canonical long-term home
 
 ## Quickstart
 
@@ -65,6 +66,7 @@ bayesian-t1dm --help
 3. Inspect or validate raw Tandem exports:
 
 ```bash
+bayesian-t1dm normalize-raw
 bayesian-t1dm validate-raw
 bayesian-t1dm ingest
 ```
@@ -73,6 +75,12 @@ bayesian-t1dm ingest
 
 ```bash
 bayesian-t1dm run
+```
+
+For faster real-data validation without the final recommendation fit:
+
+```bash
+bayesian-t1dm run --skip-recommendations
 ```
 
 5. Run tests:
@@ -87,11 +95,11 @@ Credentials and acquisition settings belong in a root-level `.env` file that is 
 
 Required or commonly used variables:
 
-- `TCONNECT_EMAIL`
-- `TCONNECT_PASSWORD`
-- `TCONNECT_REGION`
+- `TANDEM_SOURCE_EMAIL` or `TCONNECT_EMAIL`
+- `TANDEM_SOURCE_PASSWORD` or `TCONNECT_PASSWORD`
+- `TANDEM_SOURCE_REGION` or `TCONNECT_REGION`
 - `TIMEZONE_NAME`
-- `PUMP_SERIAL_NUMBER` if required for your account
+- `TANDEM_SOURCE_PUMP_SERIAL`, `TANDEM_PUMP_SERIAL`, or `PUMP_SERIAL_NUMBER` if required for your account
 
 The active acquisition flow assumes Tandem Source is the authoritative cloud source for your Mobi data and that `tconnectsync` can query it directly.
 
@@ -115,6 +123,12 @@ Validate raw files:
 bayesian-t1dm validate-raw
 ```
 
+Repair normalized `tconnectsync` windows from archived raw payloads:
+
+```bash
+bayesian-t1dm normalize-raw
+```
+
 Build coverage and manifest outputs:
 
 ```bash
@@ -127,6 +141,12 @@ Run the forecasting and recommendation pipeline:
 bayesian-t1dm run
 ```
 
+Run time-aware validation without the final recommendation fit:
+
+```bash
+bayesian-t1dm run --skip-recommendations
+```
+
 ## Data Flow
 
 The active pipeline is:
@@ -136,21 +156,53 @@ The active pipeline is:
 3. raw API responses are archived under the cloud raw tree
 4. normalized CGM, bolus, basal, and activity tables are written beside the raw responses
 5. a per-window manifest records coverage, hashes, timestamps, and pump identity
-6. the repo can also ingest manual CSV exports placed in `data/raw/`
+6. the repo can also ingest manual CSV exports staged locally, but the canonical scraped-data home is the cloud project folder
 7. a canonical 5-minute time grid is built
 8. insulin exposure and IOB are derived from bolus events
 9. lagged, rolling, and calendar features are created
 10. the Bayesian forecasting model is fit
 11. scenario comparison and recommendation ranking are generated
 
+## Review Flow
+
+Canonical repair/review workflow:
+
+1. `bayesian-t1dm normalize-raw`
+2. `bayesian-t1dm ingest`
+3. `bayesian-t1dm run --skip-recommendations`
+
+This keeps raw-window repair, coverage review, and predictive validation separate from recommendation generation.
+
+Recommended recipes:
+
+- latest real window review:
+
+```bash
+bayesian-t1dm normalize-raw --window-id YYYY-MM-DD__YYYY-MM-DD
+bayesian-t1dm ingest
+bayesian-t1dm run --skip-recommendations
+```
+
+- latest 14-day review:
+
+```bash
+bayesian-t1dm run --skip-recommendations --eval-folds 2 --draws 200 --tune 200 --chains 2
+```
+
 ## Storage Layout
 
-Local and cloud paths are organized as follows:
+Canonical project organization:
 
 - code: `~/Projects/bayesian-t1dm`
-- runtime scratch: `~/ProjectsRuntime/bayesian-t1dm`
-- cloud raw data and manifests: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw`
-- cloud published outputs: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/output`
+- runtime outputs, scratch space, and intermediate artifacts: `~/ProjectsRuntime/bayesian-t1dm`
+- cloud project home: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm`
+
+Within the cloud project home:
+
+- scraped/raw acquisition data lives under `data/raw/`
+- final published outputs belong under `output/`
+- routine working summaries now default to `~/ProjectsRuntime/bayesian-t1dm/output/`
+- cloud `output/` should be used for intentional published/final artifacts rather than default working reports
 
 Within the cloud raw tree, the acquisition flow writes:
 
@@ -158,6 +210,8 @@ Within the cloud raw tree, the acquisition flow writes:
 - normalized CSVs under `data/raw/tconnectsync/<window_id>/normalized/`
 - per-window manifests under `data/raw/tconnectsync/<window_id>/window_manifest.csv`
 - collection manifest at `data/raw/tandem_export_manifest.csv`
+
+Repo-local `data/raw/` is a convenience/manual staging location, not the canonical scraped-data home.
 
 ## Repository Layout
 
@@ -172,10 +226,23 @@ Within the cloud raw tree, the acquisition flow writes:
 The pipeline produces:
 
 - coverage summaries showing how much history is available
+- self-contained HTML review pages for coverage and run inspection
 - processed tables with normalized timestamps and derived insulin exposure
 - posterior forecasts with uncertainty intervals
-- recommendation summaries for human review
-- markdown reports suitable for inspection or downstream logging
+- walk-forward metrics against a persistence baseline
+- sampler diagnostics for every walk-forward fit and the final fit
+- explicit data-quality summaries showing whether source windows are good, degraded, or broken
+- recommendation policy metadata showing whether recommendations were generated, suppressed, or skipped
+- recommendation summaries for human review when the validation and sampler gates pass, including per-recommendation confidence and warning flags
+- runtime reports under `~/ProjectsRuntime/bayesian-t1dm/output/` by default
+
+Default runtime review artifacts:
+
+- `coverage.md`
+- `coverage_review.html`
+- `run_summary.md`
+- `run_summary.json`
+- `run_review.html`
 
 ## Limitations
 
@@ -184,14 +251,19 @@ The pipeline produces:
 - Recommendations are advisory and must be reviewed by you.
 - The default insulin action curve is an approximation, not physiology ground truth.
 - The Bayesian model is intentionally conservative because personal data can be sparse and irregular.
+- A modest MAE win over persistence does not justify recommendations if interval coverage is poor or sampler diagnostics fail.
 
-## Design Decisions
+## Interpretation
 
-- Python is the active path because the current workflow is Python-heavy and easier to test and reuse as a package.
-- Notebooks remain for exploratory analysis and visual debugging.
-- R is archived because the active R scripts were broken and incomplete as standalone entry points.
-- Recommendations are human-reviewable rather than automated because the goal is decision support with uncertainty, not automatic pump control.
-- Credentials live in a local `.env` so API acquisition can run without exposing secrets in Git or cloud sync.
+Treat predictive discrimination, interval calibration, and recommendation confidence as separate questions.
+
+- `run` may perform multiple expensive fits because walk-forward evaluation is time-aware.
+- `--skip-recommendations` is the preferred fast path for real-data validation.
+- incomplete source windows remain reviewable, but they suppress recommendations by policy.
+- `run_summary.json` includes fit diagnostics and recommendation-policy status.
+- `coverage_review.html` and `run_review.html` are the primary visual inspection artifacts for active-pipeline review.
+- recommendation records include `confidence` and `flags` so low-signal cases are explicit in machine-readable output.
+- An empty recommendation list can mean no scenario cleared the gain threshold, or that recommendations were intentionally suppressed or skipped.
 
 ## Technical Notes
 

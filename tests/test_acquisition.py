@@ -95,20 +95,21 @@ def test_tconnectsync_client_archives_raw_payloads_and_normalizes_outputs(tmp_pa
     adapter = FakeTConnectSyncAdapter(payloads)
     client = TConnectSyncSourceClient(workspace, adapter=adapter, timezone="America/New_York", pump_serial="123456")
 
-    result = client.export_daily_timeline_window(window, workspace.runtime_downloads)
+    result = client.export_daily_timeline_window(window, workspace.runtime / "downloads")
     record = collect_tandem_exports(
         client,
         [window],
         workspace,
         TandemCredentials(email="me@example.com", password="secret", timezone="America/New_York", pump_serial="123456"),
         resume=False,
+        strict=False,
         manifest_path=workspace.cloud_raw / "tandem_export_manifest.csv",
-        report_path=workspace.cloud_output / "tandem_acquisition_summary.md",
+        report_path=workspace.reports / "tandem_acquisition_summary.md",
     )[0]
 
     assert isinstance(result, NormalizedWindowResult)
     assert isinstance(result.raw_artifacts[0], RawApiArtifact)
-    assert result.is_complete_window
+    assert not result.is_complete_window
     assert result.row_counts["cgm"] == 3
     assert result.row_counts["bolus"] == 1
     assert result.row_counts["basal"] == 1
@@ -117,12 +118,56 @@ def test_tconnectsync_client_archives_raw_payloads_and_normalizes_outputs(tmp_pa
     assert (workspace.cloud_raw / "tconnectsync" / window.window_id / "raw" / "cgm.json").exists()
     assert (workspace.cloud_raw / "tconnectsync" / window.window_id / "normalized" / "cgm.csv").exists()
     assert record.source_type == "api"
-    assert record.is_complete_window
+    assert not record.is_complete_window
     assert json.loads(record.raw_artifact_paths_json)
     assert json.loads(record.normalized_paths_json)["cgm"].endswith("cgm.csv")
-    assert json.loads(record.completeness_json)["is_complete_window"]
+    completeness = json.loads(record.completeness_json)
+    assert completeness["is_complete_window"] is False
+    assert "ends_early" in completeness["completeness_reasons"]
+    cgm_text = (workspace.cloud_raw / "tconnectsync" / window.window_id / "normalized" / "cgm.csv").read_text(encoding="utf-8")
+    assert "+00:00" not in cgm_text
+    assert "-04:00" not in cgm_text
     assert adapter.calls[0][0] == "fetch"
     assert adapter.calls[0][1] == window.window_id
+
+
+def test_normalize_tconnectsync_archive_rebuilds_window_and_is_idempotent(tmp_path):
+    workspace = _workspace(tmp_path)
+    window_dir = workspace.cloud_raw / "tconnectsync" / "2024-05-01__2024-05-03" / "raw"
+    window_dir.mkdir(parents=True, exist_ok=True)
+    payloads = {
+        "cgm": [
+            {"eventDateTime": "2024-05-01T00:00:00-04:00", "egv_estimatedGlucoseValue": 110},
+            {"eventDateTime": "2024-05-01 00:05:00", "egv_estimatedGlucoseValue": 111},
+        ],
+        "bolus": [{"completionDateTime": "2024-05-01T08:05:00-04:00", "actualTotalBolusRequested": 4.0, "carbSize": 45}],
+        "basal": [{"startDateTime": "2024-05-01T00:00:00-04:00", "endDateTime": "2024-05-02 00:00:00", "basalRate": 0.85}],
+        "activity": [],
+    }
+    for kind, payload in payloads.items():
+        (window_dir / f"{kind}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    results = acquisition.normalize_tconnectsync_archive(
+        workspace,
+        raw_root=workspace.cloud_raw / "tconnectsync",
+        timezone="America/New_York",
+    )
+
+    assert len(results) == 1
+    manifest = pd.read_csv(workspace.cloud_raw / "tconnectsync" / "2024-05-01__2024-05-03" / "window_manifest.csv")
+    assert {"requested_start", "requested_end", "observed_first_timestamp", "observed_last_timestamp", "observed_duration_days", "coverage_fraction", "completeness_reasons"} <= set(manifest.columns)
+    normalized_basal = pd.read_csv(workspace.cloud_raw / "tconnectsync" / "2024-05-01__2024-05-03" / "normalized" / "basal.csv")
+    assert normalized_basal["end_timestamp"].astype(str).str.contains(r"[+-]\d{2}:\d{2}").sum() == 0
+
+    second = acquisition.normalize_tconnectsync_archive(
+        workspace,
+        raw_root=workspace.cloud_raw / "tconnectsync",
+        timezone="America/New_York",
+    )
+    assert second == []
+
+    report_text = (workspace.reports / "normalize_raw_summary.md").read_text(encoding="utf-8")
+    assert "skipped (existing normalized artifacts present)" in report_text
 
 
 def test_tconnectsync_payload_hash_is_deterministic(tmp_path):
@@ -221,7 +266,7 @@ def test_backfill_skips_completed_windows(tmp_path):
         direction="forward",
         resume=True,
         manifest_path=workspace.cloud_raw / "tandem_export_manifest.csv",
-        report_path=workspace.cloud_output / "tandem_acquisition_summary.md",
+        report_path=workspace.reports / "tandem_acquisition_summary.md",
     )
     export_calls_after_first = [call for call in client.calls if call[0] == "fetch"]
     assert len(records_first) == 2
@@ -237,7 +282,7 @@ def test_backfill_skips_completed_windows(tmp_path):
         direction="forward",
         resume=True,
         manifest_path=workspace.cloud_raw / "tandem_export_manifest.csv",
-        report_path=workspace.cloud_output / "tandem_acquisition_summary.md",
+        report_path=workspace.reports / "tandem_acquisition_summary.md",
     )
     export_calls_after_second = [call for call in client.calls if call[0] == "fetch"]
     assert len(records_second) == 2
