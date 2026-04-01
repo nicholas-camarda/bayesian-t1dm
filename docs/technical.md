@@ -8,13 +8,16 @@ The active pipeline is:
 2. `tconnectsync` logs in to Tandem Source and queries API windows directly
 3. raw API responses are archived under `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/tconnectsync/<window_id>/raw/`
 4. normalized CGM, bolus, basal, and activity tables are written beside the raw responses
-5. a per-window manifest records coverage, hashes, timestamps, and pump identity
-6. the repo can also ingest manual CSV exports staged locally, but the canonical scraped-data home is the cloud project folder
-7. 5-minute canonical time grid
-8. derived insulin exposure and IOB
-9. lagged, rolling, and calendar features
-10. Bayesian forecast model
-11. scenario comparison and pump-setting recommendation ranking
+5. optional Health Auto Export bundles are archived under `data/raw/health_auto_export/<export_id>/...`
+6. imported Apple Health tables are unified with deterministic latest-export-wins overlap resolution
+7. `prepare-model-data` inspects Apple and Tandem coverage, requests missing Tandem history when needed, and writes a preparation/alignment report
+8. a per-window Tandem manifest records coverage, hashes, timestamps, and pump identity
+9. a Tandem 5-minute feature frame is built
+10. canonical Apple Health context is merged onto Tandem feature-frame timestamps when available to create the final prepared dataset
+11. derived insulin exposure and IOB
+12. lagged, rolling, and calendar features
+13. Bayesian forecast model
+14. scenario comparison and pump-setting recommendation ranking
 
 ## Tandem Source Acquisition
 
@@ -45,6 +48,12 @@ Storage convention:
 - scraped/raw acquisition data: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw`
 - final published outputs: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/output`
 - default working summaries: `~/ProjectsRuntime/bayesian-t1dm/output`
+
+Raw discovery rules:
+
+- active Tandem ingest excludes deprecated `archive data/` content from generic raw discovery
+- canonical Apple Health loading reads only `data/raw/health_auto_export/...`
+- `data/raw/apple_health_data/` is a source pool for `import-health-auto-export`, not a direct modeling input
 
 The acquisition manifest captures:
 
@@ -253,6 +262,29 @@ Canonical real-data review flow:
 2. `bayesian-t1dm ingest`
 3. `bayesian-t1dm run --skip-recommendations`
 
+Canonical default model-data flow:
+
+1. `bayesian-t1dm normalize-raw`
+2. `bayesian-t1dm prepare-model-data --apple-input ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data`
+3. `bayesian-t1dm screen-health-features`
+4. `bayesian-t1dm run --skip-recommendations`
+5. `bayesian-t1dm run`
+
+Canonical Tandem-only fallback flow:
+
+1. `bayesian-t1dm normalize-raw`
+2. `bayesian-t1dm prepare-model-data`
+3. `bayesian-t1dm run --skip-recommendations`
+4. `bayesian-t1dm run`
+
+Step-by-step behavior:
+
+1. `normalize-raw` rebuilds normalized Tandem tables from archived `tconnectsync` raw payloads.
+2. `prepare-model-data` imports Apple Health bundles when provided, computes Apple/Tandem overlap, backfills Tandem history when needed, and writes a prepared 5-minute model dataset. If Apple Health is absent, it falls back cleanly to Tandem-only preparation and targets roughly one year of Tandem history by default.
+3. `screen-health-features` consumes that prepared dataset and skips cleanly when Apple Health is absent.
+4. `run --skip-recommendations` is the preferred fast validation path because it exercises walk-forward prediction without the final recommendation fit.
+5. `run` executes the full modeling and recommendation stack using the same prepared dataset contract: Apple-enriched when Apple data exists, Tandem-only otherwise.
+
 ## Output Contract
 
 `run_summary.json` includes:
@@ -284,6 +316,13 @@ In addition to markdown and JSON summaries, the active pipeline writes self-cont
 
 These are the primary visual inspection surfaces for active-pipeline review. They combine source completeness, walk-forward behavior, baseline comparison, and sampler diagnostics in one place.
 
+Apple Health-specific working artifacts:
+
+- `import-health-auto-export` writes per-bundle manifests under `data/raw/health_auto_export/<export_id>/health_auto_export_manifest.csv`
+- `prepare-model-data` writes `model_data_preparation.md` and `prepared_model_data_5min.csv` under the runtime output directory by default
+- `build-health-analysis-ready` writes a wide Tandem-aligned 5-minute table, by default under `~/ProjectsRuntime/bayesian-t1dm/output/analysis_ready_health_5min.csv`
+- `screen-health-features` writes `health_feature_screening.md` and `health_feature_scores.csv` under the runtime output directory
+
 ## Assumptions and Failure Modes
 
 Assumptions:
@@ -310,3 +349,5 @@ Known failure modes:
 - There is no supported Playwright/browser fallback in the active acquisition path; the browser code has been retired.
 - A raw acquisition manifest is required so export completeness is checked before modeling rather than after the fact.
 - Coverage completeness is defined on the acquisition manifest, while cross-file gap checks live in the normalized ingest manifest.
+- Deprecated `archive data/` content is intentionally excluded from active Tandem ingest because it may contain legacy Apple Health exports and non-tabular ECG CSVs that are not part of the modeling contract.
+- Canonical Apple Health loading is scoped to `data/raw/health_auto_export/...`; the `apple_health_data/` directory is a source pool for import, not a direct modeling input.

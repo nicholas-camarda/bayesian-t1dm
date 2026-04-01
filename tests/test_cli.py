@@ -12,6 +12,19 @@ from bayesian_t1dm.cli import main
 from bayesian_t1dm.acquisition import ExportWindow, NormalizedWindowResult
 
 
+def _write_tandem_cgm_export(raw_dir: Path, *, start: str = "2025-05-24 00:00:00", periods: int = 288) -> Path:
+    workbook = raw_dir / "therapy_events_2025-05.xlsx"
+    frame = pd.DataFrame(
+        {
+            "eventDateTime": pd.date_range(start, periods=periods, freq="5min"),
+            "egv_estimatedGlucoseValue": [110 + (index % 18) for index in range(periods)],
+        }
+    )
+    with pd.ExcelWriter(workbook) as writer:
+        frame.to_excel(writer, index=False)
+    return workbook
+
+
 def test_validate_raw_command_writes_summary_report(tmp_path):
     workbook = tmp_path / "therapy_events_2023-02.xlsx"
     frame = pd.DataFrame(
@@ -262,3 +275,85 @@ def test_run_skip_recommendations_writes_skipped_policy(tmp_path, tandem_fixture
     assert (tmp_path / "runtime" / "output" / "run_review.html").exists()
     report_text = (tmp_path / "runtime" / "output" / "run_summary.md").read_text(encoding="utf-8")
     assert "[run_review_html](run_review.html)" in report_text
+
+
+def test_prepare_model_data_without_apple_writes_tandem_only_dataset(tmp_path, monkeypatch):
+    workspace_root = tmp_path / "repo"
+    workspace_root.mkdir()
+    cloud_root = tmp_path / "cloud"
+    runtime_root = tmp_path / "runtime"
+    raw_root = cloud_root / "data" / "raw"
+    raw_root.mkdir(parents=True, exist_ok=True)
+    _write_tandem_cgm_export(raw_root)
+
+    monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(cloud_root))
+    monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
+
+    output = tmp_path / "prepared_model_data_5min.csv"
+    report = tmp_path / "model_data_preparation.md"
+    exit_code = main(
+        [
+            "--root",
+            str(workspace_root),
+            "prepare-model-data",
+            "--raw",
+            str(raw_root),
+            "--output",
+            str(output),
+            "--report",
+            str(report),
+            "--skip-backfill",
+        ]
+    )
+
+    assert exit_code == 0
+    assert output.exists()
+    assert report.exists()
+
+    prepared = pd.read_csv(output)
+    assert "health_activity_value" not in prepared.columns
+    text = report.read_text(encoding="utf-8")
+    assert "- mode: tandem_only" in text
+    assert "- apple_available: False" in text
+    assert "- health_features_included: False" in text
+    assert "below the requested minimum" in text
+
+
+def test_prepare_model_data_backfills_tandem_when_needed_without_apple(tmp_path, monkeypatch):
+    workspace_root = tmp_path / "repo"
+    workspace_root.mkdir()
+    cloud_root = tmp_path / "cloud"
+    runtime_root = tmp_path / "runtime"
+    raw_root = cloud_root / "data" / "raw"
+    raw_root.mkdir(parents=True, exist_ok=True)
+    _write_tandem_cgm_export(raw_root)
+
+    monkeypatch.setenv("TANDEM_SOURCE_EMAIL", "me@example.com")
+    monkeypatch.setenv("TANDEM_SOURCE_PASSWORD", "secret")
+    monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(cloud_root))
+    monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
+    monkeypatch.setattr(cli, "TConnectSyncSourceClient", lambda paths, **kwargs: _FakeApiClient(paths, **kwargs))
+
+    report = tmp_path / "model_data_preparation.md"
+    exit_code = main(
+        [
+            "--root",
+            str(workspace_root),
+            "prepare-model-data",
+            "--raw",
+            str(raw_root),
+            "--report",
+            str(report),
+            "--history-days",
+            "30",
+        ]
+    )
+
+    assert exit_code == 0
+    client = _FakeApiClient.last_instance
+    assert client is not None
+    assert any(call[0] == "export" for call in client.calls)
+    text = report.read_text(encoding="utf-8")
+    assert "- backfill_status: completed" in text
+    assert "- requested_tandem_start: 2025-04-25 00:00:00" in text
+    assert "- requested_tandem_end: 2025-05-24 00:00:00" in text

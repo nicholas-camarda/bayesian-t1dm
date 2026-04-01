@@ -22,6 +22,9 @@ What is currently in place:
 - Tandem Source acquisition through `tconnectsync`
 - raw API payload archival as the source of truth
 - normalization of CGM, bolus, basal, and activity tables
+- multi-export Apple Health import with canonical overlap resolution
+- Tandem-aligned 5-minute analysis-ready dataset materialization
+- Apple Health feature screening against Tandem targets
 - manifest generation and coverage checks
 - 5-minute feature-table construction
 - insulin activity and IOB expansion from bolus events
@@ -71,7 +74,16 @@ bayesian-t1dm validate-raw
 bayesian-t1dm ingest
 ```
 
-4. Run the full pipeline:
+4. Prepare model-ready data:
+
+```bash
+bayesian-t1dm prepare-model-data --apple-input \
+  ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data
+```
+
+`prepare-model-data` is the default data-prep workflow. If Apple Health bundles are available, it imports them, measures Apple/Tandem overlap, backfills Tandem data when credentials are available, and writes an aligned 5-minute model dataset. If Apple Health is absent, it falls back to a Tandem-only dataset and targets roughly one year of Tandem history by default.
+
+5. Run the full pipeline:
 
 ```bash
 bayesian-t1dm run
@@ -83,7 +95,7 @@ For faster real-data validation without the final recommendation fit:
 bayesian-t1dm run --skip-recommendations
 ```
 
-5. Run tests:
+6. Run tests:
 
 ```bash
 pytest
@@ -147,6 +159,32 @@ Run time-aware validation without the final recommendation fit:
 bayesian-t1dm run --skip-recommendations
 ```
 
+Import one or more Health Auto Export bundles from a parent directory:
+
+```bash
+bayesian-t1dm import-health-auto-export --input \
+  ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data
+```
+
+Prepare the default model-ready dataset with optional Apple Health enrichment:
+
+```bash
+bayesian-t1dm prepare-model-data --apple-input \
+  ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data
+```
+
+Materialize the Tandem-aligned 5-minute analysis-ready table:
+
+```bash
+bayesian-t1dm build-health-analysis-ready
+```
+
+Screen Apple Health context features against Tandem glucose targets:
+
+```bash
+bayesian-t1dm screen-health-features
+```
+
 ## Data Flow
 
 The active pipeline is:
@@ -155,13 +193,16 @@ The active pipeline is:
 2. `tconnectsync` logs in and requests Tandem Source API windows
 3. raw API responses are archived under the cloud raw tree
 4. normalized CGM, bolus, basal, and activity tables are written beside the raw responses
-5. a per-window manifest records coverage, hashes, timestamps, and pump identity
-6. the repo can also ingest manual CSV exports staged locally, but the canonical scraped-data home is the cloud project folder
-7. a canonical 5-minute time grid is built
-8. insulin exposure and IOB are derived from bolus events
-9. lagged, rolling, and calendar features are created
-10. the Bayesian forecasting model is fit
-11. scenario comparison and recommendation ranking are generated
+5. optional Apple Health year-chunk bundles are imported under `data/raw/health_auto_export/<export_id>/...`
+6. imported Apple Health tables are unified with deterministic latest-export-wins dedupe
+7. `prepare-model-data` inspects Apple and Tandem spans, requests missing Tandem history when needed, and writes an alignment/preparation report
+8. a per-window Tandem manifest records coverage, hashes, timestamps, and pump identity
+9. a Tandem 5-minute feature grid is built
+10. Apple Health context is merged onto those Tandem timestamps when available to create the final prepared dataset
+11. insulin exposure and IOB are derived from bolus events
+12. lagged, rolling, and calendar features are created
+13. the Bayesian forecasting model is fit
+14. scenario comparison and recommendation ranking are generated
 
 ## Review Flow
 
@@ -172,6 +213,29 @@ Canonical repair/review workflow:
 3. `bayesian-t1dm run --skip-recommendations`
 
 This keeps raw-window repair, coverage review, and predictive validation separate from recommendation generation.
+
+Canonical Tandem + Apple Health workflow:
+
+1. `bayesian-t1dm normalize-raw`
+2. `bayesian-t1dm prepare-model-data --apple-input ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data`
+3. `bayesian-t1dm screen-health-features`
+4. `bayesian-t1dm run --skip-recommendations`
+5. `bayesian-t1dm run`
+
+Canonical Tandem-only fallback workflow:
+
+1. `bayesian-t1dm normalize-raw`
+2. `bayesian-t1dm prepare-model-data`
+3. `bayesian-t1dm run --skip-recommendations`
+4. `bayesian-t1dm run`
+
+What each step does:
+
+1. `normalize-raw` rebuilds normalized Tandem tables from archived raw API payloads.
+2. `prepare-model-data` optionally imports Apple Health bundles, computes Apple/Tandem overlap, backfills Tandem data when needed, and writes the prepared 5-minute model dataset plus a preparation report.
+3. `screen-health-features` evaluates Apple context features against Tandem glucose targets using the unified prepared dataset and skips cleanly when Apple Health is absent.
+4. `run --skip-recommendations` is the preferred fast validation path because it checks walk-forward forecasting without paying for the final recommendation fit.
+5. `run` performs the full modeling and recommendation pipeline. It now uses the same prepared dataset contract: Apple-enriched when Apple data exists, Tandem-only otherwise.
 
 Recommended recipes:
 
@@ -210,6 +274,13 @@ Within the cloud raw tree, the acquisition flow writes:
 - normalized CSVs under `data/raw/tconnectsync/<window_id>/normalized/`
 - per-window manifests under `data/raw/tconnectsync/<window_id>/window_manifest.csv`
 - collection manifest at `data/raw/tandem_export_manifest.csv`
+- imported Apple Health bundles under `data/raw/health_auto_export/<export_id>/raw/` and `.../normalized/`
+
+Discovery rules:
+
+- active Tandem ingest walks the cloud raw tree but excludes deprecated `archive data/` content
+- canonical Apple Health loading reads only `data/raw/health_auto_export/...`
+- repo-local `data/raw/` remains a manual staging area, not the canonical long-term source tree
 
 Repo-local `data/raw/` is a convenience/manual staging location, not the canonical scraped-data home.
 
@@ -240,6 +311,11 @@ Default runtime review artifacts:
 
 - `coverage.md`
 - `coverage_review.html`
+- `model_data_preparation.md`
+- `prepared_model_data_5min.csv`
+- `analysis_ready_health_5min.csv`
+- `health_feature_screening.md`
+- `health_feature_scores.csv`
 - `run_summary.md`
 - `run_summary.json`
 - `run_review.html`

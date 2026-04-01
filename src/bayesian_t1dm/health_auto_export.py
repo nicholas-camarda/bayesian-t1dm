@@ -62,10 +62,35 @@ class HealthAutoExportImportResult:
 @dataclass(frozen=True)
 class AnalysisReadyHealthDataset:
     frame: pd.DataFrame
+    feature_columns: list[str]
     tandem_feature_columns: list[str]
     health_feature_columns: list[str]
     target_column: str
+    horizon_minutes: int
     config: FeatureConfig
+    mode: str = "tandem_only"
+    apple_available: bool = False
+
+
+@dataclass(frozen=True)
+class ModelDataPreparationResult:
+    dataset: AnalysisReadyHealthDataset
+    apple_available: bool
+    apple_span_start: pd.Timestamp | None
+    apple_span_end: pd.Timestamp | None
+    tandem_span_before_start: pd.Timestamp | None
+    tandem_span_before_end: pd.Timestamp | None
+    tandem_span_after_start: pd.Timestamp | None
+    tandem_span_after_end: pd.Timestamp | None
+    requested_tandem_start: pd.Timestamp | None
+    requested_tandem_end: pd.Timestamp | None
+    overlap_start: pd.Timestamp | None
+    overlap_end: pd.Timestamp | None
+    final_dataset_start: pd.Timestamp | None
+    final_dataset_end: pd.Timestamp | None
+    final_row_count: int
+    backfill_status: str = "not_requested"
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -76,6 +101,9 @@ class HealthFeatureScreeningResult:
     baseline_mae_mean: float
     augmented_mae_mean: float
     split_count: int
+    status: str = "completed"
+    apple_available: bool = True
+    message: str = ""
 
 
 def _parse_timestamp(value: Any) -> pd.Timestamp:
@@ -658,6 +686,71 @@ def load_health_auto_export_tables(raw_dir: str | Path) -> dict[str, pd.DataFram
     return load_unified_health_auto_export_tables(raw_dir)
 
 
+def has_apple_health_data(data: IngestedData) -> bool:
+    return any(
+        not frame.empty
+        for frame in [data.health_activity, data.health_measurements, data.sleep, data.workouts]
+    )
+
+
+def summarize_tandem_data_span(data: IngestedData) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    timestamps: list[pd.Series] = []
+    for frame, columns in [
+        (data.cgm, ("timestamp",)),
+        (data.bolus, ("timestamp",)),
+        (data.carbs, ("timestamp",)),
+        (data.activity, ("timestamp",)),
+        (data.basal, ("start_timestamp", "end_timestamp")),
+    ]:
+        if frame.empty:
+            continue
+        for column in columns:
+            if column in frame.columns:
+                timestamps.append(_parse_series(frame[column]))
+    if not timestamps:
+        return None, None
+    combined = pd.concat(timestamps, ignore_index=True).dropna()
+    if combined.empty:
+        return None, None
+    return pd.Timestamp(combined.min()), pd.Timestamp(combined.max())
+
+
+def summarize_apple_health_span(data: IngestedData) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    timestamps: list[pd.Series] = []
+    for frame, columns in [
+        (data.health_activity, ("timestamp",)),
+        (data.health_measurements, ("timestamp",)),
+        (data.sleep, ("date", "sleep_start", "sleep_end", "in_bed_start", "in_bed_end")),
+        (data.workouts, ("start_timestamp", "end_timestamp")),
+    ]:
+        if frame.empty:
+            continue
+        for column in columns:
+            if column in frame.columns:
+                timestamps.append(_parse_series(frame[column]))
+    if not timestamps:
+        return None, None
+    combined = pd.concat(timestamps, ignore_index=True).dropna()
+    if combined.empty:
+        return None, None
+    return pd.Timestamp(combined.min()), pd.Timestamp(combined.max())
+
+
+def intersect_spans(
+    first_start: pd.Timestamp | None,
+    first_end: pd.Timestamp | None,
+    second_start: pd.Timestamp | None,
+    second_end: pd.Timestamp | None,
+) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    if first_start is None or first_end is None or second_start is None or second_end is None:
+        return None, None
+    start = max(first_start, second_start)
+    end = min(first_end, second_end)
+    if end < start:
+        return None, None
+    return start, end
+
+
 def build_health_context_frame(base_frame: pd.DataFrame, data: IngestedData, *, freq: str = "5min") -> tuple[pd.DataFrame, list[str]]:
     out = base_frame.loc[:, ["timestamp"]].copy()
     out["timestamp"] = _parse_series(out["timestamp"])
@@ -885,13 +978,30 @@ def build_analysis_ready_health_dataset(
     config: FeatureConfig | None = None,
 ) -> AnalysisReadyHealthDataset:
     feature_frame = build_feature_frame(tandem_data, config or FeatureConfig())
+    apple_available = has_apple_health_data(health_data)
     if feature_frame.frame.empty:
         return AnalysisReadyHealthDataset(
             frame=feature_frame.frame.copy(),
+            feature_columns=list(feature_frame.feature_columns),
             tandem_feature_columns=list(feature_frame.feature_columns),
             health_feature_columns=[],
             target_column=feature_frame.target_column,
+            horizon_minutes=feature_frame.horizon_minutes,
             config=feature_frame.config,
+            mode="apple_enriched" if apple_available else "tandem_only",
+            apple_available=apple_available,
+        )
+    if not apple_available:
+        return AnalysisReadyHealthDataset(
+            frame=feature_frame.frame.copy(),
+            feature_columns=list(feature_frame.feature_columns),
+            tandem_feature_columns=list(feature_frame.feature_columns),
+            health_feature_columns=[],
+            target_column=feature_frame.target_column,
+            horizon_minutes=feature_frame.horizon_minutes,
+            config=feature_frame.config,
+            mode="tandem_only",
+            apple_available=False,
         )
     context_frame, health_feature_columns = build_health_context_frame(
         feature_frame.frame,
@@ -902,12 +1012,30 @@ def build_analysis_ready_health_dataset(
     health_feature_columns = [column for column in dict.fromkeys(health_feature_columns) if column in combined.columns]
     if health_feature_columns:
         combined[health_feature_columns] = combined[health_feature_columns].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    feature_columns = list(feature_frame.feature_columns) + [column for column in health_feature_columns if column not in feature_frame.feature_columns]
     return AnalysisReadyHealthDataset(
         frame=combined,
+        feature_columns=feature_columns,
         tandem_feature_columns=list(feature_frame.feature_columns),
         health_feature_columns=health_feature_columns,
         target_column=feature_frame.target_column,
+        horizon_minutes=feature_frame.horizon_minutes,
         config=feature_frame.config,
+        mode="apple_enriched",
+        apple_available=True,
+    )
+
+
+def build_prepared_model_dataset(
+    *,
+    tandem_data: IngestedData,
+    health_data: IngestedData,
+    config: FeatureConfig | None = None,
+) -> AnalysisReadyHealthDataset:
+    return build_analysis_ready_health_dataset(
+        tandem_data=tandem_data,
+        health_data=health_data,
+        config=config,
     )
 
 
@@ -955,6 +1083,20 @@ def screen_health_features(
     )
     if analysis_ready.frame.empty:
         raise ValueError("No Tandem feature rows are available for health feature screening")
+    if not analysis_ready.health_feature_columns:
+        return HealthFeatureScreeningResult(
+            scores=pd.DataFrame(
+                columns=["feature", "availability", "mean_abs_coefficient", "std_abs_coefficient", "split_count", "recommended"]
+            ),
+            baseline_rmse_mean=float("nan"),
+            augmented_rmse_mean=float("nan"),
+            baseline_mae_mean=float("nan"),
+            augmented_mae_mean=float("nan"),
+            split_count=0,
+            status="skipped",
+            apple_available=False,
+            message="Apple Health not available; screening skipped.",
+        )
 
     combined = analysis_ready.frame.copy()
     baseline_columns = list(analysis_ready.tandem_feature_columns)
@@ -1056,6 +1198,8 @@ def screen_health_features(
         baseline_mae_mean=float(np.mean(baseline_mae)),
         augmented_mae_mean=float(np.mean(augmented_mae)),
         split_count=len(splits),
+        status="completed",
+        apple_available=True,
     )
 
 
@@ -1065,17 +1209,31 @@ def write_health_screening_report(result: HealthFeatureScreeningResult, path: st
     lines = [
         "# Health Feature Screening",
         "",
-        f"- split_count: {result.split_count}",
-        f"- baseline_rmse_mean: {result.baseline_rmse_mean:.4f}",
-        f"- augmented_rmse_mean: {result.augmented_rmse_mean:.4f}",
-        f"- baseline_mae_mean: {result.baseline_mae_mean:.4f}",
-        f"- augmented_mae_mean: {result.augmented_mae_mean:.4f}",
-        "",
-        "## Recommended Features",
+        f"- status: {result.status}",
+        f"- apple_available: {result.apple_available}",
     ]
+    if result.message:
+        lines.append(f"- message: {result.message}")
+    if result.status == "completed":
+        lines.extend(
+            [
+                f"- split_count: {result.split_count}",
+                f"- baseline_rmse_mean: {result.baseline_rmse_mean:.4f}",
+                f"- augmented_rmse_mean: {result.augmented_rmse_mean:.4f}",
+                f"- baseline_mae_mean: {result.baseline_mae_mean:.4f}",
+                f"- augmented_mae_mean: {result.augmented_mae_mean:.4f}",
+                "",
+                "## Recommended Features",
+            ]
+        )
+    else:
+        lines.extend(["", "## Recommended Features"])
     if result.scores.empty:
         lines.append("")
-        lines.append("No health context features were available.")
+        if result.status == "skipped":
+            lines.append(result.message or "Apple Health not available; screening skipped.")
+        else:
+            lines.append("No health context features were available.")
     else:
         recommended = result.scores.loc[result.scores["recommended"].fillna(False)]
         if recommended.empty:
@@ -1087,5 +1245,49 @@ def write_health_screening_report(result: HealthFeatureScreeningResult, path: st
                 lines.append(
                     f"- {row.feature}: availability={row.availability:.2f}, mean_abs_coefficient={row.mean_abs_coefficient:.4f}"
                 )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def write_model_data_preparation_report(result: ModelDataPreparationResult, path: str | Path) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# Model Data Preparation",
+        "",
+        f"- mode: {result.dataset.mode}",
+        f"- apple_available: {result.apple_available}",
+        f"- backfill_status: {result.backfill_status}",
+        f"- requested_tandem_start: {result.requested_tandem_start}",
+        f"- requested_tandem_end: {result.requested_tandem_end}",
+        f"- tandem_span_before_start: {result.tandem_span_before_start}",
+        f"- tandem_span_before_end: {result.tandem_span_before_end}",
+        f"- tandem_span_after_start: {result.tandem_span_after_start}",
+        f"- tandem_span_after_end: {result.tandem_span_after_end}",
+        f"- apple_span_start: {result.apple_span_start}",
+        f"- apple_span_end: {result.apple_span_end}",
+        f"- overlap_start: {result.overlap_start}",
+        f"- overlap_end: {result.overlap_end}",
+        f"- final_dataset_start: {result.final_dataset_start}",
+        f"- final_dataset_end: {result.final_dataset_end}",
+        f"- final_row_count: {result.final_row_count}",
+        f"- health_features_included: {bool(result.dataset.health_feature_columns)}",
+        f"- health_feature_count: {len(result.dataset.health_feature_columns)}",
+        "",
+        "## Health Features",
+    ]
+    if not result.dataset.health_feature_columns:
+        lines.extend(["", "No Apple Health context features were included in the final dataset."])
+    else:
+        lines.append("")
+        for column in result.dataset.health_feature_columns:
+            lines.append(f"- {column}")
+    lines.extend(["", "## Warnings"])
+    if not result.warnings:
+        lines.extend(["", "None."])
+    else:
+        lines.append("")
+        for warning in result.warnings:
+            lines.append(f"- {warning}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path

@@ -8,6 +8,7 @@ import pytest
 
 from bayesian_t1dm.ingest import (
     build_export_manifest,
+    discover_source_files,
     load_tandem_exports,
     summarize_coverage,
     summarize_export_manifest,
@@ -148,6 +149,61 @@ def test_load_tandem_exports_discovers_parquet(tmp_path):
 
     data = load_tandem_exports(tmp_path)
     assert data.cgm.shape[0] >= 1488
+
+
+def test_discover_source_files_excludes_archive_data_subtree(tmp_path):
+    workbook = _write_dense_therapy_events_workbook(tmp_path)
+    archive_dir = tmp_path / "archive data" / "apple-health-data" / "electrocardiograms"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    bad_csv = archive_dir / "ecg_2022-03-08.csv"
+    bad_csv.write_text(
+        "\n".join(
+            [
+                "Name,Nicholas Camarda",
+                'Date of Birth,"Nov 13, 1993"',
+                "Recorded Date,2022-03-08 17:16:56 -0500",
+                "Classification,Sinus Rhythm",
+                "Symptoms,Rapid, pounding, or fluttering heartbeat,Skipped heartbeat,Fatigue,Dizziness",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    source_pool_dir = tmp_path / "apple_health_data"
+    source_pool_dir.mkdir(parents=True, exist_ok=True)
+    staged_csv = source_pool_dir / "staged.csv"
+    staged_csv.write_text("timestamp,value\n2024-01-01,1\n", encoding="utf-8")
+
+    discovered = discover_source_files(tmp_path)
+
+    assert workbook in discovered
+    assert bad_csv not in discovered
+    assert staged_csv not in discovered
+
+
+def test_load_tandem_exports_excludes_archive_data_subtree(tmp_path):
+    workbook = _write_dense_therapy_events_workbook(tmp_path)
+    archive_dir = tmp_path / "archive data" / "apple-health-data" / "electrocardiograms"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    (archive_dir / "ecg_2022-03-08.csv").write_text(
+        "\n".join(
+            [
+                "Name,Nicholas Camarda",
+                'Date of Birth,"Nov 13, 1993"',
+                "Recorded Date,2022-03-08 17:16:56 -0500",
+                "Classification,Sinus Rhythm",
+                "Symptoms,Rapid, pounding, or fluttering heartbeat,Skipped heartbeat,Fatigue,Dizziness",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    data = load_tandem_exports(tmp_path)
+
+    assert workbook.resolve() in data.source_files
+    assert all("archive data" not in str(path) for path in data.source_files)
+    assert data.cgm.shape[0] == 1488
 
 
 def test_export_manifest_detects_gap_duplicate_and_out_of_order(tandem_fixture_dir):

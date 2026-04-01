@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -19,6 +20,7 @@ BOLUS_UNITS_COLUMNS = ["actualtotalbolusrequested", "bolus", "bolus_units", "ins
 CARB_COLUMNS = ["carbsize", "carbs", "carbohydrates", "guessedcarbohydrate"]
 BASAL_RATE_COLUMNS = ["basalrate", "rate", "units_per_hour", "units/hour"]
 ACTIVITY_COLUMNS = ["value", "steps", "activity", "count"]
+EXCLUDED_RAW_PATH_PARTS = {"health_auto_export", "archive data", "apple_health_data"}
 
 
 @dataclass(frozen=True)
@@ -83,17 +85,21 @@ def discover_source_files(raw_dir: str | Path) -> list[Path]:
     raw_path = Path(raw_dir)
     if not raw_path.exists():
         return []
-    return sorted(
-        path
-        for path in raw_path.rglob("*")
-        if path.is_file()
-        and path.suffix.lower() in {".csv", ".xlsx", ".xlsm", ".xls", ".parquet", ".pq"}
-        and "Rproj" not in path.name
-        and "manifest" not in path.name.lower()
-        and "coverage" not in path.name.lower()
-        and "summary" not in path.name.lower()
-        and "health_auto_export" not in path.parts
-    )
+    discovered: list[Path] = []
+    for root, dirs, files in os.walk(raw_path):
+        dirs[:] = [directory for directory in dirs if directory not in EXCLUDED_RAW_PATH_PARTS]
+        root_path = Path(root)
+        for filename in files:
+            path = root_path / filename
+            if path.suffix.lower() not in {".csv", ".xlsx", ".xlsm", ".xls", ".parquet", ".pq"}:
+                continue
+            if "Rproj" in path.name:
+                continue
+            name_lower = path.name.lower()
+            if "manifest" in name_lower or "coverage" in name_lower or "summary" in name_lower:
+                continue
+            discovered.append(path)
+    return sorted(discovered)
 
 
 def _parse_datetime(series: pd.Series) -> pd.Series:

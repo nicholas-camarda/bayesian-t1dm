@@ -444,5 +444,89 @@ def test_screen_health_features_command_writes_scores_and_report(tmp_path, monke
     assert "prior_night_total_sleep_hours" in set(score_frame["feature"])
 
     text = report.read_text(encoding="utf-8")
+    assert "status: completed" in text
     assert "baseline_rmse_mean" in text
     assert "augmented_rmse_mean" in text
+
+
+def test_screen_health_features_without_apple_skips_cleanly(tmp_path, monkeypatch):
+    workspace_root = tmp_path / "repo"
+    workspace_root.mkdir()
+    cloud_root = tmp_path / "cloud"
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(cloud_root))
+    monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
+
+    raw_root = cloud_root / "data" / "raw"
+    raw_root.mkdir(parents=True, exist_ok=True)
+    _write_tandem_cgm_export(raw_root)
+
+    report = tmp_path / "health_feature_screening.md"
+    scores = tmp_path / "health_feature_scores.csv"
+    exit_code = main(
+        [
+            "--root",
+            str(workspace_root),
+            "screen-health-features",
+            "--raw",
+            str(raw_root),
+            "--report",
+            str(report),
+            "--scores",
+            str(scores),
+            "--horizon",
+            "30",
+        ]
+    )
+
+    assert exit_code == 0
+    assert report.exists()
+    assert scores.exists()
+    score_frame = pd.read_csv(scores)
+    assert score_frame.empty
+    text = report.read_text(encoding="utf-8")
+    assert "status: skipped" in text
+    assert "Apple Health not available; screening skipped." in text
+
+
+def test_prepare_model_data_with_apple_builds_enriched_dataset_and_report(tmp_path, monkeypatch):
+    workspace_root = tmp_path / "repo"
+    workspace_root.mkdir()
+    cloud_root = tmp_path / "cloud"
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(cloud_root))
+    monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
+
+    raw_root = cloud_root / "data" / "raw"
+    raw_root.mkdir(parents=True, exist_ok=True)
+    _write_tandem_cgm_export(raw_root)
+    parent_dir = _write_two_bundle_parent(tmp_path / "apple-health-exports")
+
+    output = tmp_path / "prepared_model_data_5min.csv"
+    report = tmp_path / "model_data_preparation.md"
+    exit_code = main(
+        [
+            "--root",
+            str(workspace_root),
+            "prepare-model-data",
+            "--raw",
+            str(raw_root),
+            "--apple-input",
+            str(parent_dir),
+            "--output",
+            str(output),
+            "--report",
+            str(report),
+            "--skip-backfill",
+        ]
+    )
+
+    assert exit_code == 0
+    prepared = pd.read_csv(output)
+    assert "health_activity_value" in prepared.columns
+    assert "prior_night_total_sleep_hours" in prepared.columns
+    text = report.read_text(encoding="utf-8")
+    assert "- mode: apple_enriched" in text
+    assert "- apple_available: True" in text
+    assert "- health_features_included: True" in text
+    assert "- overlap_start: 2025-05-24 00:00:00" in text
