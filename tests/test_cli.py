@@ -357,3 +357,26 @@ def test_prepare_model_data_backfills_tandem_when_needed_without_apple(tmp_path,
     assert "- backfill_status: completed" in text
     assert "- requested_tandem_start: 2025-04-25 00:00:00" in text
     assert "- requested_tandem_end: 2025-05-24 00:00:00" in text
+
+
+def test_validate_therapy_infra_command_writes_artifacts(tmp_path):
+    workspace_root = tmp_path / "repo"
+    workspace_root.mkdir()
+    report_dir = tmp_path / "reports"
+
+    exit_code = main(
+        [
+            "--root",
+            str(workspace_root),
+            "validate-therapy-infra",
+            "--report-dir",
+            str(report_dir),
+            "--include-models",
+            "ridge,segmented_ridge,tree_boost",
+        ]
+    )
+
+    assert exit_code == 0
+    assert (report_dir / "therapy_infra_validation.md").exists()
+    assert (report_dir / "therapy_synthetic_results.csv").exists()
+    assert (report_dir / "therapy_synthetic_recommendation_audit.md").exists()

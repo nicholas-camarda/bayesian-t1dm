@@ -40,6 +40,14 @@ from .recommend import RecommendationPolicy, recommend_setting_changes
 from .report import build_run_summary, write_json_report, write_markdown_report
 from .review import write_coverage_review_html, write_run_review_html
 from .features import FeatureFrame
+from .therapy_research import (
+    parse_model_list,
+    parse_therapy_segments,
+    run_therapy_research,
+    validate_therapy_infra,
+    write_therapy_infra_validation_artifacts,
+    write_therapy_research_artifacts,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -87,6 +95,26 @@ def build_parser() -> argparse.ArgumentParser:
     screen_health.add_argument("--report", default=None)
     screen_health.add_argument("--scores", default=None)
     screen_health.add_argument("--horizon", type=int, default=30)
+
+    research_therapy = subparsers.add_parser("research-therapy-settings", help="Run research-grade therapy setting analysis on prepared Tandem and Apple Health data")
+    research_therapy.add_argument("--raw", default=None)
+    research_therapy.add_argument("--apple-input", default=None, help="Optional Health Auto Export parent directory")
+    research_therapy.add_argument("--horizon", type=int, default=30)
+    research_therapy.add_argument("--segments", default=None, help="Comma-separated day segments like overnight=00:00-06:00,morning=06:00-11:00")
+    research_therapy.add_argument("--include-models", default=None, help="Comma-separated model families such as bayesian,ridge,elastic_net,segmented_ridge,tree_boost,ensemble")
+    research_therapy.add_argument("--skip-backfill", action=argparse.BooleanOptionalAction, default=False)
+    research_therapy.add_argument("--report-dir", default=None)
+    research_therapy.add_argument("--env-file", default=None, help="Optional .env file with Tandem credentials")
+    research_therapy.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
+    research_therapy.add_argument("--ic-policy", choices=["exploratory_only", "conservative", "off"], default="exploratory_only")
+    research_therapy.add_argument("--write-source-report-cards", action=argparse.BooleanOptionalAction, default=True)
+    research_therapy.add_argument("--write-research-gate", action=argparse.BooleanOptionalAction, default=True)
+
+    validate_therapy = subparsers.add_parser("validate-therapy-infra", help="Run synthetic truth-recovery validation for the therapy research infrastructure")
+    validate_therapy.add_argument("--report-dir", default=None)
+    validate_therapy.add_argument("--include-models", default=None, help="Comma-separated model families such as ridge,segmented_ridge,tree_boost,ensemble")
+    validate_therapy.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
+    validate_therapy.add_argument("--ic-policy", choices=["exploratory_only", "conservative", "off"], default="exploratory_only")
 
     run = subparsers.add_parser("run", help="Run the full forecasting and recommendation pipeline")
     run.add_argument("--raw", default=None)
@@ -149,6 +177,8 @@ def _prepare_model_data(
 ) -> ModelDataPreparationResult:
     warnings_list: list[str] = []
     raw_root = Path(args.raw)
+    history_days = int(getattr(args, "history_days", 365))
+    min_history_days = int(getattr(args, "min_history_days", 180))
 
     if getattr(args, "apple_input", None):
         try:
@@ -173,7 +203,7 @@ def _prepare_model_data(
             else pd.Timestamp(date.today())
         )
         requested_tandem_end = anchor_end
-        requested_tandem_start = anchor_end - pd.Timedelta(days=max(int(args.history_days), 1) - 1)
+        requested_tandem_start = anchor_end - pd.Timedelta(days=max(history_days, 1) - 1)
 
     backfill_status = "not_needed"
     needs_backfill = (
@@ -243,9 +273,9 @@ def _prepare_model_data(
     final_dataset_end = pd.to_datetime(dataset.frame["timestamp"], errors="coerce").max() if not dataset.frame.empty else None
     if final_dataset_start is not None and pd.notna(final_dataset_start) and final_dataset_end is not None and pd.notna(final_dataset_end):
         actual_history_days = int((pd.Timestamp(final_dataset_end).normalize() - pd.Timestamp(final_dataset_start).normalize()).days + 1)
-        if actual_history_days < int(args.min_history_days):
+        if actual_history_days < min_history_days:
             warnings_list.append(
-                f"Final dataset history is only {actual_history_days} days, below the requested minimum of {int(args.min_history_days)} days."
+                f"Final dataset history is only {actual_history_days} days, below the requested minimum of {min_history_days} days."
             )
     elif dataset.frame.empty:
         warnings_list.append("Final prepared dataset is empty.")
@@ -276,7 +306,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     paths = ProjectPaths.from_root(args.root).ensure()
 
-    if args.command in {"ingest", "run", "screen-health-features", "build-health-analysis-ready", "prepare-model-data"}:
+    if args.command in {"ingest", "run", "screen-health-features", "build-health-analysis-ready", "prepare-model-data", "research-therapy-settings"}:
         args.raw = args.raw or str(paths.cloud_raw)
         if args.command == "ingest":
             args.report = args.report or str(paths.reports / "coverage.md")
@@ -287,11 +317,15 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "prepare-model-data":
             args.output = args.output or str(paths.reports / "prepared_model_data_5min.csv")
             args.report = args.report or str(paths.reports / "model_data_preparation.md")
+        elif args.command == "research-therapy-settings":
+            args.report_dir = args.report_dir or str(paths.reports)
         elif args.command == "build-health-analysis-ready":
             args.output = args.output or str(paths.reports / "analysis_ready_health_5min.csv")
         else:
             args.report = args.report or str(paths.reports / "health_feature_screening.md")
             args.scores = args.scores or str(paths.reports / "health_feature_scores.csv")
+    if args.command == "validate-therapy-infra":
+        args.report_dir = args.report_dir or str(paths.reports / "therapy_infra_validation")
     if args.command == "normalize-raw":
         args.raw = args.raw or str(paths.cloud_raw / "tconnectsync")
         args.report = args.report or str(paths.reports / "normalize_raw_summary.md")
@@ -333,6 +367,32 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
         preparation.dataset.frame.to_csv(args.output, index=False)
         write_model_data_preparation_report(preparation, args.report)
+        return 0
+
+    if args.command == "research-therapy-settings":
+        preparation = _prepare_model_data(args=args, paths=paths)
+        result = run_therapy_research(
+            preparation.dataset,
+            segments=parse_therapy_segments(args.segments),
+            include_models=parse_model_list(args.include_models),
+            meal_proxy_mode=args.meal_proxy_mode,
+            ic_policy=args.ic_policy,
+        )
+        write_therapy_research_artifacts(
+            result,
+            args.report_dir,
+            write_source_report_cards=args.write_source_report_cards,
+            write_research_gate=args.write_research_gate,
+        )
+        return 0
+
+    if args.command == "validate-therapy-infra":
+        result = validate_therapy_infra(
+            meal_proxy_mode=args.meal_proxy_mode,
+            ic_policy=args.ic_policy,
+            include_models=parse_model_list(args.include_models or "ridge,segmented_ridge,tree_boost,ensemble"),
+        )
+        write_therapy_infra_validation_artifacts(result, args.report_dir)
         return 0
 
     if args.command == "build-health-analysis-ready":

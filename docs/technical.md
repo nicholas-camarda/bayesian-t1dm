@@ -16,8 +16,9 @@ The active pipeline is:
 10. canonical Apple Health context is merged onto Tandem feature-frame timestamps when available to create the final prepared dataset
 11. derived insulin exposure and IOB
 12. lagged, rolling, and calendar features
-13. Bayesian forecast model
-14. scenario comparison and pump-setting recommendation ranking
+13. optional therapy research builds day-segmented contexts, audits feature engineering, and compares candidate models for basal schedule and I/C ratio inference
+14. Bayesian forecast model
+15. scenario comparison and pump-setting recommendation ranking
 
 ## Tandem Source Acquisition
 
@@ -277,6 +278,14 @@ Canonical Tandem-only fallback flow:
 3. `bayesian-t1dm run --skip-recommendations`
 4. `bayesian-t1dm run`
 
+Canonical therapy research flow:
+
+1. `bayesian-t1dm normalize-raw`
+2. `bayesian-t1dm prepare-model-data --apple-input ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data`
+3. `bayesian-t1dm research-therapy-settings`
+4. `bayesian-t1dm validate-therapy-infra`
+5. review the therapy research and validation artifacts before considering any schedule changes
+
 Step-by-step behavior:
 
 1. `normalize-raw` rebuilds normalized Tandem tables from archived `tconnectsync` raw payloads.
@@ -284,6 +293,8 @@ Step-by-step behavior:
 3. `screen-health-features` consumes that prepared dataset and skips cleanly when Apple Health is absent.
 4. `run --skip-recommendations` is the preferred fast validation path because it exercises walk-forward prediction without the final recommendation fit.
 5. `run` executes the full modeling and recommendation stack using the same prepared dataset contract: Apple-enriched when Apple data exists, Tandem-only otherwise.
+6. `research-therapy-settings` runs a distinct research-grade therapy workflow: it starts with a methodological gate, builds fasting, meal, and correction contexts, creates strict meal-bolus proxy features when explicit carbs are absent, audits Apple/Tandem feature engineering, compares Bayesian, linear, segmented, tree-boosted, and ensemble-style candidates, and writes segment-level recommendation evidence for basal and I/C ratio. Sensitivity factor remains staged and suppressed by default in the current implementation.
+7. `validate-therapy-infra` runs a synthetic truth-recovery suite against the same therapy research contract. It checks basal direction recovery, proxy-only conservatism, Apple-helpful vs Apple-null behavior, and suppression under corrupted or low-identifiability scenarios.
 
 ## Output Contract
 
@@ -322,6 +333,8 @@ Apple Health-specific working artifacts:
 - `prepare-model-data` writes `model_data_preparation.md` and `prepared_model_data_5min.csv` under the runtime output directory by default
 - `build-health-analysis-ready` writes a wide Tandem-aligned 5-minute table, by default under `~/ProjectsRuntime/bayesian-t1dm/output/analysis_ready_health_5min.csv`
 - `screen-health-features` writes `health_feature_screening.md` and `health_feature_scores.csv` under the runtime output directory
+- `research-therapy-settings` writes `therapy_research_gate.md`, `meal_proxy_audit.md`, `therapy_feature_audit.md`, `therapy_feature_registry.csv`, `therapy_model_comparison.md`, `therapy_segment_evidence.csv`, `therapy_recommendation_research.md`, `tandem_source_report_card.md`, `apple_source_report_card.md`, `source_numeric_summary.csv`, and `source_missingness_summary.csv`
+- `validate-therapy-infra` writes `therapy_infra_validation.md`, `therapy_synthetic_results.csv`, and `therapy_synthetic_recommendation_audit.md`
 
 ## Assumptions and Failure Modes
 

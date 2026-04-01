@@ -2,6 +2,7 @@ numpy>=1.24
 pandas>=2.0
 scipy>=1.10
 openpyxl>=3.1
+plotly>=6.0
 pyarrow>=15
 arviz>=0.16
 pymc>=5.0

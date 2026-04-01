@@ -51,11 +51,18 @@ Supported collection path:
 
 ## Quickstart
 
-1. Create a virtual environment and install the package:
+1. Create and activate the Conda environment:
 
 ```bash
-python3 -m venv bayesian-t1dm
-source bayesian-t1dm/bin/activate
+conda env create -f environment.yml
+conda activate bt1dm
+```
+
+This environment file installs the package in editable dev mode. If you prefer to create it manually instead of using [`environment.yml`](./environment.yml):
+
+```bash
+conda create -n bt1dm python=3.11
+conda activate bt1dm
 python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
 ```
@@ -173,6 +180,19 @@ bayesian-t1dm prepare-model-data --apple-input \
   ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data
 ```
 
+Run therapy-setting research with segmented decision-support artifacts:
+
+```bash
+bayesian-t1dm research-therapy-settings --apple-input \
+  ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data
+```
+
+Run the synthetic therapy infrastructure validator:
+
+```bash
+bayesian-t1dm validate-therapy-infra
+```
+
 Materialize the Tandem-aligned 5-minute analysis-ready table:
 
 ```bash
@@ -201,8 +221,10 @@ The active pipeline is:
 10. Apple Health context is merged onto those Tandem timestamps when available to create the final prepared dataset
 11. insulin exposure and IOB are derived from bolus events
 12. lagged, rolling, and calendar features are created
-13. the Bayesian forecasting model is fit
-14. scenario comparison and recommendation ranking are generated
+13. optional therapy research builds segment-level contexts, audits feature engineering, and compares candidate models
+14. therapy research now writes a methodological gate, meal-proxy audit, and standardized Tandem/Apple source report cards before model comparison
+15. the Bayesian forecasting model is fit
+16. scenario comparison and recommendation ranking are generated
 
 ## Review Flow
 
@@ -229,6 +251,14 @@ Canonical Tandem-only fallback workflow:
 3. `bayesian-t1dm run --skip-recommendations`
 4. `bayesian-t1dm run`
 
+Canonical therapy research workflow:
+
+1. `bayesian-t1dm normalize-raw`
+2. `bayesian-t1dm prepare-model-data --apple-input ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data`
+3. `bayesian-t1dm research-therapy-settings`
+4. `bayesian-t1dm validate-therapy-infra`
+5. review `therapy_research_gate.md`, `meal_proxy_audit.md`, `therapy_model_comparison.md`, `therapy_segment_evidence.csv`, `therapy_recommendation_research.md`, and `therapy_infra_validation.md`
+
 What each step does:
 
 1. `normalize-raw` rebuilds normalized Tandem tables from archived raw API payloads.
@@ -236,6 +266,8 @@ What each step does:
 3. `screen-health-features` evaluates Apple context features against Tandem glucose targets using the unified prepared dataset and skips cleanly when Apple Health is absent.
 4. `run --skip-recommendations` is the preferred fast validation path because it checks walk-forward forecasting without paying for the final recommendation fit.
 5. `run` performs the full modeling and recommendation pipeline. It now uses the same prepared dataset contract: Apple-enriched when Apple data exists, Tandem-only otherwise.
+6. `research-therapy-settings` runs a separate research-grade workflow for basal schedule, I/C ratio, and later sensitivity factor analysis. It starts with a methodological gate, builds strict meal-bolus proxy features when explicit carbs are absent, writes Tandem and Apple source report cards, compares candidate models, and writes human-reviewable segment-level evidence rather than auto-changing settings.
+7. `validate-therapy-infra` runs synthetic truth-recovery scenarios against the same therapy research stack so the infrastructure has to recover known therapy directions and suppress itself in corrupted or weak-identifiability cases.
 
 Recommended recipes:
 
@@ -316,6 +348,11 @@ Default runtime review artifacts:
 - `analysis_ready_health_5min.csv`
 - `health_feature_screening.md`
 - `health_feature_scores.csv`
+- `therapy_feature_audit.md`
+- `therapy_feature_registry.csv`
+- `therapy_model_comparison.md`
+- `therapy_segment_evidence.csv`
+- `therapy_recommendation_research.md`
 - `run_summary.md`
 - `run_summary.json`
 - `run_review.html`
