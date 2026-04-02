@@ -64,6 +64,7 @@ bayesian-t1dm prepare-model-data
 ```
 
 This writes the current 5-minute prepared dataset and preparation report under `~/ProjectsRuntime/bayesian-t1dm/output/`.
+It automatically aligns already-imported Apple Health context to Tandem timestamps when overlap exists and records the overlap window in `model_data_preparation.md`.
 
 2. Build the main therapy dashboard:
 
@@ -176,99 +177,39 @@ Required or commonly used variables:
 
 The active acquisition flow assumes Tandem Source is the authoritative cloud source for your Mobi data and that `tconnectsync` can query it directly.
 
-## Common Commands
+## Core Commands
 
-Collect up to a 30-day window:
-
-```bash
-bayesian-t1dm collect --start-date 2025-10-01 --end-date 2025-10-30
-```
-
-Backfill a longer range:
+If you are actively working in the repo, these are the commands that matter most:
 
 ```bash
-bayesian-t1dm backfill --start-date 2025-10-01 --end-date 2026-03-28
-```
+# refresh the prepared dataset
+bayesian-t1dm prepare-model-data
 
-Validate raw files:
+# rebuild the main therapy dashboard
+bayesian-t1dm review-therapy-evidence
 
-```bash
-bayesian-t1dm validate-raw
-```
+# rebuild the forecasting / validation dashboard
+bayesian-t1dm run --skip-recommendations
 
-Repair normalized `tconnectsync` windows from archived raw payloads:
-
-```bash
-bayesian-t1dm normalize-raw
-```
-
-Build coverage and manifest outputs:
-
-```bash
-bayesian-t1dm ingest
-```
-
-Run the forecasting and recommendation pipeline:
-
-```bash
+# run the full forecasting + recommendation pipeline
 bayesian-t1dm run
 ```
 
-Run time-aware validation without the final recommendation fit and build the forecasting/validation dashboard:
+Use these less often, when needed:
 
 ```bash
-bayesian-t1dm run --skip-recommendations
-```
-
-Import one or more Health Auto Export bundles from a parent directory:
-
-```bash
+# import new Apple Health bundles
 bayesian-t1dm import-health-auto-export --input \
   ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data
-```
 
-Prepare the default model-ready dataset with optional Apple Health enrichment:
+# repair or inspect Tandem raw data
+bayesian-t1dm normalize-raw
+bayesian-t1dm ingest
+bayesian-t1dm validate-raw
 
-```bash
-bayesian-t1dm prepare-model-data
-```
-
-If you need to import new Apple Health bundles first:
-
-```bash
-bayesian-t1dm import-health-auto-export --input \
-  ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data
-bayesian-t1dm prepare-model-data
-```
-
-Run supporting therapy-setting research artifacts:
-
-```bash
+# generate supporting therapy research artifacts
 bayesian-t1dm research-therapy-settings
-```
-
-Run the synthetic therapy infrastructure validator:
-
-```bash
 bayesian-t1dm validate-therapy-infra
-```
-
-Build the main therapy dashboard:
-
-```bash
-bayesian-t1dm review-therapy-evidence
-```
-
-Materialize the Tandem-aligned 5-minute analysis-ready table:
-
-```bash
-bayesian-t1dm build-health-analysis-ready
-```
-
-Screen Apple Health context features against Tandem glucose targets:
-
-```bash
-bayesian-t1dm screen-health-features
 ```
 
 ## Data Flow

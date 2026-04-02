@@ -222,15 +222,15 @@ def _prepare_model_data(
                 warnings_list.append(f"Apple Health import skipped: {exc}")
                 if session is not None:
                     session.log_event(
-                        "prepare_model_data.apple_import.skipped",
+                        "prepare_model_data.apple_import.unavailable",
                         level="WARNING",
                         message=str(exc),
                         stage="prepare_model_data.apple_import",
                     )
     elif session is not None:
         session.log_event(
-            "prepare_model_data.apple_import.skipped",
-            message="No Apple Health import path provided; reusing any already-imported Apple Health tables.",
+            "prepare_model_data.apple_import.reused_existing",
+            message="No new Apple Health import requested; reusing any previously imported Apple Health tables.",
             stage="prepare_model_data.apple_import",
         )
 
@@ -259,6 +259,20 @@ def _prepare_model_data(
         apple_available = has_apple_health_data(health_before)
         apple_span_start, apple_span_end = summarize_apple_health_span(health_before)
     if session is not None:
+        if apple_available:
+            session.log_event(
+                "prepare_model_data.apple_health.detected",
+                message="Apple Health data detected in the canonical raw tree.",
+                stage="prepare_model_data.load_inputs",
+                apple_span_start=apple_span_start,
+                apple_span_end=apple_span_end,
+            )
+        else:
+            session.log_event(
+                "prepare_model_data.apple_health.not_detected",
+                message="No Apple Health data detected in the canonical raw tree; proceeding Tandem-only.",
+                stage="prepare_model_data.load_inputs",
+            )
         session.log_event(
             "prepare_model_data.input_summary",
             stage="prepare_model_data.load_inputs",
