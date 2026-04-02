@@ -333,6 +333,37 @@ def _final_fit_card(summary: dict[str, Any]) -> str:
     )
 
 
+def _forecast_summary_html(summary: dict[str, Any]) -> str:
+    walk_forward = summary.get("walk_forward") or {}
+    aggregate = walk_forward.get("aggregate") or {}
+    policy = summary.get("recommendation_policy") or {}
+    data_quality = summary.get("data_quality") or {}
+    items = [
+        ("data_quality_status", data_quality.get("status") or "unknown"),
+        ("incomplete_windows", data_quality.get("incomplete_window_count") if data_quality else "NA"),
+        ("model_mae", "NA" if aggregate.get("mae") is None else f"{float(aggregate['mae']):.3f}"),
+        ("persistence_mae", "NA" if walk_forward.get("aggregate_persistence_mae") is None else f"{float(walk_forward['aggregate_persistence_mae']):.3f}"),
+        ("coverage", "NA" if aggregate.get("coverage") is None else f"{float(aggregate['coverage']):.3f}"),
+        ("recommendation_policy", policy.get("status") or "unknown"),
+    ]
+    return "\n".join(
+        [
+            "<div class='section'>",
+            "<h2>Decision Summary</h2>",
+            "<div class='card-grid'>",
+            "<div class='card'>",
+            *[f"<div><strong>{html.escape(name)}</strong>: {html.escape(str(value))}</div>" for name, value in items],
+            "</div>",
+            "<div class='card'>",
+            "<strong>Interpretation</strong>",
+            "<div class='muted'>This page is the forecast-validation drill-down. The key questions are whether validation beats persistence, whether source quality is acceptable, and whether model diagnostics are trustworthy enough to support downstream decisions.</div>",
+            "</div>",
+            "</div>",
+            "</div>",
+        ]
+    )
+
+
 def write_run_review_html(summary: dict[str, Any], path: str | Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -376,6 +407,7 @@ def write_run_review_html(summary: dict[str, Any], path: str | Path) -> Path:
         recommendation_panel = "<div class='empty-state'><strong>No recommendations were generated.</strong></div>"
 
     sections = [
+        _forecast_summary_html(summary),
         "<div class='section'><h2>Coverage by Fold</h2>" + figures[0] + "</div>",
         "<div class='section'><h2>Model vs Persistence</h2>" + figures[1] + "</div>",
         *[f"<div class='section'><h2>Forecast Trace</h2>{trace}</div>" for trace in trace_figures],
@@ -570,7 +602,53 @@ def _overnight_summary_html(overnight_summary: dict[str, Any]) -> str:
     )
 
 
-def _artifact_index_html(report_dir: Path, *, include_validation: bool) -> str:
+def _therapy_decision_summary_html(research_result: TherapyResearchResult, overnight_summary: dict[str, Any]) -> str:
+    candidates = research_result.recommendations.loc[
+        research_result.recommendations["status"].astype(str).eq("candidate")
+    ].copy()
+    suppressed = research_result.recommendations.loc[
+        research_result.recommendations["status"].astype(str).isin(["suppressed", "exploratory"])
+    ].copy()
+    candidate_text = "No actionable therapy candidates were produced."
+    if not candidates.empty:
+        lead = candidates.iloc[0]
+        candidate_text = (
+            f"{lead['parameter']} / {lead['segment']}: "
+            f"{lead['expected_direction']} {float(lead['proposed_change_percent']):.1f}% "
+            f"({lead['confidence']} confidence)"
+        )
+    blocked_reason = overnight_summary.get("reason") or "none"
+    blocked_rows = [
+        ("overnight_status", overnight_summary.get("status") or "unknown"),
+        ("blocked_reason", blocked_reason),
+        ("candidate_count", int(len(candidates))),
+        ("suppressed_count", int(len(suppressed))),
+        ("lead_candidate", candidate_text),
+    ]
+    return "\n".join(
+        [
+            "<div class='section'>",
+            "<h2>Decision Summary</h2>",
+            "<div class='card-grid'>",
+            "<div class='card'>",
+            *[f"<div><strong>{html.escape(name)}</strong>: {html.escape(str(value))}</div>" for name, value in blocked_rows],
+            "</div>",
+            "<div class='card'>",
+            "<strong>Interpretation</strong>",
+            "<div class='muted'>This page should answer whether the current data support a therapy-setting change, support leaving settings alone, or are still blocked by identifiability or confounding.</div>",
+            "</div>",
+            "</div>",
+            "</div>",
+        ]
+    )
+
+
+def _artifact_index_html(
+    artifact_root: Path,
+    *,
+    include_validation: bool,
+    artifact_href_prefix: str = "",
+) -> str:
     artifacts = [
         "model_data_preparation.md",
         "prepared_model_data_5min.csv",
@@ -596,8 +674,9 @@ def _artifact_index_html(report_dir: Path, *, include_validation: bool) -> str:
         )
     rows = []
     for artifact in artifacts:
-        path = report_dir / artifact
-        link_html = f"<a href=\"{html.escape(artifact)}\">open</a>" if path.exists() else ""
+        path = artifact_root / artifact
+        link_target = f"{artifact_href_prefix}{artifact}"
+        link_html = f"<a href=\"{html.escape(link_target)}\">open</a>" if path.exists() else ""
         rows.append(
             "<tr>"
             f"<td>{html.escape(artifact)}</td>"
@@ -625,9 +704,12 @@ def write_therapy_evidence_review_html(
     path: str | Path,
     *,
     validation_result: TherapyInfraValidationResult | None = None,
+    artifact_root: str | Path | None = None,
+    artifact_href_prefix: str = "",
 ) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_root_path = Path(artifact_root) if artifact_root is not None else path.parent
     overnight_summary, exclusion_counts = summarize_overnight_basal_evidence(research_result)
     include_js = True
     figures = []
@@ -649,19 +731,121 @@ def write_therapy_evidence_review_html(
             "</div></div>"
         )
     sections = [
-        _workflow_table_html(),
+        _therapy_decision_summary_html(research_result, overnight_summary),
         _parameter_gate_html(research_result),
         _overnight_summary_html(overnight_summary),
+        validation_card,
         "<div class='section'><h2>Data Timeline</h2>" + figures[0] + "</div>",
         "<div class='section'><h2>Recent Overnight Evidence</h2>" + figures[1] + "</div>",
         "<div class='section'><h2>Overnight Exclusion Summary</h2>" + figures[2] + "</div>",
-        validation_card,
-        _artifact_index_html(path.parent, include_validation=validation_result is not None),
+        _artifact_index_html(
+            artifact_root_path,
+            include_validation=validation_result is not None,
+            artifact_href_prefix=artifact_href_prefix,
+        ),
+        _workflow_table_html(),
     ]
     html_text = _page_shell(
         title="Bayesian T1DM Therapy Evidence Review",
         banner_html=_therapy_banner(preparation, overnight_summary),
         sections=[section for section in sections if section],
+    )
+    path.write_text(html_text, encoding="utf-8")
+    return path
+
+
+def _current_status_banner(payload: dict[str, Any]) -> str:
+    overall_state = str(payload.get("overall_state") or "blocked")
+    banner_class = {
+        "recommendation_ready": "good",
+        "no_change_supported": "degraded",
+        "blocked": "broken",
+    }.get(overall_state, "degraded")
+    return (
+        f"<div class='banner {html.escape(banner_class)}'>"
+        f"{html.escape(str(payload.get('headline') or 'Status unavailable'))} "
+        f"Run id: <code>{html.escape(str(payload.get('run_id') or 'unknown'))}</code>."
+        "</div>"
+    )
+
+
+def _current_status_summary_html(payload: dict[str, Any], *, therapy_href: str, forecast_href: str) -> str:
+    data_prep = payload.get("data_prep") or {}
+    blockers = payload.get("primary_blockers") or []
+    blocker_lines = "".join(
+        f"<li><strong>{html.escape(str(item.get('label') or item.get('code')))}</strong>: {html.escape(str(item.get('detail') or ''))}</li>"
+        for item in blockers
+    ) or "<li>No active blockers.</li>"
+    next_actions = payload.get("next_actions") or []
+    next_action_lines = "".join(f"<li>{html.escape(str(item))}</li>" for item in next_actions) or "<li>No next actions recorded.</li>"
+    therapy = payload.get("therapy") or {}
+    overnight = therapy.get("overnight") or {}
+    forecast = payload.get("forecast") or {}
+    return "\n".join(
+        [
+            "<div class='section'>",
+            "<h2>Current Verdict</h2>",
+            "<div class='card-grid'>",
+            "<div class='card'>",
+            f"<div><strong>overall_state</strong>: <code>{html.escape(str(payload.get('overall_state') or 'unknown'))}</code></div>",
+            f"<div><strong>summary</strong>: {html.escape(str(payload.get('summary') or ''))}</div>",
+            f"<div><strong>apple_available</strong>: {html.escape(str(data_prep.get('apple_available')))}</div>",
+            f"<div><strong>overlap_window</strong>: {html.escape(str(data_prep.get('overlap_start')))} to {html.escape(str(data_prep.get('overlap_end')))}</div>",
+            f"<div><strong>final_dataset_rows</strong>: {html.escape(str(data_prep.get('final_row_count')))}</div>",
+            "</div>",
+            "<div class='card'>",
+            "<strong>Evidence Links</strong>",
+            f"<div><a href=\"{html.escape(therapy_href)}\">Therapy evidence dashboard</a></div>",
+            f"<div><a href=\"{html.escape(forecast_href)}\">Forecast validation dashboard</a></div>",
+            "</div>",
+            "</div>",
+            "</div>",
+            "<div class='section'>",
+            "<h2>Primary Blockers</h2>",
+            "<div class='card'><ul>",
+            blocker_lines,
+            "</ul></div>",
+            "</div>",
+            "<div class='section'>",
+            "<h2>Next Actions</h2>",
+            "<div class='card'><ol>",
+            next_action_lines,
+            "</ol></div>",
+            "</div>",
+            "<div class='section'>",
+            "<h2>Therapy Summary</h2>",
+            "<div class='card-grid'>",
+            "<div class='card'>",
+            f"<div><strong>overnight_status</strong>: {html.escape(str(overnight.get('status') or 'unknown'))}</div>",
+            f"<div><strong>blocked_reason</strong>: {html.escape(str(overnight.get('reason') or 'none'))}</div>",
+            f"<div><strong>clean_rows</strong>: {html.escape(str(overnight.get('clean_rows') or 0))}</div>",
+            f"<div><strong>clean_nights</strong>: {html.escape(str(overnight.get('clean_nights') or 0))}</div>",
+            "</div>",
+            "<div class='card'>",
+            f"<div><strong>forecast_quality</strong>: {html.escape(str(forecast.get('data_quality_status') or 'unknown'))}</div>",
+            f"<div><strong>model_mae</strong>: {html.escape(str(forecast.get('model_mae') or 'NA'))}</div>",
+            f"<div><strong>persistence_mae</strong>: {html.escape(str(forecast.get('persistence_mae') or 'NA'))}</div>",
+            f"<div><strong>sampler_health</strong>: {html.escape(str(forecast.get('sampler_health') or 'unknown'))}</div>",
+            "</div>",
+            "</div>",
+            "</div>",
+        ]
+    )
+
+
+def write_current_status_html(
+    payload: dict[str, Any],
+    path: str | Path,
+    *,
+    therapy_href: str,
+    forecast_href: str,
+) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    html_text = _page_shell(
+        title="Bayesian T1DM Current Status",
+        banner_html=_current_status_banner(payload),
+        sections=[_current_status_summary_html(payload, therapy_href=therapy_href, forecast_href=forecast_href)],
     )
     path.write_text(html_text, encoding="utf-8")
     return path

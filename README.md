@@ -57,7 +57,22 @@ Supported collection path:
 
 If you only need the current active workflow, use these commands:
 
-1. Build or refresh the analysis-ready dataset:
+1. Run the primary status workflow:
+
+```bash
+bayesian-t1dm status
+```
+
+This is now the main front door. It refreshes data prep, therapy research, therapy infra validation, and forecast validation, then writes:
+
+- `~/ProjectsRuntime/bayesian-t1dm/output/current_status.html`
+- `~/ProjectsRuntime/bayesian-t1dm/output/current_status.json`
+- `~/ProjectsRuntime/bayesian-t1dm/output/therapy_evidence_review.html`
+- `~/ProjectsRuntime/bayesian-t1dm/output/run_review.html`
+
+It also stores the full dated run bundle under `~/ProjectsRuntime/bayesian-t1dm/output/runs/<run_id>/`.
+
+2. Build or refresh the analysis-ready dataset only:
 
 ```bash
 bayesian-t1dm prepare-model-data
@@ -66,23 +81,23 @@ bayesian-t1dm prepare-model-data
 This writes the current 5-minute prepared dataset and preparation report under `~/ProjectsRuntime/bayesian-t1dm/output/`.
 It automatically aligns already-imported Apple Health context to Tandem timestamps when overlap exists and records the overlap window in `model_data_preparation.md`.
 
-2. Build the main therapy dashboard:
+3. Build the therapy drill-down dashboard only:
 
 ```bash
 bayesian-t1dm review-therapy-evidence
 ```
 
-This is the primary therapy-facing entrypoint. Review the resulting dashboard at `~/ProjectsRuntime/bayesian-t1dm/output/therapy_evidence_review.html`.
+This is the therapy evidence drill-down behind the main status page.
 
-3. Build the forecasting and validation dashboard:
+4. Build the forecasting and validation drill-down only:
 
 ```bash
 bayesian-t1dm run --skip-recommendations
 ```
 
-This is the main forecasting/validation review path. Review the resulting dashboard at `~/ProjectsRuntime/bayesian-t1dm/output/run_review.html`.
+This is the forecasting/validation drill-down behind the main status page.
 
-4. Use `research-therapy-settings` only when you want supporting research artifacts:
+5. Use `research-therapy-settings` only when you want supporting research artifacts:
 
 ```bash
 bayesian-t1dm research-therapy-settings
@@ -182,13 +197,16 @@ The active acquisition flow assumes Tandem Source is the authoritative cloud sou
 If you are actively working in the repo, these are the commands that matter most:
 
 ```bash
+# run the main end-to-end status workflow
+bayesian-t1dm status
+
 # refresh the prepared dataset
 bayesian-t1dm prepare-model-data
 
-# rebuild the main therapy dashboard
+# rebuild the therapy drill-down dashboard
 bayesian-t1dm review-therapy-evidence
 
-# rebuild the forecasting / validation dashboard
+# rebuild the forecasting / validation drill-down dashboard
 bayesian-t1dm run --skip-recommendations
 
 # run the full forecasting + recommendation pipeline
@@ -240,6 +258,12 @@ Canonical repair/review workflow:
 1. `bayesian-t1dm normalize-raw`
 2. `bayesian-t1dm ingest`
 3. `bayesian-t1dm run --skip-recommendations`
+
+Canonical current-status workflow:
+
+1. `bayesian-t1dm status`
+2. open `~/ProjectsRuntime/bayesian-t1dm/output/current_status.html`
+3. drill into `therapy_evidence_review.html` or `run_review.html` only when you need the supporting detail
 
 This keeps raw-window repair, coverage review, and predictive validation separate from recommendation generation.
 

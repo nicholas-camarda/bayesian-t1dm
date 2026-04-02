@@ -11,7 +11,7 @@ from bayesian_t1dm.evaluate import CalibrationSummary, WalkForwardReport
 from bayesian_t1dm.cli import main
 from bayesian_t1dm.acquisition import ExportWindow, NormalizedWindowResult
 from bayesian_t1dm.health_auto_export import ModelDataPreparationResult
-from bayesian_t1dm.therapy_research import _synthetic_base_dataset
+from bayesian_t1dm.therapy_research import TherapyInfraValidationResult, TherapyResearchResult, _synthetic_base_dataset
 
 
 def _latest_log_dir(runtime_root: Path, command: str) -> Path:
@@ -30,6 +30,81 @@ def _write_tandem_cgm_export(raw_dir: Path, *, start: str = "2025-05-24 00:00:00
     with pd.ExcelWriter(workbook) as writer:
         frame.to_excel(writer, index=False)
     return workbook
+
+
+def _fake_status_research_result() -> TherapyResearchResult:
+    dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
+    research_frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2025-01-01 00:00:00", periods=12, freq="5min"),
+            "therapy_segment": ["overnight"] * 12,
+            "basal_context": [0] * 12,
+            "therapy_stable_epoch": [0] * 12,
+            "glucose": [110.0] * 12,
+            "target_delta": [0.0] * 12,
+            "recent_meal_120m": [1] * 12,
+            "recent_bolus_120m": [1] * 12,
+            "recent_exercise_context": [0] * 12,
+            "closed_loop_confounding_flag": [1] * 12,
+            "missing_cgm": [0] * 12,
+        }
+    )
+    gate = pd.DataFrame(
+        [
+            {
+                "parameter": "basal",
+                "identifiability": "not_identified",
+                "gate_status": "diagnostics_only",
+                "source_quality_status": "good",
+                "direct_meal_rows": 0,
+                "proxy_meal_rows": 12,
+                "basal_context_rows": 0,
+                "correction_context_rows": 12,
+                "closed_loop_confounding_risk": "high",
+                "apple_alignment_status": "credible",
+            }
+        ]
+    )
+    recommendations = pd.DataFrame(
+        [
+            {
+                "parameter": "basal",
+                "segment": "overnight",
+                "status": "suppressed",
+                "proposed_change_percent": None,
+                "expected_direction": "hold",
+                "mean_expected_gain": 0.1,
+                "fold_better_fraction": 0.5,
+                "confidence": "low",
+                "reasons_for": "",
+                "reasons_against": "expected_gain_too_small",
+                "identifiability": "not_identified",
+            }
+        ]
+    )
+    return TherapyResearchResult(
+        prepared_dataset=dataset,
+        research_frame=research_frame,
+        research_gate=gate,
+        feature_registry=pd.DataFrame(),
+        meal_proxy_audit=pd.DataFrame(),
+        model_comparison=pd.DataFrame(),
+        segment_evidence=pd.DataFrame(),
+        recommendations=recommendations,
+        research_gate_markdown="# gate\n",
+        feature_audit_markdown="# audit\n",
+        meal_proxy_audit_markdown="# meal\n",
+        model_comparison_markdown="# model\n",
+        recommendation_markdown="# recs\n",
+        tandem_source_report_markdown="# tandem\n",
+        apple_source_report_markdown="# apple\n",
+        source_numeric_summary=pd.DataFrame(),
+        source_missingness_summary=pd.DataFrame(),
+        segments=tuple(),
+        include_models=("ridge",),
+        meal_proxy_mode="strict",
+        ic_policy="exploratory_only",
+    )
 
 
 def test_validate_raw_command_writes_summary_report(tmp_path):
@@ -475,6 +550,89 @@ def test_review_therapy_evidence_command_writes_report_and_supporting_artifacts(
     assert (tmp_path / "model_data_preparation.md").exists()
     assert (tmp_path / "therapy_research_gate.md").exists()
     assert (tmp_path / "therapy_infra_validation.md").exists()
+
+
+def test_status_command_writes_curated_latest_outputs_and_run_bundle(tmp_path, monkeypatch):
+    workspace_root = tmp_path / "repo"
+    workspace_root.mkdir()
+    cloud_root = tmp_path / "cloud"
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(cloud_root))
+    monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
+
+    dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
+    preparation = ModelDataPreparationResult(
+        dataset=dataset,
+        apple_available=True,
+        apple_span_start=pd.Timestamp("2025-01-01 00:00:00"),
+        apple_span_end=pd.Timestamp("2025-01-07 23:55:00"),
+        tandem_span_before_start=pd.Timestamp("2025-01-01 00:00:00"),
+        tandem_span_before_end=pd.Timestamp("2025-01-07 23:55:00"),
+        tandem_span_after_start=pd.Timestamp("2025-01-01 00:00:00"),
+        tandem_span_after_end=pd.Timestamp("2025-01-07 23:55:00"),
+        requested_tandem_start=pd.Timestamp("2025-01-01 00:00:00"),
+        requested_tandem_end=pd.Timestamp("2025-01-07 23:55:00"),
+        overlap_start=pd.Timestamp("2025-01-01 00:00:00"),
+        overlap_end=pd.Timestamp("2025-01-07 23:55:00"),
+        final_dataset_start=pd.Timestamp("2025-01-01 00:00:00"),
+        final_dataset_end=pd.Timestamp("2025-01-07 23:55:00"),
+        final_row_count=len(dataset.frame),
+    )
+    monkeypatch.setattr(cli, "_prepare_model_data", lambda args, paths, session=None: preparation)
+    monkeypatch.setattr(cli, "run_therapy_research", lambda *args, **kwargs: _fake_status_research_result())
+    monkeypatch.setattr(
+        cli,
+        "validate_therapy_infra",
+        lambda *args, **kwargs: TherapyInfraValidationResult(
+            scenario_results=pd.DataFrame([{"scenario": "x", "passed": True}]),
+            report_markdown="# validation\n",
+            recommendation_audit_markdown="# audit\n",
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_build_forecast_summary",
+        lambda *args, **kwargs: {
+            "walk_forward": {
+                "aggregate": {"mae": 16.0, "rmse": 20.0, "coverage": 0.2, "interval_width": 10.0},
+                "aggregate_persistence_mae": 14.0,
+                "folds": [{"fold": 1, "fit_diagnostics": {"chains": 2, "divergences": 4, "rhat_max": 1.7, "ess_bulk_min": 8.0}}],
+            },
+            "data_quality": {"status": "degraded", "incomplete_window_count": 2},
+            "recommendation_policy": {"status": "skipped", "reasons": ["skipped_by_flag"]},
+            "recommendations": [],
+        },
+    )
+
+    output_root = runtime_root / "output"
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "old_artifact.md").write_text("old", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "--root",
+            str(workspace_root),
+            "status",
+            "--include-models",
+            "ridge",
+        ]
+    )
+
+    assert exit_code == 0
+    current_payload = json.loads((output_root / "current_status.json").read_text(encoding="utf-8"))
+    assert current_payload["overall_state"] == "blocked"
+    assert (output_root / "current_status.html").exists()
+    assert (output_root / "therapy_evidence_review.html").exists()
+    assert (output_root / "run_review.html").exists()
+    assert not (output_root / "old_artifact.md").exists()
+
+    latest = json.loads((output_root / "latest_run.json").read_text(encoding="utf-8"))
+    run_dir = Path(latest["run_dir"])
+    assert (run_dir / "status" / "current_status.html").exists()
+    assert (run_dir / "therapy" / "therapy_evidence_review.html").exists()
+    assert (run_dir / "forecast" / "run_review.html").exists()
+    assert (run_dir / "supporting" / "model_data_preparation.md").exists()
+    assert (run_dir / "logs" / "events.jsonl").exists()
 
 
 def test_ingest_failure_is_logged(tmp_path, tandem_fixture_dir, monkeypatch):

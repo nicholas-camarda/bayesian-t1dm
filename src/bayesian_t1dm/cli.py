@@ -41,8 +41,9 @@ from .paths import ProjectPaths
 from .quality import assess_data_quality
 from .recommend import RecommendationPolicy, recommend_setting_changes
 from .report import build_run_summary, write_json_report, write_markdown_report
-from .review import write_coverage_review_html, write_run_review_html, write_therapy_evidence_review_html
+from .review import write_coverage_review_html, write_current_status_html, write_run_review_html, write_therapy_evidence_review_html
 from .features import FeatureFrame
+from .status import cleanup_legacy_top_level_output, create_status_bundle, derive_current_status, finalize_status_logs, publish_latest_entrypoints, write_status_json
 from .therapy_research import (
     parse_model_list,
     parse_therapy_segments,
@@ -138,6 +139,25 @@ def build_parser() -> argparse.ArgumentParser:
     review_therapy.add_argument("--env-file", default=None, help="Optional .env file with Tandem credentials")
     review_therapy.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
     review_therapy.add_argument("--ic-policy", choices=["exploratory_only", "conservative", "off"], default="exploratory_only")
+
+    status = add_command("status", "Run the primary end-to-end status workflow and publish the latest dashboards")
+    status.add_argument("--raw", default=None)
+    status.add_argument("--apple-input", default=None, help="Optional Health Auto Export parent directory")
+    status.add_argument("--horizon", type=int, default=30)
+    status.add_argument("--history-days", type=int, default=365)
+    status.add_argument("--min-history-days", type=int, default=180)
+    status.add_argument("--segments", default=None)
+    status.add_argument("--include-models", default=None)
+    status.add_argument("--skip-backfill", action=argparse.BooleanOptionalAction, default=False)
+    status.add_argument("--env-file", default=None, help="Optional .env file with Tandem credentials")
+    status.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
+    status.add_argument("--ic-policy", choices=["exploratory_only", "conservative", "off"], default="exploratory_only")
+    status.add_argument("--eval-folds", type=int, default=4)
+    status.add_argument("--draws", type=int, default=1000)
+    status.add_argument("--tune", type=int, default=1000)
+    status.add_argument("--chains", type=int, default=2)
+    status.add_argument("--target-accept", type=float, default=0.95)
+    status.add_argument("--max-treedepth", type=int, default=12)
 
     run = add_command("run", "Run the full forecasting and recommendation pipeline")
     run.add_argument("--raw", default=None)
@@ -457,8 +477,133 @@ def _prepare_model_data(
     )
 
 
+def _run_therapy_analysis(
+    *,
+    args,
+    paths: ProjectPaths,
+    session: LoggingSession | None = None,
+    preparation_stage: str = "therapy.prepare_data",
+    research_stage: str = "therapy.research",
+    validation_stage: str = "therapy.validation",
+    include_validation: bool = True,
+):
+    with _session_stage(session, preparation_stage):
+        preparation = _prepare_model_data(args=args, paths=paths, session=session)
+    with _session_stage(session, research_stage):
+        research_result = run_therapy_research(
+            preparation.dataset,
+            segments=parse_therapy_segments(args.segments),
+            include_models=parse_model_list(args.include_models),
+            meal_proxy_mode=args.meal_proxy_mode,
+            ic_policy=args.ic_policy,
+        )
+    validation_result = None
+    if include_validation:
+        with _session_stage(session, validation_stage):
+            validation_result = validate_therapy_infra(
+                meal_proxy_mode=args.meal_proxy_mode,
+                ic_policy=args.ic_policy,
+                include_models=parse_model_list("ridge,segmented_ridge,tree_boost,ensemble"),
+            )
+    return preparation, research_result, validation_result
+
+
+def _write_therapy_outputs(
+    *,
+    preparation: ModelDataPreparationResult,
+    research_result,
+    validation_result,
+    supporting_dir: Path,
+    review_path: Path,
+    artifact_href_prefix: str,
+) -> None:
+    supporting_dir.mkdir(parents=True, exist_ok=True)
+    write_model_data_preparation_report(preparation, supporting_dir / "model_data_preparation.md")
+    preparation.dataset.frame.to_csv(supporting_dir / "prepared_model_data_5min.csv", index=False)
+    write_therapy_research_artifacts(research_result, supporting_dir)
+    write_therapy_infra_validation_artifacts(validation_result, supporting_dir)
+    write_therapy_evidence_review_html(
+        preparation,
+        research_result,
+        review_path,
+        validation_result=validation_result,
+        artifact_root=supporting_dir,
+        artifact_href_prefix=artifact_href_prefix,
+    )
+
+
+def _build_forecast_summary(
+    *,
+    args,
+    paths: ProjectPaths,
+    session: LoggingSession | None = None,
+    skip_recommendations: bool = False,
+) -> dict[str, object]:
+    with _session_stage(session, "run.load_data", raw=args.raw):
+        tandem_data = load_tandem_exports(args.raw, include_health_auto_export=False)
+        data = load_tandem_exports(args.raw, include_health_auto_export=True)
+        prepared = build_prepared_model_dataset(
+            tandem_data=tandem_data,
+            health_data=data,
+            config=FeatureConfig(horizon_minutes=args.horizon),
+        )
+        feature_frame = _build_feature_frame_from_prepared(prepared)
+    with _session_stage(session, "run.assess_inputs", manifest_path=args.manifest):
+        export_manifest = build_export_manifest(data)
+        write_export_manifest(export_manifest, args.manifest)
+        coverage = summarize_coverage(data)
+        data_quality, quality_rows = assess_data_quality(args.raw, export_manifest=export_manifest)
+    if args.chains < 2:
+        warnings.warn(
+            f"--chains={args.chains} may produce unreliable diagnostics; use at least 2 chains for MCMC.",
+            UserWarning,
+            stacklevel=2,
+        )
+    with _session_stage(session, "run.walk_forward", eval_folds=args.eval_folds):
+        model = BayesianGlucoseModel(
+            draws=args.draws,
+            tune=args.tune,
+            chains=args.chains,
+            target_accept=args.target_accept,
+            max_treedepth=args.max_treedepth,
+        )
+        walk_forward = run_walk_forward(feature_frame, model, n_folds=args.eval_folds)
+    fit_diagnostics = None
+    recommendations = []
+    if skip_recommendations:
+        recommendation_policy = RecommendationPolicy(
+            status="skipped",
+            reasons=["skipped_by_flag"],
+            validation_passed=False,
+            sampler_passed=False,
+            signal_passed=False,
+        )
+    else:
+        with _session_stage(session, "run.recommendations", skip_recommendations=False):
+            fit = model.fit(feature_frame)
+            fit_diagnostics = fit.diagnostics
+            recommendations, _, recommendation_policy = recommend_setting_changes(
+                model,
+                fit,
+                feature_frame.frame,
+                walk_forward=walk_forward,
+                data_quality=data_quality,
+                carbs_present=not data.carbs.empty,
+                activity_present=not data.activity.empty,
+            )
+    return build_run_summary(
+        coverage=coverage,
+        walk_forward=walk_forward,
+        recommendations=recommendations,
+        fit_diagnostics=fit_diagnostics,
+        data_quality=data_quality,
+        recommendation_policy=recommendation_policy,
+        review_artifacts={},
+    )
+
+
 def _apply_command_defaults(args: argparse.Namespace, paths: ProjectPaths) -> None:
-    if args.command in {"ingest", "run", "screen-health-features", "build-health-analysis-ready", "prepare-model-data", "research-therapy-settings", "review-therapy-evidence"}:
+    if args.command in {"ingest", "run", "screen-health-features", "build-health-analysis-ready", "prepare-model-data", "research-therapy-settings", "review-therapy-evidence", "status"}:
         args.raw = args.raw or str(paths.cloud_raw)
         if args.command == "ingest":
             args.report = args.report or str(paths.reports / "coverage.md")
@@ -466,6 +611,8 @@ def _apply_command_defaults(args: argparse.Namespace, paths: ProjectPaths) -> No
         elif args.command == "run":
             args.report = args.report or str(paths.reports / "run_summary.md")
             args.manifest = args.manifest or str(paths.cloud_raw / "tandem_export_manifest.csv")
+        elif args.command == "status":
+            args.manifest = str(paths.cloud_raw / "tandem_export_manifest.csv")
         elif args.command == "prepare-model-data":
             args.output = args.output or str(paths.reports / "prepared_model_data_5min.csv")
             args.report = args.report or str(paths.reports / "model_data_preparation.md")
@@ -540,16 +687,7 @@ def _dispatch_command(
         return 0
 
     if args.command == "research-therapy-settings":
-        with session.stage("therapy.prepare_data", report_dir=args.report_dir):
-            preparation = _prepare_model_data(args=args, paths=paths, session=session)
-        with session.stage("therapy.research", report_dir=args.report_dir):
-            result = run_therapy_research(
-                preparation.dataset,
-                segments=parse_therapy_segments(args.segments),
-                include_models=parse_model_list(args.include_models),
-                meal_proxy_mode=args.meal_proxy_mode,
-                ic_policy=args.ic_policy,
-            )
+        preparation, result, _ = _run_therapy_analysis(args=args, paths=paths, session=session, include_validation=False)
         with session.stage("therapy.write_artifacts", report_dir=args.report_dir):
             write_therapy_research_artifacts(
                 result,
@@ -570,30 +708,108 @@ def _dispatch_command(
         return 0
 
     if args.command == "review-therapy-evidence":
-        with session.stage("therapy.prepare_data", report_path=args.report):
-            preparation = _prepare_model_data(args=args, paths=paths, session=session)
         report_path = Path(args.report)
         report_dir = report_path.parent
-        with session.stage("therapy.research", report_dir=str(report_dir)):
-            research_result = run_therapy_research(
-                preparation.dataset,
-                segments=parse_therapy_segments(args.segments),
-                include_models=parse_model_list(args.include_models),
-                meal_proxy_mode=args.meal_proxy_mode,
-                ic_policy=args.ic_policy,
-            )
-        with session.stage("therapy.validation", report_dir=str(report_dir)):
-            validation_result = validate_therapy_infra(
-                meal_proxy_mode=args.meal_proxy_mode,
-                ic_policy=args.ic_policy,
-                include_models=parse_model_list("ridge,segmented_ridge,tree_boost,ensemble"),
-            )
+        preparation, research_result, validation_result = _run_therapy_analysis(args=args, paths=paths, session=session)
         with session.stage("therapy.write_review", report_path=args.report):
-            write_model_data_preparation_report(preparation, report_dir / "model_data_preparation.md")
-            preparation.dataset.frame.to_csv(report_dir / "prepared_model_data_5min.csv", index=False)
-            write_therapy_research_artifacts(research_result, report_dir)
-            write_therapy_infra_validation_artifacts(validation_result, report_dir)
-            write_therapy_evidence_review_html(preparation, research_result, report_path, validation_result=validation_result)
+            _write_therapy_outputs(
+                preparation=preparation,
+                research_result=research_result,
+                validation_result=validation_result,
+                supporting_dir=report_dir,
+                review_path=report_path,
+                artifact_href_prefix="",
+            )
+        return 0
+
+    if args.command == "status":
+        with session.stage("status.initialize", output_root=str(paths.reports)):
+            cleanup_legacy_top_level_output(paths)
+            bundle = create_status_bundle(paths, session.context.run_id)
+        preparation, research_result, validation_result = _run_therapy_analysis(
+            args=args,
+            paths=paths,
+            session=session,
+            preparation_stage="status.prepare_data",
+            research_stage="status.therapy_research",
+            validation_stage="status.therapy_validation",
+        )
+        with session.stage("status.write_therapy_bundle", bundle_root=str(bundle.root)):
+            _write_therapy_outputs(
+                preparation=preparation,
+                research_result=research_result,
+                validation_result=validation_result,
+                supporting_dir=bundle.supporting_dir,
+                review_path=bundle.therapy_dir / "therapy_evidence_review.html",
+                artifact_href_prefix="../supporting/",
+            )
+            _write_therapy_outputs(
+                preparation=preparation,
+                research_result=research_result,
+                validation_result=validation_result,
+                supporting_dir=bundle.supporting_dir,
+                review_path=paths.reports / "therapy_evidence_review.html",
+                artifact_href_prefix=f"runs/{session.context.run_id}/supporting/",
+            )
+        with session.stage("status.forecast_validation", bundle_root=str(bundle.root)):
+            forecast_summary = _build_forecast_summary(args=args, paths=paths, session=session, skip_recommendations=True)
+        with session.stage("status.write_forecast_bundle", bundle_root=str(bundle.root)):
+            bundle_run_summary_md = bundle.supporting_dir / "run_summary.md"
+            bundle_run_summary_json = bundle.supporting_dir / "run_summary.json"
+            write_markdown_report(
+                {
+                    **forecast_summary,
+                    "review_artifacts": {"run_review_html": "../forecast/run_review.html"},
+                },
+                bundle_run_summary_md,
+            )
+            write_json_report(forecast_summary, bundle_run_summary_json)
+            write_run_review_html(forecast_summary, bundle.forecast_dir / "run_review.html")
+            write_run_review_html(forecast_summary, paths.reports / "run_review.html")
+        with session.stage("status.write_status", bundle_root=str(bundle.root)):
+            top_level_status_html = paths.reports / "current_status.html"
+            top_level_status_json = paths.reports / "current_status.json"
+            artifact_paths = {
+                "current_status_html": str(top_level_status_html),
+                "current_status_json": str(top_level_status_json),
+                "therapy_evidence_review_html": str(paths.reports / "therapy_evidence_review.html"),
+                "run_review_html": str(paths.reports / "run_review.html"),
+                "bundle_root": str(bundle.root),
+                "bundle_status_html": str(bundle.status_dir / "current_status.html"),
+                "bundle_status_json": str(bundle.status_dir / "current_status.json"),
+                "supporting_dir": str(bundle.supporting_dir),
+            }
+            payload = derive_current_status(
+                preparation=preparation,
+                research_result=research_result,
+                forecast_summary=forecast_summary,
+                run_id=session.context.run_id,
+                artifact_paths=artifact_paths,
+            )
+            write_current_status_html(
+                payload,
+                bundle.status_dir / "current_status.html",
+                therapy_href="../therapy/therapy_evidence_review.html",
+                forecast_href="../forecast/run_review.html",
+            )
+            write_status_json(payload, bundle.status_dir / "current_status.json")
+            write_current_status_html(
+                payload,
+                top_level_status_html,
+                therapy_href="therapy_evidence_review.html",
+                forecast_href="run_review.html",
+            )
+            write_status_json(payload, top_level_status_json)
+            publish_latest_entrypoints(
+                paths=paths,
+                run_id=session.context.run_id,
+                payload=payload,
+                bundle=bundle,
+                top_level_status_html=top_level_status_html,
+                top_level_status_json=top_level_status_json,
+                top_level_therapy_html=paths.reports / "therapy_evidence_review.html",
+                top_level_forecast_html=paths.reports / "run_review.html",
+            )
         return 0
 
     if args.command == "build-health-analysis-ready":
@@ -624,70 +840,15 @@ def _dispatch_command(
         return 0
 
     if args.command == "run":
-        with session.stage("run.load_data", raw=args.raw):
-            tandem_data = load_tandem_exports(args.raw, include_health_auto_export=False)
-            data = load_tandem_exports(args.raw, include_health_auto_export=True)
-            prepared = build_prepared_model_dataset(
-                tandem_data=tandem_data,
-                health_data=data,
-                config=FeatureConfig(horizon_minutes=args.horizon),
-            )
-            feature_frame = _build_feature_frame_from_prepared(prepared)
-        with session.stage("run.assess_inputs", manifest_path=args.manifest):
-            export_manifest = build_export_manifest(data)
-            write_export_manifest(export_manifest, args.manifest)
-            coverage = summarize_coverage(data)
-            data_quality, quality_rows = assess_data_quality(args.raw, export_manifest=export_manifest)
-        if args.chains < 2:
-            warnings.warn(
-                f"--chains={args.chains} may produce unreliable diagnostics; use at least 2 chains for MCMC.",
-                UserWarning,
-                stacklevel=2,
-            )
-        with session.stage("run.walk_forward", eval_folds=args.eval_folds):
-            model = BayesianGlucoseModel(
-                draws=args.draws,
-                tune=args.tune,
-                chains=args.chains,
-                target_accept=args.target_accept,
-                max_treedepth=args.max_treedepth,
-            )
-            walk_forward = run_walk_forward(feature_frame, model, n_folds=args.eval_folds)
-        fit_diagnostics = None
-        recommendations = []
-        if args.skip_recommendations:
-            recommendation_policy = RecommendationPolicy(
-                status="skipped",
-                reasons=["skipped_by_flag"],
-                validation_passed=False,
-                sampler_passed=False,
-                signal_passed=False,
-            )
-        else:
-            with session.stage("run.recommendations", skip_recommendations=args.skip_recommendations):
-                fit = model.fit(feature_frame)
-                fit_diagnostics = fit.diagnostics
-                recommendations, _, recommendation_policy = recommend_setting_changes(
-                    model,
-                    fit,
-                    feature_frame.frame,
-                    walk_forward=walk_forward,
-                    data_quality=data_quality,
-                    carbs_present=not data.carbs.empty,
-                    activity_present=not data.activity.empty,
-                )
+        summary = _build_forecast_summary(
+            args=args,
+            paths=paths,
+            session=session,
+            skip_recommendations=bool(args.skip_recommendations),
+        )
         review_path = str(Path(args.report).with_name("run_review.html"))
         with session.stage("run.reporting", report_path=args.report, review_path=review_path):
-            summary = build_run_summary(
-                coverage=coverage,
-                walk_forward=walk_forward,
-                recommendations=recommendations,
-                fit_diagnostics=fit_diagnostics,
-                data_quality=data_quality,
-                recommendation_policy=recommendation_policy,
-                review_artifacts={"run_review_html": review_path},
-            )
-            write_markdown_report(summary, args.report)
+            write_markdown_report({**summary, "review_artifacts": {"run_review_html": review_path}}, args.report)
             json_path = Path(args.report).with_suffix(".json")
             write_json_report(summary, json_path)
             write_run_review_html(summary, review_path)
@@ -834,6 +995,9 @@ def main(argv: list[str] | None = None) -> int:
                 exit_code=exit_code,
             )
         session.finalize(exit_code=exit_code, status="failed")
+        if args.command == "status":
+            bundle = create_status_bundle(paths, session.context.run_id)
+            finalize_status_logs(bundle, session.context.run_dir)
         raise
     except Exception as exc:
         if not session.error_logged:
@@ -846,7 +1010,13 @@ def main(argv: list[str] | None = None) -> int:
                 error_type=type(exc).__name__,
             )
         session.finalize(exit_code=1, status="failed")
+        if args.command == "status":
+            bundle = create_status_bundle(paths, session.context.run_id)
+            finalize_status_logs(bundle, session.context.run_dir)
         raise
 
     session.finalize(exit_code=exit_code, status="success" if exit_code == 0 else "failed")
+    if args.command == "status":
+        bundle = create_status_bundle(paths, session.context.run_id)
+        finalize_status_logs(bundle, session.context.run_dir)
     return exit_code
