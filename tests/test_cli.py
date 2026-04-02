@@ -362,6 +362,12 @@ def test_prepare_model_data_without_apple_writes_tandem_only_dataset(tmp_path, m
     assert "- apple_available: False" in text
     assert "- health_features_included: False" in text
     assert "below the requested minimum" in text
+    run_dir = _latest_log_dir(runtime_root, "prepare-model-data")
+    events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert any(event["event"] == "prepare_model_data.apple_import.skipped" for event in events)
+    assert any(event["event"] == "command.stage.start" and event["stage"] == "prepare_model_data.load_inputs" for event in events)
+    assert any(event["event"] == "command.stage.start" and event["stage"] == "prepare_model_data.build_dataset" for event in events)
+    assert any(event["event"] == "prepare_model_data.dataset_summary" for event in events)
 
 
 def test_prepare_model_data_backfills_tandem_when_needed_without_apple(tmp_path, monkeypatch):

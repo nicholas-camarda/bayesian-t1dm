@@ -53,6 +53,42 @@ Supported collection path:
 - browser or Playwright acquisition is not part of the active workflow
 - manual CSV exports can still be staged locally and ingested, but repo-local `data/raw/` is not the canonical long-term home
 
+## Start Here
+
+If you only need the current active workflow, use these commands:
+
+1. Build or refresh the analysis-ready dataset:
+
+```bash
+bayesian-t1dm prepare-model-data
+```
+
+This writes the current 5-minute prepared dataset and preparation report under `~/ProjectsRuntime/bayesian-t1dm/output/`.
+
+2. Build the main therapy dashboard:
+
+```bash
+bayesian-t1dm review-therapy-evidence
+```
+
+This is the primary therapy-facing entrypoint. Review the resulting dashboard at `~/ProjectsRuntime/bayesian-t1dm/output/therapy_evidence_review.html`.
+
+3. Build the forecasting and validation dashboard:
+
+```bash
+bayesian-t1dm run --skip-recommendations
+```
+
+This is the main forecasting/validation review path. Review the resulting dashboard at `~/ProjectsRuntime/bayesian-t1dm/output/run_review.html`.
+
+4. Use `research-therapy-settings` only when you want supporting research artifacts:
+
+```bash
+bayesian-t1dm research-therapy-settings
+```
+
+This generates deeper therapy research outputs, but it is not the primary dashboard entrypoint.
+
 ## Quickstart
 
 1. Create and activate the Conda environment:
@@ -88,11 +124,25 @@ bayesian-t1dm ingest
 4. Prepare model-ready data:
 
 ```bash
-bayesian-t1dm prepare-model-data --apple-input \
+bayesian-t1dm prepare-model-data
+```
+
+`prepare-model-data` is the default data-prep workflow. It reads already-imported Apple Health tables from the canonical cloud raw tree when they are present, measures Apple/Tandem overlap, backfills Tandem data when credentials are available, and writes an aligned 5-minute model dataset. If Apple Health is absent, it falls back to a Tandem-only dataset and targets roughly one year of Tandem history by default.
+
+If you have new Health Auto Export bundles that have not been imported yet, run the import step first:
+
+```bash
+bayesian-t1dm import-health-auto-export --input \
   ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data
 ```
 
-`prepare-model-data` is the default data-prep workflow. If Apple Health bundles are available, it imports them, measures Apple/Tandem overlap, backfills Tandem data when credentials are available, and writes an aligned 5-minute model dataset. If Apple Health is absent, it falls back to a Tandem-only dataset and targets roughly one year of Tandem history by default.
+Then rerun:
+
+```bash
+bayesian-t1dm prepare-model-data
+```
+
+Use `--apple-input` with `prepare-model-data` only when you intentionally want it to import fresh Apple Health bundles before preparing the dataset.
 
 5. Run the full pipeline:
 
@@ -164,7 +214,7 @@ Run the forecasting and recommendation pipeline:
 bayesian-t1dm run
 ```
 
-Run time-aware validation without the final recommendation fit:
+Run time-aware validation without the final recommendation fit and build the forecasting/validation dashboard:
 
 ```bash
 bayesian-t1dm run --skip-recommendations
@@ -180,15 +230,21 @@ bayesian-t1dm import-health-auto-export --input \
 Prepare the default model-ready dataset with optional Apple Health enrichment:
 
 ```bash
-bayesian-t1dm prepare-model-data --apple-input \
-  ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data
+bayesian-t1dm prepare-model-data
 ```
 
-Run therapy-setting research with segmented decision-support artifacts:
+If you need to import new Apple Health bundles first:
 
 ```bash
-bayesian-t1dm research-therapy-settings --apple-input \
+bayesian-t1dm import-health-auto-export --input \
   ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data
+bayesian-t1dm prepare-model-data
+```
+
+Run supporting therapy-setting research artifacts:
+
+```bash
+bayesian-t1dm research-therapy-settings
 ```
 
 Run the synthetic therapy infrastructure validator:
@@ -197,11 +253,10 @@ Run the synthetic therapy infrastructure validator:
 bayesian-t1dm validate-therapy-infra
 ```
 
-Build the main therapy evidence review surface:
+Build the main therapy dashboard:
 
 ```bash
-bayesian-t1dm review-therapy-evidence --apple-input \
-  ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data
+bayesian-t1dm review-therapy-evidence
 ```
 
 Materialize the Tandem-aligned 5-minute analysis-ready table:
@@ -226,7 +281,7 @@ The active pipeline is:
 4. normalized CGM, bolus, basal, and activity tables are written beside the raw responses
 5. optional Apple Health year-chunk bundles are imported under `data/raw/health_auto_export/<export_id>/...`
 6. imported Apple Health tables are unified with deterministic latest-export-wins dedupe
-7. `prepare-model-data` inspects Apple and Tandem spans, requests missing Tandem history when needed, and writes an alignment/preparation report
+7. `prepare-model-data` inspects Apple and Tandem spans from the canonical raw tree, requests missing Tandem history when needed, and writes an alignment/preparation report
 8. a per-window Tandem manifest records coverage, hashes, timestamps, and pump identity
 9. a Tandem 5-minute feature grid is built
 10. Apple Health context is merged onto those Tandem timestamps when available to create the final prepared dataset
@@ -250,10 +305,11 @@ This keeps raw-window repair, coverage review, and predictive validation separat
 Canonical Tandem + Apple Health workflow:
 
 1. `bayesian-t1dm normalize-raw`
-2. `bayesian-t1dm prepare-model-data --apple-input ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data`
-3. `bayesian-t1dm screen-health-features`
-4. `bayesian-t1dm run --skip-recommendations`
-5. `bayesian-t1dm run`
+2. `bayesian-t1dm import-health-auto-export --input ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data` when new bundles need to be imported
+3. `bayesian-t1dm prepare-model-data`
+4. `bayesian-t1dm screen-health-features`
+5. `bayesian-t1dm run --skip-recommendations`
+6. `bayesian-t1dm run`
 
 Canonical Tandem-only fallback workflow:
 
@@ -265,14 +321,15 @@ Canonical Tandem-only fallback workflow:
 Canonical therapy evidence workflow:
 
 1. `bayesian-t1dm normalize-raw`
-2. `bayesian-t1dm prepare-model-data --apple-input ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data`
-3. `bayesian-t1dm review-therapy-evidence`
-4. review `therapy_evidence_review.html` first, then inspect the linked supporting artifacts if you need to go deeper
+2. `bayesian-t1dm import-health-auto-export --input ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data` when new bundles need to be imported
+3. `bayesian-t1dm prepare-model-data`
+4. `bayesian-t1dm review-therapy-evidence`
+5. review `therapy_evidence_review.html` first, then inspect the linked supporting artifacts if you need to go deeper
 
 What each step does:
 
 1. `normalize-raw` rebuilds normalized Tandem tables from archived raw API payloads.
-2. `prepare-model-data` optionally imports Apple Health bundles, computes Apple/Tandem overlap, backfills Tandem data when needed, and writes the prepared 5-minute model dataset plus a preparation report.
+2. `prepare-model-data` reuses already-imported Apple Health tables from the canonical raw tree by default, computes Apple/Tandem overlap, backfills Tandem data when needed, and writes the prepared 5-minute model dataset plus a preparation report. Use `import-health-auto-export` first when you have new bundles to ingest.
 3. `screen-health-features` evaluates Apple context features against Tandem glucose targets using the unified prepared dataset and skips cleanly when Apple Health is absent.
 4. `run --skip-recommendations` is the preferred fast validation path because it checks walk-forward forecasting without paying for the final recommendation fit.
 5. `run` performs the full modeling and recommendation pipeline. It now uses the same prepared dataset contract: Apple-enriched when Apple data exists, Tandem-only otherwise.

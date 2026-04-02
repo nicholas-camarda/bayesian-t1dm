@@ -703,6 +703,55 @@ def _load_frames(path: Path) -> list[tuple[pd.DataFrame, str | None]]:
     return []
 
 
+def _load_canonical_normalized_table(path: Path) -> tuple[str, pd.DataFrame] | None:
+    if path.parent.name != "normalized":
+        return None
+    stem = path.stem.lower()
+    frame = read_table(path)
+    if frame.empty:
+        return None
+
+    if stem == "cgm" and {"timestamp", "glucose"} <= set(frame.columns):
+        out = frame.copy()
+        out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
+        out["glucose"] = pd.to_numeric(out["glucose"], errors="coerce")
+        out = out.dropna(subset=["timestamp", "glucose"]).reset_index(drop=True)
+        return "cgm", out
+
+    if stem == "bolus" and {"timestamp", "bolus_units"} <= set(frame.columns):
+        out = frame.copy()
+        out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
+        out["bolus_units"] = pd.to_numeric(out["bolus_units"], errors="coerce")
+        if "carb_grams" in out.columns:
+            out["carb_grams"] = pd.to_numeric(out["carb_grams"], errors="coerce")
+        out = out.dropna(subset=["timestamp", "bolus_units"]).reset_index(drop=True)
+        return "bolus", out
+
+    if stem == "basal" and {"start_timestamp", "end_timestamp", "basal_units_per_hour"} <= set(frame.columns):
+        out = frame.copy()
+        out["start_timestamp"] = pd.to_datetime(out["start_timestamp"], errors="coerce")
+        out["end_timestamp"] = pd.to_datetime(out["end_timestamp"], errors="coerce")
+        out["basal_units_per_hour"] = pd.to_numeric(out["basal_units_per_hour"], errors="coerce")
+        out = out.dropna(subset=["start_timestamp", "end_timestamp", "basal_units_per_hour"]).reset_index(drop=True)
+        return "basal", out
+
+    if stem == "activity" and {"timestamp", "activity_value"} <= set(frame.columns):
+        out = frame.copy()
+        out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
+        out["activity_value"] = pd.to_numeric(out["activity_value"], errors="coerce")
+        out = out.dropna(subset=["timestamp", "activity_value"]).reset_index(drop=True)
+        return "activity", out
+
+    if stem == "carbs" and {"timestamp", "carb_grams"} <= set(frame.columns):
+        out = frame.copy()
+        out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
+        out["carb_grams"] = pd.to_numeric(out["carb_grams"], errors="coerce")
+        out = out.dropna(subset=["timestamp", "carb_grams"]).reset_index(drop=True)
+        return "carbs", out
+
+    return None
+
+
 def load_tandem_exports(raw_dir: str | Path, *, include_health_auto_export: bool = False) -> IngestedData:
     raw_path = Path(raw_dir)
     source_files = sorted({path.resolve() for path in [*discover_source_files(raw_path), *_manifest_declared_source_files(raw_path)]})
@@ -713,6 +762,29 @@ def load_tandem_exports(raw_dir: str | Path, *, include_health_auto_export: bool
     activity_frames: list[pd.DataFrame] = []
 
     for source in source_files:
+        canonical = _load_canonical_normalized_table(source)
+        if canonical is not None:
+            kind, frame = canonical
+            if kind == "cgm":
+                cgm_frames.append(frame)
+            elif kind == "bolus":
+                bolus_frames.append(frame)
+                if "carb_grams" in frame.columns:
+                    carb_frame = frame.loc[:, [column for column in ["timestamp", "carb_grams", "source_file", "source_sheet", "source_label"] if column in frame.columns]].copy()
+                    carb_frame["source_label"] = carb_frame.get("source_label", "bolus")
+                    carb_frame["_carb_source_priority"] = 1
+                    carb_frames.append(carb_frame)
+            elif kind == "basal":
+                basal_frames.append(frame)
+            elif kind == "activity":
+                activity_frames.append(frame)
+            elif kind == "carbs":
+                direct_carbs = frame.copy()
+                if "source_label" not in direct_carbs.columns:
+                    direct_carbs["source_label"] = source.stem
+                direct_carbs["_carb_source_priority"] = 0
+                carb_frames.append(direct_carbs)
+            continue
         for frame, sheet in _load_frames(source):
             if frame.empty:
                 continue

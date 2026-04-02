@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from datetime import date, timedelta
 from pathlib import Path
 import sys
@@ -192,6 +193,10 @@ def _build_feature_frame_from_prepared(dataset) -> FeatureFrame:
     )
 
 
+def _session_stage(session: LoggingSession | None, stage: str, **fields: object):
+    return session.stage(stage, **fields) if session is not None else nullcontext()
+
+
 def _prepare_model_data(
     *,
     args,
@@ -204,16 +209,67 @@ def _prepare_model_data(
     min_history_days = int(getattr(args, "min_history_days", 180))
 
     if getattr(args, "apple_input", None):
-        try:
-            import_health_auto_export_batch(args.apple_input, paths.ensure())
-        except ValueError as exc:
-            warnings_list.append(f"Apple Health import skipped: {exc}")
+        with _session_stage(session, "prepare_model_data.apple_import", apple_input=str(args.apple_input)):
+            try:
+                imported = import_health_auto_export_batch(args.apple_input, paths.ensure())
+                if session is not None:
+                    session.log_event(
+                        "prepare_model_data.apple_import.complete",
+                        stage="prepare_model_data.apple_import",
+                        imported_bundle_count=len(imported),
+                    )
+            except ValueError as exc:
+                warnings_list.append(f"Apple Health import skipped: {exc}")
+                if session is not None:
+                    session.log_event(
+                        "prepare_model_data.apple_import.skipped",
+                        level="WARNING",
+                        message=str(exc),
+                        stage="prepare_model_data.apple_import",
+                    )
+    elif session is not None:
+        session.log_event(
+            "prepare_model_data.apple_import.skipped",
+            message="No Apple Health import path provided; reusing any already-imported Apple Health tables.",
+            stage="prepare_model_data.apple_import",
+        )
 
-    tandem_before = load_tandem_exports(raw_root, include_health_auto_export=False)
-    health_before = load_tandem_exports(raw_root, include_health_auto_export=True)
-    tandem_span_before_start, tandem_span_before_end = summarize_tandem_data_span(tandem_before)
-    apple_available = has_apple_health_data(health_before)
-    apple_span_start, apple_span_end = summarize_apple_health_span(health_before)
+    with _session_stage(session, "prepare_model_data.load_inputs", raw_root=str(raw_root)):
+        if session is not None:
+            session.log_event(
+                "prepare_model_data.tandem_inputs.loading",
+                stage="prepare_model_data.load_inputs",
+                message="Loading Tandem normalized inputs.",
+            )
+        tandem_before = load_tandem_exports(raw_root, include_health_auto_export=False)
+        if session is not None:
+            session.log_event(
+                "prepare_model_data.tandem_inputs.loaded",
+                stage="prepare_model_data.load_inputs",
+                tandem_cgm_rows=int(len(tandem_before.cgm)),
+                tandem_bolus_rows=int(len(tandem_before.bolus)),
+            )
+            session.log_event(
+                "prepare_model_data.health_inputs.loading",
+                stage="prepare_model_data.load_inputs",
+                message="Loading Tandem plus already-imported Apple Health inputs.",
+            )
+        health_before = load_tandem_exports(raw_root, include_health_auto_export=True)
+        tandem_span_before_start, tandem_span_before_end = summarize_tandem_data_span(tandem_before)
+        apple_available = has_apple_health_data(health_before)
+        apple_span_start, apple_span_end = summarize_apple_health_span(health_before)
+    if session is not None:
+        session.log_event(
+            "prepare_model_data.input_summary",
+            stage="prepare_model_data.load_inputs",
+            tandem_cgm_rows=int(len(tandem_before.cgm)),
+            tandem_bolus_rows=int(len(tandem_before.bolus)),
+            apple_available=apple_available,
+            health_activity_rows=int(len(health_before.health_activity)),
+            health_measurement_rows=int(len(health_before.health_measurements)),
+            sleep_rows=int(len(health_before.sleep)),
+            workout_rows=int(len(health_before.workouts)),
+        )
 
     requested_tandem_start: pd.Timestamp | None = None
     requested_tandem_end: pd.Timestamp | None = None
@@ -239,54 +295,106 @@ def _prepare_model_data(
             or pd.Timestamp(tandem_span_before_end).normalize() < requested_tandem_end
         )
     )
+    if session is not None:
+        session.log_event(
+            "prepare_model_data.backfill_decision",
+            stage="prepare_model_data.backfill_decision",
+            needs_backfill=needs_backfill,
+            requested_tandem_start=requested_tandem_start,
+            requested_tandem_end=requested_tandem_end,
+            tandem_span_before_start=tandem_span_before_start,
+            tandem_span_before_end=tandem_span_before_end,
+            apple_available=apple_available,
+        )
 
     if needs_backfill and getattr(args, "skip_backfill", False):
         backfill_status = "skipped_by_flag"
         warnings_list.append("Requested Tandem backfill was skipped by flag; using currently available Tandem history.")
+        if session is not None:
+            session.log_event(
+                "prepare_model_data.backfill.skipped",
+                level="WARNING",
+                message="Requested Tandem backfill skipped by flag.",
+                stage="prepare_model_data.backfill",
+                backfill_status=backfill_status,
+            )
     elif needs_backfill:
-        try:
-            credentials = load_tandem_credentials(args.root, getattr(args, "env_file", None))
-            client_kwargs = {
-                "region": credentials.region,
-                "timezone": credentials.timezone,
-                "pump_serial": credentials.pump_serial,
-            }
-            client_cm = TConnectSyncSourceClient(paths, **client_kwargs)
-            with client_cm as client:
-                backfill_tandem_exports(
-                    client,
-                    start_date=requested_tandem_start.date().isoformat(),
-                    end_date=requested_tandem_end.date().isoformat(),
-                    workspace=paths,
-                    credentials=credentials,
-                    window_days=30,
-                    direction="backward",
-                    manifest_path=str(paths.cloud_raw / "tandem_export_manifest.csv"),
-                    report_path=str(paths.reports / "tandem_acquisition_summary.md"),
-                    resume=True,
-                    strict=False,
-                    step_log=StepLogger(session=session) if session is not None else None,
-                )
-            backfill_status = "completed"
-        except AcquisitionError as exc:
-            backfill_status = "unavailable"
-            warnings_list.append(f"Tandem backfill unavailable: {exc}")
-        except Exception as exc:
-            backfill_status = "failed"
-            warnings_list.append(f"Tandem backfill failed: {exc}")
+        with _session_stage(
+            session,
+            "prepare_model_data.backfill",
+            requested_tandem_start=requested_tandem_start,
+            requested_tandem_end=requested_tandem_end,
+        ):
+            try:
+                credentials = load_tandem_credentials(args.root, getattr(args, "env_file", None))
+                client_kwargs = {
+                    "region": credentials.region,
+                    "timezone": credentials.timezone,
+                    "pump_serial": credentials.pump_serial,
+                }
+                client_cm = TConnectSyncSourceClient(paths, **client_kwargs)
+                with client_cm as client:
+                    backfill_tandem_exports(
+                        client,
+                        start_date=requested_tandem_start.date().isoformat(),
+                        end_date=requested_tandem_end.date().isoformat(),
+                        workspace=paths,
+                        credentials=credentials,
+                        window_days=30,
+                        direction="backward",
+                        manifest_path=str(paths.cloud_raw / "tandem_export_manifest.csv"),
+                        report_path=str(paths.reports / "tandem_acquisition_summary.md"),
+                        resume=True,
+                        strict=False,
+                        step_log=StepLogger(session=session) if session is not None else None,
+                    )
+                backfill_status = "completed"
+            except AcquisitionError as exc:
+                backfill_status = "unavailable"
+                warnings_list.append(f"Tandem backfill unavailable: {exc}")
+            except Exception as exc:
+                backfill_status = "failed"
+                warnings_list.append(f"Tandem backfill failed: {exc}")
+        if session is not None:
+            session.log_event(
+                "prepare_model_data.backfill.complete",
+                stage="prepare_model_data.backfill",
+                backfill_status=backfill_status,
+            )
+    elif session is not None:
+        session.log_event(
+            "prepare_model_data.backfill.skipped",
+            message="Backfill not needed.",
+            stage="prepare_model_data.backfill",
+            backfill_status=backfill_status,
+        )
 
-    tandem_after = load_tandem_exports(raw_root, include_health_auto_export=False)
-    health_after = load_tandem_exports(raw_root, include_health_auto_export=True)
-    export_manifest = build_export_manifest(health_after)
-    write_export_manifest(export_manifest, paths.cloud_raw / "tandem_export_manifest.csv")
+    with _session_stage(session, "prepare_model_data.reload_inputs", raw_root=str(raw_root)):
+        if session is not None:
+            session.log_event(
+                "prepare_model_data.tandem_inputs.reloading",
+                stage="prepare_model_data.reload_inputs",
+                message="Reloading Tandem inputs after backfill decision.",
+            )
+        tandem_after = load_tandem_exports(raw_root, include_health_auto_export=False)
+        if session is not None:
+            session.log_event(
+                "prepare_model_data.health_inputs.reloading",
+                stage="prepare_model_data.reload_inputs",
+                message="Reloading Tandem plus Apple Health inputs after backfill decision.",
+            )
+        health_after = load_tandem_exports(raw_root, include_health_auto_export=True)
+        export_manifest = build_export_manifest(health_after)
+        write_export_manifest(export_manifest, paths.cloud_raw / "tandem_export_manifest.csv")
 
-    dataset = build_prepared_model_dataset(
-        tandem_data=tandem_after,
-        health_data=health_after,
-        config=FeatureConfig(horizon_minutes=args.horizon),
-    )
-    tandem_span_after_start, tandem_span_after_end = summarize_tandem_data_span(tandem_after)
-    apple_span_start, apple_span_end = summarize_apple_health_span(health_after)
+    with _session_stage(session, "prepare_model_data.build_dataset", horizon_minutes=args.horizon):
+        dataset = build_prepared_model_dataset(
+            tandem_data=tandem_after,
+            health_data=health_after,
+            config=FeatureConfig(horizon_minutes=args.horizon),
+        )
+        tandem_span_after_start, tandem_span_after_end = summarize_tandem_data_span(tandem_after)
+        apple_span_start, apple_span_end = summarize_apple_health_span(health_after)
     overlap_start, overlap_end = intersect_spans(
         apple_span_start,
         apple_span_end,
@@ -303,6 +411,16 @@ def _prepare_model_data(
             )
     elif dataset.frame.empty:
         warnings_list.append("Final prepared dataset is empty.")
+    if session is not None:
+        session.log_event(
+            "prepare_model_data.dataset_summary",
+            stage="prepare_model_data.build_dataset",
+            final_row_count=int(len(dataset.frame)),
+            final_dataset_start=None if pd.isna(final_dataset_start) else pd.Timestamp(final_dataset_start),
+            final_dataset_end=None if pd.isna(final_dataset_end) else pd.Timestamp(final_dataset_end),
+            backfill_status=backfill_status,
+            apple_available=dataset.apple_available,
+        )
 
     return ModelDataPreparationResult(
         dataset=dataset,

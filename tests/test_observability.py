@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 import warnings
 
 from bayesian_t1dm.acquisition import StepLogger
-from bayesian_t1dm.observability import REDACTED, sanitize_fields, setup_run_logging
+from bayesian_t1dm.observability import REDACTED, HumanReadableFormatter, sanitize_fields, setup_run_logging
 from bayesian_t1dm.paths import ProjectPaths
 
 
@@ -35,6 +36,46 @@ def test_sanitize_fields_redacts_sensitive_and_raw_values():
     assert fields["payload"] == REDACTED
     assert fields["glucose_values"] == REDACTED
     assert fields["row_count"] == 4
+
+
+def test_sanitize_fields_keeps_summary_counts_and_timestamps_readable():
+    fields = sanitize_fields(
+        {
+            "health_measurement_rows": 832432,
+            "health_activity_rows": 70054,
+            "requested_tandem_start": "2025-04-25T00:00:00",
+            "requested_tandem_end": "2025-05-24T00:00:00",
+        }
+    )
+
+    assert fields["health_measurement_rows"] == 832432
+    assert fields["health_activity_rows"] == 70054
+    assert fields["requested_tandem_start"] == "2025-04-25T00:00:00"
+    assert fields["requested_tandem_end"] == "2025-05-24T00:00:00"
+
+
+def test_human_readable_formatter_is_compact_for_terminal_output():
+    formatter = HumanReadableFormatter()
+    record = logging.LogRecord(
+        name="bayesian_t1dm",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="Loading Tandem normalized inputs.",
+        args=(),
+        exc_info=None,
+    )
+    record.stage = "prepare_model_data.load_inputs"
+    record.status = None
+    record.event_name = "prepare_model_data.tandem_inputs.loading"
+    record.event_fields = {}
+
+    rendered = formatter.format(record)
+
+    assert "load inputs:" in rendered
+    assert "Loading Tandem normalized inputs." in rendered
+    assert "prepare_model_data.tandem_inputs.loading" not in rendered
+    assert "command.stage.start" not in rendered
 
 
 def test_setup_run_logging_writes_run_bundle_and_captures_warnings(tmp_path):

@@ -30,19 +30,16 @@ _SENSITIVE_KEY_FRAGMENTS = (
 _RAW_DATA_KEY_FRAGMENTS = (
     "payload",
     "body",
-    "response",
-    "request",
     "headers",
-    "health",
     "glucose",
     "insulin",
-    "carb",
     "heart_rate",
     "steps",
     "values",
 )
 _SENSITIVE_OPTION_FRAGMENTS = ("password", "secret", "token", "auth")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_SAFE_SUMMARY_SUFFIXES = ("_rows", "_count", "_counts", "_seconds", "_minutes", "_hours", "_days")
 
 
 def _utc_now() -> datetime:
@@ -79,11 +76,18 @@ def _looks_like_email(value: Any) -> bool:
     return isinstance(value, str) and bool(_EMAIL_RE.match(value.strip()))
 
 
+def _is_safe_summary_field(key: str, value: Any) -> bool:
+    lower_key = key.lower()
+    return lower_key.endswith(_SAFE_SUMMARY_SUFFIXES) and isinstance(value, (int, float, bool))
+
+
 def redact_value(key: str, value: Any, *, unsafe_debug_logging: bool = False) -> Any:
     if _key_has_fragment(key, _SENSITIVE_KEY_FRAGMENTS):
         return REDACTED
     if _looks_like_email(value):
         return REDACTED
+    if _is_safe_summary_field(key, value):
+        return _json_safe(value)
     if _key_has_fragment(key, _RAW_DATA_KEY_FRAGMENTS) and not unsafe_debug_logging:
         return REDACTED
     if isinstance(value, Mapping):
@@ -150,23 +154,100 @@ class JsonlEventHandler(logging.Handler):
 
 
 class HumanReadableFormatter(logging.Formatter):
+    def _format_stage(self, stage: str | None) -> str | None:
+        if not stage:
+            return None
+        label = stage.split(".")[-1].replace("_", " ").strip()
+        return label or None
+
+    def _format_event(self, event_name: str | None) -> str | None:
+        if not event_name:
+            return None
+        if event_name in {"command.start", "command.complete", "command.warning", "command.error"}:
+            return None
+        if event_name in {"command.stage.start", "command.stage.complete"}:
+            return None
+        return event_name.split(".")[-1].replace("_", " ").strip()
+
+    def _format_scalar(self, value: Any) -> str:
+        if value == REDACTED:
+            return REDACTED
+        if isinstance(value, bool):
+            return "yes" if value else "no"
+        if isinstance(value, int):
+            return f"{value:,}"
+        if isinstance(value, float):
+            if value.is_integer():
+                return f"{int(value):,}"
+            return f"{value:,.3f}".rstrip("0").rstrip(".")
+        if isinstance(value, str):
+            text = value.replace(str(Path.home()), "~")
+            return text
+        return str(value)
+
+    def _format_fields(self, fields: Mapping[str, Any]) -> str:
+        if not fields:
+            return ""
+        preferred_keys = (
+            "tandem_cgm_rows",
+            "tandem_bolus_rows",
+            "health_activity_rows",
+            "health_measurement_rows",
+            "sleep_rows",
+            "workout_rows",
+            "needs_backfill",
+            "backfill_status",
+            "apple_available",
+            "final_row_count",
+            "output_path",
+            "report_path",
+            "raw_root",
+            "warning_source",
+        )
+        ordered_keys = [key for key in preferred_keys if key in fields]
+        ordered_keys.extend(key for key in fields if key not in ordered_keys)
+        rendered: list[str] = []
+        for key in ordered_keys[:5]:
+            value = fields[key]
+            if isinstance(value, (dict, list, tuple, set)):
+                continue
+            rendered.append(f"{key}={self._format_scalar(value)}")
+        return "  ".join(rendered)
+
     def format(self, record: logging.LogRecord) -> str:
-        timestamp = datetime.fromtimestamp(record.created, tz=UTC).strftime("%Y-%m-%d %H:%M:%S")
-        stage = getattr(record, "stage", None)
+        timestamp = datetime.fromtimestamp(record.created).strftime("%H:%M:%S")
+        stage = self._format_stage(getattr(record, "stage", None))
         status = getattr(record, "status", None)
         event_name = getattr(record, "event_name", None)
         fields = getattr(record, "event_fields", {})
-        parts = [timestamp, record.levelname]
+        message = record.getMessage().replace(str(Path.home()), "~")
+        event_label = self._format_event(event_name)
+        parts = [timestamp, f"{record.levelname:<7}"]
         if stage:
-            parts.append(f"[{stage}]")
-        if event_name:
-            parts.append(event_name)
-        text = " ".join(parts) + f" {record.getMessage()}"
-        if status:
-            text += f" status={status}"
-        if fields:
-            preview = ", ".join(f"{key}={json.dumps(value, default=str)}" for key, value in list(fields.items())[:6])
-            text += f" | {preview}"
+            parts.append(f"{stage}:")
+        if event_name == "command.stage.start":
+            text = " ".join(parts + ["starting"])
+        elif event_name == "command.stage.complete":
+            text = " ".join(parts + ["done"])
+        elif event_name == "command.start":
+            text = " ".join(parts + [message])
+        elif event_name == "command.complete":
+            text = " ".join(parts + [message])
+        elif event_name == "command.warning":
+            text = " ".join(parts + ["warning", message])
+        elif event_name == "command.error":
+            text = " ".join(parts + ["error", message])
+        elif event_label and message.strip() == (event_name or "").strip():
+            text = " ".join(parts + [event_label])
+        elif event_label and message.strip() == event_label:
+            text = " ".join(parts + [message])
+        else:
+            text = " ".join(parts + [message])
+        preview = self._format_fields(fields)
+        if preview:
+            text += f"  {preview}"
+        if status and event_name in {"command.start", "command.complete"}:
+            text += f"  status={status}"
         return text
 
 
@@ -475,4 +556,3 @@ def setup_run_logging(
         file_logging_enabled=event_log_path is not None and text_log_path is not None,
     )
     return LoggingSession(context=context, argv=argv, logger=logger, startup_warning=startup_warning)
-
