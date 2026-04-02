@@ -10,6 +10,8 @@ import bayesian_t1dm.cli as cli
 from bayesian_t1dm.evaluate import CalibrationSummary, WalkForwardReport
 from bayesian_t1dm.cli import main
 from bayesian_t1dm.acquisition import ExportWindow, NormalizedWindowResult
+from bayesian_t1dm.health_auto_export import ModelDataPreparationResult
+from bayesian_t1dm.therapy_research import _synthetic_base_dataset
 
 
 def _write_tandem_cgm_export(raw_dir: Path, *, start: str = "2025-05-24 00:00:00", periods: int = 288) -> Path:
@@ -380,3 +382,46 @@ def test_validate_therapy_infra_command_writes_artifacts(tmp_path):
     assert (report_dir / "therapy_infra_validation.md").exists()
     assert (report_dir / "therapy_synthetic_results.csv").exists()
     assert (report_dir / "therapy_synthetic_recommendation_audit.md").exists()
+
+
+def test_review_therapy_evidence_command_writes_report_and_supporting_artifacts(tmp_path, monkeypatch):
+    workspace_root = tmp_path / "repo"
+    workspace_root.mkdir()
+    dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
+    preparation = ModelDataPreparationResult(
+        dataset=dataset,
+        apple_available=True,
+        apple_span_start=pd.Timestamp("2025-01-01 00:00:00"),
+        apple_span_end=pd.Timestamp("2025-01-07 23:55:00"),
+        tandem_span_before_start=pd.Timestamp("2025-01-01 00:00:00"),
+        tandem_span_before_end=pd.Timestamp("2025-01-07 23:55:00"),
+        tandem_span_after_start=pd.Timestamp("2025-01-01 00:00:00"),
+        tandem_span_after_end=pd.Timestamp("2025-01-07 23:55:00"),
+        requested_tandem_start=pd.Timestamp("2025-01-01 00:00:00"),
+        requested_tandem_end=pd.Timestamp("2025-01-07 23:55:00"),
+        overlap_start=pd.Timestamp("2025-01-01 00:00:00"),
+        overlap_end=pd.Timestamp("2025-01-07 23:55:00"),
+        final_dataset_start=pd.Timestamp("2025-01-01 00:00:00"),
+        final_dataset_end=pd.Timestamp("2025-01-07 23:55:00"),
+        final_row_count=len(dataset.frame),
+    )
+    monkeypatch.setattr(cli, "_prepare_model_data", lambda args, paths: preparation)
+
+    report = tmp_path / "therapy_evidence_review.html"
+    exit_code = main(
+        [
+            "--root",
+            str(workspace_root),
+            "review-therapy-evidence",
+            "--report",
+            str(report),
+            "--include-models",
+            "ridge,segmented_ridge,tree_boost",
+        ]
+    )
+
+    assert exit_code == 0
+    assert report.exists()
+    assert (tmp_path / "model_data_preparation.md").exists()
+    assert (tmp_path / "therapy_research_gate.md").exists()
+    assert (tmp_path / "therapy_infra_validation.md").exists()

@@ -278,13 +278,12 @@ Canonical Tandem-only fallback flow:
 3. `bayesian-t1dm run --skip-recommendations`
 4. `bayesian-t1dm run`
 
-Canonical therapy research flow:
+Canonical therapy evidence flow:
 
 1. `bayesian-t1dm normalize-raw`
 2. `bayesian-t1dm prepare-model-data --apple-input ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data`
-3. `bayesian-t1dm research-therapy-settings`
-4. `bayesian-t1dm validate-therapy-infra`
-5. review the therapy research and validation artifacts before considering any schedule changes
+3. `bayesian-t1dm review-therapy-evidence`
+4. review `therapy_evidence_review.html` first, then inspect linked artifacts for detail
 
 Step-by-step behavior:
 
@@ -295,6 +294,17 @@ Step-by-step behavior:
 5. `run` executes the full modeling and recommendation stack using the same prepared dataset contract: Apple-enriched when Apple data exists, Tandem-only otherwise.
 6. `research-therapy-settings` runs a distinct research-grade therapy workflow: it starts with a methodological gate, builds fasting, meal, and correction contexts, creates strict meal-bolus proxy features when explicit carbs are absent, audits Apple/Tandem feature engineering, compares Bayesian, linear, segmented, tree-boosted, and ensemble-style candidates, and writes segment-level recommendation evidence for basal and I/C ratio. Sensitivity factor remains staged and suppressed by default in the current implementation.
 7. `validate-therapy-infra` runs a synthetic truth-recovery suite against the same therapy research contract. It checks basal direction recovery, proxy-only conservatism, Apple-helpful vs Apple-null behavior, and suppression under corrupted or low-identifiability scenarios.
+8. `review-therapy-evidence` is the therapy-facing orchestration command. It prepares the model dataset, writes the therapy research and validation artifacts, computes the overnight basal evidence summary, and renders one interactive HTML page that explains what is identifiable, what is blocked, and where in the code and artifacts the logic lives.
+
+Workflow crosswalk:
+
+| Step | Question | Main artifact(s) | Main code path(s) | Interpretation |
+| --- | --- | --- | --- | --- |
+| `normalize-raw` | Did we correctly rebuild normalized Tandem windows? | `normalize_raw_summary.md` | `src/bayesian_t1dm/acquisition.py::normalize_tconnectsync_archive` | Confirms raw-to-normalized reconstruction before modeling. |
+| `prepare-model-data` | What data spans are available and aligned? | `model_data_preparation.md`, `prepared_model_data_5min.csv` | `src/bayesian_t1dm/cli.py::_prepare_model_data`, `src/bayesian_t1dm/health_auto_export.py::build_prepared_model_dataset` | Establishes the final Tandem-aligned modeling grid and overlap logic. |
+| `research-therapy-settings` | What therapy contexts and identifiability gates are available? | `therapy_research_gate.md`, `therapy_feature_audit.md`, `therapy_model_comparison.md` | `src/bayesian_t1dm/therapy_research.py::build_therapy_research_frame`, `src/bayesian_t1dm/therapy_research.py::run_therapy_research` | Shows whether basal / I:C / ISF are directly observed, proxy-supported, weakly identified, or blocked. |
+| `validate-therapy-infra` | Does the therapy workflow recover known truth and suppress itself correctly? | `therapy_infra_validation.md`, `therapy_synthetic_results.csv` | `src/bayesian_t1dm/therapy_research.py::validate_therapy_infra` | Tests truth-recovery and false-positive suppression, not just predictive fit. |
+| `review-therapy-evidence` | What is actually happening with overnight basal evidence in the current data? | `therapy_evidence_review.html` | `src/bayesian_t1dm/review.py::write_therapy_evidence_review_html` | Primary therapy-facing explanation surface. |
 
 ## Output Contract
 
@@ -335,6 +345,7 @@ Apple Health-specific working artifacts:
 - `screen-health-features` writes `health_feature_screening.md` and `health_feature_scores.csv` under the runtime output directory
 - `research-therapy-settings` writes `therapy_research_gate.md`, `meal_proxy_audit.md`, `therapy_feature_audit.md`, `therapy_feature_registry.csv`, `therapy_model_comparison.md`, `therapy_segment_evidence.csv`, `therapy_recommendation_research.md`, `tandem_source_report_card.md`, `apple_source_report_card.md`, `source_numeric_summary.csv`, and `source_missingness_summary.csv`
 - `validate-therapy-infra` writes `therapy_infra_validation.md`, `therapy_synthetic_results.csv`, and `therapy_synthetic_recommendation_audit.md`
+- `review-therapy-evidence` writes `therapy_evidence_review.html`, which links the preparation, therapy-research, source-report, and validation artifacts into one therapy-facing explanation surface
 
 ## Assumptions and Failure Modes
 

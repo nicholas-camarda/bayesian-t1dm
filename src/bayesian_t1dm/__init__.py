@@ -50,7 +50,7 @@ from .model import BayesianGlucoseModel, FitDiagnostics, ModelFit, ScenarioForec
 from .quality import DataQualitySummary, assess_data_quality
 from .recommend import Recommendation, RecommendationPolicy, Scenario, build_recommendation_policy, recommend_setting_changes
 from .report import build_run_summary, write_json_report, write_markdown_report
-from .review import write_coverage_review_html, write_run_review_html
+from .review import write_coverage_review_html, write_run_review_html, write_therapy_evidence_review_html
 from .therapy_research import (
     DEFAULT_SEGMENT_SPEC,
     TherapyInfraValidationResult,
@@ -62,6 +62,7 @@ from .therapy_research import (
     parse_model_list,
     parse_therapy_segments,
     run_therapy_research,
+    summarize_overnight_basal_evidence,
     validate_therapy_infra,
     write_therapy_infra_validation_artifacts,
     write_therapy_research_artifacts,
@@ -136,6 +137,7 @@ __all__ = [
     "parse_therapy_segments",
     "recommend_setting_changes",
     "run_therapy_research",
+    "summarize_overnight_basal_evidence",
     "validate_therapy_infra",
     "assess_data_quality",
     "summarize_coverage",
@@ -155,6 +157,7 @@ __all__ = [
     "write_markdown_report",
     "write_therapy_infra_validation_artifacts",
     "write_therapy_research_artifacts",
+    "write_therapy_evidence_review_html",
     "write_run_review_html",
     "write_export_manifest",
 ]

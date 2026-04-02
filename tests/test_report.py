@@ -5,12 +5,14 @@ import json
 import pandas as pd
 
 from bayesian_t1dm.evaluate import CalibrationSummary, FoldResult, WalkForwardReport
+from bayesian_t1dm.health_auto_export import ModelDataPreparationResult
 from bayesian_t1dm.ingest import TandemCoverage
 from bayesian_t1dm.model import FitDiagnostics
 from bayesian_t1dm.quality import DataQualitySummary
 from bayesian_t1dm.recommend import Recommendation, RecommendationPolicy
 from bayesian_t1dm.report import build_run_summary, write_json_report, write_markdown_report
-from bayesian_t1dm.review import write_coverage_review_html, write_run_review_html
+from bayesian_t1dm.review import write_coverage_review_html, write_run_review_html, write_therapy_evidence_review_html
+from bayesian_t1dm.therapy_research import _synthetic_base_dataset, parse_model_list, parse_therapy_segments, run_therapy_research, validate_therapy_infra
 
 
 def test_write_json_report_serializes_timestamps(tmp_path):
@@ -286,3 +288,38 @@ def test_review_html_writers_emit_expected_sections(tmp_path):
     assert "Recommendation Policy" in run_text
     assert "Recommendations were suppressed by policy." in run_text
     assert "Final Fit Diagnostics" in run_text
+
+
+def test_write_therapy_evidence_review_html_emits_expected_sections(tmp_path):
+    dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
+    preparation = ModelDataPreparationResult(
+        dataset=dataset,
+        apple_available=True,
+        apple_span_start=pd.Timestamp("2025-01-01 00:00:00"),
+        apple_span_end=pd.Timestamp("2025-01-07 23:55:00"),
+        tandem_span_before_start=pd.Timestamp("2025-01-01 00:00:00"),
+        tandem_span_before_end=pd.Timestamp("2025-01-07 23:55:00"),
+        tandem_span_after_start=pd.Timestamp("2025-01-01 00:00:00"),
+        tandem_span_after_end=pd.Timestamp("2025-01-07 23:55:00"),
+        requested_tandem_start=pd.Timestamp("2025-01-01 00:00:00"),
+        requested_tandem_end=pd.Timestamp("2025-01-07 23:55:00"),
+        overlap_start=pd.Timestamp("2025-01-01 00:00:00"),
+        overlap_end=pd.Timestamp("2025-01-07 23:55:00"),
+        final_dataset_start=pd.Timestamp("2025-01-01 00:00:00"),
+        final_dataset_end=pd.Timestamp("2025-01-07 23:55:00"),
+        final_row_count=len(dataset.frame),
+    )
+    research_result = run_therapy_research(
+        dataset,
+        segments=parse_therapy_segments(),
+        include_models=parse_model_list("ridge,segmented_ridge,tree_boost"),
+    )
+    validation_result = validate_therapy_infra(include_models=parse_model_list("ridge,segmented_ridge,tree_boost"))
+
+    out_path = write_therapy_evidence_review_html(preparation, research_result, tmp_path / "therapy_evidence_review.html", validation_result=validation_result)
+    text = out_path.read_text(encoding="utf-8")
+
+    assert "Therapy Data Timeline" in text
+    assert "Workflow Crosswalk" in text
+    assert "Overnight Basal Proof" in text
+    assert "Supporting Artifacts" in text

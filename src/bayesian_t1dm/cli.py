@@ -38,7 +38,7 @@ from .paths import ProjectPaths
 from .quality import assess_data_quality
 from .recommend import RecommendationPolicy, recommend_setting_changes
 from .report import build_run_summary, write_json_report, write_markdown_report
-from .review import write_coverage_review_html, write_run_review_html
+from .review import write_coverage_review_html, write_run_review_html, write_therapy_evidence_review_html
 from .features import FeatureFrame
 from .therapy_research import (
     parse_model_list,
@@ -115,6 +115,18 @@ def build_parser() -> argparse.ArgumentParser:
     validate_therapy.add_argument("--include-models", default=None, help="Comma-separated model families such as ridge,segmented_ridge,tree_boost,ensemble")
     validate_therapy.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
     validate_therapy.add_argument("--ic-policy", choices=["exploratory_only", "conservative", "off"], default="exploratory_only")
+
+    review_therapy = subparsers.add_parser("review-therapy-evidence", help="Build a therapy evidence report focused on identifiability and overnight basal evidence")
+    review_therapy.add_argument("--raw", default=None)
+    review_therapy.add_argument("--apple-input", default=None, help="Optional Health Auto Export parent directory")
+    review_therapy.add_argument("--report", default=None)
+    review_therapy.add_argument("--horizon", type=int, default=30)
+    review_therapy.add_argument("--segments", default=None)
+    review_therapy.add_argument("--include-models", default=None)
+    review_therapy.add_argument("--skip-backfill", action=argparse.BooleanOptionalAction, default=False)
+    review_therapy.add_argument("--env-file", default=None, help="Optional .env file with Tandem credentials")
+    review_therapy.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
+    review_therapy.add_argument("--ic-policy", choices=["exploratory_only", "conservative", "off"], default="exploratory_only")
 
     run = subparsers.add_parser("run", help="Run the full forecasting and recommendation pipeline")
     run.add_argument("--raw", default=None)
@@ -306,7 +318,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     paths = ProjectPaths.from_root(args.root).ensure()
 
-    if args.command in {"ingest", "run", "screen-health-features", "build-health-analysis-ready", "prepare-model-data", "research-therapy-settings"}:
+    if args.command in {"ingest", "run", "screen-health-features", "build-health-analysis-ready", "prepare-model-data", "research-therapy-settings", "review-therapy-evidence"}:
         args.raw = args.raw or str(paths.cloud_raw)
         if args.command == "ingest":
             args.report = args.report or str(paths.reports / "coverage.md")
@@ -319,6 +331,8 @@ def main(argv: list[str] | None = None) -> int:
             args.report = args.report or str(paths.reports / "model_data_preparation.md")
         elif args.command == "research-therapy-settings":
             args.report_dir = args.report_dir or str(paths.reports)
+        elif args.command == "review-therapy-evidence":
+            args.report = args.report or str(paths.reports / "therapy_evidence_review.html")
         elif args.command == "build-health-analysis-ready":
             args.output = args.output or str(paths.reports / "analysis_ready_health_5min.csv")
         else:
@@ -393,6 +407,29 @@ def main(argv: list[str] | None = None) -> int:
             include_models=parse_model_list(args.include_models or "ridge,segmented_ridge,tree_boost,ensemble"),
         )
         write_therapy_infra_validation_artifacts(result, args.report_dir)
+        return 0
+
+    if args.command == "review-therapy-evidence":
+        preparation = _prepare_model_data(args=args, paths=paths)
+        report_path = Path(args.report)
+        report_dir = report_path.parent
+        write_model_data_preparation_report(preparation, report_dir / "model_data_preparation.md")
+        preparation.dataset.frame.to_csv(report_dir / "prepared_model_data_5min.csv", index=False)
+        research_result = run_therapy_research(
+            preparation.dataset,
+            segments=parse_therapy_segments(args.segments),
+            include_models=parse_model_list(args.include_models),
+            meal_proxy_mode=args.meal_proxy_mode,
+            ic_policy=args.ic_policy,
+        )
+        write_therapy_research_artifacts(research_result, report_dir)
+        validation_result = validate_therapy_infra(
+            meal_proxy_mode=args.meal_proxy_mode,
+            ic_policy=args.ic_policy,
+            include_models=parse_model_list("ridge,segmented_ridge,tree_boost,ensemble"),
+        )
+        write_therapy_infra_validation_artifacts(validation_result, report_dir)
+        write_therapy_evidence_review_html(preparation, research_result, report_path, validation_result=validation_result)
         return 0
 
     if args.command == "build-health-analysis-ready":

@@ -10,6 +10,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.io import to_html
 
+from .health_auto_export import ModelDataPreparationResult
+from .therapy_research import TherapyInfraValidationResult, TherapyResearchResult, summarize_overnight_basal_evidence
+
 
 def _figure_div(figure: go.Figure, *, include_plotlyjs: bool) -> str:
     return to_html(
@@ -384,6 +387,281 @@ def write_run_review_html(summary: dict[str, Any], path: str | Path) -> Path:
         title="Bayesian T1DM Run Review",
         banner_html=_data_quality_banner(summary, recommendation_policy=recommendation_policy),
         sections=sections,
+    )
+    path.write_text(html_text, encoding="utf-8")
+    return path
+
+
+def _therapy_banner(preparation: ModelDataPreparationResult, overnight_summary: dict[str, Any]) -> str:
+    status = {
+        "identifiable": "good",
+        "weakly_identifiable": "degraded",
+        "blocked": "broken",
+    }.get(str(overnight_summary.get("status")), "degraded")
+    return (
+        f"<div class='banner {html.escape(status)}'>"
+        f"Prepared mode: <code>{html.escape(preparation.dataset.mode)}</code>. "
+        f"Overnight basal status: <code>{html.escape(str(overnight_summary.get('status') or 'unknown'))}</code>. "
+        f"Clean overnight rows: <code>{html.escape(str(overnight_summary.get('clean_rows', 0)))}</code> across "
+        f"<code>{html.escape(str(overnight_summary.get('clean_nights', 0)))}</code> nights."
+        "</div>"
+    )
+
+
+def _therapy_timeline_figure(preparation: ModelDataPreparationResult) -> go.Figure:
+    rows: list[dict[str, Any]] = []
+    for label, start, end in [
+        ("tandem_before", preparation.tandem_span_before_start, preparation.tandem_span_before_end),
+        ("tandem_after", preparation.tandem_span_after_start, preparation.tandem_span_after_end),
+        ("apple", preparation.apple_span_start, preparation.apple_span_end),
+        ("final_dataset", preparation.final_dataset_start, preparation.final_dataset_end),
+    ]:
+        if start is None or end is None:
+            continue
+        rows.append(
+            {
+                "series": label,
+                "start": pd.Timestamp(start),
+                "end": pd.Timestamp(end),
+                "label": label.replace("_", " "),
+            }
+        )
+    if not rows:
+        return go.Figure()
+    frame = pd.DataFrame(rows)
+    fig = px.timeline(frame, x_start="start", x_end="end", y="label", color="series", title="Therapy Data Timeline")
+    fig.update_yaxes(autorange="reversed", title=None)
+    fig.update_layout(margin=dict(l=20, r=20, t=50, b=20), legend_title_text="")
+    return fig
+
+
+def _overnight_trace_figure(research_result: TherapyResearchResult) -> go.Figure:
+    frame = research_result.research_frame.loc[
+        research_result.research_frame["therapy_segment"].astype(str).eq("overnight")
+    ].copy()
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce")
+    frame = frame.dropna(subset=["timestamp"]).tail(288)
+    if frame.empty:
+        return go.Figure()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=frame["timestamp"], y=frame["glucose"], name="glucose", line=dict(color="#1f2937")))
+    if "target_glucose" in frame.columns:
+        fig.add_trace(go.Scatter(x=frame["timestamp"], y=frame["target_glucose"], name="target_glucose", line=dict(color="#2563eb", dash="dot")))
+    if "basal_units_per_hour" in frame.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=frame["timestamp"],
+                y=frame["basal_units_per_hour"],
+                name="basal_units_per_hour",
+                line=dict(color="#dc2626"),
+                yaxis="y2",
+            )
+        )
+    fig.update_layout(
+        title="Recent Overnight Glucose and Basal",
+        margin=dict(l=20, r=20, t=50, b=20),
+        xaxis_title=None,
+        yaxis_title="glucose",
+        yaxis2=dict(title="basal u/hr", overlaying="y", side="right"),
+    )
+    return fig
+
+
+def _exclusion_figure(exclusions: pd.DataFrame) -> go.Figure:
+    if exclusions.empty:
+        return go.Figure()
+    fig = px.bar(exclusions, x="reason", y="count", title="Overnight Exclusion Reasons")
+    fig.update_layout(margin=dict(l=20, r=20, t=50, b=20), xaxis_title=None)
+    return fig
+
+
+def _workflow_table_html() -> str:
+    rows = [
+        ("normalize-raw", "normalize_raw_summary.md", "src/bayesian_t1dm/acquisition.py::normalize_tconnectsync_archive", "Rebuild normalized Tandem windows from archived raw payloads."),
+        ("prepare-model-data", "model_data_preparation.md + prepared_model_data_5min.csv", "src/bayesian_t1dm/cli.py::_prepare_model_data and src/bayesian_t1dm/health_auto_export.py::build_prepared_model_dataset", "Create the Tandem-aligned model dataset and record source overlap."),
+        ("research-therapy-settings", "therapy_research_gate.md + therapy_feature_audit.md", "src/bayesian_t1dm/therapy_research.py::run_therapy_research", "Build therapy contexts, gate identifiability, and compare models."),
+        ("validate-therapy-infra", "therapy_infra_validation.md", "src/bayesian_t1dm/therapy_research.py::validate_therapy_infra", "Check truth-recovery and suppression behavior on synthetic scenarios."),
+        ("review-therapy-evidence", "therapy_evidence_review.html", "src/bayesian_t1dm/review.py::write_therapy_evidence_review_html", "Explain what the system thinks is happening and why."),
+    ]
+    html_rows = [
+        "<tr><th>step</th><th>artifact</th><th>code path</th><th>purpose</th></tr>",
+        *[
+            f"<tr><td><code>{html.escape(step)}</code></td><td>{html.escape(artifact)}</td><td><code>{html.escape(code)}</code></td><td>{html.escape(purpose)}</td></tr>"
+            for step, artifact, code, purpose in rows
+        ],
+    ]
+    return "\n".join(
+        [
+            "<div class='section'>",
+            "<h2>Workflow Crosswalk</h2>",
+            "<table>",
+            "<thead>",
+            html_rows[0],
+            "</thead>",
+            "<tbody>",
+            *html_rows[1:],
+            "</tbody></table>",
+            "</div>",
+        ]
+    )
+
+
+def _parameter_gate_html(research_result: TherapyResearchResult) -> str:
+    gate = research_result.research_gate.copy()
+    if gate.empty:
+        return "<div class='section'><h2>Parameter Gate</h2><div class='empty-state'>No research gate rows were available.</div></div>"
+    rows = [
+        "<tr><th>parameter</th><th>identifiability</th><th>gate_status</th><th>source_quality_status</th><th>confounding</th></tr>"
+    ]
+    for row in gate.itertuples(index=False):
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(row.parameter))}</td>"
+            f"<td><code>{html.escape(str(row.identifiability))}</code></td>"
+            f"<td><code>{html.escape(str(row.gate_status))}</code></td>"
+            f"<td><code>{html.escape(str(row.source_quality_status))}</code></td>"
+            f"<td><code>{html.escape(str(row.closed_loop_confounding_risk))}</code></td>"
+            "</tr>"
+        )
+    return "\n".join(
+        [
+            "<div class='section'>",
+            "<h2>Parameter Gate</h2>",
+            "<table>",
+            "<thead>",
+            rows[0],
+            "</thead>",
+            "<tbody>",
+            *rows[1:],
+            "</tbody></table>",
+            "</div>",
+        ]
+    )
+
+
+def _overnight_summary_html(overnight_summary: dict[str, Any]) -> str:
+    items = [
+        ("status", overnight_summary.get("status")),
+        ("reason", overnight_summary.get("reason") or "none"),
+        ("overnight_rows", overnight_summary.get("overnight_rows")),
+        ("clean_rows", overnight_summary.get("clean_rows")),
+        ("overnight_nights", overnight_summary.get("overnight_nights")),
+        ("clean_nights", overnight_summary.get("clean_nights")),
+        ("stable_epochs", overnight_summary.get("stable_epochs")),
+        ("mean_glucose", "NA" if pd.isna(overnight_summary.get("mean_glucose")) else f"{float(overnight_summary.get('mean_glucose')):.2f}"),
+        ("mean_target_delta", "NA" if pd.isna(overnight_summary.get("mean_target_delta")) else f"{float(overnight_summary.get('mean_target_delta')):.2f}"),
+        ("expected_direction", overnight_summary.get("expected_direction") or "none"),
+    ]
+    return "\n".join(
+        [
+            "<div class='section'>",
+            "<h2>Overnight Basal Proof</h2>",
+            "<div class='card-grid'>",
+            "<div class='card'>",
+            *[f"<div><strong>{html.escape(name)}</strong>: {html.escape(str(value))}</div>" for name, value in items],
+            "</div>",
+            "<div class='card'>",
+            "<strong>Interpretation</strong>",
+            "<div class='muted'>This section answers the first proof question: do we have enough clean overnight / fasting rows, across enough nights and stable epochs, to treat overnight basal as identifiable rather than just modeled?</div>",
+            "</div>",
+            "</div>",
+            "</div>",
+        ]
+    )
+
+
+def _artifact_index_html(report_dir: Path, *, include_validation: bool) -> str:
+    artifacts = [
+        "model_data_preparation.md",
+        "prepared_model_data_5min.csv",
+        "therapy_research_gate.md",
+        "meal_proxy_audit.md",
+        "therapy_feature_audit.md",
+        "therapy_feature_registry.csv",
+        "therapy_model_comparison.md",
+        "therapy_segment_evidence.csv",
+        "therapy_recommendation_research.md",
+        "tandem_source_report_card.md",
+        "apple_source_report_card.md",
+        "source_numeric_summary.csv",
+        "source_missingness_summary.csv",
+    ]
+    if include_validation:
+        artifacts.extend(
+            [
+                "therapy_infra_validation.md",
+                "therapy_synthetic_results.csv",
+                "therapy_synthetic_recommendation_audit.md",
+            ]
+        )
+    rows = []
+    for artifact in artifacts:
+        path = report_dir / artifact
+        link_html = f"<a href=\"{html.escape(artifact)}\">open</a>" if path.exists() else ""
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(artifact)}</td>"
+            f"<td>{'yes' if path.exists() else 'no'}</td>"
+            f"<td>{link_html}</td>"
+            "</tr>"
+        )
+    return "\n".join(
+        [
+            "<div class='section'>",
+            "<h2>Supporting Artifacts</h2>",
+            "<table>",
+            "<thead><tr><th>artifact</th><th>exists</th><th>link</th></tr></thead>",
+            "<tbody>",
+            *rows,
+            "</tbody></table>",
+            "</div>",
+        ]
+    )
+
+
+def write_therapy_evidence_review_html(
+    preparation: ModelDataPreparationResult,
+    research_result: TherapyResearchResult,
+    path: str | Path,
+    *,
+    validation_result: TherapyInfraValidationResult | None = None,
+) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    overnight_summary, exclusion_counts = summarize_overnight_basal_evidence(research_result)
+    include_js = True
+    figures = []
+    for figure in [
+        _therapy_timeline_figure(preparation),
+        _overnight_trace_figure(research_result),
+        _exclusion_figure(exclusion_counts),
+    ]:
+        figures.append(_figure_div(figure, include_plotlyjs=include_js))
+        include_js = False
+    validation_card = ""
+    if validation_result is not None and not validation_result.scenario_results.empty:
+        passed = int(validation_result.scenario_results["passed"].sum())
+        total = int(len(validation_result.scenario_results))
+        validation_card = (
+            "<div class='section'><h2>Synthetic Validation</h2>"
+            f"<div class='card'><strong>{passed}/{total}</strong> validation scenarios passed. "
+            "This tests whether the therapy workflow recovers known truth and suppresses itself when it should."
+            "</div></div>"
+        )
+    sections = [
+        _workflow_table_html(),
+        _parameter_gate_html(research_result),
+        _overnight_summary_html(overnight_summary),
+        "<div class='section'><h2>Data Timeline</h2>" + figures[0] + "</div>",
+        "<div class='section'><h2>Recent Overnight Evidence</h2>" + figures[1] + "</div>",
+        "<div class='section'><h2>Overnight Exclusion Summary</h2>" + figures[2] + "</div>",
+        validation_card,
+        _artifact_index_html(path.parent, include_validation=validation_result is not None),
+    ]
+    html_text = _page_shell(
+        title="Bayesian T1DM Therapy Evidence Review",
+        banner_html=_therapy_banner(preparation, overnight_summary),
+        sections=[section for section in sections if section],
     )
     path.write_text(html_text, encoding="utf-8")
     return path

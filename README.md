@@ -4,12 +4,16 @@ Bayesian forecasting and recommendation pipeline for personal Type 1 diabetes da
 
 ## Mission
 
-This repository turns Tandem pump, CGM, and activity exports into a research-grade analysis pipeline that can:
+This repository exists to turn your personal Tandem and Apple Health data into traceable therapy-setting evidence.
 
-- forecast near-term glucose trajectories
-- quantify uncertainty and calibration
-- compare basal, bolus, and I/C ratio scenarios
-- generate human-reviewable recommendations for further review
+The near-term mission is not just to forecast glucose. It is to answer:
+
+- do the available data identify anything useful about your current settings?
+- starting with overnight / fasting basal, what appears identifiable versus blocked?
+- what evidence supports a likely direction of change?
+- where do the blockers live when the answer is still unclear?
+
+Forecasting, feature engineering, and synthetic validation support that mission, but they are not the headline goal.
 
 This is a research project and decision-support workbench, not a medical device or automated pump controller.
 
@@ -193,6 +197,13 @@ Run the synthetic therapy infrastructure validator:
 bayesian-t1dm validate-therapy-infra
 ```
 
+Build the main therapy evidence review surface:
+
+```bash
+bayesian-t1dm review-therapy-evidence --apple-input \
+  ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data
+```
+
 Materialize the Tandem-aligned 5-minute analysis-ready table:
 
 ```bash
@@ -251,13 +262,12 @@ Canonical Tandem-only fallback workflow:
 3. `bayesian-t1dm run --skip-recommendations`
 4. `bayesian-t1dm run`
 
-Canonical therapy research workflow:
+Canonical therapy evidence workflow:
 
 1. `bayesian-t1dm normalize-raw`
 2. `bayesian-t1dm prepare-model-data --apple-input ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data`
-3. `bayesian-t1dm research-therapy-settings`
-4. `bayesian-t1dm validate-therapy-infra`
-5. review `therapy_research_gate.md`, `meal_proxy_audit.md`, `therapy_model_comparison.md`, `therapy_segment_evidence.csv`, `therapy_recommendation_research.md`, and `therapy_infra_validation.md`
+3. `bayesian-t1dm review-therapy-evidence`
+4. review `therapy_evidence_review.html` first, then inspect the linked supporting artifacts if you need to go deeper
 
 What each step does:
 
@@ -268,6 +278,7 @@ What each step does:
 5. `run` performs the full modeling and recommendation pipeline. It now uses the same prepared dataset contract: Apple-enriched when Apple data exists, Tandem-only otherwise.
 6. `research-therapy-settings` runs a separate research-grade workflow for basal schedule, I/C ratio, and later sensitivity factor analysis. It starts with a methodological gate, builds strict meal-bolus proxy features when explicit carbs are absent, writes Tandem and Apple source report cards, compares candidate models, and writes human-reviewable segment-level evidence rather than auto-changing settings.
 7. `validate-therapy-infra` runs synthetic truth-recovery scenarios against the same therapy research stack so the infrastructure has to recover known therapy directions and suppress itself in corrupted or weak-identifiability cases.
+8. `review-therapy-evidence` orchestrates the current therapy-facing workflow and writes an interactive HTML review page focused on overnight basal identifiability, evidence quality, exclusion reasons, supporting artifacts, and code-path traceability.
 
 Recommended recipes:
 
@@ -350,9 +361,19 @@ Default runtime review artifacts:
 - `health_feature_scores.csv`
 - `therapy_feature_audit.md`
 - `therapy_feature_registry.csv`
+- `therapy_research_gate.md`
+- `meal_proxy_audit.md`
 - `therapy_model_comparison.md`
 - `therapy_segment_evidence.csv`
 - `therapy_recommendation_research.md`
+- `tandem_source_report_card.md`
+- `apple_source_report_card.md`
+- `source_numeric_summary.csv`
+- `source_missingness_summary.csv`
+- `therapy_infra_validation.md`
+- `therapy_synthetic_results.csv`
+- `therapy_synthetic_recommendation_audit.md`
+- `therapy_evidence_review.html`
 - `run_summary.md`
 - `run_summary.json`
 - `run_review.html`
@@ -374,7 +395,8 @@ Treat predictive discrimination, interval calibration, and recommendation confid
 - `--skip-recommendations` is the preferred fast path for real-data validation.
 - incomplete source windows remain reviewable, but they suppress recommendations by policy.
 - `run_summary.json` includes fit diagnostics and recommendation-policy status.
-- `coverage_review.html` and `run_review.html` are the primary visual inspection artifacts for active-pipeline review.
+- `therapy_evidence_review.html` is the primary therapy-facing visual review artifact.
+- `coverage_review.html` and `run_review.html` remain the primary operational review artifacts for raw coverage and forecasting behavior.
 - recommendation records include `confidence` and `flags` so low-signal cases are explicit in machine-readable output.
 - An empty recommendation list can mean no scenario cleared the gain threshold, or that recommendations were intentionally suppressed or skipped.
 

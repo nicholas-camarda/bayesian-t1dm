@@ -69,11 +69,18 @@ Supported collection path:
 
 ## Quickstart
 
-1. Create a virtual environment and install the package:
+1. Create and activate the Conda environment:
 
 ```bash
-python3 -m venv bayesian-t1dm
-source bayesian-t1dm/bin/activate
+conda env create -f environment.yml
+conda activate bt1dm
+```
+
+This environment file installs the package in editable dev mode. If you prefer to create it manually instead of using [`environment.yml`](./environment.yml):
+
+```bash
+conda create -n bt1dm python=3.11
+conda activate bt1dm
 python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
 ```

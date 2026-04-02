@@ -2047,6 +2047,80 @@ def write_therapy_infra_validation_artifacts(result: TherapyInfraValidationResul
     return paths
 
 
+def summarize_overnight_basal_evidence(result: TherapyResearchResult) -> tuple[dict[str, Any], pd.DataFrame]:
+    frame = result.research_frame.copy()
+    if frame.empty or "therapy_segment" not in frame.columns:
+        summary = {
+            "status": "blocked",
+            "reason": "no_research_frame",
+            "overnight_rows": 0,
+            "clean_rows": 0,
+            "overnight_nights": 0,
+            "clean_nights": 0,
+            "stable_epochs": 0,
+            "mean_glucose": np.nan,
+            "mean_target_delta": np.nan,
+            "expected_direction": "",
+        }
+        return summary, pd.DataFrame(columns=["reason", "count"])
+
+    overnight = frame.loc[frame["therapy_segment"].astype(str).eq("overnight")].copy()
+    if overnight.empty:
+        summary = {
+            "status": "blocked",
+            "reason": "no_overnight_rows",
+            "overnight_rows": 0,
+            "clean_rows": 0,
+            "overnight_nights": 0,
+            "clean_nights": 0,
+            "stable_epochs": 0,
+            "mean_glucose": np.nan,
+            "mean_target_delta": np.nan,
+            "expected_direction": "",
+        }
+        return summary, pd.DataFrame(columns=["reason", "count"])
+
+    overnight["date"] = pd.to_datetime(overnight["timestamp"], errors="coerce").dt.normalize()
+    clean_mask = overnight.get("basal_context", pd.Series(0, index=overnight.index)).fillna(0).astype(int).eq(1)
+    clean = overnight.loc[clean_mask].copy()
+    exclusion_counts = pd.DataFrame(
+        [
+            {"reason": "recent_meal_or_proxy", "count": int(overnight.get("recent_meal_120m", pd.Series(0, index=overnight.index)).fillna(0).astype(int).sum())},
+            {"reason": "recent_bolus_or_iob", "count": int(overnight.get("recent_bolus_120m", pd.Series(0, index=overnight.index)).fillna(0).astype(int).sum())},
+            {"reason": "recent_exercise", "count": int(overnight.get("recent_exercise_context", pd.Series(0, index=overnight.index)).fillna(0).astype(int).sum())},
+            {"reason": "closed_loop_or_transition", "count": int(overnight.get("closed_loop_confounding_flag", pd.Series(0, index=overnight.index)).fillna(0).astype(int).sum())},
+            {"reason": "missing_cgm", "count": int(pd.to_numeric(overnight.get("missing_cgm", pd.Series(0, index=overnight.index)), errors="coerce").fillna(0.0).gt(0).sum())},
+        ]
+    )
+    rec = result.recommendations.loc[
+        result.recommendations["parameter"].eq("basal")
+        & result.recommendations["segment"].eq("overnight")
+    ].head(1)
+    expected_direction = "" if rec.empty else str(rec.iloc[0].get("expected_direction") or "")
+    reason = ""
+    status = "blocked"
+    if len(clean) >= 72 and int(clean["date"].nunique()) >= 3 and int(pd.to_numeric(clean.get("therapy_stable_epoch"), errors="coerce").nunique()) >= 2:
+        status = "identifiable"
+    elif len(clean) >= 36 and int(clean["date"].nunique()) >= 2:
+        status = "weakly_identifiable"
+        reason = "limited_clean_overnight_windows"
+    else:
+        reason = "insufficient_clean_overnight_windows"
+    summary = {
+        "status": status,
+        "reason": reason,
+        "overnight_rows": int(len(overnight)),
+        "clean_rows": int(len(clean)),
+        "overnight_nights": int(overnight["date"].nunique()),
+        "clean_nights": int(clean["date"].nunique()) if not clean.empty else 0,
+        "stable_epochs": int(pd.to_numeric(clean.get("therapy_stable_epoch"), errors="coerce").nunique()) if not clean.empty else 0,
+        "mean_glucose": float(pd.to_numeric(clean.get("glucose"), errors="coerce").mean()) if not clean.empty else float("nan"),
+        "mean_target_delta": float(pd.to_numeric(clean.get(TARGET_DELTA_COLUMN), errors="coerce").mean()) if not clean.empty else float("nan"),
+        "expected_direction": expected_direction,
+    }
+    return summary, exclusion_counts
+
+
 __all__ = [
     "DEFAULT_SEGMENT_SPEC",
     "TherapyInfraValidationResult",
@@ -2058,6 +2132,7 @@ __all__ = [
     "parse_model_list",
     "parse_therapy_segments",
     "run_therapy_research",
+    "summarize_overnight_basal_evidence",
     "validate_therapy_infra",
     "write_therapy_infra_validation_artifacts",
     "write_therapy_research_artifacts",
