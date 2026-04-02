@@ -14,6 +14,11 @@ from bayesian_t1dm.health_auto_export import ModelDataPreparationResult
 from bayesian_t1dm.therapy_research import _synthetic_base_dataset
 
 
+def _latest_log_dir(runtime_root: Path, command: str) -> Path:
+    latest = json.loads((runtime_root / "output" / "logs" / command / "latest.json").read_text(encoding="utf-8"))
+    return Path(latest["run_dir"])
+
+
 def _write_tandem_cgm_export(raw_dir: Path, *, start: str = "2025-05-24 00:00:00", periods: int = 288) -> Path:
     workbook = raw_dir / "therapy_events_2025-05.xlsx"
     frame = pd.DataFrame(
@@ -149,6 +154,40 @@ def test_collect_command_uses_api_client_by_default(tmp_path, monkeypatch):
     assert (client.workspace.reports / "tandem_acquisition_summary.md").exists()
 
 
+def test_collect_command_writes_redacted_run_logs(tmp_path, monkeypatch):
+    workspace_root = tmp_path / "repo"
+    workspace_root.mkdir()
+    monkeypatch.setenv("TANDEM_SOURCE_EMAIL", "me@example.com")
+    monkeypatch.setenv("TANDEM_SOURCE_PASSWORD", "secret")
+    monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(tmp_path / "cloud"))
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
+    monkeypatch.setattr(cli, "TConnectSyncSourceClient", lambda paths, **kwargs: _FakeApiClient(paths, **kwargs))
+
+    exit_code = main(
+        [
+            "--root",
+            str(workspace_root),
+            "collect",
+            "--start-date",
+            "2024-01-01",
+            "--end-date",
+            "2024-01-01",
+        ]
+    )
+
+    assert exit_code == 0
+    run_dir = _latest_log_dir(runtime_root, "collect")
+    events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    event_names = {event["event"] for event in events}
+    assert "login.start" in event_names
+    assert "window.complete" in event_names
+    login_start = next(event for event in events if event["event"] == "login.start")
+    assert login_start["fields"]["email"] == "[REDACTED]"
+    assert (run_dir / "run.log").exists()
+    assert (run_dir / "run_meta.json").exists()
+
+
 def test_backfill_command_continues_on_partial_window(tmp_path, monkeypatch):
     workspace_root = tmp_path / "repo"
     workspace_root.mkdir()
@@ -277,6 +316,10 @@ def test_run_skip_recommendations_writes_skipped_policy(tmp_path, tandem_fixture
     assert (tmp_path / "runtime" / "output" / "run_review.html").exists()
     report_text = (tmp_path / "runtime" / "output" / "run_summary.md").read_text(encoding="utf-8")
     assert "[run_review_html](run_review.html)" in report_text
+    run_dir = _latest_log_dir(tmp_path / "runtime", "run")
+    events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert any(event["event"] == "command.stage.start" and event["stage"] == "run.walk_forward" for event in events)
+    assert any(event["event"] == "command.complete" and event["status"] == "success" for event in events)
 
 
 def test_prepare_model_data_without_apple_writes_tandem_only_dataset(tmp_path, monkeypatch):
@@ -405,7 +448,7 @@ def test_review_therapy_evidence_command_writes_report_and_supporting_artifacts(
         final_dataset_end=pd.Timestamp("2025-01-07 23:55:00"),
         final_row_count=len(dataset.frame),
     )
-    monkeypatch.setattr(cli, "_prepare_model_data", lambda args, paths: preparation)
+    monkeypatch.setattr(cli, "_prepare_model_data", lambda args, paths, session=None: preparation)
 
     report = tmp_path / "therapy_evidence_review.html"
     exit_code = main(
@@ -425,3 +468,32 @@ def test_review_therapy_evidence_command_writes_report_and_supporting_artifacts(
     assert (tmp_path / "model_data_preparation.md").exists()
     assert (tmp_path / "therapy_research_gate.md").exists()
     assert (tmp_path / "therapy_infra_validation.md").exists()
+
+
+def test_ingest_failure_is_logged(tmp_path, tandem_fixture_dir, monkeypatch):
+    workspace_root = tmp_path / "repo"
+    workspace_root.mkdir()
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(tmp_path / "cloud"))
+    monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
+    monkeypatch.setattr(cli, "load_tandem_exports", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    try:
+        main(
+            [
+                "--root",
+                str(workspace_root),
+                "ingest",
+                "--raw",
+                str(tandem_fixture_dir),
+            ]
+        )
+    except RuntimeError as exc:
+        assert str(exc) == "boom"
+    else:
+        raise AssertionError("expected ingest to fail")
+
+    run_dir = _latest_log_dir(runtime_root, "ingest")
+    events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert any(event["event"] == "command.error" and event["fields"]["error_type"] == "RuntimeError" for event in events)
+    assert any(event["event"] == "command.complete" and event["status"] == "failed" for event in events)

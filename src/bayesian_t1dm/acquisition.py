@@ -15,6 +15,7 @@ import pandas as pd
 
 from .io import read_table
 from .ingest import IngestedData, build_export_manifest, load_tandem_exports, summarize_export_manifest
+from .observability import sanitize_fields
 from .paths import ProjectPaths
 from .quality import REQUIRED_WINDOW_KINDS, build_window_quality_row
 
@@ -141,18 +142,37 @@ class TandemSourceClient(Protocol):
 
 
 class StepLogger:
-    def __init__(self, path: str | Path) -> None:
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        *,
+        session: Any | None = None,
+        stage: str = "acquisition",
+    ) -> None:
+        self.path = None if path is None else Path(path)
+        self.session = session
+        self.stage = stage
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def write(self, event: str, **fields: object) -> None:
+        sanitized_fields = sanitize_fields(fields)
         record = {
             'timestamp': datetime.now(UTC).isoformat(timespec='seconds').replace('+00:00', 'Z'),
             'event': event,
-            **fields,
+            **sanitized_fields,
         }
-        with self.path.open('a', encoding='utf-8') as handle:
-            handle.write(json.dumps(record, default=str) + '\n')
+        if self.path is not None:
+            with self.path.open('a', encoding='utf-8') as handle:
+                handle.write(json.dumps(record, default=str) + '\n')
+        if self.session is not None:
+            self.session.log_event(
+                event,
+                logger_name="bayesian_t1dm.acquisition",
+                stage=self.stage,
+                message=event,
+                **sanitized_fields,
+            )
 
 
 def load_local_env_file(path: str | Path) -> dict[str, str]:

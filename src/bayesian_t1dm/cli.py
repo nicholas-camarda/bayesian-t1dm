@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from datetime import date, timedelta
 from pathlib import Path
+import sys
 
 import pandas as pd
 
@@ -34,6 +35,7 @@ from .health_auto_export import (
 )
 from .ingest import build_export_manifest, load_tandem_exports, summarize_coverage, summarize_tandem_raw_dir, write_export_manifest
 from .model import BayesianGlucoseModel
+from .observability import LoggingSession, setup_run_logging
 from .paths import ProjectPaths
 from .quality import assess_data_quality
 from .recommend import RecommendationPolicy, recommend_setting_changes
@@ -51,30 +53,38 @@ from .therapy_research import (
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="bayesian-t1dm")
+    logging_parent = argparse.ArgumentParser(add_help=False)
+    logging_parent.add_argument("--log-level", choices=["ERROR", "WARNING", "INFO", "DEBUG"], default="INFO")
+    logging_parent.add_argument("--quiet", action=argparse.BooleanOptionalAction, default=False)
+    logging_parent.add_argument("--unsafe-debug-logging", action=argparse.BooleanOptionalAction, default=False)
+
+    parser = argparse.ArgumentParser(prog="bayesian-t1dm", parents=[logging_parent])
     parser.add_argument("--root", default=".", help="Project root")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    ingest = subparsers.add_parser("ingest", help="Load Tandem exports and write a coverage report")
+    def add_command(name: str, help_text: str) -> argparse.ArgumentParser:
+        return subparsers.add_parser(name, help=help_text, parents=[logging_parent])
+
+    ingest = add_command("ingest", "Load Tandem exports and write a coverage report")
     ingest.add_argument("--raw", default=None)
     ingest.add_argument("--report", default=None)
     ingest.add_argument("--manifest", default=None)
 
-    normalize_raw = subparsers.add_parser("normalize-raw", help="Rebuild normalized tconnectsync windows from archived raw payloads")
+    normalize_raw = add_command("normalize-raw", "Rebuild normalized tconnectsync windows from archived raw payloads")
     normalize_raw.add_argument("--raw", default=None)
     normalize_raw.add_argument("--window-id", default=None)
     normalize_raw.add_argument("--force", action=argparse.BooleanOptionalAction, default=False)
     normalize_raw.add_argument("--report", default=None)
     normalize_raw.add_argument("--manifest", default=None)
 
-    validate_raw = subparsers.add_parser("validate-raw", help="Classify Tandem raw files as dense CGM or summary-only")
+    validate_raw = add_command("validate-raw", "Classify Tandem raw files as dense CGM or summary-only")
     validate_raw.add_argument("--raw", default=None)
     validate_raw.add_argument("--report", default=None)
 
-    import_health = subparsers.add_parser("import-health-auto-export", help="Archive and normalize a Health Auto Export JSON bundle")
+    import_health = add_command("import-health-auto-export", "Archive and normalize a Health Auto Export JSON bundle")
     import_health.add_argument("--input", required=True, help="Path to the exported Health Auto Export directory")
 
-    prepare_model = subparsers.add_parser("prepare-model-data", help="Prepare the best available model dataset with optional Apple Health enrichment")
+    prepare_model = add_command("prepare-model-data", "Prepare the best available model dataset with optional Apple Health enrichment")
     prepare_model.add_argument("--raw", default=None)
     prepare_model.add_argument("--apple-input", default=None, help="Optional Health Auto Export parent directory")
     prepare_model.add_argument("--output", default=None)
@@ -85,18 +95,18 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_model.add_argument("--skip-backfill", action=argparse.BooleanOptionalAction, default=False)
     prepare_model.add_argument("--env-file", default=None, help="Optional .env file with Tandem credentials")
 
-    analysis_ready = subparsers.add_parser("build-health-analysis-ready", help="Build a Tandem-aligned 5-minute analysis-ready dataset with unified Apple Health context")
+    analysis_ready = add_command("build-health-analysis-ready", "Build a Tandem-aligned 5-minute analysis-ready dataset with unified Apple Health context")
     analysis_ready.add_argument("--raw", default=None)
     analysis_ready.add_argument("--output", default=None)
     analysis_ready.add_argument("--horizon", type=int, default=30)
 
-    screen_health = subparsers.add_parser("screen-health-features", help="Screen imported Apple Health context features against Tandem glucose targets")
+    screen_health = add_command("screen-health-features", "Screen imported Apple Health context features against Tandem glucose targets")
     screen_health.add_argument("--raw", default=None)
     screen_health.add_argument("--report", default=None)
     screen_health.add_argument("--scores", default=None)
     screen_health.add_argument("--horizon", type=int, default=30)
 
-    research_therapy = subparsers.add_parser("research-therapy-settings", help="Run research-grade therapy setting analysis on prepared Tandem and Apple Health data")
+    research_therapy = add_command("research-therapy-settings", "Run research-grade therapy setting analysis on prepared Tandem and Apple Health data")
     research_therapy.add_argument("--raw", default=None)
     research_therapy.add_argument("--apple-input", default=None, help="Optional Health Auto Export parent directory")
     research_therapy.add_argument("--horizon", type=int, default=30)
@@ -110,13 +120,13 @@ def build_parser() -> argparse.ArgumentParser:
     research_therapy.add_argument("--write-source-report-cards", action=argparse.BooleanOptionalAction, default=True)
     research_therapy.add_argument("--write-research-gate", action=argparse.BooleanOptionalAction, default=True)
 
-    validate_therapy = subparsers.add_parser("validate-therapy-infra", help="Run synthetic truth-recovery validation for the therapy research infrastructure")
+    validate_therapy = add_command("validate-therapy-infra", "Run synthetic truth-recovery validation for the therapy research infrastructure")
     validate_therapy.add_argument("--report-dir", default=None)
     validate_therapy.add_argument("--include-models", default=None, help="Comma-separated model families such as ridge,segmented_ridge,tree_boost,ensemble")
     validate_therapy.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
     validate_therapy.add_argument("--ic-policy", choices=["exploratory_only", "conservative", "off"], default="exploratory_only")
 
-    review_therapy = subparsers.add_parser("review-therapy-evidence", help="Build a therapy evidence report focused on identifiability and overnight basal evidence")
+    review_therapy = add_command("review-therapy-evidence", "Build a therapy evidence report focused on identifiability and overnight basal evidence")
     review_therapy.add_argument("--raw", default=None)
     review_therapy.add_argument("--apple-input", default=None, help="Optional Health Auto Export parent directory")
     review_therapy.add_argument("--report", default=None)
@@ -128,7 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
     review_therapy.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
     review_therapy.add_argument("--ic-policy", choices=["exploratory_only", "conservative", "off"], default="exploratory_only")
 
-    run = subparsers.add_parser("run", help="Run the full forecasting and recommendation pipeline")
+    run = add_command("run", "Run the full forecasting and recommendation pipeline")
     run.add_argument("--raw", default=None)
     run.add_argument("--report", default=None)
     run.add_argument("--manifest", default=None)
@@ -141,7 +151,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-treedepth", type=int, default=12)
     run.add_argument("--skip-recommendations", action=argparse.BooleanOptionalAction, default=False)
 
-    collect = subparsers.add_parser("collect", help="Fetch one Tandem Source window through tconnectsync")
+    collect = add_command("collect", "Fetch one Tandem Source window through tconnectsync")
     collect.add_argument("--start-date", default=None, help="Requested window start date (YYYY-MM-DD)")
     collect.add_argument("--end-date", default=None, help="Requested window end date (YYYY-MM-DD)")
     collect.add_argument("--manifest", default=None)
@@ -149,7 +159,7 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--env-file", default=None, help="Optional .env file with Tandem credentials")
     collect.add_argument("--strict", action=argparse.BooleanOptionalAction, default=True)
 
-    backfill = subparsers.add_parser("backfill", help="Backfill Tandem Source windows through tconnectsync")
+    backfill = add_command("backfill", "Backfill Tandem Source windows through tconnectsync")
     backfill.add_argument("--start-date", required=True, help="Earliest requested date (YYYY-MM-DD)")
     backfill.add_argument("--end-date", required=True, help="Latest requested date (YYYY-MM-DD)")
     backfill.add_argument("--window-days", type=int, default=30)
@@ -186,6 +196,7 @@ def _prepare_model_data(
     *,
     args,
     paths: ProjectPaths,
+    session: LoggingSession | None = None,
 ) -> ModelDataPreparationResult:
     warnings_list: list[str] = []
     raw_root = Path(args.raw)
@@ -254,6 +265,7 @@ def _prepare_model_data(
                     report_path=str(paths.reports / "tandem_acquisition_summary.md"),
                     resume=True,
                     strict=False,
+                    step_log=StepLogger(session=session) if session is not None else None,
                 )
             backfill_status = "completed"
         except AcquisitionError as exc:
@@ -313,11 +325,7 @@ def _prepare_model_data(
     )
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    paths = ProjectPaths.from_root(args.root).ensure()
-
+def _apply_command_defaults(args: argparse.Namespace, paths: ProjectPaths) -> None:
     if args.command in {"ingest", "run", "screen-health-features", "build-health-analysis-ready", "prepare-model-data", "research-therapy-settings", "review-therapy-evidence"}:
         args.raw = args.raw or str(paths.cloud_raw)
         if args.command == "ingest":
@@ -345,141 +353,174 @@ def main(argv: list[str] | None = None) -> int:
         args.report = args.report or str(paths.reports / "normalize_raw_summary.md")
         args.manifest = args.manifest or str(paths.cloud_raw / "tandem_export_manifest.csv")
 
+
+def _dispatch_command(
+    *,
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    paths: ProjectPaths,
+    session: LoggingSession,
+) -> int:
     if args.command == "ingest":
-        data = load_tandem_exports(args.raw, include_health_auto_export=True)
-        export_manifest = build_export_manifest(data)
-        write_export_manifest(export_manifest, args.manifest)
-        coverage = summarize_coverage(data)
-        data_quality, quality_rows = assess_data_quality(args.raw, export_manifest=export_manifest)
+        with session.stage("ingest.load_data", raw=args.raw):
+            data = load_tandem_exports(args.raw, include_health_auto_export=True)
+        with session.stage("ingest.manifest", manifest_path=args.manifest):
+            export_manifest = build_export_manifest(data)
+            write_export_manifest(export_manifest, args.manifest)
+        with session.stage("ingest.coverage", report_path=args.report):
+            coverage = summarize_coverage(data)
+            data_quality, quality_rows = assess_data_quality(args.raw, export_manifest=export_manifest)
         review_path = str(Path(args.report).with_name("coverage_review.html"))
-        summary = build_run_summary(
-            coverage=coverage,
-            data_quality=data_quality,
-            review_artifacts={"coverage_review_html": review_path},
-        )
-        write_markdown_report(summary, args.report)
-        write_coverage_review_html(summary, quality_rows, review_path)
+        with session.stage("ingest.reporting", report_path=args.report, review_path=review_path):
+            summary = build_run_summary(
+                coverage=coverage,
+                data_quality=data_quality,
+                review_artifacts={"coverage_review_html": review_path},
+            )
+            write_markdown_report(summary, args.report)
+            write_coverage_review_html(summary, quality_rows, review_path)
         return 0
 
     if args.command == "normalize-raw":
-        normalize_tconnectsync_archive(
-            paths,
-            raw_root=args.raw,
-            window_id=args.window_id,
-            force=args.force,
-            report_path=args.report,
-            manifest_path=args.manifest,
-        )
+        with session.stage("normalize_raw.rebuild", raw_root=args.raw, report_path=args.report):
+            normalize_tconnectsync_archive(
+                paths,
+                raw_root=args.raw,
+                window_id=args.window_id,
+                force=args.force,
+                report_path=args.report,
+                manifest_path=args.manifest,
+            )
         return 0
 
     if args.command == "import-health-auto-export":
-        import_health_auto_export_batch(args.input, paths.ensure())
+        with session.stage("health.import", input_path=args.input):
+            import_health_auto_export_batch(args.input, paths.ensure())
         return 0
 
     if args.command == "prepare-model-data":
-        preparation = _prepare_model_data(args=args, paths=paths)
-        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-        preparation.dataset.frame.to_csv(args.output, index=False)
-        write_model_data_preparation_report(preparation, args.report)
+        with session.stage("prepare_model_data.build", output_path=args.output):
+            preparation = _prepare_model_data(args=args, paths=paths, session=session)
+        with session.stage("prepare_model_data.write", output_path=args.output, report_path=args.report):
+            Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+            preparation.dataset.frame.to_csv(args.output, index=False)
+            write_model_data_preparation_report(preparation, args.report)
         return 0
 
     if args.command == "research-therapy-settings":
-        preparation = _prepare_model_data(args=args, paths=paths)
-        result = run_therapy_research(
-            preparation.dataset,
-            segments=parse_therapy_segments(args.segments),
-            include_models=parse_model_list(args.include_models),
-            meal_proxy_mode=args.meal_proxy_mode,
-            ic_policy=args.ic_policy,
-        )
-        write_therapy_research_artifacts(
-            result,
-            args.report_dir,
-            write_source_report_cards=args.write_source_report_cards,
-            write_research_gate=args.write_research_gate,
-        )
+        with session.stage("therapy.prepare_data", report_dir=args.report_dir):
+            preparation = _prepare_model_data(args=args, paths=paths, session=session)
+        with session.stage("therapy.research", report_dir=args.report_dir):
+            result = run_therapy_research(
+                preparation.dataset,
+                segments=parse_therapy_segments(args.segments),
+                include_models=parse_model_list(args.include_models),
+                meal_proxy_mode=args.meal_proxy_mode,
+                ic_policy=args.ic_policy,
+            )
+        with session.stage("therapy.write_artifacts", report_dir=args.report_dir):
+            write_therapy_research_artifacts(
+                result,
+                args.report_dir,
+                write_source_report_cards=args.write_source_report_cards,
+                write_research_gate=args.write_research_gate,
+            )
         return 0
 
     if args.command == "validate-therapy-infra":
-        result = validate_therapy_infra(
-            meal_proxy_mode=args.meal_proxy_mode,
-            ic_policy=args.ic_policy,
-            include_models=parse_model_list(args.include_models or "ridge,segmented_ridge,tree_boost,ensemble"),
-        )
-        write_therapy_infra_validation_artifacts(result, args.report_dir)
+        with session.stage("therapy.validate_infra", report_dir=args.report_dir):
+            result = validate_therapy_infra(
+                meal_proxy_mode=args.meal_proxy_mode,
+                ic_policy=args.ic_policy,
+                include_models=parse_model_list(args.include_models or "ridge,segmented_ridge,tree_boost,ensemble"),
+            )
+            write_therapy_infra_validation_artifacts(result, args.report_dir)
         return 0
 
     if args.command == "review-therapy-evidence":
-        preparation = _prepare_model_data(args=args, paths=paths)
+        with session.stage("therapy.prepare_data", report_path=args.report):
+            preparation = _prepare_model_data(args=args, paths=paths, session=session)
         report_path = Path(args.report)
         report_dir = report_path.parent
-        write_model_data_preparation_report(preparation, report_dir / "model_data_preparation.md")
-        preparation.dataset.frame.to_csv(report_dir / "prepared_model_data_5min.csv", index=False)
-        research_result = run_therapy_research(
-            preparation.dataset,
-            segments=parse_therapy_segments(args.segments),
-            include_models=parse_model_list(args.include_models),
-            meal_proxy_mode=args.meal_proxy_mode,
-            ic_policy=args.ic_policy,
-        )
-        write_therapy_research_artifacts(research_result, report_dir)
-        validation_result = validate_therapy_infra(
-            meal_proxy_mode=args.meal_proxy_mode,
-            ic_policy=args.ic_policy,
-            include_models=parse_model_list("ridge,segmented_ridge,tree_boost,ensemble"),
-        )
-        write_therapy_infra_validation_artifacts(validation_result, report_dir)
-        write_therapy_evidence_review_html(preparation, research_result, report_path, validation_result=validation_result)
+        with session.stage("therapy.research", report_dir=str(report_dir)):
+            research_result = run_therapy_research(
+                preparation.dataset,
+                segments=parse_therapy_segments(args.segments),
+                include_models=parse_model_list(args.include_models),
+                meal_proxy_mode=args.meal_proxy_mode,
+                ic_policy=args.ic_policy,
+            )
+        with session.stage("therapy.validation", report_dir=str(report_dir)):
+            validation_result = validate_therapy_infra(
+                meal_proxy_mode=args.meal_proxy_mode,
+                ic_policy=args.ic_policy,
+                include_models=parse_model_list("ridge,segmented_ridge,tree_boost,ensemble"),
+            )
+        with session.stage("therapy.write_review", report_path=args.report):
+            write_model_data_preparation_report(preparation, report_dir / "model_data_preparation.md")
+            preparation.dataset.frame.to_csv(report_dir / "prepared_model_data_5min.csv", index=False)
+            write_therapy_research_artifacts(research_result, report_dir)
+            write_therapy_infra_validation_artifacts(validation_result, report_dir)
+            write_therapy_evidence_review_html(preparation, research_result, report_path, validation_result=validation_result)
         return 0
 
     if args.command == "build-health-analysis-ready":
-        tandem_data = load_tandem_exports(args.raw, include_health_auto_export=False)
-        health_data = load_tandem_exports(args.raw, include_health_auto_export=True)
-        analysis_ready = build_prepared_model_dataset(
-            tandem_data=tandem_data,
-            health_data=health_data,
-            config=FeatureConfig(horizon_minutes=args.horizon),
-        )
-        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-        analysis_ready.frame.to_csv(args.output, index=False)
+        with session.stage("analysis_ready.load_data", raw=args.raw):
+            tandem_data = load_tandem_exports(args.raw, include_health_auto_export=False)
+            health_data = load_tandem_exports(args.raw, include_health_auto_export=True)
+        with session.stage("analysis_ready.build", output_path=args.output):
+            analysis_ready = build_prepared_model_dataset(
+                tandem_data=tandem_data,
+                health_data=health_data,
+                config=FeatureConfig(horizon_minutes=args.horizon),
+            )
+        with session.stage("analysis_ready.write", output_path=args.output):
+            Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+            analysis_ready.frame.to_csv(args.output, index=False)
         return 0
 
     if args.command == "screen-health-features":
-        tandem_data = load_tandem_exports(args.raw, include_health_auto_export=False)
-        health_data = load_tandem_exports(args.raw, include_health_auto_export=True)
-        screening = screen_health_features(tandem_data=tandem_data, health_data=health_data, horizon_minutes=args.horizon)
-        Path(args.scores).parent.mkdir(parents=True, exist_ok=True)
-        screening.scores.to_csv(args.scores, index=False)
-        write_health_screening_report(screening, args.report)
+        with session.stage("health_screen.load_data", raw=args.raw):
+            tandem_data = load_tandem_exports(args.raw, include_health_auto_export=False)
+            health_data = load_tandem_exports(args.raw, include_health_auto_export=True)
+        with session.stage("health_screen.score", report_path=args.report):
+            screening = screen_health_features(tandem_data=tandem_data, health_data=health_data, horizon_minutes=args.horizon)
+        with session.stage("health_screen.write", report_path=args.report, scores_path=args.scores):
+            Path(args.scores).parent.mkdir(parents=True, exist_ok=True)
+            screening.scores.to_csv(args.scores, index=False)
+            write_health_screening_report(screening, args.report)
         return 0
 
     if args.command == "run":
-        tandem_data = load_tandem_exports(args.raw, include_health_auto_export=False)
-        data = load_tandem_exports(args.raw, include_health_auto_export=True)
-        prepared = build_prepared_model_dataset(
-            tandem_data=tandem_data,
-            health_data=data,
-            config=FeatureConfig(horizon_minutes=args.horizon),
-        )
-        feature_frame = _build_feature_frame_from_prepared(prepared)
-        export_manifest = build_export_manifest(data)
-        write_export_manifest(export_manifest, args.manifest)
-        coverage = summarize_coverage(data)
-        data_quality, quality_rows = assess_data_quality(args.raw, export_manifest=export_manifest)
+        with session.stage("run.load_data", raw=args.raw):
+            tandem_data = load_tandem_exports(args.raw, include_health_auto_export=False)
+            data = load_tandem_exports(args.raw, include_health_auto_export=True)
+            prepared = build_prepared_model_dataset(
+                tandem_data=tandem_data,
+                health_data=data,
+                config=FeatureConfig(horizon_minutes=args.horizon),
+            )
+            feature_frame = _build_feature_frame_from_prepared(prepared)
+        with session.stage("run.assess_inputs", manifest_path=args.manifest):
+            export_manifest = build_export_manifest(data)
+            write_export_manifest(export_manifest, args.manifest)
+            coverage = summarize_coverage(data)
+            data_quality, quality_rows = assess_data_quality(args.raw, export_manifest=export_manifest)
         if args.chains < 2:
             warnings.warn(
                 f"--chains={args.chains} may produce unreliable diagnostics; use at least 2 chains for MCMC.",
                 UserWarning,
                 stacklevel=2,
             )
-        model = BayesianGlucoseModel(
-            draws=args.draws,
-            tune=args.tune,
-            chains=args.chains,
-            target_accept=args.target_accept,
-            max_treedepth=args.max_treedepth,
-        )
-        walk_forward = run_walk_forward(feature_frame, model, n_folds=args.eval_folds)
+        with session.stage("run.walk_forward", eval_folds=args.eval_folds):
+            model = BayesianGlucoseModel(
+                draws=args.draws,
+                tune=args.tune,
+                chains=args.chains,
+                target_accept=args.target_accept,
+                max_treedepth=args.max_treedepth,
+            )
+            walk_forward = run_walk_forward(feature_frame, model, n_folds=args.eval_folds)
         fit_diagnostics = None
         recommendations = []
         if args.skip_recommendations:
@@ -491,79 +532,83 @@ def main(argv: list[str] | None = None) -> int:
                 signal_passed=False,
             )
         else:
-            fit = model.fit(feature_frame)
-            fit_diagnostics = fit.diagnostics
-            recommendations, _, recommendation_policy = recommend_setting_changes(
-                model,
-                fit,
-                feature_frame.frame,
-                walk_forward=walk_forward,
-                data_quality=data_quality,
-                carbs_present=not data.carbs.empty,
-                activity_present=not data.activity.empty,
-            )
+            with session.stage("run.recommendations", skip_recommendations=args.skip_recommendations):
+                fit = model.fit(feature_frame)
+                fit_diagnostics = fit.diagnostics
+                recommendations, _, recommendation_policy = recommend_setting_changes(
+                    model,
+                    fit,
+                    feature_frame.frame,
+                    walk_forward=walk_forward,
+                    data_quality=data_quality,
+                    carbs_present=not data.carbs.empty,
+                    activity_present=not data.activity.empty,
+                )
         review_path = str(Path(args.report).with_name("run_review.html"))
-        summary = build_run_summary(
-            coverage=coverage,
-            walk_forward=walk_forward,
-            recommendations=recommendations,
-            fit_diagnostics=fit_diagnostics,
-            data_quality=data_quality,
-            recommendation_policy=recommendation_policy,
-            review_artifacts={"run_review_html": review_path},
-        )
-        write_markdown_report(summary, args.report)
-        json_path = Path(args.report).with_suffix(".json")
-        write_json_report(summary, json_path)
-        write_run_review_html(summary, review_path)
+        with session.stage("run.reporting", report_path=args.report, review_path=review_path):
+            summary = build_run_summary(
+                coverage=coverage,
+                walk_forward=walk_forward,
+                recommendations=recommendations,
+                fit_diagnostics=fit_diagnostics,
+                data_quality=data_quality,
+                recommendation_policy=recommendation_policy,
+                review_artifacts={"run_review_html": review_path},
+            )
+            write_markdown_report(summary, args.report)
+            json_path = Path(args.report).with_suffix(".json")
+            write_json_report(summary, json_path)
+            write_run_review_html(summary, review_path)
         return 0
 
     if args.command == "validate-raw":
         args.raw = args.raw or str(paths.cloud_raw)
         args.report = args.report or str(paths.reports / "tandem_raw_validation.md")
-        summary = summarize_tandem_raw_dir(args.raw)
-        report_lines = [
-            "# Tandem Raw Validation",
-            "",
-            f"- raw_dir: {args.raw}",
-            f"- file_count: {len(summary)}",
-        ]
-        if summary.empty:
-            report_lines.extend(["", "No Tandem raw files were found."])
-        else:
-            report_lines.extend(
-                [
-                    "",
-                    "| file | dense_cgm | cgm_rows | all_cgm_rows | median_spacing_minutes | first_timestamp | last_timestamp |",
-                    "| --- | --- | ---: | ---: | ---: | --- | --- |",
-                ]
-            )
-            for row in summary.itertuples(index=False):
-                report_lines.append(
-                    "| {file} | {dense} | {cgm_rows} | {all_rows} | {spacing} | {first} | {last} |".format(
-                        file=row.source_file,
-                        dense="yes" if bool(row.has_dense_cgm_stream) else "no",
-                        cgm_rows=int(row.cgm_rows),
-                        all_rows=int(row.all_cgm_rows),
-                        spacing="NA" if pd.isna(row.median_spacing_minutes) else f"{float(row.median_spacing_minutes):.1f}",
-                        first="" if pd.isna(row.first_timestamp) else str(pd.Timestamp(row.first_timestamp)),
-                        last="" if pd.isna(row.last_timestamp) else str(pd.Timestamp(row.last_timestamp)),
-                    )
+        with session.stage("validate_raw.summarize", raw=args.raw, report_path=args.report):
+            summary = summarize_tandem_raw_dir(args.raw)
+            report_lines = [
+                "# Tandem Raw Validation",
+                "",
+                f"- raw_dir: {args.raw}",
+                f"- file_count: {len(summary)}",
+            ]
+            if summary.empty:
+                report_lines.extend(["", "No Tandem raw files were found."])
+            else:
+                report_lines.extend(
+                    [
+                        "",
+                        "| file | dense_cgm | cgm_rows | all_cgm_rows | median_spacing_minutes | first_timestamp | last_timestamp |",
+                        "| --- | --- | ---: | ---: | ---: | --- | --- |",
+                    ]
                 )
-            dense = summary.loc[summary["has_dense_cgm_stream"].fillna(False)]
-            report_lines.extend(
-                [
-                    "",
-                    f"- dense_cgm_files: {len(dense)}",
-                    f"- dense_cgm_rows_total: {int(dense['cgm_rows'].sum()) if not dense.empty else 0}",
-                ]
-            )
-        Path(args.report).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.report).write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+                for row in summary.itertuples(index=False):
+                    report_lines.append(
+                        "| {file} | {dense} | {cgm_rows} | {all_rows} | {spacing} | {first} | {last} |".format(
+                            file=row.source_file,
+                            dense="yes" if bool(row.has_dense_cgm_stream) else "no",
+                            cgm_rows=int(row.cgm_rows),
+                            all_rows=int(row.all_cgm_rows),
+                            spacing="NA" if pd.isna(row.median_spacing_minutes) else f"{float(row.median_spacing_minutes):.1f}",
+                            first="" if pd.isna(row.first_timestamp) else str(pd.Timestamp(row.first_timestamp)),
+                            last="" if pd.isna(row.last_timestamp) else str(pd.Timestamp(row.last_timestamp)),
+                        )
+                    )
+                dense = summary.loc[summary["has_dense_cgm_stream"].fillna(False)]
+                report_lines.extend(
+                    [
+                        "",
+                        f"- dense_cgm_files: {len(dense)}",
+                        f"- dense_cgm_rows_total: {int(dense['cgm_rows'].sum()) if not dense.empty else 0}",
+                    ]
+                )
+            Path(args.report).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.report).write_text("\n".join(report_lines) + "\n", encoding="utf-8")
         return 0
 
     if args.command in {"collect", "backfill"}:
-        credentials = load_tandem_credentials(args.root, args.env_file)
+        with session.stage("acquisition.credentials", command=args.command):
+            credentials = load_tandem_credentials(args.root, args.env_file)
         manifest_path = args.manifest or str(paths.cloud_raw / "tandem_export_manifest.csv")
         report_path = args.report or str(paths.reports / "tandem_acquisition_summary.md")
         client_kwargs = {
@@ -571,39 +616,105 @@ def main(argv: list[str] | None = None) -> int:
             "timezone": credentials.timezone,
             "pump_serial": credentials.pump_serial,
         }
-        client_cm = TConnectSyncSourceClient(paths, **client_kwargs)
-        with client_cm as client:
-            if args.command == "collect":
-                start_date = date.fromisoformat(args.start_date) if args.start_date else date.today() - timedelta(days=29)
-                end_date = date.fromisoformat(args.end_date) if args.end_date else date.today()
-                if (end_date - start_date).days + 1 > 30:
-                    parser.error("collect accepts at most a 30-day window; use backfill for larger ranges")
-                windows = [ExportWindow(start_date=start_date, end_date=end_date)]
-                collect_tandem_exports(
+        step_log = StepLogger(session=session)
+        with session.stage("acquisition.run", manifest_path=manifest_path, report_path=report_path):
+            client_cm = TConnectSyncSourceClient(paths, **client_kwargs)
+            with client_cm as client:
+                if args.command == "collect":
+                    start_date = date.fromisoformat(args.start_date) if args.start_date else date.today() - timedelta(days=29)
+                    end_date = date.fromisoformat(args.end_date) if args.end_date else date.today()
+                    if (end_date - start_date).days + 1 > 30:
+                        parser.error("collect accepts at most a 30-day window; use backfill for larger ranges")
+                    windows = [ExportWindow(start_date=start_date, end_date=end_date)]
+                    collect_tandem_exports(
+                        client,
+                        windows,
+                        paths,
+                        credentials,
+                        manifest_path=manifest_path,
+                        report_path=report_path,
+                        resume=True,
+                        strict=args.strict,
+                        step_log=step_log,
+                    )
+                    return 0
+                backfill_tandem_exports(
                     client,
-                    windows,
-                    paths,
-                    credentials,
+                    start_date=args.start_date,
+                    end_date=args.end_date,
+                    workspace=paths,
+                    credentials=credentials,
+                    window_days=args.window_days,
+                    direction=args.direction,
                     manifest_path=manifest_path,
                     report_path=report_path,
-                    resume=True,
+                    resume=args.resume,
                     strict=args.strict,
+                    step_log=step_log,
                 )
                 return 0
-            backfill_tandem_exports(
-                client,
-                start_date=args.start_date,
-                end_date=args.end_date,
-                workspace=paths,
-                credentials=credentials,
-                window_days=args.window_days,
-                direction=args.direction,
-                manifest_path=manifest_path,
-                report_path=report_path,
-                resume=args.resume,
-                strict=args.strict,
-            )
-            return 0
 
     parser.error(f"Unknown command: {args.command}")
     return 2
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    paths = ProjectPaths.from_root(args.root).ensure()
+    _apply_command_defaults(args, paths)
+
+    session = setup_run_logging(
+        paths,
+        command=args.command,
+        argv=list(argv) if argv is not None else sys.argv[1:],
+        log_level=args.log_level,
+        quiet=args.quiet,
+        unsafe_debug_logging=args.unsafe_debug_logging,
+    )
+    session.start()
+    session.log_event(
+        "command.start",
+        message=f"{args.command} started",
+        status="started",
+        root=str(paths.root),
+    )
+    if session.startup_warning is not None:
+        session.log_event(
+            "command.warning",
+            level="WARNING",
+            message=session.startup_warning,
+            status="degraded",
+        )
+
+    try:
+        exit_code = _dispatch_command(args=args, parser=parser, paths=paths, session=session)
+    except SystemExit as exc:
+        exit_code = exc.code if isinstance(exc.code, int) else 1
+        if not session.error_logged:
+            session.log_event(
+                "command.error",
+                level="ERROR",
+                message=str(exc),
+                stage=session.current_stage,
+                status="failed",
+                error_type="SystemExit",
+                exit_code=exit_code,
+            )
+        session.finalize(exit_code=exit_code, status="failed")
+        raise
+    except Exception as exc:
+        if not session.error_logged:
+            session.log_event(
+                "command.error",
+                level="ERROR",
+                message=str(exc),
+                stage=session.current_stage,
+                status="failed",
+                error_type=type(exc).__name__,
+            )
+        session.finalize(exit_code=1, status="failed")
+        raise
+
+    session.finalize(exit_code=exit_code, status="success" if exit_code == 0 else "failed")
+    return exit_code
