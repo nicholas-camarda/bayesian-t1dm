@@ -552,6 +552,54 @@ def test_review_therapy_evidence_command_writes_report_and_supporting_artifacts(
     assert (tmp_path / "therapy_infra_validation.md").exists()
 
 
+def test_research_latent_meal_icr_command_writes_artifacts_and_review(tmp_path, monkeypatch):
+    workspace_root = tmp_path / "repo"
+    workspace_root.mkdir()
+    dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
+    preparation = ModelDataPreparationResult(
+        dataset=dataset,
+        apple_available=True,
+        apple_span_start=pd.Timestamp("2025-01-01 00:00:00"),
+        apple_span_end=pd.Timestamp("2025-01-07 23:55:00"),
+        tandem_span_before_start=pd.Timestamp("2025-01-01 00:00:00"),
+        tandem_span_before_end=pd.Timestamp("2025-01-07 23:55:00"),
+        tandem_span_after_start=pd.Timestamp("2025-01-01 00:00:00"),
+        tandem_span_after_end=pd.Timestamp("2025-01-07 23:55:00"),
+        requested_tandem_start=pd.Timestamp("2025-01-01 00:00:00"),
+        requested_tandem_end=pd.Timestamp("2025-01-07 23:55:00"),
+        overlap_start=pd.Timestamp("2025-01-01 00:00:00"),
+        overlap_end=pd.Timestamp("2025-01-07 23:55:00"),
+        final_dataset_start=pd.Timestamp("2025-01-01 00:00:00"),
+        final_dataset_end=pd.Timestamp("2025-01-07 23:55:00"),
+        final_row_count=len(dataset.frame),
+    )
+    monkeypatch.setattr(cli, "_prepare_model_data", lambda args, paths, session=None: preparation)
+
+    report_dir = tmp_path / "latent_meal"
+    review_html = report_dir / "latent_meal_review.html"
+    exit_code = main(
+        [
+            "--root",
+            str(workspace_root),
+            "research-latent-meal-icr",
+            "--report-dir",
+            str(report_dir),
+            "--review-html",
+            str(review_html),
+        ]
+    )
+
+    assert exit_code == 0
+    assert (report_dir / "latent_meal_research_gate.md").exists()
+    assert (report_dir / "meal_event_registry.csv").exists()
+    assert (report_dir / "meal_window_audit.md").exists()
+    assert (report_dir / "latent_meal_fit_summary.md").exists()
+    assert (report_dir / "latent_meal_posterior_meals.csv").exists()
+    assert (report_dir / "latent_meal_confidence_report.md").exists()
+    assert (report_dir / "latent_meal_model_comparison.md").exists()
+    assert review_html.exists()
+
+
 def test_status_command_writes_curated_latest_outputs_and_run_bundle(tmp_path, monkeypatch):
     workspace_root = tmp_path / "repo"
     workspace_root.mkdir()

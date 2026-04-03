@@ -395,6 +395,85 @@ def test_build_health_analysis_ready_command_writes_tandem_aligned_dataset(tmp_p
     assert float(first_row["hrv_latest"]) == 55.0
 
 
+def test_build_health_analysis_ready_command_computes_plausible_workout_windows(tmp_path, monkeypatch):
+    workspace_root = tmp_path / "repo"
+    workspace_root.mkdir()
+    cloud_root = tmp_path / "cloud"
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(cloud_root))
+    monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
+
+    raw_root = cloud_root / "data" / "raw"
+    raw_root.mkdir(parents=True, exist_ok=True)
+    _write_tandem_cgm_export(raw_root)
+    bundle_dir = tmp_path / "HealthAutoExport_20260331133020"
+    _write_health_auto_export_bundle(
+        bundle_dir,
+        json_name="HealthAutoExport-2025-05-24-2025-05-24.json",
+        payload=_build_health_auto_export_payload(
+            workout_rows=[
+                {
+                    "id": "workout-1",
+                    "name": "Walk",
+                    "start": "2025-05-24 06:00:00 -0400",
+                    "end": "2025-05-24 06:20:00 -0400",
+                    "duration": 1200,
+                    "distance": {"qty": 1.2, "units": "mi"},
+                    "activeEnergyBurned": {"qty": 110, "units": "kcal"},
+                    "avgHeartRate": {"qty": 115, "units": "bpm"},
+                    "maxHeartRate": {"qty": 132, "units": "bpm"},
+                },
+                {
+                    "id": "workout-2",
+                    "name": "Run",
+                    "start": "2025-05-24 18:00:00 -0400",
+                    "end": "2025-05-24 18:20:00 -0400",
+                    "duration": 1200,
+                    "distance": {"qty": 2.4, "units": "mi"},
+                    "activeEnergyBurned": {"qty": 220, "units": "kcal"},
+                    "avgHeartRate": {"qty": 140, "units": "bpm"},
+                    "maxHeartRate": {"qty": 160, "units": "bpm"},
+                },
+            ],
+        ),
+    )
+    import_exit = main(["--root", str(workspace_root), "import-health-auto-export", "--input", str(bundle_dir)])
+    assert import_exit == 0
+
+    output = tmp_path / "analysis_ready_health_5min.csv"
+    exit_code = main(
+        [
+            "--root",
+            str(workspace_root),
+            "build-health-analysis-ready",
+            "--raw",
+            str(raw_root),
+            "--output",
+            str(output),
+            "--horizon",
+            "30",
+        ]
+    )
+
+    assert exit_code == 0
+    analysis_ready = pd.read_csv(output)
+
+    row_0000 = analysis_ready.loc[analysis_ready["timestamp"] == "2025-05-24 00:00:00"].iloc[0]
+    row_0700 = analysis_ready.loc[analysis_ready["timestamp"] == "2025-05-24 07:00:00"].iloc[0]
+    row_1300 = analysis_ready.loc[analysis_ready["timestamp"] == "2025-05-24 13:00:00"].iloc[0]
+    row_1900 = analysis_ready.loc[analysis_ready["timestamp"] == "2025-05-24 19:00:00"].iloc[0]
+
+    assert int(row_0000["recent_workout_6h"]) == 0
+    assert float(row_0000["workout_count_24h"]) == 0.0
+    assert int(row_0700["recent_workout_6h"]) == 1
+    assert float(row_0700["workout_count_24h"]) == 1.0
+    assert int(row_1300["recent_workout_6h"]) == 0
+    assert float(row_1300["workout_count_24h"]) == 1.0
+    assert int(row_1900["recent_workout_6h"]) == 1
+    assert float(row_1900["workout_count_24h"]) == 2.0
+    assert int(row_1900["workout_summary_plausible"]) == 1
+
+
 def test_screen_health_features_command_writes_scores_and_report(tmp_path, monkeypatch):
     workspace_root = tmp_path / "repo"
     workspace_root.mkdir()

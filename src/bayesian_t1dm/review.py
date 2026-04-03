@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 from plotly.io import to_html
 
 from .health_auto_export import ModelDataPreparationResult
-from .therapy_research import TherapyInfraValidationResult, TherapyResearchResult, summarize_overnight_basal_evidence
+from .therapy_research import LatentMealResearchResult, TherapyInfraValidationResult, TherapyResearchResult, summarize_overnight_basal_evidence
 
 
 def _figure_div(figure: go.Figure, *, include_plotlyjs: bool) -> str:
@@ -749,6 +749,190 @@ def write_therapy_evidence_review_html(
         title="Bayesian T1DM Therapy Evidence Review",
         banner_html=_therapy_banner(preparation, overnight_summary),
         sections=[section for section in sections if section],
+    )
+    path.write_text(html_text, encoding="utf-8")
+    return path
+
+
+def _latent_meal_banner(result: LatentMealResearchResult) -> str:
+    if result.research_gate.empty:
+        status = "broken"
+        identifiability = "not_identified"
+        meal_windows = 0
+    else:
+        gate_row = result.research_gate.iloc[0]
+        identifiability = str(gate_row.get("identifiability") or "not_identified")
+        meal_windows = int(gate_row.get("meal_windows") or 0)
+        status = {
+            "prior_informed": "good",
+            "response_inferred": "degraded",
+            "weakly_identified": "degraded",
+            "not_identified": "broken",
+        }.get(identifiability, "degraded")
+    return (
+        f"<div class='banner {html.escape(status)}'>"
+        f"Latent meal identifiability: <code>{html.escape(identifiability)}</code>. "
+        f"Meal windows: <code>{html.escape(str(meal_windows))}</code>."
+        "</div>"
+    )
+
+
+def _latent_meal_gate_html(result: LatentMealResearchResult) -> str:
+    if result.research_gate.empty:
+        return "<div class='section'><h2>Research Gate</h2><div class='empty-state'>No latent meal gate was available.</div></div>"
+    rows = []
+    for row in result.research_gate.itertuples(index=False):
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(row.parameter))}</td>"
+            f"<td>{html.escape(str(row.estimand))}</td>"
+            f"<td><code>{html.escape(str(row.identifiability))}</code></td>"
+            f"<td><code>{html.escape(str(row.gate_status))}</code></td>"
+            f"<td><code>{html.escape(str(row.source_quality_status))}</code></td>"
+            f"<td><code>{html.escape(str(row.closed_loop_confounding_risk))}</code></td>"
+            "</tr>"
+        )
+    return "\n".join(
+        [
+            "<div class='section'>",
+            "<h2>Research Gate</h2>",
+            "<table>",
+            "<thead><tr><th>parameter</th><th>estimand</th><th>identifiability</th><th>gate_status</th><th>source_quality</th><th>confounding</th></tr></thead>",
+            "<tbody>",
+            *rows,
+            "</tbody></table>",
+            "</div>",
+        ]
+    )
+
+
+def _latent_meal_model_comparison_html(result: LatentMealResearchResult) -> str:
+    if result.model_comparison.empty:
+        return "<div class='section'><h2>Model Comparison</h2><div class='empty-state'>No model comparison rows were available.</div></div>"
+    rows = []
+    for row in result.model_comparison.itertuples(index=False):
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(row.model))}</td>"
+            f"<td>{int(row.meal_count)}</td>"
+            f"<td>{'NA' if pd.isna(row.stated_carb_mae) else f'{float(row.stated_carb_mae):.3f}'}</td>"
+            f"<td>{'NA' if pd.isna(row.peak_delta_mae) else f'{float(row.peak_delta_mae):.3f}'}</td>"
+            f"<td>{'NA' if pd.isna(row.peak_delta_correlation) else f'{float(row.peak_delta_correlation):.3f}'}</td>"
+            f"<td>{'yes' if bool(row.selected) else 'no'}</td>"
+            "</tr>"
+        )
+    return "\n".join(
+        [
+            "<div class='section'>",
+            "<h2>Model Comparison</h2>",
+            "<table>",
+            "<thead><tr><th>model</th><th>meal_count</th><th>stated_carb_mae</th><th>peak_delta_mae</th><th>peak_delta_correlation</th><th>selected</th></tr></thead>",
+            "<tbody>",
+            *rows,
+            "</tbody></table>",
+            "</div>",
+        ]
+    )
+
+
+def _latent_meal_posterior_html(result: LatentMealResearchResult) -> str:
+    if result.posterior_meals.empty:
+        return "<div class='section'><h2>Posterior Meals</h2><div class='empty-state'>No posterior meal estimates were generated.</div></div>"
+    top = result.posterior_meals.copy()
+    top["abs_gap"] = (
+        pd.to_numeric(top["latent_carbs_posterior_mean"], errors="coerce")
+        - pd.to_numeric(top["stated_carbs"], errors="coerce")
+    ).abs()
+    top = top.sort_values(["carb_accuracy_score", "timestamp"], ascending=[False, True]).head(15)
+    rows = []
+    for row in top.itertuples(index=False):
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(row.meal_id))}</td>"
+            f"<td>{html.escape(str(row.timestamp))}</td>"
+            f"<td>{html.escape(str(row.segment))}</td>"
+            f"<td>{html.escape(str(row.evidence_source))}</td>"
+            f"<td>{'NA' if pd.isna(row.stated_carbs) else f'{float(row.stated_carbs):.1f}'}</td>"
+            f"<td>{float(row.latent_carbs_posterior_mean):.1f}</td>"
+            f"<td>{float(row.carb_accuracy_score):.3f}</td>"
+            f"<td>{html.escape(str(row.identifiability_status))}</td>"
+            f"<td>{html.escape(str(row.suppression_reason or 'none'))}</td>"
+            "</tr>"
+        )
+    return "\n".join(
+        [
+            "<div class='section'>",
+            "<h2>Posterior Meals</h2>",
+            "<table>",
+            "<thead><tr><th>meal_id</th><th>timestamp</th><th>segment</th><th>evidence</th><th>stated_carbs</th><th>latent_carbs</th><th>accuracy_score</th><th>identifiability</th><th>suppression</th></tr></thead>",
+            "<tbody>",
+            *rows,
+            "</tbody></table>",
+            "</div>",
+        ]
+    )
+
+
+def _latent_meal_artifact_index_html(
+    artifact_root: Path,
+    *,
+    artifact_href_prefix: str = "",
+) -> str:
+    artifacts = [
+        "latent_meal_research_gate.md",
+        "meal_event_registry.csv",
+        "meal_window_audit.md",
+        "latent_meal_fit_summary.md",
+        "latent_meal_posterior_meals.csv",
+        "latent_meal_confidence_report.md",
+        "latent_meal_model_comparison.md",
+    ]
+    rows = []
+    for artifact in artifacts:
+        path = artifact_root / artifact
+        link_target = f"{artifact_href_prefix}{artifact}"
+        link_html = f"<a href=\"{html.escape(link_target)}\">open</a>" if path.exists() else ""
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(artifact)}</td>"
+            f"<td>{'yes' if path.exists() else 'no'}</td>"
+            f"<td>{link_html}</td>"
+            "</tr>"
+        )
+    return "\n".join(
+        [
+            "<div class='section'>",
+            "<h2>Supporting Artifacts</h2>",
+            "<table>",
+            "<thead><tr><th>artifact</th><th>exists</th><th>link</th></tr></thead>",
+            "<tbody>",
+            *rows,
+            "</tbody></table>",
+            "</div>",
+        ]
+    )
+
+
+def write_latent_meal_review_html(
+    result: LatentMealResearchResult,
+    path: str | Path,
+    *,
+    artifact_root: str | Path | None = None,
+    artifact_href_prefix: str = "",
+) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_root_path = Path(artifact_root) if artifact_root is not None else path.parent
+    sections = [
+        _latent_meal_gate_html(result),
+        _latent_meal_model_comparison_html(result),
+        _latent_meal_posterior_html(result),
+        _latent_meal_artifact_index_html(artifact_root_path, artifact_href_prefix=artifact_href_prefix),
+    ]
+    html_text = _page_shell(
+        title="Bayesian T1DM Latent Meal Review",
+        banner_html=_latent_meal_banner(result),
+        sections=sections,
     )
     path.write_text(html_text, encoding="utf-8")
     return path

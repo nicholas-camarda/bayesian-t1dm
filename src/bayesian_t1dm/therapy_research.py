@@ -93,6 +93,24 @@ class TherapyInfraValidationResult:
 
 
 @dataclass(frozen=True)
+class LatentMealResearchResult:
+    prepared_dataset: AnalysisReadyHealthDataset
+    research_frame: pd.DataFrame
+    research_gate: pd.DataFrame
+    meal_event_registry: pd.DataFrame
+    meal_windows: pd.DataFrame
+    posterior_meals: pd.DataFrame
+    model_comparison: pd.DataFrame
+    research_gate_markdown: str
+    meal_window_audit_markdown: str
+    fit_summary_markdown: str
+    confidence_report_markdown: str
+    model_comparison_markdown: str
+    segments: tuple[TherapySegment, ...]
+    meal_proxy_mode: str
+
+
+@dataclass(frozen=True)
 class _ModelPrediction:
     mean: np.ndarray
     lower: np.ndarray
@@ -305,6 +323,12 @@ def _summarize_source_report_card(
                 invalid = int(numeric.lt(5).sum() + numeric.gt(40).sum())
             elif "weight" in column:
                 invalid = int(numeric.lt(50).sum() + numeric.gt(500).sum())
+            elif column == "workout_count_24h":
+                invalid = int(numeric.lt(0).sum() + numeric.gt(12).sum())
+            elif column == "workout_duration_sum_24h":
+                invalid = int(numeric.lt(0).sum() + numeric.gt(24 * 60 * 60).sum())
+            elif column == "minutes_since_last_workout":
+                invalid = int(numeric.lt(0).sum())
             else:
                 invalid = 0
             if invalid > 0:
@@ -1737,6 +1761,692 @@ def write_therapy_research_artifacts(
     return paths
 
 
+def _fit_ridge_regression(
+    frame: pd.DataFrame,
+    *,
+    feature_columns: list[str],
+    target_column: str,
+    alpha: float = 4.0,
+) -> dict[str, Any] | None:
+    if frame.empty or target_column not in frame.columns:
+        return None
+    X = frame.loc[:, feature_columns].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    y = pd.to_numeric(frame[target_column], errors="coerce").to_numpy(dtype=float)
+    valid = np.isfinite(y)
+    if not np.any(valid):
+        return None
+    X = X[valid]
+    y = y[valid]
+    if X.shape[0] < 3:
+        return None
+    means = X.mean(axis=0)
+    scales = X.std(axis=0, ddof=0)
+    scales = np.where(np.isfinite(scales) & (scales > 0), scales, 1.0)
+    standardized = (X - means) / scales
+    y_mean = float(np.mean(y))
+    centered = y - y_mean
+    gram = standardized.T @ standardized + alpha * np.eye(standardized.shape[1], dtype=float)
+    coef = np.linalg.solve(gram, standardized.T @ centered)
+    fitted = standardized @ coef + y_mean
+    residual_rmse = float(np.sqrt(np.mean((fitted - y) ** 2))) if len(y) else float("nan")
+    return {
+        "feature_columns": list(feature_columns),
+        "coef": coef,
+        "means": means,
+        "scales": scales,
+        "intercept": y_mean,
+        "residual_rmse": residual_rmse,
+        "training_rows": int(len(y)),
+    }
+
+
+def _predict_ridge_regression(model: dict[str, Any] | None, frame: pd.DataFrame) -> np.ndarray:
+    if model is None or frame.empty:
+        return np.array([], dtype=float)
+    X = frame.loc[:, model["feature_columns"]].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    standardized = (X - model["means"]) / model["scales"]
+    return standardized @ model["coef"] + float(model["intercept"])
+
+
+def build_meal_event_registry(
+    research_frame: pd.DataFrame,
+    *,
+    cluster_gap_minutes: int = 90,
+) -> pd.DataFrame:
+    columns = [
+        "meal_id",
+        "timestamp",
+        "segment",
+        "event_row_index",
+        "evidence_source",
+        "explicit_carb_rows",
+        "proxy_rows",
+        "stated_carbs",
+        "bolus_units",
+        "meal_proxy_confidence",
+        "glucose",
+    ]
+    if research_frame.empty:
+        return pd.DataFrame(columns=columns)
+
+    ordered = research_frame.copy()
+    ordered["timestamp"] = pd.to_datetime(ordered["timestamp"], errors="coerce")
+    ordered = ordered.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=False)
+    explicit_signal = (
+        pd.to_numeric(_column_or_default(ordered, "meal_event"), errors="coerce").fillna(0.0).gt(0)
+        | pd.to_numeric(_column_or_default(ordered, "carb_grams"), errors="coerce").fillna(0.0).gt(0)
+    )
+    proxy_signal = pd.to_numeric(_column_or_default(ordered, "meal_proxy_event"), errors="coerce").fillna(0.0).gt(0)
+    candidates = ordered.loc[explicit_signal | proxy_signal].copy()
+    if candidates.empty:
+        return pd.DataFrame(columns=columns)
+
+    gap = candidates["timestamp"].diff().dt.total_seconds().div(60.0).fillna(float(cluster_gap_minutes + 1))
+    candidates["meal_cluster_id"] = gap.gt(cluster_gap_minutes).cumsum().astype(int)
+    rows: list[dict[str, Any]] = []
+    for cluster_id, cluster in candidates.groupby("meal_cluster_id", dropna=False):
+        cluster = cluster.copy()
+        cluster["explicit_signal"] = (
+            pd.to_numeric(_column_or_default(cluster, "meal_event"), errors="coerce").fillna(0.0).gt(0)
+            | pd.to_numeric(_column_or_default(cluster, "carb_grams"), errors="coerce").fillna(0.0).gt(0)
+        ).astype(int)
+        cluster["proxy_signal"] = pd.to_numeric(_column_or_default(cluster, "meal_proxy_event"), errors="coerce").fillna(0.0).gt(0).astype(int)
+        cluster["ranking_stated_carbs"] = pd.to_numeric(_column_or_default(cluster, "carb_grams"), errors="coerce").fillna(0.0)
+        cluster["ranking_bolus"] = pd.to_numeric(_column_or_default(cluster, "bolus_units"), errors="coerce").fillna(0.0)
+        cluster["ranking_proxy_confidence"] = pd.to_numeric(_column_or_default(cluster, "meal_proxy_confidence"), errors="coerce").fillna(0.0)
+        selected = cluster.sort_values(
+            ["explicit_signal", "ranking_stated_carbs", "ranking_proxy_confidence", "ranking_bolus", "timestamp"],
+            ascending=[False, False, False, False, True],
+        ).iloc[0]
+        explicit_rows = int(cluster["explicit_signal"].sum())
+        proxy_rows = int(cluster["proxy_signal"].sum())
+        evidence_source = "explicit_and_proxy" if explicit_rows and proxy_rows else "explicit_logged" if explicit_rows else "proxy_only"
+        stated_carbs = pd.to_numeric(pd.Series([selected.get("carb_grams")]), errors="coerce").iloc[0]
+        rows.append(
+            {
+                "meal_id": f"meal_{int(cluster_id):04d}",
+                "timestamp": pd.Timestamp(selected["timestamp"]),
+                "segment": str(selected.get("therapy_segment") or ""),
+                "event_row_index": int(selected["index"]),
+                "evidence_source": evidence_source,
+                "explicit_carb_rows": explicit_rows,
+                "proxy_rows": proxy_rows,
+                "stated_carbs": None if pd.isna(stated_carbs) or float(stated_carbs) <= 0 else float(stated_carbs),
+                "bolus_units": float(pd.to_numeric(pd.Series([selected.get("bolus_units")]), errors="coerce").fillna(0.0).iloc[0]),
+                "meal_proxy_confidence": float(pd.to_numeric(pd.Series([selected.get("meal_proxy_confidence")]), errors="coerce").fillna(0.0).iloc[0]),
+                "glucose": float(pd.to_numeric(pd.Series([selected.get("glucose")]), errors="coerce").fillna(np.nan).iloc[0]),
+            }
+        )
+    return pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+
+
+def build_meal_window_dataset(
+    research_frame: pd.DataFrame,
+    meal_event_registry: pd.DataFrame,
+    *,
+    premeal_minutes: int = 30,
+    postmeal_minutes: int = 180,
+) -> pd.DataFrame:
+    columns = [
+        "meal_id",
+        "timestamp",
+        "segment",
+        "evidence_source",
+        "stated_carbs",
+        "bolus_units_window",
+        "iob_at_start",
+        "premeal_glucose",
+        "peak_glucose_180m",
+        "peak_delta_180m",
+        "positive_auc_180m",
+        "window_complete",
+        "confounding_grade",
+        "source_quality_grade",
+        "recent_exercise_context",
+        "sleep_deficit_flag",
+        "hrv_latest_window",
+        "heart_rate_avg_latest_window",
+        "hrv_minutes_since_last",
+        "resting_heart_rate_minutes_since_last",
+        "missing_cgm_fraction",
+        "suppression_reason",
+    ]
+    if research_frame.empty or meal_event_registry.empty:
+        return pd.DataFrame(columns=columns)
+
+    ordered = research_frame.copy()
+    ordered["timestamp"] = pd.to_datetime(ordered["timestamp"], errors="coerce")
+    ordered = ordered.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    step_minutes = 5.0
+    if len(ordered) > 1:
+        deltas = ordered["timestamp"].diff().dt.total_seconds().div(60.0).dropna()
+        if not deltas.empty:
+            step_minutes = float(max(deltas.median(), 1.0))
+
+    rows: list[dict[str, Any]] = []
+    for meal in meal_event_registry.itertuples(index=False):
+        timestamp = pd.Timestamp(meal.timestamp)
+        pre = ordered.loc[
+            ordered["timestamp"].ge(timestamp - pd.Timedelta(minutes=premeal_minutes))
+            & ordered["timestamp"].lt(timestamp)
+        ].copy()
+        post = ordered.loc[
+            ordered["timestamp"].ge(timestamp)
+            & ordered["timestamp"].le(timestamp + pd.Timedelta(minutes=postmeal_minutes))
+        ].copy()
+        if post.empty:
+            continue
+        meal_row = ordered.loc[ordered["timestamp"].eq(timestamp)].head(1)
+        meal_row = post.head(1) if meal_row.empty else meal_row
+        def _meal_row_value(column: str, default: float) -> float:
+            if column not in meal_row.columns:
+                return float(default)
+            return float(pd.to_numeric(meal_row[column], errors="coerce").fillna(default).iloc[0])
+        premeal_glucose = pd.to_numeric(pre.get("glucose"), errors="coerce").median()
+        if pd.isna(premeal_glucose):
+            premeal_glucose = _meal_row_value("glucose", float("nan"))
+        post_glucose = pd.to_numeric(post.get("glucose"), errors="coerce")
+        peak_glucose = float(post_glucose.max()) if post_glucose.notna().any() else float("nan")
+        peak_delta = float(max(peak_glucose - premeal_glucose, 0.0)) if np.isfinite(premeal_glucose) and np.isfinite(peak_glucose) else float("nan")
+        positive_auc = float(np.maximum(post_glucose.fillna(premeal_glucose) - premeal_glucose, 0.0).sum() * step_minutes / 60.0)
+        bolus_units_window = float(
+            pd.to_numeric(
+                ordered.loc[
+                    ordered["timestamp"].ge(timestamp - pd.Timedelta(minutes=15))
+                    & ordered["timestamp"].le(timestamp + pd.Timedelta(minutes=30)),
+                    "bolus_units",
+                ],
+                errors="coerce",
+            ).fillna(0.0).sum()
+        )
+        iob_at_start = _meal_row_value("iob_units", 0.0)
+        missing_cgm_fraction = float(pd.to_numeric(post.get("missing_cgm"), errors="coerce").fillna(0.0).mean())
+        workout_plausible = bool(_meal_row_value("workout_summary_plausible", 1.0) > 0)
+        hrv_freshness = _meal_row_value("hrv_minutes_since_last", 1e6)
+        resting_hr_freshness = _meal_row_value("resting_heart_rate_minutes_since_last", 1e6)
+        closed_loop_flag = bool(pd.to_numeric(post.get("closed_loop_confounding_flag"), errors="coerce").fillna(0.0).max() > 0)
+        recent_exercise = bool(_meal_row_value("recent_exercise_context", 0.0) > 0)
+        if closed_loop_flag or iob_at_start > 3.0:
+            confounding_grade = "high"
+        elif recent_exercise or bolus_units_window > 10.0:
+            confounding_grade = "moderate"
+        else:
+            confounding_grade = "low"
+        if missing_cgm_fraction > 0 or not workout_plausible:
+            source_quality_grade = "degraded"
+        elif hrv_freshness > 24 * 60 and resting_hr_freshness > 7 * 24 * 60:
+            source_quality_grade = "limited"
+        else:
+            source_quality_grade = "good"
+        window_complete = bool(len(pre) >= max(int(premeal_minutes / step_minutes / 2), 3) and len(post) >= max(int(postmeal_minutes / step_minutes * 0.7), 12))
+        suppression_reason = ""
+        if bolus_units_window < 0.5:
+            suppression_reason = "no_meaningful_bolus"
+        elif not window_complete:
+            suppression_reason = "incomplete_window"
+        elif confounding_grade == "high":
+            suppression_reason = "high_closed_loop_confounding"
+        elif source_quality_grade == "degraded":
+            suppression_reason = "source_quality_degraded"
+        rows.append(
+            {
+                "meal_id": meal.meal_id,
+                "timestamp": timestamp,
+                "segment": meal.segment,
+                "evidence_source": meal.evidence_source,
+                "stated_carbs": meal.stated_carbs,
+                "bolus_units_window": bolus_units_window,
+                "iob_at_start": iob_at_start,
+                "premeal_glucose": float(premeal_glucose) if np.isfinite(premeal_glucose) else float("nan"),
+                "peak_glucose_180m": peak_glucose,
+                "peak_delta_180m": peak_delta,
+                "positive_auc_180m": positive_auc,
+                "window_complete": int(window_complete),
+                "confounding_grade": confounding_grade,
+                "source_quality_grade": source_quality_grade,
+                "recent_exercise_context": int(recent_exercise),
+                "sleep_deficit_flag": int(_meal_row_value("sleep_deficit_flag", 0.0)),
+                "hrv_latest_window": _meal_row_value("hrv_latest", 0.0) if hrv_freshness <= 24 * 60 else 0.0,
+                "heart_rate_avg_latest_window": _meal_row_value("heart_rate_avg_latest", 0.0),
+                "hrv_minutes_since_last": hrv_freshness,
+                "resting_heart_rate_minutes_since_last": resting_hr_freshness,
+                "missing_cgm_fraction": missing_cgm_fraction,
+                "suppression_reason": suppression_reason,
+            }
+        )
+    return pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+
+
+def _latent_meal_gate(meal_windows: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    logged_meals = int(pd.to_numeric(meal_windows.get("stated_carbs"), errors="coerce").notna().sum()) if not meal_windows.empty else 0
+    proxy_only_meals = int(meal_windows.get("evidence_source", pd.Series(dtype=str)).astype(str).eq("proxy_only").sum()) if not meal_windows.empty else 0
+    complete_windows = int(pd.to_numeric(meal_windows.get("window_complete"), errors="coerce").fillna(0.0).sum()) if not meal_windows.empty else 0
+    trainable_windows = int(
+        (
+            pd.to_numeric(meal_windows.get("window_complete"), errors="coerce").fillna(0.0).gt(0)
+            & pd.to_numeric(meal_windows.get("bolus_units_window"), errors="coerce").fillna(0.0).ge(0.5)
+            & meal_windows.get("confounding_grade", pd.Series(dtype=str)).astype(str).ne("high")
+        ).sum()
+    ) if not meal_windows.empty else 0
+    degraded_fraction = float(meal_windows.get("source_quality_grade", pd.Series(dtype=str)).astype(str).eq("degraded").mean()) if not meal_windows.empty else 1.0
+    if degraded_fraction > 0.2:
+        source_quality_status = "degraded"
+    elif meal_windows.empty:
+        source_quality_status = "failed"
+    else:
+        source_quality_status = "good"
+    high_confounding_fraction = float(meal_windows.get("confounding_grade", pd.Series(dtype=str)).astype(str).eq("high").mean()) if not meal_windows.empty else 1.0
+    if high_confounding_fraction >= 0.5:
+        confounding_risk = "high"
+    elif high_confounding_fraction >= 0.2:
+        confounding_risk = "moderate"
+    else:
+        confounding_risk = "low"
+    if trainable_windows >= 12 and logged_meals >= 12:
+        identifiability = "prior_informed"
+        gate_status = "research_only"
+    elif trainable_windows >= 18 and proxy_only_meals >= 12:
+        identifiability = "response_inferred"
+        gate_status = "diagnostics_only"
+    elif complete_windows >= 8:
+        identifiability = "weakly_identified"
+        gate_status = "diagnostics_only"
+    else:
+        identifiability = "not_identified"
+        gate_status = "diagnostics_only"
+    gate = pd.DataFrame(
+        [
+            {
+                "parameter": "I/C ratio",
+                "estimand": "latent meal carbs + effective I/C",
+                "identifiability": identifiability,
+                "gate_status": gate_status,
+                "source_quality_status": source_quality_status,
+                "closed_loop_confounding_risk": confounding_risk,
+                "meal_windows": int(len(meal_windows)),
+                "logged_meals": logged_meals,
+                "proxy_only_meals": proxy_only_meals,
+                "complete_windows": complete_windows,
+                "trainable_windows": trainable_windows,
+            }
+        ]
+    )
+    lines = [
+        "# Latent Meal Research Gate",
+        "",
+        f"- source_quality_status: {source_quality_status}",
+        f"- closed_loop_confounding_risk: {confounding_risk}",
+        f"- meal_windows: {int(len(meal_windows))}",
+        f"- logged_meals: {logged_meals}",
+        f"- proxy_only_meals: {proxy_only_meals}",
+        f"- complete_windows: {complete_windows}",
+        f"- trainable_windows: {trainable_windows}",
+        "",
+        "## Parameter Gate",
+        "",
+        "| parameter | estimand | identifiability | gate_status | source_quality_status | closed_loop_confounding_risk |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    row = gate.iloc[0]
+    lines.append(
+        f"| {row['parameter']} | {row['estimand']} | {row['identifiability']} | {row['gate_status']} | {row['source_quality_status']} | {row['closed_loop_confounding_risk']} |"
+    )
+    return gate, "\n".join(lines) + "\n"
+
+
+def _response_feature_frame(meal_windows: pd.DataFrame) -> pd.DataFrame:
+    out = meal_windows.copy()
+    out["confounding_is_low"] = out.get("confounding_grade", pd.Series(dtype=str)).astype(str).eq("low").astype(float)
+    out["source_quality_is_good"] = out.get("source_quality_grade", pd.Series(dtype=str)).astype(str).eq("good").astype(float)
+    return out
+
+
+def _render_latent_meal_window_audit(meal_windows: pd.DataFrame) -> str:
+    lines = [
+        "# Meal Window Audit",
+        "",
+        f"- meal_window_count: {len(meal_windows)}",
+        f"- complete_windows: {int(pd.to_numeric(meal_windows.get('window_complete'), errors='coerce').fillna(0.0).sum()) if not meal_windows.empty else 0}",
+        "",
+        "| confounding_grade | count | mean_peak_delta_180m | mean_positive_auc_180m |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    if meal_windows.empty:
+        lines.append("| none | 0 | 0.000 | 0.000 |")
+    else:
+        grouped = (
+            meal_windows.groupby("confounding_grade", as_index=False)
+            .agg(
+                count=("meal_id", "size"),
+                mean_peak_delta_180m=("peak_delta_180m", "mean"),
+                mean_positive_auc_180m=("positive_auc_180m", "mean"),
+            )
+            .sort_values("confounding_grade")
+        )
+        for row in grouped.itertuples(index=False):
+            lines.append(
+                f"| {row.confounding_grade} | {int(row.count)} | {float(row.mean_peak_delta_180m):.3f} | {float(row.mean_positive_auc_180m):.3f} |"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def _render_latent_meal_fit_summary(
+    *,
+    gate: pd.DataFrame,
+    reference_ic: float,
+    carb_model: dict[str, Any] | None,
+    selected_model: str,
+    selected_peak_delta_mae: float | None,
+) -> str:
+    training_rows = 0 if carb_model is None else int(carb_model.get("training_rows", 0))
+    residual_rmse = None if carb_model is None else carb_model.get("residual_rmse")
+    lines = [
+        "# Latent Meal Fit Summary",
+        "",
+        "- This workflow is a latent meal deconvolution approximation intended for research and diagnostics.",
+        "- Logged carbs are treated as noisy priors when present, not exact truth.",
+        f"- selected_model: {selected_model}",
+        f"- reference_ic_ratio: {reference_ic:.3f}",
+        f"- training_meals: {training_rows}",
+        f"- carb_model_residual_rmse: {'NA' if residual_rmse is None or pd.isna(residual_rmse) else f'{float(residual_rmse):.3f}'}",
+        f"- selected_peak_delta_mae: {'NA' if selected_peak_delta_mae is None or pd.isna(selected_peak_delta_mae) else f'{float(selected_peak_delta_mae):.3f}'}",
+        "",
+        "## Gate Snapshot",
+        "",
+        "| parameter | identifiability | gate_status | closed_loop_confounding_risk |",
+        "| --- | --- | --- | --- |",
+    ]
+    if gate.empty:
+        lines.append("| I/C ratio | not_identified | diagnostics_only | high |")
+    else:
+        row = gate.iloc[0]
+        lines.append(
+            f"| {row['parameter']} | {row['identifiability']} | {row['gate_status']} | {row['closed_loop_confounding_risk']} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _render_latent_meal_confidence_report(posterior_meals: pd.DataFrame) -> str:
+    lines = [
+        "# Latent Meal Confidence Report",
+        "",
+        "| evidence_source | count | mean_accuracy_score | high_confidence_fraction |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    if posterior_meals.empty:
+        lines.append("| none | 0 | 0.000 | 0.000 |")
+        return "\n".join(lines) + "\n"
+    grouped = (
+        posterior_meals.groupby("evidence_source", as_index=False)
+        .agg(
+            count=("meal_id", "size"),
+            mean_accuracy_score=("carb_accuracy_score", "mean"),
+            high_confidence_fraction=("carb_accuracy_score", lambda s: float(pd.to_numeric(s, errors="coerce").fillna(0.0).ge(0.75).mean())),
+        )
+        .sort_values("evidence_source")
+    )
+    for row in grouped.itertuples(index=False):
+        lines.append(
+            f"| {row.evidence_source} | {int(row.count)} | {float(row.mean_accuracy_score):.3f} | {float(row.high_confidence_fraction):.3f} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _render_latent_meal_model_comparison(model_comparison: pd.DataFrame) -> str:
+    lines = [
+        "# Latent Meal Model Comparison",
+        "",
+        "- Retrospective comparison is anchored on logged meals and post-meal peak-delta explanation.",
+        "",
+        "| model | meal_count | stated_carb_mae | peak_delta_mae | peak_delta_correlation | selected |",
+        "| --- | ---: | ---: | ---: | ---: | --- |",
+    ]
+    if model_comparison.empty:
+        lines.append("| none | 0 | NA | NA | NA | no |")
+        return "\n".join(lines) + "\n"
+    for row in model_comparison.itertuples(index=False):
+        lines.append(
+            "| {model} | {meal_count} | {carb_mae} | {peak_mae} | {corr} | {selected} |".format(
+                model=row.model,
+                meal_count=int(row.meal_count),
+                carb_mae="NA" if pd.isna(row.stated_carb_mae) else f"{float(row.stated_carb_mae):.3f}",
+                peak_mae="NA" if pd.isna(row.peak_delta_mae) else f"{float(row.peak_delta_mae):.3f}",
+                corr="NA" if pd.isna(row.peak_delta_correlation) else f"{float(row.peak_delta_correlation):.3f}",
+                selected="yes" if bool(row.selected) else "no",
+            )
+        )
+    return "\n".join(lines) + "\n"
+
+
+def run_latent_meal_icr_research(
+    dataset: AnalysisReadyHealthDataset,
+    *,
+    segments: tuple[TherapySegment, ...] | None = None,
+    meal_proxy_mode: str = "strict",
+) -> LatentMealResearchResult:
+    segments = segments or parse_therapy_segments()
+    research_frame = build_therapy_research_frame(dataset, segments=segments, meal_proxy_mode=meal_proxy_mode)
+    meal_event_registry = build_meal_event_registry(research_frame)
+    meal_windows = build_meal_window_dataset(research_frame, meal_event_registry)
+    gate, gate_markdown = _latent_meal_gate(meal_windows)
+
+    feature_frame = _response_feature_frame(meal_windows)
+    training_mask = (
+        pd.to_numeric(feature_frame.get("stated_carbs"), errors="coerce").notna()
+        & pd.to_numeric(feature_frame.get("window_complete"), errors="coerce").fillna(0.0).gt(0)
+        & pd.to_numeric(feature_frame.get("bolus_units_window"), errors="coerce").fillna(0.0).ge(0.5)
+        & feature_frame.get("confounding_grade", pd.Series(dtype=str)).astype(str).ne("high")
+    )
+    training = feature_frame.loc[training_mask].copy()
+    ic_series = (
+        pd.to_numeric(training.get("stated_carbs"), errors="coerce")
+        / pd.to_numeric(training.get("bolus_units_window"), errors="coerce").replace(0.0, np.nan)
+    )
+    reference_ic = float(np.nanmedian(ic_series.to_numpy(dtype=float))) if np.isfinite(np.nanmedian(ic_series.to_numpy(dtype=float))) else 12.0
+    if not np.isfinite(reference_ic):
+        reference_ic = 12.0
+    reference_ic = float(np.clip(reference_ic, 4.0, 40.0))
+
+    carb_model_features = [
+        "bolus_units_window",
+        "iob_at_start",
+        "premeal_glucose",
+        "peak_delta_180m",
+        "positive_auc_180m",
+        "recent_exercise_context",
+        "sleep_deficit_flag",
+        "hrv_latest_window",
+        "heart_rate_avg_latest_window",
+        "confounding_is_low",
+        "source_quality_is_good",
+    ]
+    carb_model = _fit_ridge_regression(
+        training,
+        feature_columns=carb_model_features,
+        target_column="stated_carbs",
+        alpha=4.0,
+    )
+    response_model = _fit_ridge_regression(
+        training.assign(candidate_carbs=pd.to_numeric(training.get("stated_carbs"), errors="coerce").fillna(0.0)),
+        feature_columns=["candidate_carbs", "bolus_units_window", "premeal_glucose"],
+        target_column="peak_delta_180m",
+        alpha=2.0,
+    )
+
+    windows = feature_frame.copy()
+    windows["bolus_reference_carbs"] = np.clip(
+        pd.to_numeric(windows.get("bolus_units_window"), errors="coerce").fillna(0.0) * reference_ic,
+        0.0,
+        250.0,
+    )
+    stated_carbs = pd.to_numeric(windows.get("stated_carbs"), errors="coerce")
+    windows["stated_prior_blend_carbs"] = stated_carbs.fillna(windows["bolus_reference_carbs"])
+    response_adjusted_raw = _predict_ridge_regression(carb_model, windows.loc[:, carb_model_features]) if carb_model is not None else np.array([], dtype=float)
+    if len(response_adjusted_raw) != len(windows):
+        response_adjusted_raw = windows["bolus_reference_carbs"].to_numpy(dtype=float)
+    raw_response_series = pd.Series(np.clip(response_adjusted_raw, 0.0, 250.0), index=windows.index, dtype=float)
+    prior_weight = np.where(
+        stated_carbs.notna(),
+        np.where(
+            windows.get("confounding_grade", pd.Series(dtype=str)).astype(str).eq("low"),
+            0.65,
+            np.where(windows.get("confounding_grade", pd.Series(dtype=str)).astype(str).eq("moderate"), 0.45, 0.25),
+        ),
+        0.0,
+    )
+    windows["latent_response_adjusted_carbs"] = np.clip(
+        np.where(stated_carbs.notna(), prior_weight * stated_carbs.fillna(0.0) + (1.0 - prior_weight) * raw_response_series, raw_response_series),
+        0.0,
+        250.0,
+    )
+
+    eval_logged = windows.loc[stated_carbs.notna()].copy()
+    comparison_rows: list[dict[str, Any]] = []
+    selected_model = "latent_response_adjusted"
+    selected_peak_delta_mae = None
+    for model_name, carb_column in [
+        ("bolus_reference", "bolus_reference_carbs"),
+        ("stated_prior_blend", "stated_prior_blend_carbs"),
+        ("latent_response_adjusted", "latent_response_adjusted_carbs"),
+    ]:
+        peak_delta_predictions = np.full(len(eval_logged), np.nan, dtype=float)
+        if response_model is not None and not eval_logged.empty:
+            prediction_input = eval_logged.assign(candidate_carbs=pd.to_numeric(eval_logged[carb_column], errors="coerce").fillna(0.0))
+            peak_delta_predictions = _predict_ridge_regression(response_model, prediction_input)
+        actual_peak_delta = pd.to_numeric(eval_logged.get("peak_delta_180m"), errors="coerce")
+        carb_predictions = pd.to_numeric(eval_logged.get(carb_column), errors="coerce")
+        peak_delta_mae = float(np.nanmean(np.abs(peak_delta_predictions - actual_peak_delta.to_numpy(dtype=float)))) if len(eval_logged) else float("nan")
+        if len(eval_logged) > 1 and np.isfinite(actual_peak_delta).sum() > 1 and np.isfinite(peak_delta_predictions).sum() > 1:
+            peak_delta_correlation = float(np.corrcoef(actual_peak_delta.to_numpy(dtype=float), peak_delta_predictions)[0, 1])
+        else:
+            peak_delta_correlation = float("nan")
+        stated_carb_mae = float(np.nanmean(np.abs(carb_predictions.to_numpy(dtype=float) - stated_carbs.loc[eval_logged.index].to_numpy(dtype=float)))) if len(eval_logged) else float("nan")
+        comparison_rows.append(
+            {
+                "model": model_name,
+                "meal_count": int(len(eval_logged)),
+                "stated_carb_mae": stated_carb_mae,
+                "peak_delta_mae": peak_delta_mae,
+                "peak_delta_correlation": peak_delta_correlation,
+                "selected": False,
+            }
+        )
+    model_comparison = pd.DataFrame(comparison_rows)
+    if not model_comparison.empty:
+        model_comparison = model_comparison.sort_values(["peak_delta_mae", "stated_carb_mae"], na_position="last").reset_index(drop=True)
+        model_comparison.loc[0, "selected"] = True
+        selected_model = str(model_comparison.iloc[0]["model"])
+        selected_peak_delta_mae = None if pd.isna(model_comparison.iloc[0]["peak_delta_mae"]) else float(model_comparison.iloc[0]["peak_delta_mae"])
+
+    selected_carb_column = {
+        "bolus_reference": "bolus_reference_carbs",
+        "stated_prior_blend": "stated_prior_blend_carbs",
+        "latent_response_adjusted": "latent_response_adjusted_carbs",
+    }.get(selected_model, "latent_response_adjusted_carbs")
+    residual_scale = float(carb_model.get("residual_rmse", 18.0)) if carb_model is not None else 18.0
+    residual_scale = float(max(residual_scale, 12.0))
+
+    posterior_rows: list[dict[str, Any]] = []
+    for row in windows.itertuples(index=False):
+        latent_carbs = float(pd.to_numeric(pd.Series([getattr(row, selected_carb_column)]), errors="coerce").fillna(0.0).iloc[0])
+        stated_value = pd.to_numeric(pd.Series([getattr(row, "stated_carbs")]), errors="coerce").iloc[0]
+        raw_discrepancy = abs(latent_carbs - float(stated_value)) if pd.notna(stated_value) else residual_scale
+        quality_multiplier = 1.0 if getattr(row, "source_quality_grade") == "good" else 0.75 if getattr(row, "source_quality_grade") == "limited" else 0.45
+        confounding_multiplier = 1.0 if getattr(row, "confounding_grade") == "low" else 0.7 if getattr(row, "confounding_grade") == "moderate" else 0.35
+        if pd.notna(stated_value):
+            carb_accuracy_score = float(np.clip(np.exp(-raw_discrepancy / residual_scale) * quality_multiplier * confounding_multiplier, 0.0, 1.0))
+        else:
+            carb_accuracy_score = float(np.clip(0.45 * quality_multiplier * confounding_multiplier, 0.0, 0.5))
+        latent_lower = max(latent_carbs - 1.64 * residual_scale, 0.0)
+        latent_upper = latent_carbs + 1.64 * residual_scale
+        bolus_units = float(pd.to_numeric(pd.Series([getattr(row, "bolus_units_window")]), errors="coerce").fillna(0.0).iloc[0])
+        if bolus_units >= 0.5:
+            ic_mean = latent_carbs / bolus_units
+            ic_lower = latent_lower / bolus_units
+            ic_upper = latent_upper / bolus_units
+        else:
+            ic_mean = float("nan")
+            ic_lower = float("nan")
+            ic_upper = float("nan")
+        if getattr(row, "suppression_reason"):
+            identifiability_status = "not_identified" if getattr(row, "suppression_reason") in {"no_meaningful_bolus", "incomplete_window"} else "weakly_identified"
+        elif pd.notna(stated_value):
+            identifiability_status = "prior_informed"
+        elif getattr(row, "confounding_grade") == "low":
+            identifiability_status = "response_inferred"
+        else:
+            identifiability_status = "weakly_identified"
+        posterior_rows.append(
+            {
+                "meal_id": getattr(row, "meal_id"),
+                "timestamp": getattr(row, "timestamp"),
+                "segment": getattr(row, "segment"),
+                "evidence_source": getattr(row, "evidence_source"),
+                "stated_carbs": None if pd.isna(stated_value) else float(stated_value),
+                "latent_carbs_posterior_mean": latent_carbs,
+                "latent_carbs_lower": latent_lower,
+                "latent_carbs_upper": latent_upper,
+                "carb_accuracy_score": carb_accuracy_score,
+                "ic_posterior_mean": ic_mean,
+                "ic_lower": ic_lower,
+                "ic_upper": ic_upper,
+                "confounding_grade": getattr(row, "confounding_grade"),
+                "source_quality_grade": getattr(row, "source_quality_grade"),
+                "identifiability_status": identifiability_status,
+                "suppression_reason": getattr(row, "suppression_reason") or "",
+            }
+        )
+    posterior_meals = pd.DataFrame(posterior_rows).sort_values("timestamp").reset_index(drop=True)
+
+    return LatentMealResearchResult(
+        prepared_dataset=dataset,
+        research_frame=research_frame,
+        research_gate=gate,
+        meal_event_registry=meal_event_registry,
+        meal_windows=meal_windows,
+        posterior_meals=posterior_meals,
+        model_comparison=model_comparison,
+        research_gate_markdown=gate_markdown,
+        meal_window_audit_markdown=_render_latent_meal_window_audit(meal_windows),
+        fit_summary_markdown=_render_latent_meal_fit_summary(
+            gate=gate,
+            reference_ic=reference_ic,
+            carb_model=carb_model,
+            selected_model=selected_model,
+            selected_peak_delta_mae=selected_peak_delta_mae,
+        ),
+        confidence_report_markdown=_render_latent_meal_confidence_report(posterior_meals),
+        model_comparison_markdown=_render_latent_meal_model_comparison(model_comparison),
+        segments=segments,
+        meal_proxy_mode=meal_proxy_mode,
+    )
+
+
+def write_latent_meal_research_artifacts(
+    result: LatentMealResearchResult,
+    report_dir: str | Path,
+) -> dict[str, Path]:
+    root = Path(report_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "research_gate": root / "latent_meal_research_gate.md",
+        "meal_event_registry": root / "meal_event_registry.csv",
+        "meal_window_audit": root / "meal_window_audit.md",
+        "fit_summary": root / "latent_meal_fit_summary.md",
+        "posterior_meals": root / "latent_meal_posterior_meals.csv",
+        "confidence_report": root / "latent_meal_confidence_report.md",
+        "model_comparison": root / "latent_meal_model_comparison.md",
+    }
+    paths["research_gate"].write_text(result.research_gate_markdown, encoding="utf-8")
+    result.meal_event_registry.to_csv(paths["meal_event_registry"], index=False)
+    paths["meal_window_audit"].write_text(result.meal_window_audit_markdown, encoding="utf-8")
+    paths["fit_summary"].write_text(result.fit_summary_markdown, encoding="utf-8")
+    result.posterior_meals.to_csv(paths["posterior_meals"], index=False)
+    paths["confidence_report"].write_text(result.confidence_report_markdown, encoding="utf-8")
+    paths["model_comparison"].write_text(result.model_comparison_markdown, encoding="utf-8")
+    return paths
+
+
 def _synthetic_base_dataset(
     *,
     apple: bool,
@@ -2123,17 +2833,21 @@ def summarize_overnight_basal_evidence(result: TherapyResearchResult) -> tuple[d
 
 __all__ = [
     "DEFAULT_SEGMENT_SPEC",
+    "LatentMealResearchResult",
     "TherapyInfraValidationResult",
     "TherapyResearchResult",
     "TherapySegment",
+    "build_meal_event_registry",
     "build_therapy_feature_registry",
     "build_therapy_research_frame",
     "build_source_report_cards",
     "parse_model_list",
     "parse_therapy_segments",
+    "run_latent_meal_icr_research",
     "run_therapy_research",
     "summarize_overnight_basal_evidence",
     "validate_therapy_infra",
+    "write_latent_meal_research_artifacts",
     "write_therapy_infra_validation_artifacts",
     "write_therapy_research_artifacts",
 ]

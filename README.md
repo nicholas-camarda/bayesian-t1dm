@@ -21,6 +21,11 @@ This is a research project and decision-support workbench, not a medical device 
 
 The active implementation is Python. Legacy R work is archived in [`archive/r/`](./archive/r/), and exploratory notebooks live in [`notebooks/`](./notebooks/).
 
+For project orientation at two different levels:
+
+- implementation and data-flow details: [`docs/technical.md`](./docs/technical.md)
+- current scientific direction and branch truth: [`docs/TECHNICAL_LAB_NOTEBOOK.md`](./docs/TECHNICAL_LAB_NOTEBOOK.md)
+
 What is currently in place:
 
 - Tandem Source acquisition through `tconnectsync`
@@ -104,6 +109,14 @@ bayesian-t1dm research-therapy-settings
 ```
 
 This generates deeper therapy research outputs, but it is not the primary dashboard entrypoint.
+
+6. Use `research-latent-meal-icr` when you want the experimental meal deconvolution workflow:
+
+```bash
+bayesian-t1dm research-latent-meal-icr
+```
+
+This keeps the main therapy workflow unchanged and writes separate research artifacts for meal-event assembly, meal-window audits, latent carb estimates, effective I/C estimates, and confidence reporting.
 
 ## Quickstart
 
@@ -227,6 +240,10 @@ bayesian-t1dm validate-raw
 
 # generate supporting therapy research artifacts
 bayesian-t1dm research-therapy-settings
+
+# generate experimental latent meal / I:C research artifacts
+bayesian-t1dm research-latent-meal-icr
+
 bayesian-t1dm validate-therapy-infra
 ```
 

@@ -14,8 +14,11 @@ from bayesian_t1dm.therapy_research import (
     build_therapy_research_frame,
     parse_model_list,
     parse_therapy_segments,
+    run_latent_meal_icr_research,
     run_therapy_research,
+    write_latent_meal_research_artifacts,
     validate_therapy_infra,
+    _synthetic_base_dataset,
 )
 
 
@@ -237,6 +240,46 @@ def test_run_therapy_research_without_apple_degrades_cleanly():
     assert "therapy_feature_audit" not in result.feature_audit_markdown.lower() or "apple_available: False" in result.feature_audit_markdown
 
 
+def test_run_latent_meal_icr_research_builds_explicit_meal_outputs(tmp_path):
+    dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
+
+    result = run_latent_meal_icr_research(
+        dataset,
+        segments=parse_therapy_segments(),
+        meal_proxy_mode="strict",
+    )
+
+    assert not result.research_gate.empty
+    assert not result.meal_event_registry.empty
+    assert not result.meal_windows.empty
+    assert not result.posterior_meals.empty
+    assert not result.model_comparison.empty
+    assert {"meal_id", "stated_carbs", "latent_carbs_posterior_mean", "carb_accuracy_score", "ic_posterior_mean"}.issubset(result.posterior_meals.columns)
+    assert "Latent Meal Research Gate" in result.research_gate_markdown
+    assert "Latent Meal Fit Summary" in result.fit_summary_markdown
+    assert "Latent Meal Confidence Report" in result.confidence_report_markdown
+
+    paths = write_latent_meal_research_artifacts(result, tmp_path / "latent")
+    assert paths["research_gate"].exists()
+    assert paths["meal_event_registry"].exists()
+    assert paths["posterior_meals"].exists()
+
+
+def test_run_latent_meal_icr_research_caps_proxy_only_confidence():
+    dataset = _synthetic_base_dataset(apple=False, explicit_carbs=False, proxy_only=True)
+
+    result = run_latent_meal_icr_research(
+        dataset,
+        segments=parse_therapy_segments(),
+        meal_proxy_mode="strict",
+    )
+
+    assert not result.meal_event_registry.empty
+    assert not result.posterior_meals.empty
+    assert result.posterior_meals["stated_carbs"].isna().all()
+    assert result.posterior_meals["carb_accuracy_score"].max() <= 0.5
+
+
 def test_strict_meal_proxy_only_creates_high_confidence_meal_contexts():
     dataset = _build_prepared_dataset(apple=False)
     frame = dataset.frame.copy()
@@ -266,7 +309,7 @@ def test_strict_meal_proxy_only_creates_high_confidence_meal_contexts():
 def test_research_therapy_settings_cli_writes_artifacts(tmp_path, monkeypatch):
     dataset = _build_prepared_dataset(apple=True)
     preparation = SimpleNamespace(dataset=dataset)
-    monkeypatch.setattr(cli, "_prepare_model_data", lambda args, paths: preparation)
+    monkeypatch.setattr(cli, "_prepare_model_data", lambda args, paths, session=None: preparation)
 
     report_dir = tmp_path / "reports"
     exit_code = main(

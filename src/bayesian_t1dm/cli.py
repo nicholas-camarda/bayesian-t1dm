@@ -41,14 +41,16 @@ from .paths import ProjectPaths
 from .quality import assess_data_quality
 from .recommend import RecommendationPolicy, recommend_setting_changes
 from .report import build_run_summary, write_json_report, write_markdown_report
-from .review import write_coverage_review_html, write_current_status_html, write_run_review_html, write_therapy_evidence_review_html
+from .review import write_coverage_review_html, write_current_status_html, write_latent_meal_review_html, write_run_review_html, write_therapy_evidence_review_html
 from .features import FeatureFrame
 from .status import cleanup_legacy_top_level_output, create_status_bundle, derive_current_status, finalize_status_logs, publish_latest_entrypoints, write_status_json
 from .therapy_research import (
     parse_model_list,
     parse_therapy_segments,
+    run_latent_meal_icr_research,
     run_therapy_research,
     validate_therapy_infra,
+    write_latent_meal_research_artifacts,
     write_therapy_infra_validation_artifacts,
     write_therapy_research_artifacts,
 )
@@ -121,6 +123,17 @@ def build_parser() -> argparse.ArgumentParser:
     research_therapy.add_argument("--ic-policy", choices=["exploratory_only", "conservative", "off"], default="exploratory_only")
     research_therapy.add_argument("--write-source-report-cards", action=argparse.BooleanOptionalAction, default=True)
     research_therapy.add_argument("--write-research-gate", action=argparse.BooleanOptionalAction, default=True)
+
+    latent_meal = add_command("research-latent-meal-icr", "Run an experimental latent meal and I/C research workflow")
+    latent_meal.add_argument("--raw", default=None)
+    latent_meal.add_argument("--apple-input", default=None, help="Optional Health Auto Export parent directory")
+    latent_meal.add_argument("--horizon", type=int, default=30)
+    latent_meal.add_argument("--segments", default=None, help="Comma-separated day segments like overnight=00:00-06:00,morning=06:00-11:00")
+    latent_meal.add_argument("--skip-backfill", action=argparse.BooleanOptionalAction, default=False)
+    latent_meal.add_argument("--report-dir", default=None)
+    latent_meal.add_argument("--review-html", default=None)
+    latent_meal.add_argument("--env-file", default=None, help="Optional .env file with Tandem credentials")
+    latent_meal.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
 
     validate_therapy = add_command("validate-therapy-infra", "Run synthetic truth-recovery validation for the therapy research infrastructure")
     validate_therapy.add_argument("--report-dir", default=None)
@@ -602,8 +615,25 @@ def _build_forecast_summary(
     )
 
 
+def _run_latent_meal_analysis(
+    *,
+    args,
+    paths: ProjectPaths,
+    session: LoggingSession | None = None,
+):
+    with _session_stage(session, "latent_meal.prepare_data"):
+        preparation = _prepare_model_data(args=args, paths=paths, session=session)
+    with _session_stage(session, "latent_meal.research"):
+        result = run_latent_meal_icr_research(
+            preparation.dataset,
+            segments=parse_therapy_segments(args.segments),
+            meal_proxy_mode=args.meal_proxy_mode,
+        )
+    return preparation, result
+
+
 def _apply_command_defaults(args: argparse.Namespace, paths: ProjectPaths) -> None:
-    if args.command in {"ingest", "run", "screen-health-features", "build-health-analysis-ready", "prepare-model-data", "research-therapy-settings", "review-therapy-evidence", "status"}:
+    if args.command in {"ingest", "run", "screen-health-features", "build-health-analysis-ready", "prepare-model-data", "research-therapy-settings", "research-latent-meal-icr", "review-therapy-evidence", "status"}:
         args.raw = args.raw or str(paths.cloud_raw)
         if args.command == "ingest":
             args.report = args.report or str(paths.reports / "coverage.md")
@@ -618,6 +648,9 @@ def _apply_command_defaults(args: argparse.Namespace, paths: ProjectPaths) -> No
             args.report = args.report or str(paths.reports / "model_data_preparation.md")
         elif args.command == "research-therapy-settings":
             args.report_dir = args.report_dir or str(paths.reports)
+        elif args.command == "research-latent-meal-icr":
+            args.report_dir = args.report_dir or str(paths.reports / "latent_meal_research")
+            args.review_html = args.review_html or str(Path(args.report_dir) / "latent_meal_review.html")
         elif args.command == "review-therapy-evidence":
             args.report = args.report or str(paths.reports / "therapy_evidence_review.html")
         elif args.command == "build-health-analysis-ready":
@@ -694,6 +727,18 @@ def _dispatch_command(
                 args.report_dir,
                 write_source_report_cards=args.write_source_report_cards,
                 write_research_gate=args.write_research_gate,
+            )
+        return 0
+
+    if args.command == "research-latent-meal-icr":
+        _, result = _run_latent_meal_analysis(args=args, paths=paths, session=session)
+        with session.stage("latent_meal.write_artifacts", report_dir=args.report_dir, review_html=args.review_html):
+            write_latent_meal_research_artifacts(result, args.report_dir)
+            write_latent_meal_review_html(
+                result,
+                args.review_html,
+                artifact_root=args.report_dir,
+                artifact_href_prefix="",
             )
         return 0
 

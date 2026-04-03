@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 import pytest
 
@@ -102,3 +104,28 @@ def test_build_feature_frame_adds_basal_and_meal_exposures():
     assert basal_row["basal_units_delivered"] == pytest.approx((1.0 * 2.0 + 2.0 * 3.0) / 60.0)
     assert basal_row["minutes_since_basal_change"] == pytest.approx(0.0)
     assert next_row["minutes_since_basal_change"] == pytest.approx(5.0)
+
+
+def test_build_feature_frame_warns_when_tconnectsync_has_no_explicit_carb_records():
+    data = IngestedData(
+        cgm=_frame(
+            {
+                "timestamp": pd.date_range("2023-06-01 00:00:00", periods=3, freq="5min"),
+                "glucose": [100.0, 102.0, 104.0],
+                "source_file": ["fixture.csv"] * 3,
+            }
+        ),
+        bolus=_frame(
+            {
+                "timestamp": [pd.Timestamp("2023-06-01 00:05:00")],
+                "bolus_units": [2.0],
+                "source_file": ["fixture.csv"],
+            }
+        ),
+        source_files=[Path("/tmp/tconnectsync/2026-03-02__2026-03-31/normalized/bolus.csv")],
+    )
+
+    with pytest.warns(UserWarning, match="tconnectsync/Tandem payloads in this dataset do not appear to include explicit carbohydrate records"):
+        frame = build_feature_frame(data, FeatureConfig(horizon_minutes=5))
+
+    assert not frame.frame.empty

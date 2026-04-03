@@ -50,20 +50,24 @@ from .model import BayesianGlucoseModel, FitDiagnostics, ModelFit, ScenarioForec
 from .quality import DataQualitySummary, assess_data_quality
 from .recommend import Recommendation, RecommendationPolicy, Scenario, build_recommendation_policy, recommend_setting_changes
 from .report import build_run_summary, write_json_report, write_markdown_report
-from .review import write_coverage_review_html, write_run_review_html, write_therapy_evidence_review_html
+from .review import write_coverage_review_html, write_latent_meal_review_html, write_run_review_html, write_therapy_evidence_review_html
 from .therapy_research import (
     DEFAULT_SEGMENT_SPEC,
+    LatentMealResearchResult,
     TherapyInfraValidationResult,
     TherapyResearchResult,
     TherapySegment,
+    build_meal_event_registry,
     build_therapy_feature_registry,
     build_therapy_research_frame,
     build_source_report_cards,
     parse_model_list,
     parse_therapy_segments,
+    run_latent_meal_icr_research,
     run_therapy_research,
     summarize_overnight_basal_evidence,
     validate_therapy_infra,
+    write_latent_meal_research_artifacts,
     write_therapy_infra_validation_artifacts,
     write_therapy_research_artifacts,
 )
@@ -96,6 +100,7 @@ __all__ = [
     "TConnectSyncSourceClient",
     "TandemCoverage",
     "TandemCredentials",
+    "LatentMealResearchResult",
     "TherapyResearchResult",
     "TherapyInfraValidationResult",
     "TherapySegment",
@@ -108,6 +113,7 @@ __all__ = [
     "build_feature_frame",
     "build_health_context_frame",
     "build_export_manifest",
+    "build_meal_event_registry",
     "build_run_summary",
     "build_therapy_feature_registry",
     "build_therapy_research_frame",
@@ -136,6 +142,7 @@ __all__ = [
     "parse_model_list",
     "parse_therapy_segments",
     "recommend_setting_changes",
+    "run_latent_meal_icr_research",
     "run_therapy_research",
     "summarize_overnight_basal_evidence",
     "validate_therapy_infra",
@@ -154,6 +161,8 @@ __all__ = [
     "write_health_screening_report",
     "write_model_data_preparation_report",
     "write_json_report",
+    "write_latent_meal_research_artifacts",
+    "write_latent_meal_review_html",
     "write_markdown_report",
     "write_therapy_infra_validation_artifacts",
     "write_therapy_research_artifacts",

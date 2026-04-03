@@ -38,6 +38,21 @@ def _freq_minutes(freq: str) -> int:
     return int(pd.Timedelta(freq).total_seconds() // 60)
 
 
+def _carb_data_warning_message(data: IngestedData) -> str:
+    base = (
+        "Carb data is empty — carb_grams will be 0 everywhere. "
+        "If you expect carb data, check that your Tandem export includes carbohydrate records."
+    )
+    source_paths = [str(path).lower() for path in getattr(data, "source_files", [])]
+    if any("tconnectsync" in path for path in source_paths):
+        return (
+            f"{base} Current tconnectsync/Tandem payloads in this dataset do not appear to include "
+            "explicit carbohydrate records, so downstream workflows should treat meal truth as missing. "
+            "The latent meal research workflow can still infer research-only meal carbs from bolus and glucose response."
+        )
+    return base
+
+
 def build_time_grid(data: IngestedData, freq: str = "5min") -> pd.DataFrame:
     timestamps: list[pd.Series] = []
     if not data.cgm.empty and "timestamp" in data.cgm.columns:
@@ -285,8 +300,7 @@ def build_feature_frame(data: IngestedData, config: FeatureConfig | None = None)
     config = config or FeatureConfig()
     if data.carbs.empty:
         warnings.warn(
-            "Carb data is empty — carb_grams will be 0 everywhere. "
-            "If you expect carb data, check that your Tandem export includes carbohydrate records.",
+            _carb_data_warning_message(data),
             UserWarning,
             stacklevel=2,
         )

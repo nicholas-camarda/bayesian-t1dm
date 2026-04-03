@@ -751,6 +751,10 @@ def intersect_spans(
     return start, end
 
 
+def _window_periods(window_minutes: int, *, step_minutes: int) -> int:
+    return max(int(window_minutes / max(step_minutes, 1)), 1)
+
+
 def build_health_context_frame(base_frame: pd.DataFrame, data: IngestedData, *, freq: str = "5min") -> tuple[pd.DataFrame, list[str]]:
     out = base_frame.loc[:, ["timestamp"]].copy()
     out["timestamp"] = _parse_series(out["timestamp"])
@@ -831,59 +835,86 @@ def build_health_context_frame(base_frame: pd.DataFrame, data: IngestedData, *, 
         workouts["avg_heart_rate"] = pd.to_numeric(workouts["avg_heart_rate"], errors="coerce")
         workouts["max_heart_rate"] = pd.to_numeric(workouts["max_heart_rate"], errors="coerce")
         workouts = workouts.dropna(subset=["end_timestamp"]).sort_values("end_timestamp")
-        workout_times = workouts["end_timestamp"].to_numpy(dtype="datetime64[ns]")
-        grid_times = out["timestamp"].to_numpy(dtype="datetime64[ns]")
-        indices = np.searchsorted(workout_times, grid_times, side="right") - 1
-        out["last_workout_duration_seconds"] = 0.0
-        out["last_workout_active_energy_value"] = 0.0
-        out["last_workout_distance_value"] = 0.0
-        out["last_workout_avg_heart_rate"] = 0.0
-        out["last_workout_max_heart_rate"] = 0.0
-        out["minutes_since_last_workout"] = np.nan
-        valid = indices >= 0
-        if np.any(valid):
-            valid_indices = indices[valid]
-            matched = workouts.iloc[valid_indices]
-            out.loc[valid, "last_workout_duration_seconds"] = matched["duration_seconds"].fillna(0.0).to_numpy()
-            out.loc[valid, "last_workout_active_energy_value"] = matched["active_energy_value"].fillna(0.0).to_numpy()
-            out.loc[valid, "last_workout_distance_value"] = matched["distance_value"].fillna(0.0).to_numpy()
-            out.loc[valid, "last_workout_avg_heart_rate"] = matched["avg_heart_rate"].fillna(0.0).to_numpy()
-            out.loc[valid, "last_workout_max_heart_rate"] = matched["max_heart_rate"].fillna(0.0).to_numpy()
-            deltas = (out.loc[valid, "timestamp"].to_numpy(dtype="datetime64[ns]") - matched["end_timestamp"].to_numpy(dtype="datetime64[ns]")) / np.timedelta64(1, "m")
-            out.loc[valid, "minutes_since_last_workout"] = deltas
+        out = out.sort_values("timestamp").reset_index(drop=True)
+        out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce").astype("datetime64[ns]")
 
-        end_minutes = workouts["end_timestamp"].astype("int64").to_numpy()
-        duration_values = workouts["duration_seconds"].fillna(0.0).to_numpy(dtype=float)
-        energy_values = workouts["active_energy_value"].fillna(0.0).to_numpy(dtype=float)
-        grid_minutes = out["timestamp"].astype("int64").to_numpy()
-        if len(end_minutes):
-            cumulative_duration = np.cumsum(duration_values)
-            cumulative_energy = np.cumsum(energy_values)
-            idx_6h = np.searchsorted(end_minutes, grid_minutes - int(pd.Timedelta(hours=6).value), side="left")
-            idx_12h = np.searchsorted(end_minutes, grid_minutes - int(pd.Timedelta(hours=12).value), side="left")
-            idx_24h = np.searchsorted(end_minutes, grid_minutes - int(pd.Timedelta(hours=24).value), side="left")
-            current_idx = np.searchsorted(end_minutes, grid_minutes, side="right") - 1
-            counts_6h = np.maximum(current_idx - idx_6h + 1, 0)
-            counts_12h = np.maximum(current_idx - idx_12h + 1, 0)
-            counts_24h = np.maximum(current_idx - idx_24h + 1, 0)
-            out["recent_workout_6h"] = (counts_6h > 0).astype(int)
-            out["recent_workout_12h"] = (counts_12h > 0).astype(int)
-            out["workout_count_24h"] = counts_24h.astype(float)
+        last_workout_lookup = workouts.loc[
+            :,
+            [
+                "end_timestamp",
+                "duration_seconds",
+                "active_energy_value",
+                "distance_value",
+                "avg_heart_rate",
+                "max_heart_rate",
+            ],
+        ].rename(columns={"end_timestamp": "_last_workout_end_timestamp"})
+        last_workout_lookup["_last_workout_end_timestamp"] = pd.to_datetime(
+            last_workout_lookup["_last_workout_end_timestamp"], errors="coerce"
+        ).astype("datetime64[ns]")
+        out = pd.merge_asof(
+            out,
+            last_workout_lookup,
+            left_on="timestamp",
+            right_on="_last_workout_end_timestamp",
+            direction="backward",
+        )
+        out = out.rename(
+            columns={
+                "duration_seconds": "last_workout_duration_seconds",
+                "active_energy_value": "last_workout_active_energy_value",
+                "distance_value": "last_workout_distance_value",
+                "avg_heart_rate": "last_workout_avg_heart_rate",
+                "max_heart_rate": "last_workout_max_heart_rate",
+            }
+        )
+        out["minutes_since_last_workout"] = (
+            out["timestamp"] - out["_last_workout_end_timestamp"]
+        ).dt.total_seconds().div(60.0)
 
-            duration_before_24h = np.where(idx_24h > 0, cumulative_duration[idx_24h - 1], 0.0)
-            energy_before_24h = np.where(idx_24h > 0, cumulative_energy[idx_24h - 1], 0.0)
-            duration_up_to_current = np.where(current_idx >= 0, cumulative_duration[current_idx], 0.0)
-            energy_up_to_current = np.where(current_idx >= 0, cumulative_energy[current_idx], 0.0)
-            out["workout_duration_sum_24h"] = duration_up_to_current - duration_before_24h
-            out["workout_active_energy_sum_24h"] = energy_up_to_current - energy_before_24h
-        else:
-            out["recent_workout_6h"] = 0
-            out["recent_workout_12h"] = 0
-            out["workout_count_24h"] = 0.0
-            out["workout_duration_sum_24h"] = 0.0
-            out["workout_active_energy_sum_24h"] = 0.0
-        out["recent_workout_12h"] = out["minutes_since_last_workout"].le(12 * 60).fillna(False).astype(int)
+        workout_events = workouts.assign(
+            timestamp=workouts["end_timestamp"].dt.floor(freq),
+            workout_event_count=1.0,
+            workout_duration_event=workouts["duration_seconds"].fillna(0.0),
+            workout_energy_event=workouts["active_energy_value"].fillna(0.0),
+        )
+        workout_events = (
+            workout_events.groupby("timestamp", as_index=False)
+            .agg(
+                workout_event_count=("workout_event_count", "sum"),
+                workout_duration_event=("workout_duration_event", "sum"),
+                workout_energy_event=("workout_energy_event", "sum"),
+            )
+        )
+        out = out.merge(workout_events, on="timestamp", how="left")
+        for column in ["workout_event_count", "workout_duration_event", "workout_energy_event"]:
+            out[column] = pd.to_numeric(out[column], errors="coerce").fillna(0.0)
+
+        out["recent_workout_6h"] = (
+            out["workout_event_count"].rolling(_window_periods(6 * 60, step_minutes=step_minutes), min_periods=1).sum().gt(0)
+        ).astype(int)
+        out["recent_workout_12h"] = (
+            out["workout_event_count"].rolling(_window_periods(12 * 60, step_minutes=step_minutes), min_periods=1).sum().gt(0)
+        ).astype(int)
+        out["workout_count_24h"] = out["workout_event_count"].rolling(
+            _window_periods(24 * 60, step_minutes=step_minutes),
+            min_periods=1,
+        ).sum()
+        out["workout_duration_sum_24h"] = out["workout_duration_event"].rolling(
+            _window_periods(24 * 60, step_minutes=step_minutes),
+            min_periods=1,
+        ).sum()
+        out["workout_active_energy_sum_24h"] = out["workout_energy_event"].rolling(
+            _window_periods(24 * 60, step_minutes=step_minutes),
+            min_periods=1,
+        ).sum()
         out["minutes_since_last_workout"] = out["minutes_since_last_workout"].fillna(1e6)
+        out["workout_summary_plausible"] = (
+            out["workout_count_24h"].le(12)
+            & out["workout_duration_sum_24h"].le(24 * 60 * 60)
+            & out["minutes_since_last_workout"].ge(0)
+        ).astype(int)
+        out = out.drop(columns=["_last_workout_end_timestamp", "workout_event_count", "workout_duration_event", "workout_energy_event"])
         feature_columns.extend(
             [
                 "last_workout_duration_seconds",
@@ -933,15 +964,42 @@ def build_health_context_frame(base_frame: pd.DataFrame, data: IngestedData, *, 
                 )
             ].copy()
             if not sparse.empty:
-                pivot = (
-                    sparse.assign(column=sparse["metric"].astype(str) + "__" + sparse["stat"].astype(str))
-                .pivot_table(index="timestamp", columns="column", values="value", aggfunc="mean")
-                .reset_index()
-                )
-                out = out.merge(pivot, on="timestamp", how="left")
-                fill_forward_columns = [column for column in out.columns if "__" in column and not column.startswith("heart_rate__")]
-                if fill_forward_columns:
-                    out[fill_forward_columns] = out[fill_forward_columns].ffill()
+                freshness_map = {
+                    "heart_rate_variability": ("heart_rate_variability__value", "hrv_minutes_since_last", 24 * 60),
+                    "respiratory_rate": ("respiratory_rate__value", "respiratory_rate_minutes_since_last", 24 * 60),
+                    "resting_heart_rate": ("resting_heart_rate__value", "resting_heart_rate_minutes_since_last", 7 * 24 * 60),
+                    "weight_body_mass": ("weight_body_mass__value", "weight_minutes_since_last", 30 * 24 * 60),
+                }
+                for metric, (source_column, freshness_column, freshness_cap_minutes) in freshness_map.items():
+                    metric_rows = sparse.loc[sparse["metric"] == metric, ["timestamp", "value"]].copy()
+                    if metric_rows.empty:
+                        continue
+                    metric_rows = (
+                        metric_rows.groupby("timestamp", as_index=False)
+                        .agg(value=("value", "mean"))
+                        .sort_values("timestamp")
+                    )
+                    metric_rows["timestamp"] = pd.to_datetime(metric_rows["timestamp"], errors="coerce").astype("datetime64[ns]")
+                    value_frame = metric_rows.rename(columns={"value": source_column})
+                    freshness_frame = metric_rows.rename(columns={"timestamp": freshness_column, "value": "_unused_metric_value"})
+                    out = pd.merge_asof(
+                        out.sort_values("timestamp"),
+                        value_frame.sort_values("timestamp"),
+                        on="timestamp",
+                        direction="backward",
+                    )
+                    out = pd.merge_asof(
+                        out.sort_values("timestamp"),
+                        freshness_frame.sort_values(freshness_column),
+                        left_on="timestamp",
+                        right_on=freshness_column,
+                        direction="backward",
+                    )
+                    out[freshness_column] = (
+                        out["timestamp"] - out[freshness_column]
+                    ).dt.total_seconds().div(60.0).fillna(1e6)
+                    out[freshness_column] = out[freshness_column].clip(lower=0.0, upper=float(freshness_cap_minutes))
+                    out = out.drop(columns=["_unused_metric_value"])
 
             for source_column, target_column, periods in [
                 ("heart_rate_variability__value", "hrv_latest", None),
@@ -966,6 +1024,9 @@ def build_health_context_frame(base_frame: pd.DataFrame, data: IngestedData, *, 
         out = out.drop(columns=raw_measurement_columns)
 
     feature_columns = [column for column in dict.fromkeys(feature_columns) if column in out.columns]
+    freshness_columns = [column for column in out.columns if column.endswith("_minutes_since_last")]
+    if freshness_columns:
+        out[freshness_columns] = out[freshness_columns].apply(pd.to_numeric, errors="coerce").fillna(1e6)
     if feature_columns:
         out[feature_columns] = out[feature_columns].apply(pd.to_numeric, errors="coerce").fillna(0.0)
     return out, feature_columns
