@@ -510,10 +510,10 @@ def _exclusion_figure(exclusions: pd.DataFrame) -> go.Figure:
 def _workflow_table_html() -> str:
     rows = [
         ("normalize-raw", "normalize_raw_summary.md", "src/bayesian_t1dm/acquisition.py::normalize_tconnectsync_archive", "Rebuild normalized Tandem windows from archived raw payloads."),
-        ("prepare-model-data", "model_data_preparation.md + prepared_model_data_5min.csv", "src/bayesian_t1dm/cli.py::_prepare_model_data and src/bayesian_t1dm/health_auto_export.py::build_prepared_model_dataset", "Create the Tandem-aligned model dataset and record source overlap."),
+        ("prepare-model-data", "output/prepare/model_data_preparation.md + cache/prepared/prepared_model_data_5min.csv", "src/bayesian_t1dm/cli.py::_prepare_model_data and src/bayesian_t1dm/health_auto_export.py::build_prepared_model_dataset", "Create the Tandem-aligned model dataset and record source overlap."),
         ("research-therapy-settings", "therapy_research_gate.md + therapy_feature_audit.md", "src/bayesian_t1dm/therapy_research.py::run_therapy_research", "Build therapy contexts, gate identifiability, and compare models."),
         ("validate-therapy-infra", "therapy_infra_validation.md", "src/bayesian_t1dm/therapy_research.py::validate_therapy_infra", "Check truth-recovery and suppression behavior on synthetic scenarios."),
-        ("review-therapy-evidence", "therapy_evidence_review.html", "src/bayesian_t1dm/review.py::write_therapy_evidence_review_html", "Explain what the system thinks is happening and why."),
+        ("review-therapy-evidence", "output/therapy/therapy_review.html", "src/bayesian_t1dm/review.py::write_therapy_evidence_review_html", "Explain what the system thinks is happening and why."),
     ]
     html_rows = [
         "<tr><th>step</th><th>artifact</th><th>code path</th><th>purpose</th></tr>",
@@ -651,7 +651,6 @@ def _artifact_index_html(
 ) -> str:
     artifacts = [
         "model_data_preparation.md",
-        "prepared_model_data_5min.csv",
         "therapy_research_gate.md",
         "meal_proxy_audit.md",
         "therapy_feature_audit.md",
@@ -757,22 +756,21 @@ def write_therapy_evidence_review_html(
 def _latent_meal_banner(result: LatentMealResearchResult) -> str:
     if result.research_gate.empty:
         status = "broken"
-        identifiability = "not_identified"
-        meal_windows = 0
+        headline = "Latent meal foundation status unavailable."
     else:
         gate_row = result.research_gate.iloc[0]
-        identifiability = str(gate_row.get("identifiability") or "not_identified")
-        meal_windows = int(gate_row.get("meal_windows") or 0)
-        status = {
-            "prior_informed": "good",
-            "response_inferred": "degraded",
-            "weakly_identified": "degraded",
-            "not_identified": "broken",
-        }.get(identifiability, "degraded")
+        accepted_windows = int(gate_row.get("accepted_windows") or 0)
+        evaluated_candidates = int(gate_row.get("evaluated_candidates") or 0)
+        explicit_available = bool(gate_row.get("explicit_carb_source_available"))
+        status = "good" if accepted_windows > 0 else "degraded" if evaluated_candidates > 0 else "broken"
+        headline = (
+            f"Foundation scope: <code>{html.escape(str(gate_row.get('research_scope') or 'foundation'))}</code>. "
+            f"Accepted first-meal windows: <code>{accepted_windows}</code> / <code>{evaluated_candidates}</code>. "
+            f"Explicit carb source available: <code>{str(explicit_available).lower()}</code>."
+        )
     return (
         f"<div class='banner {html.escape(status)}'>"
-        f"Latent meal identifiability: <code>{html.escape(identifiability)}</code>. "
-        f"Meal windows: <code>{html.escape(str(meal_windows))}</code>."
+        f"{headline}"
         "</div>"
     )
 
@@ -780,6 +778,28 @@ def _latent_meal_banner(result: LatentMealResearchResult) -> str:
 def _latent_meal_gate_html(result: LatentMealResearchResult) -> str:
     if result.research_gate.empty:
         return "<div class='section'><h2>Research Gate</h2><div class='empty-state'>No latent meal gate was available.</div></div>"
+    if str(getattr(result, "research_scope", "foundation")) == "foundation":
+        row = result.research_gate.iloc[0]
+        return "\n".join(
+            [
+                "<div class='section'>",
+                "<h2>Research Gate</h2>",
+                "<table>",
+                "<thead><tr><th>research_scope</th><th>explicit_carb_source_available</th><th>latent_fit_status</th><th>evaluated_candidates</th><th>accepted_windows</th><th>source_quality</th><th>cohort_status</th></tr></thead>",
+                "<tbody>",
+                "<tr>"
+                f"<td><code>{html.escape(str(row.research_scope))}</code></td>"
+                f"<td><code>{html.escape(str(bool(row.explicit_carb_source_available)).lower())}</code></td>"
+                f"<td><code>{html.escape(str(row.latent_fit_status))}</code></td>"
+                f"<td>{int(row.evaluated_candidates)}</td>"
+                f"<td>{int(row.accepted_windows)}</td>"
+                f"<td><code>{html.escape(str(row.source_quality_status))}</code></td>"
+                f"<td><code>{html.escape(str(row.cohort_status))}</code></td>"
+                "</tr>",
+                "</tbody></table>",
+                "</div>",
+            ]
+        )
     rows = []
     for row in result.research_gate.itertuples(index=False):
         rows.append(
@@ -798,6 +818,92 @@ def _latent_meal_gate_html(result: LatentMealResearchResult) -> str:
             "<h2>Research Gate</h2>",
             "<table>",
             "<thead><tr><th>parameter</th><th>estimand</th><th>identifiability</th><th>gate_status</th><th>source_quality</th><th>confounding</th></tr></thead>",
+            "<tbody>",
+            *rows,
+            "</tbody></table>",
+            "</div>",
+        ]
+    )
+
+
+def _latent_meal_semantics_html(result: LatentMealResearchResult) -> str:
+    frame = result.research_frame.copy()
+    if frame.empty:
+        return "<div class='section'><h2>Meal Truth Semantics</h2><div class='empty-state'>No research rows were available.</div></div>"
+    status_counts = frame.get("meal_truth_status", pd.Series(dtype=str)).astype(str).value_counts(dropna=False)
+    rows = []
+    for status, count in status_counts.items():
+        rows.append(
+            "<tr>"
+            f"<td><code>{html.escape(str(status))}</code></td>"
+            f"<td>{int(count)}</td>"
+            "</tr>"
+        )
+    explicit_available = bool(getattr(result.prepared_dataset, "explicit_carb_source_available", False))
+    return "\n".join(
+        [
+            "<div class='section'>",
+            "<h2>Meal Truth Semantics</h2>",
+            f"<div class='muted'>Explicit carb source available: <code>{str(explicit_available).lower()}</code>. Legacy meal columns remain for compatibility and are not treated as observed truth when the explicit source is unavailable.</div>",
+            "<table>",
+            "<thead><tr><th>meal_truth_status</th><th>count</th></tr></thead>",
+            "<tbody>",
+            *rows,
+            "</tbody></table>",
+            "</div>",
+        ]
+    )
+
+
+def _first_meal_clean_window_html(result: LatentMealResearchResult) -> str:
+    if result.meal_windows.empty:
+        return "<div class='section'><h2>First Meal Clean Windows</h2><div class='empty-state'>No morning first-meal candidates were evaluated.</div></div>"
+    top = result.meal_windows.head(20)
+    rows = []
+    for row in top.itertuples(index=False):
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(row.candidate_id))}</td>"
+            f"<td>{html.escape(str(row.timestamp))}</td>"
+            f"<td>{html.escape(str(row.segment))}</td>"
+            f"<td>{'yes' if bool(row.included) else 'no'}</td>"
+            f"<td>{'NA' if pd.isna(row.premeal_glucose) else f'{float(row.premeal_glucose):.1f}'}</td>"
+            f"<td>{'NA' if pd.isna(row.premeal_iob) else f'{float(row.premeal_iob):.2f}'}</td>"
+            f"<td>{float(row.cgm_coverage_fraction):.3f}</td>"
+            f"<td>{html.escape(str(row.exclusion_reasons or 'none'))}</td>"
+            "</tr>"
+        )
+    return "\n".join(
+        [
+            "<div class='section'>",
+            "<h2>First Meal Clean Windows</h2>",
+            "<table>",
+            "<thead><tr><th>candidate_id</th><th>timestamp</th><th>segment</th><th>included</th><th>premeal_glucose</th><th>premeal_iob</th><th>cgm_coverage</th><th>exclusions</th></tr></thead>",
+            "<tbody>",
+            *rows,
+            "</tbody></table>",
+            "</div>",
+        ]
+    )
+
+
+def _first_meal_exclusion_html(result: LatentMealResearchResult) -> str:
+    if result.first_meal_exclusion_summary.empty:
+        return "<div class='section'><h2>Exclusion Summary</h2><div class='empty-state'>No exclusion summary was available.</div></div>"
+    rows = []
+    for row in result.first_meal_exclusion_summary.itertuples(index=False):
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(row.reason))}</td>"
+            f"<td>{int(row.count)}</td>"
+            "</tr>"
+        )
+    return "\n".join(
+        [
+            "<div class='section'>",
+            "<h2>Exclusion Summary</h2>",
+            "<table>",
+            "<thead><tr><th>reason</th><th>count</th></tr></thead>",
             "<tbody>",
             *rows,
             "</tbody></table>",
@@ -876,17 +982,28 @@ def _latent_meal_posterior_html(result: LatentMealResearchResult) -> str:
 def _latent_meal_artifact_index_html(
     artifact_root: Path,
     *,
+    research_scope: str = "foundation",
     artifact_href_prefix: str = "",
 ) -> str:
-    artifacts = [
-        "latent_meal_research_gate.md",
-        "meal_event_registry.csv",
-        "meal_window_audit.md",
-        "latent_meal_fit_summary.md",
-        "latent_meal_posterior_meals.csv",
-        "latent_meal_confidence_report.md",
-        "latent_meal_model_comparison.md",
-    ]
+    if research_scope == "foundation":
+        artifacts = [
+            "latent_meal_research_gate.md",
+            "meal_truth_semantics_report.md",
+            "meal_event_registry.csv",
+            "first_meal_clean_window_registry.csv",
+            "first_meal_clean_window_audit.md",
+            "first_meal_exclusion_summary.csv",
+        ]
+    else:
+        artifacts = [
+            "latent_meal_research_gate.md",
+            "meal_event_registry.csv",
+            "meal_window_audit.md",
+            "latent_meal_fit_summary.md",
+            "latent_meal_posterior_meals.csv",
+            "latent_meal_confidence_report.md",
+            "latent_meal_model_comparison.md",
+        ]
     rows = []
     for artifact in artifacts:
         path = artifact_root / artifact
@@ -923,12 +1040,25 @@ def write_latent_meal_review_html(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     artifact_root_path = Path(artifact_root) if artifact_root is not None else path.parent
-    sections = [
-        _latent_meal_gate_html(result),
-        _latent_meal_model_comparison_html(result),
-        _latent_meal_posterior_html(result),
-        _latent_meal_artifact_index_html(artifact_root_path, artifact_href_prefix=artifact_href_prefix),
-    ]
+    if str(getattr(result, "research_scope", "foundation")) == "foundation":
+        sections = [
+            _latent_meal_gate_html(result),
+            _latent_meal_semantics_html(result),
+            _first_meal_clean_window_html(result),
+            _first_meal_exclusion_html(result),
+            _latent_meal_artifact_index_html(
+                artifact_root_path,
+                research_scope="foundation",
+                artifact_href_prefix=artifact_href_prefix,
+            ),
+        ]
+    else:
+        sections = [
+            _latent_meal_gate_html(result),
+            _latent_meal_model_comparison_html(result),
+            _latent_meal_posterior_html(result),
+            _latent_meal_artifact_index_html(artifact_root_path, research_scope="full", artifact_href_prefix=artifact_href_prefix),
+        ]
     html_text = _page_shell(
         title="Bayesian T1DM Latent Meal Review",
         banner_html=_latent_meal_banner(result),

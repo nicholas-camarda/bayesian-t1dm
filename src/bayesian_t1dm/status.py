@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -17,62 +16,19 @@ from .therapy_research import TherapyInfraValidationResult, TherapyResearchResul
 
 TOP_LEVEL_ENTRYPOINTS = {
     "current_status.html",
-    "current_status.json",
-    "therapy_evidence_review.html",
-    "run_review.html",
-    "latest_run.json",
-    "logs",
-    "runs",
+    "therapy_review.html",
+    "forecast_review.html",
+    "forecast",
+    "therapy",
+    "latent_meal",
+    "fixture",
+    "source",
+    "prepare",
 }
-
-
-@dataclass(frozen=True)
-class StatusBundlePaths:
-    root: Path
-    status_dir: Path
-    therapy_dir: Path
-    forecast_dir: Path
-    supporting_dir: Path
-    logs_dir: Path
 
 
 def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def create_status_bundle(paths: ProjectPaths, run_id: str) -> StatusBundlePaths:
-    root = paths.reports / "runs" / run_id
-    bundle = StatusBundlePaths(
-        root=root,
-        status_dir=root / "status",
-        therapy_dir=root / "therapy",
-        forecast_dir=root / "forecast",
-        supporting_dir=root / "supporting",
-        logs_dir=root / "logs",
-    )
-    for directory in [
-        bundle.root,
-        bundle.status_dir,
-        bundle.therapy_dir,
-        bundle.forecast_dir,
-        bundle.supporting_dir,
-        bundle.logs_dir,
-    ]:
-        directory.mkdir(parents=True, exist_ok=True)
-    return bundle
-
-
-def _next_available_path(path: Path) -> Path:
-    if not path.exists():
-        return path
-    stem = path.stem
-    suffix = path.suffix
-    counter = 2
-    while True:
-        candidate = path.with_name(f"{stem}_{counter}{suffix}")
-        if not candidate.exists():
-            return candidate
-        counter += 1
 
 
 def cleanup_legacy_top_level_output(paths: ProjectPaths, *, keep_names: set[str] | None = None) -> Path | None:
@@ -80,17 +36,26 @@ def cleanup_legacy_top_level_output(paths: ProjectPaths, *, keep_names: set[str]
     extras = [item for item in sorted(paths.reports.iterdir(), key=lambda candidate: candidate.name) if item.name not in keep]
     if not extras:
         return None
-    legacy_root = _next_available_path(paths.reports / "runs" / f"legacy_top_level_{datetime.now().strftime('%Y%m%d')}")
+    legacy_root = paths.quarantine
+    if legacy_root.exists():
+        shutil.rmtree(legacy_root)
     legacy_root.mkdir(parents=True, exist_ok=True)
     moved: list[dict[str, str]] = []
     for item in extras:
         destination = legacy_root / item.name
-        destination = _next_available_path(destination)
         shutil.move(str(item), str(destination))
         moved.append({"source": str(item), "destination": str(destination)})
     manifest_path = legacy_root / "legacy_cleanup_manifest.json"
     manifest_path.write_text(json.dumps({"moved": moved, "moved_at": _utc_timestamp()}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return manifest_path
+
+
+def reset_output_directory(path: str | Path) -> Path:
+    path = Path(path)
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def _sampler_health(summary: dict[str, Any]) -> tuple[str, list[dict[str, str]]]:
@@ -324,44 +289,15 @@ def write_status_json(payload: dict[str, Any], path: str | Path) -> Path:
     return path
 
 
-def publish_latest_entrypoints(
-    *,
-    paths: ProjectPaths,
-    run_id: str,
-    payload: dict[str, Any],
-    bundle: StatusBundlePaths,
-    top_level_status_html: Path,
-    top_level_status_json: Path,
-    top_level_therapy_html: Path,
-    top_level_forecast_html: Path,
-) -> Path:
-    latest_run_path = paths.reports / "latest_run.json"
-    latest_payload = {
-        "run_id": run_id,
-        "generated_at": payload.get("generated_at"),
-        "overall_state": payload.get("overall_state"),
-        "headline": payload.get("headline"),
-        "run_dir": str(bundle.root),
-        "artifacts": {
-            "current_status_html": str(top_level_status_html),
-            "current_status_json": str(top_level_status_json),
-            "therapy_evidence_review_html": str(top_level_therapy_html),
-            "run_review_html": str(top_level_forecast_html),
-            "bundle_root": str(bundle.root),
-        },
-    }
-    latest_run_path.write_text(json.dumps(latest_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return latest_run_path
+def publish_html_entrypoint(source: str | Path, destination: str | Path) -> Path:
+    source = Path(source)
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    return destination
 
 
-def finalize_status_logs(bundle: StatusBundlePaths, log_run_dir: Path | None) -> None:
+def finalize_status_logs(paths: ProjectPaths, log_run_dir: Path | None) -> Path | None:
     if log_run_dir is None or not log_run_dir.exists():
-        return
-    for path in sorted(log_run_dir.iterdir(), key=lambda candidate: candidate.name):
-        destination = bundle.logs_dir / path.name
-        if path.is_dir():
-            if destination.exists():
-                shutil.rmtree(destination)
-            shutil.copytree(path, destination)
-        else:
-            shutil.copy2(path, destination)
+        return None
+    return log_run_dir

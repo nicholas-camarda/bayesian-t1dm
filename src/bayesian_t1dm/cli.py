@@ -4,6 +4,7 @@ import argparse
 from contextlib import nullcontext
 from datetime import date, timedelta
 from pathlib import Path
+import shutil
 import sys
 
 import pandas as pd
@@ -23,6 +24,7 @@ from .acquisition import (
 )
 from .features import FeatureConfig
 from .health_auto_export import (
+    AnalysisReadyHealthDataset,
     build_prepared_model_dataset,
     has_apple_health_data,
     import_health_auto_export_batch,
@@ -43,14 +45,16 @@ from .recommend import RecommendationPolicy, recommend_setting_changes
 from .report import build_run_summary, write_json_report, write_markdown_report
 from .review import write_coverage_review_html, write_current_status_html, write_latent_meal_review_html, write_run_review_html, write_therapy_evidence_review_html
 from .features import FeatureFrame
-from .status import cleanup_legacy_top_level_output, create_status_bundle, derive_current_status, finalize_status_logs, publish_latest_entrypoints, write_status_json
+from .status import cleanup_legacy_top_level_output, derive_current_status, finalize_status_logs, publish_html_entrypoint, reset_output_directory, write_status_json
 from .therapy_research import (
+    build_representative_latent_meal_fixture,
     parse_model_list,
     parse_therapy_segments,
     run_latent_meal_icr_research,
     run_therapy_research,
     validate_therapy_infra,
     write_latent_meal_research_artifacts,
+    write_representative_latent_meal_fixture_artifacts,
     write_therapy_infra_validation_artifacts,
     write_therapy_research_artifacts,
 )
@@ -134,6 +138,17 @@ def build_parser() -> argparse.ArgumentParser:
     latent_meal.add_argument("--review-html", default=None)
     latent_meal.add_argument("--env-file", default=None, help="Optional .env file with Tandem credentials")
     latent_meal.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
+    latent_meal.add_argument("--research-scope", choices=["foundation", "full"], default="foundation")
+
+    latent_fixture = add_command("build-latent-meal-fixture", "Build a representative prepared-data fixture for latent meal foundation debugging")
+    latent_fixture.add_argument("--prepared-csv", default=None, help="Prepared model dataset CSV to subset; defaults to the runtime prepared_model_data_5min.csv")
+    latent_fixture.add_argument("--output-dir", default=None, help="Directory to write the fixture dataset and foundation artifacts")
+    latent_fixture.add_argument("--review-html", default=None, help="Optional HTML review path for the fixture")
+    latent_fixture.add_argument("--segments", default=None, help="Comma-separated day segments like overnight=00:00-06:00,morning=06:00-11:00")
+    latent_fixture.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
+    latent_fixture.add_argument("--background-days", type=int, default=7)
+    latent_fixture.add_argument("--seed", type=int, default=17)
+    latent_fixture.add_argument("--horizon", type=int, default=30)
 
     validate_therapy = add_command("validate-therapy-infra", "Run synthetic truth-recovery validation for the therapy research infrastructure")
     validate_therapy.add_argument("--report-dir", default=None)
@@ -529,10 +544,13 @@ def _write_therapy_outputs(
     supporting_dir: Path,
     review_path: Path,
     artifact_href_prefix: str,
+    prepared_csv_path: Path | None = None,
 ) -> None:
     supporting_dir.mkdir(parents=True, exist_ok=True)
     write_model_data_preparation_report(preparation, supporting_dir / "model_data_preparation.md")
-    preparation.dataset.frame.to_csv(supporting_dir / "prepared_model_data_5min.csv", index=False)
+    if prepared_csv_path is not None:
+        prepared_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        preparation.dataset.frame.to_csv(prepared_csv_path, index=False)
     write_therapy_research_artifacts(research_result, supporting_dir)
     write_therapy_infra_validation_artifacts(validation_result, supporting_dir)
     write_therapy_evidence_review_html(
@@ -628,41 +646,149 @@ def _run_latent_meal_analysis(
             preparation.dataset,
             segments=parse_therapy_segments(args.segments),
             meal_proxy_mode=args.meal_proxy_mode,
+            research_scope=args.research_scope,
         )
     return preparation, result
+
+
+def _load_prepared_dataset_csv(
+    prepared_csv: str | Path,
+    *,
+    horizon_minutes: int,
+) -> AnalysisReadyHealthDataset:
+    path = Path(prepared_csv)
+    if not path.exists():
+        raise FileNotFoundError(f"Prepared dataset CSV not found: {path}")
+    frame = pd.read_csv(path, parse_dates=["timestamp"])
+    semantic_columns = {
+        "timestamp",
+        "target_glucose",
+        "target_delta",
+        "explicit_carb_grams",
+        "explicit_meal_event",
+        "minutes_since_last_explicit_meal",
+        "explicit_carb_source_available",
+        "meal_truth_status",
+    }
+    feature_columns = [column for column in frame.columns if column not in semantic_columns]
+    health_markers = (
+        "sleep",
+        "workout",
+        "hrv",
+        "heart_rate",
+        "respiratory",
+        "resting_",
+        "health_",
+    )
+    health_feature_columns = [
+        column
+        for column in feature_columns
+        if any(marker in column for marker in health_markers)
+    ]
+    tandem_feature_columns = [column for column in feature_columns if column not in health_feature_columns]
+    explicit_carb_source_available = False
+    if "explicit_carb_source_available" in frame.columns:
+        explicit_carb_source_available = bool(pd.to_numeric(frame["explicit_carb_source_available"], errors="coerce").fillna(0).astype(int).max())
+    elif "meal_truth_status" in frame.columns:
+        explicit_carb_source_available = bool(frame["meal_truth_status"].astype(str).eq("observed_explicit").any())
+    elif "explicit_carb_grams" in frame.columns:
+        explicit_carb_source_available = bool(pd.to_numeric(frame["explicit_carb_grams"], errors="coerce").notna().any())
+    return AnalysisReadyHealthDataset(
+        frame=frame,
+        feature_columns=feature_columns,
+        tandem_feature_columns=tandem_feature_columns,
+        health_feature_columns=health_feature_columns,
+        target_column="target_glucose" if "target_glucose" in frame.columns else "target_glucose",
+        horizon_minutes=int(horizon_minutes),
+        config=FeatureConfig(horizon_minutes=int(horizon_minutes)),
+        mode="apple_enriched" if bool(health_feature_columns) else "tandem_only",
+        apple_available=bool(health_feature_columns),
+        explicit_carb_source_available=explicit_carb_source_available,
+    )
+
+
+def _run_latent_meal_fixture_builder(
+    *,
+    args,
+    paths: ProjectPaths,
+    session: LoggingSession | None = None,
+):
+    with _session_stage(session, "latent_meal_fixture.load_prepared_csv", prepared_csv=args.prepared_csv):
+        dataset = _load_prepared_dataset_csv(args.prepared_csv, horizon_minutes=args.horizon)
+    with _session_stage(session, "latent_meal_fixture.build", background_days=args.background_days):
+        result = build_representative_latent_meal_fixture(
+            dataset,
+            segments=parse_therapy_segments(args.segments),
+            meal_proxy_mode=args.meal_proxy_mode,
+            background_days=args.background_days,
+            seed=args.seed,
+        )
+    return result
+
+
+def _path_matches(candidate: str | Path | None, expected: str | Path) -> bool:
+    if candidate is None:
+        return False
+    return Path(candidate).expanduser().resolve() == Path(expected).expanduser().resolve()
+
+
+def _prepare_runtime_output(paths: ProjectPaths, *directories: str | Path) -> None:
+    cleanup_legacy_top_level_output(paths)
+    for directory in directories:
+        reset_output_directory(directory)
+
+
+def _write_analysis_ready_summary(frame: pd.DataFrame, path: str | Path) -> Path:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    timestamps = pd.to_datetime(frame.get("timestamp"), errors="coerce") if "timestamp" in frame.columns else pd.Series(dtype="datetime64[ns]")
+    lines = [
+        "# Analysis-Ready Health Dataset",
+        "",
+        f"- rows: {int(len(frame))}",
+        f"- columns: {int(len(frame.columns))}",
+        f"- start: {'' if timestamps.empty or timestamps.isna().all() else str(timestamps.min())}",
+        f"- end: {'' if timestamps.empty or timestamps.isna().all() else str(timestamps.max())}",
+    ]
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return output_path
 
 
 def _apply_command_defaults(args: argparse.Namespace, paths: ProjectPaths) -> None:
     if args.command in {"ingest", "run", "screen-health-features", "build-health-analysis-ready", "prepare-model-data", "research-therapy-settings", "research-latent-meal-icr", "review-therapy-evidence", "status"}:
         args.raw = args.raw or str(paths.cloud_raw)
         if args.command == "ingest":
-            args.report = args.report or str(paths.reports / "coverage.md")
+            args.report = args.report or str(paths.output_source / "coverage.md")
             args.manifest = args.manifest or str(paths.cloud_raw / "tandem_export_manifest.csv")
         elif args.command == "run":
-            args.report = args.report or str(paths.reports / "run_summary.md")
+            args.report = args.report or str(paths.output_forecast / "run_summary.md")
             args.manifest = args.manifest or str(paths.cloud_raw / "tandem_export_manifest.csv")
         elif args.command == "status":
             args.manifest = str(paths.cloud_raw / "tandem_export_manifest.csv")
         elif args.command == "prepare-model-data":
-            args.output = args.output or str(paths.reports / "prepared_model_data_5min.csv")
-            args.report = args.report or str(paths.reports / "model_data_preparation.md")
+            args.output = args.output or str(paths.cache_prepared / "prepared_model_data_5min.csv")
+            args.report = args.report or str(paths.output_prepare / "model_data_preparation.md")
         elif args.command == "research-therapy-settings":
-            args.report_dir = args.report_dir or str(paths.reports)
+            args.report_dir = args.report_dir or str(paths.output_therapy)
         elif args.command == "research-latent-meal-icr":
-            args.report_dir = args.report_dir or str(paths.reports / "latent_meal_research")
+            args.report_dir = args.report_dir or str(paths.output_latent_meal)
             args.review_html = args.review_html or str(Path(args.report_dir) / "latent_meal_review.html")
         elif args.command == "review-therapy-evidence":
-            args.report = args.report or str(paths.reports / "therapy_evidence_review.html")
+            args.report = args.report or str(paths.output_therapy / "therapy_review.html")
         elif args.command == "build-health-analysis-ready":
-            args.output = args.output or str(paths.reports / "analysis_ready_health_5min.csv")
+            args.output = args.output or str(paths.cache_analysis_ready / "analysis_ready_health_5min.csv")
         else:
-            args.report = args.report or str(paths.reports / "health_feature_screening.md")
-            args.scores = args.scores or str(paths.reports / "health_feature_scores.csv")
+            args.report = args.report or str(paths.output_prepare / "health_feature_screening.md")
+            args.scores = args.scores or str(paths.cache_prepare / "health_feature_scores.csv")
+    if args.command == "build-latent-meal-fixture":
+        args.prepared_csv = args.prepared_csv or str(paths.cache_prepared / "prepared_model_data_5min.csv")
+        args.output_dir = args.output_dir or str(paths.output_fixture)
+        args.review_html = args.review_html or str(Path(args.output_dir) / "latent_meal_review.html")
     if args.command == "validate-therapy-infra":
-        args.report_dir = args.report_dir or str(paths.reports / "therapy_infra_validation")
+        args.report_dir = args.report_dir or str(paths.output_therapy / "validation")
     if args.command == "normalize-raw":
         args.raw = args.raw or str(paths.cloud_raw / "tconnectsync")
-        args.report = args.report or str(paths.reports / "normalize_raw_summary.md")
+        args.report = args.report or str(paths.output_source / "normalize_raw_summary.md")
         args.manifest = args.manifest or str(paths.cloud_raw / "tandem_export_manifest.csv")
 
 
@@ -674,6 +800,8 @@ def _dispatch_command(
     session: LoggingSession,
 ) -> int:
     if args.command == "ingest":
+        if _path_matches(args.report, paths.output_source / "coverage.md"):
+            _prepare_runtime_output(paths, paths.output_source)
         with session.stage("ingest.load_data", raw=args.raw):
             data = load_tandem_exports(args.raw, include_health_auto_export=True)
         with session.stage("ingest.manifest", manifest_path=args.manifest):
@@ -694,6 +822,8 @@ def _dispatch_command(
         return 0
 
     if args.command == "normalize-raw":
+        if _path_matches(args.report, paths.output_source / "normalize_raw_summary.md"):
+            _prepare_runtime_output(paths, paths.output_source)
         with session.stage("normalize_raw.rebuild", raw_root=args.raw, report_path=args.report):
             normalize_tconnectsync_archive(
                 paths,
@@ -711,6 +841,8 @@ def _dispatch_command(
         return 0
 
     if args.command == "prepare-model-data":
+        if _path_matches(args.report, paths.output_prepare / "model_data_preparation.md"):
+            _prepare_runtime_output(paths, paths.output_prepare)
         with session.stage("prepare_model_data.build", output_path=args.output):
             preparation = _prepare_model_data(args=args, paths=paths, session=session)
         with session.stage("prepare_model_data.write", output_path=args.output, report_path=args.report):
@@ -720,6 +852,8 @@ def _dispatch_command(
         return 0
 
     if args.command == "research-therapy-settings":
+        if _path_matches(args.report_dir, paths.output_therapy):
+            _prepare_runtime_output(paths, paths.output_therapy)
         preparation, result, _ = _run_therapy_analysis(args=args, paths=paths, session=session, include_validation=False)
         with session.stage("therapy.write_artifacts", report_dir=args.report_dir):
             write_therapy_research_artifacts(
@@ -731,6 +865,10 @@ def _dispatch_command(
         return 0
 
     if args.command == "research-latent-meal-icr":
+        if args.research_scope != "foundation":
+            parser.error("not_yet_implemented: --research-scope full is reserved for later latent meal fitting work")
+        if _path_matches(args.report_dir, paths.output_latent_meal):
+            _prepare_runtime_output(paths, paths.output_latent_meal)
         _, result = _run_latent_meal_analysis(args=args, paths=paths, session=session)
         with session.stage("latent_meal.write_artifacts", report_dir=args.report_dir, review_html=args.review_html):
             write_latent_meal_research_artifacts(result, args.report_dir)
@@ -742,7 +880,25 @@ def _dispatch_command(
             )
         return 0
 
+    if args.command == "build-latent-meal-fixture":
+        if _path_matches(args.output_dir, paths.output_fixture):
+            _prepare_runtime_output(paths, paths.output_fixture)
+        result = _run_latent_meal_fixture_builder(args=args, paths=paths, session=session)
+        with session.stage("latent_meal_fixture.write_artifacts", output_dir=args.output_dir, review_html=args.review_html):
+            prepared_csv_path = paths.cache_latent_meal / "prepared_model_data_5min.csv" if _path_matches(args.output_dir, paths.output_fixture) else None
+            write_representative_latent_meal_fixture_artifacts(result, args.output_dir, prepared_csv_path=prepared_csv_path)
+            write_latent_meal_review_html(
+                result.fixture_result,
+                args.review_html,
+                artifact_root=args.output_dir,
+                artifact_href_prefix="",
+            )
+        return 0
+
     if args.command == "validate-therapy-infra":
+        if _path_matches(args.report_dir, paths.output_therapy / "validation"):
+            cleanup_legacy_top_level_output(paths)
+            reset_output_directory(args.report_dir)
         with session.stage("therapy.validate_infra", report_dir=args.report_dir):
             result = validate_therapy_infra(
                 meal_proxy_mode=args.meal_proxy_mode,
@@ -755,6 +911,9 @@ def _dispatch_command(
     if args.command == "review-therapy-evidence":
         report_path = Path(args.report)
         report_dir = report_path.parent
+        publish_latest = _path_matches(report_path, paths.output_therapy / "therapy_review.html")
+        if publish_latest:
+            _prepare_runtime_output(paths, paths.output_therapy)
         preparation, research_result, validation_result = _run_therapy_analysis(args=args, paths=paths, session=session)
         with session.stage("therapy.write_review", report_path=args.report):
             _write_therapy_outputs(
@@ -764,13 +923,22 @@ def _dispatch_command(
                 supporting_dir=report_dir,
                 review_path=report_path,
                 artifact_href_prefix="",
+                prepared_csv_path=(paths.cache_prepared / "prepared_model_data_5min.csv") if publish_latest else None,
             )
+            if publish_latest:
+                write_therapy_evidence_review_html(
+                    preparation,
+                    research_result,
+                    paths.reports / "therapy_review.html",
+                    validation_result=validation_result,
+                    artifact_root=report_dir,
+                    artifact_href_prefix="therapy/",
+                )
         return 0
 
     if args.command == "status":
         with session.stage("status.initialize", output_root=str(paths.reports)):
-            cleanup_legacy_top_level_output(paths)
-            bundle = create_status_bundle(paths, session.context.run_id)
+            _prepare_runtime_output(paths, paths.output_therapy, paths.output_forecast)
         preparation, research_result, validation_result = _run_therapy_analysis(
             args=args,
             paths=paths,
@@ -779,50 +947,52 @@ def _dispatch_command(
             research_stage="status.therapy_research",
             validation_stage="status.therapy_validation",
         )
-        with session.stage("status.write_therapy_bundle", bundle_root=str(bundle.root)):
+        with session.stage("status.write_therapy_bundle", therapy_root=str(paths.output_therapy)):
             _write_therapy_outputs(
                 preparation=preparation,
                 research_result=research_result,
                 validation_result=validation_result,
-                supporting_dir=bundle.supporting_dir,
-                review_path=bundle.therapy_dir / "therapy_evidence_review.html",
-                artifact_href_prefix="../supporting/",
+                supporting_dir=paths.output_therapy,
+                review_path=paths.output_therapy / "therapy_review.html",
+                artifact_href_prefix="",
+                prepared_csv_path=paths.cache_prepared / "prepared_model_data_5min.csv",
             )
-            _write_therapy_outputs(
-                preparation=preparation,
-                research_result=research_result,
+            write_therapy_evidence_review_html(
+                preparation,
+                research_result,
+                paths.reports / "therapy_review.html",
                 validation_result=validation_result,
-                supporting_dir=bundle.supporting_dir,
-                review_path=paths.reports / "therapy_evidence_review.html",
-                artifact_href_prefix=f"runs/{session.context.run_id}/supporting/",
+                artifact_root=paths.output_therapy,
+                artifact_href_prefix="therapy/",
             )
-        with session.stage("status.forecast_validation", bundle_root=str(bundle.root)):
+        with session.stage("status.forecast_validation", forecast_root=str(paths.output_forecast)):
             forecast_summary = _build_forecast_summary(args=args, paths=paths, session=session, skip_recommendations=True)
-        with session.stage("status.write_forecast_bundle", bundle_root=str(bundle.root)):
-            bundle_run_summary_md = bundle.supporting_dir / "run_summary.md"
-            bundle_run_summary_json = bundle.supporting_dir / "run_summary.json"
+        with session.stage("status.write_forecast_bundle", forecast_root=str(paths.output_forecast)):
+            forecast_report_path = paths.output_forecast / "run_summary.md"
+            forecast_review_path = paths.output_forecast / "forecast_review.html"
+            forecast_json_path = paths.cache_forecast / "run_summary.json"
             write_markdown_report(
                 {
                     **forecast_summary,
-                    "review_artifacts": {"run_review_html": "../forecast/run_review.html"},
+                    "review_artifacts": {"forecast_review_html": "forecast_review.html"},
                 },
-                bundle_run_summary_md,
+                forecast_report_path,
             )
-            write_json_report(forecast_summary, bundle_run_summary_json)
-            write_run_review_html(forecast_summary, bundle.forecast_dir / "run_review.html")
-            write_run_review_html(forecast_summary, paths.reports / "run_review.html")
-        with session.stage("status.write_status", bundle_root=str(bundle.root)):
+            write_json_report(forecast_summary, forecast_json_path)
+            write_run_review_html(forecast_summary, forecast_review_path)
+            publish_html_entrypoint(forecast_review_path, paths.reports / "forecast_review.html")
+        with session.stage("status.write_status", output_root=str(paths.reports)):
             top_level_status_html = paths.reports / "current_status.html"
-            top_level_status_json = paths.reports / "current_status.json"
+            cached_status_json = paths.cache_status / "current_status.json"
             artifact_paths = {
                 "current_status_html": str(top_level_status_html),
-                "current_status_json": str(top_level_status_json),
-                "therapy_evidence_review_html": str(paths.reports / "therapy_evidence_review.html"),
-                "run_review_html": str(paths.reports / "run_review.html"),
-                "bundle_root": str(bundle.root),
-                "bundle_status_html": str(bundle.status_dir / "current_status.html"),
-                "bundle_status_json": str(bundle.status_dir / "current_status.json"),
-                "supporting_dir": str(bundle.supporting_dir),
+                "current_status_json": str(cached_status_json),
+                "therapy_review_html": str(paths.reports / "therapy_review.html"),
+                "forecast_review_html": str(paths.reports / "forecast_review.html"),
+                "therapy_dir": str(paths.output_therapy),
+                "forecast_dir": str(paths.output_forecast),
+                "prepared_model_data_csv": str(paths.cache_prepared / "prepared_model_data_5min.csv"),
+                "forecast_summary_json": str(paths.cache_forecast / "run_summary.json"),
             }
             payload = derive_current_status(
                 preparation=preparation,
@@ -833,31 +1003,16 @@ def _dispatch_command(
             )
             write_current_status_html(
                 payload,
-                bundle.status_dir / "current_status.html",
-                therapy_href="../therapy/therapy_evidence_review.html",
-                forecast_href="../forecast/run_review.html",
-            )
-            write_status_json(payload, bundle.status_dir / "current_status.json")
-            write_current_status_html(
-                payload,
                 top_level_status_html,
-                therapy_href="therapy_evidence_review.html",
-                forecast_href="run_review.html",
+                therapy_href="therapy_review.html",
+                forecast_href="forecast_review.html",
             )
-            write_status_json(payload, top_level_status_json)
-            publish_latest_entrypoints(
-                paths=paths,
-                run_id=session.context.run_id,
-                payload=payload,
-                bundle=bundle,
-                top_level_status_html=top_level_status_html,
-                top_level_status_json=top_level_status_json,
-                top_level_therapy_html=paths.reports / "therapy_evidence_review.html",
-                top_level_forecast_html=paths.reports / "run_review.html",
-            )
+            write_status_json(payload, cached_status_json)
         return 0
 
     if args.command == "build-health-analysis-ready":
+        if _path_matches(args.output, paths.cache_analysis_ready / "analysis_ready_health_5min.csv"):
+            _prepare_runtime_output(paths, paths.output_prepare)
         with session.stage("analysis_ready.load_data", raw=args.raw):
             tandem_data = load_tandem_exports(args.raw, include_health_auto_export=False)
             health_data = load_tandem_exports(args.raw, include_health_auto_export=True)
@@ -870,9 +1025,13 @@ def _dispatch_command(
         with session.stage("analysis_ready.write", output_path=args.output):
             Path(args.output).parent.mkdir(parents=True, exist_ok=True)
             analysis_ready.frame.to_csv(args.output, index=False)
+            if _path_matches(args.output, paths.cache_analysis_ready / "analysis_ready_health_5min.csv"):
+                _write_analysis_ready_summary(analysis_ready.frame, paths.output_prepare / "analysis_ready_health_summary.md")
         return 0
 
     if args.command == "screen-health-features":
+        if _path_matches(args.report, paths.output_prepare / "health_feature_screening.md"):
+            _prepare_runtime_output(paths, paths.output_prepare)
         with session.stage("health_screen.load_data", raw=args.raw):
             tandem_data = load_tandem_exports(args.raw, include_health_auto_export=False)
             health_data = load_tandem_exports(args.raw, include_health_auto_export=True)
@@ -885,23 +1044,30 @@ def _dispatch_command(
         return 0
 
     if args.command == "run":
+        publish_latest = _path_matches(args.report, paths.output_forecast / "run_summary.md")
+        if publish_latest:
+            _prepare_runtime_output(paths, paths.output_forecast)
         summary = _build_forecast_summary(
             args=args,
             paths=paths,
             session=session,
             skip_recommendations=bool(args.skip_recommendations),
         )
-        review_path = str(Path(args.report).with_name("run_review.html"))
+        review_path = str(Path(args.report).with_name("forecast_review.html"))
         with session.stage("run.reporting", report_path=args.report, review_path=review_path):
-            write_markdown_report({**summary, "review_artifacts": {"run_review_html": review_path}}, args.report)
-            json_path = Path(args.report).with_suffix(".json")
+            write_markdown_report({**summary, "review_artifacts": {"forecast_review_html": review_path}}, args.report)
+            json_path = paths.cache_forecast / "run_summary.json" if publish_latest else Path(args.report).with_suffix(".json")
             write_json_report(summary, json_path)
             write_run_review_html(summary, review_path)
+            if publish_latest:
+                publish_html_entrypoint(review_path, paths.reports / "forecast_review.html")
         return 0
 
     if args.command == "validate-raw":
         args.raw = args.raw or str(paths.cloud_raw)
-        args.report = args.report or str(paths.reports / "tandem_raw_validation.md")
+        args.report = args.report or str(paths.output_source / "tandem_raw_validation.md")
+        if _path_matches(args.report, paths.output_source / "tandem_raw_validation.md"):
+            _prepare_runtime_output(paths, paths.output_source)
         with session.stage("validate_raw.summarize", raw=args.raw, report_path=args.report):
             summary = summarize_tandem_raw_dir(args.raw)
             report_lines = [
@@ -948,7 +1114,9 @@ def _dispatch_command(
         with session.stage("acquisition.credentials", command=args.command):
             credentials = load_tandem_credentials(args.root, args.env_file)
         manifest_path = args.manifest or str(paths.cloud_raw / "tandem_export_manifest.csv")
-        report_path = args.report or str(paths.reports / "tandem_acquisition_summary.md")
+        report_path = args.report or str(paths.output_source / "tandem_acquisition_summary.md")
+        if _path_matches(report_path, paths.output_source / "tandem_acquisition_summary.md"):
+            _prepare_runtime_output(paths, paths.output_source)
         client_kwargs = {
             "region": credentials.region,
             "timezone": credentials.timezone,
@@ -1041,8 +1209,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         session.finalize(exit_code=exit_code, status="failed")
         if args.command == "status":
-            bundle = create_status_bundle(paths, session.context.run_id)
-            finalize_status_logs(bundle, session.context.run_dir)
+            finalize_status_logs(paths, session.context.run_dir)
         raise
     except Exception as exc:
         if not session.error_logged:
@@ -1056,12 +1223,10 @@ def main(argv: list[str] | None = None) -> int:
             )
         session.finalize(exit_code=1, status="failed")
         if args.command == "status":
-            bundle = create_status_bundle(paths, session.context.run_id)
-            finalize_status_logs(bundle, session.context.run_dir)
+            finalize_status_logs(paths, session.context.run_dir)
         raise
 
     session.finalize(exit_code=exit_code, status="success" if exit_code == 0 else "failed")
     if args.command == "status":
-        bundle = create_status_bundle(paths, session.context.run_id)
-        finalize_status_logs(bundle, session.context.run_dir)
+        finalize_status_logs(paths, session.context.run_dir)
     return exit_code

@@ -86,7 +86,7 @@ def test_setup_run_logging_writes_run_bundle_and_captures_warnings(tmp_path):
     warnings.warn("coverage degraded", UserWarning, stacklevel=1)
     session.finalize(exit_code=0, status="success")
 
-    latest = json.loads((paths.reports / "logs" / "ingest" / "latest.json").read_text(encoding="utf-8"))
+    latest = json.loads((paths.logs / "ingest" / "latest.json").read_text(encoding="utf-8"))
     run_dir = Path(latest["run_dir"])
     assert (run_dir / "events.jsonl").exists()
     assert (run_dir / "run.log").exists()

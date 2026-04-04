@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 from pathlib import Path
@@ -19,6 +19,8 @@ from .model import BayesianGlucoseModel, FitDiagnostics
 TARGET_GLUCOSE_COLUMN = "target_glucose"
 TARGET_DELTA_COLUMN = "target_delta"
 DEFAULT_SEGMENT_SPEC = "overnight=00:00-06:00,morning=06:00-11:00,afternoon=11:00-17:00,evening=17:00-24:00"
+MEANINGFUL_BASAL_RATE_CHANGE_THRESHOLD = 0.4
+MAX_PLAUSIBLE_WORKOUT_COUNT_24H = 12
 RESEARCH_FEATURE_EXCLUDE = {
     "timestamp",
     "glucose_observed",
@@ -38,6 +40,20 @@ def _column_or_default(frame: pd.DataFrame, column: str, default: float = 0.0) -
     if column in frame.columns:
         return frame[column]
     return pd.Series(default, index=frame.index, dtype=float)
+
+
+def _workout_summary_trustworthy(frame: pd.DataFrame) -> pd.Series:
+    plausible = pd.to_numeric(_column_or_default(frame, "workout_summary_plausible", default=np.nan), errors="coerce")
+    count_24h = pd.to_numeric(_column_or_default(frame, "workout_count_24h", default=np.nan), errors="coerce")
+    duration_24h = pd.to_numeric(_column_or_default(frame, "workout_duration_sum_24h", default=np.nan), errors="coerce")
+    trust = pd.Series(True, index=frame.index, dtype=bool)
+    if plausible.notna().any():
+        trust &= plausible.fillna(0.0).eq(1.0)
+    if count_24h.notna().any():
+        trust &= count_24h.fillna(0.0).le(MAX_PLAUSIBLE_WORKOUT_COUNT_24H)
+    if duration_24h.notna().any():
+        trust &= duration_24h.fillna(0.0).le(24 * 60 * 60)
+    return trust.astype(int)
 
 
 @dataclass(frozen=True)
@@ -99,15 +115,29 @@ class LatentMealResearchResult:
     research_gate: pd.DataFrame
     meal_event_registry: pd.DataFrame
     meal_windows: pd.DataFrame
+    first_meal_exclusion_summary: pd.DataFrame
     posterior_meals: pd.DataFrame
     model_comparison: pd.DataFrame
     research_gate_markdown: str
+    meal_truth_semantics_report_markdown: str
     meal_window_audit_markdown: str
     fit_summary_markdown: str
     confidence_report_markdown: str
     model_comparison_markdown: str
     segments: tuple[TherapySegment, ...]
     meal_proxy_mode: str
+    research_scope: str = "foundation"
+
+
+@dataclass(frozen=True)
+class LatentMealFixtureResult:
+    source_result: LatentMealResearchResult
+    fixture_result: LatentMealResearchResult
+    fixture_dataset: AnalysisReadyHealthDataset
+    selected_day_manifest: pd.DataFrame
+    summary_markdown: str
+    background_days_requested: int
+    seed: int
 
 
 @dataclass(frozen=True)
@@ -374,6 +404,16 @@ def build_source_report_cards(dataset: AnalysisReadyHealthDataset) -> tuple[pd.D
     )
     source_numeric = pd.concat([tandem_numeric, apple_numeric], ignore_index=True)
     source_missingness = pd.concat([tandem_missing, apple_missing], ignore_index=True)
+    tandem_note_lines = [
+        f"- explicit_carb_source_available: {bool(getattr(dataset, 'explicit_carb_source_available', False))}",
+    ]
+    if not getattr(dataset, "explicit_carb_source_available", False):
+        tandem_note_lines.append("- note: explicit Tandem carbohydrate records were not present in the prepared dataset source, so legacy carb-derived columns must not be interpreted as observed meal truth.")
+    tandem_markdown = tandem_markdown.replace(
+        "## Feature Missingness",
+        "\n".join(tandem_note_lines) + "\n\n## Feature Missingness",
+        1,
+    )
     return source_numeric, source_missingness, tandem_markdown, apple_markdown
 
 
@@ -413,7 +453,7 @@ def build_research_gate(
     timestamp = pd.to_datetime(research_frame.get("timestamp", pd.Series(dtype="datetime64[ns]")), errors="coerce")
     invalid_timestamp_rows = int(timestamp.isna().sum())
     suspicious_timestamp_rows = int(timestamp.lt(pd.Timestamp("2024-01-01")).sum()) if not timestamp.empty else 0
-    direct_meal_rows = int(pd.to_numeric(_column_or_default(research_frame, "meal_event"), errors="coerce").fillna(0.0).gt(0).sum())
+    direct_meal_rows = int(pd.to_numeric(_column_or_default(research_frame, "explicit_meal_event", default=np.nan), errors="coerce").fillna(0.0).gt(0).sum())
     proxy_meal_rows = int(_column_or_default(research_frame, "meal_proxy_event").astype(float).gt(0).sum())
     basal_rows = int(_column_or_default(research_frame, "basal_context").astype(float).gt(0).sum())
     correction_rows = int(_column_or_default(research_frame, "correction_context").astype(float).gt(0).sum())
@@ -465,6 +505,7 @@ def build_research_gate(
         "# Therapy Research Gate",
         "",
         f"- source_quality_status: {source_quality_status}",
+        f"- explicit_carb_source_available: {bool(getattr(dataset, 'explicit_carb_source_available', False))}",
         f"- invalid_timestamp_rows: {invalid_timestamp_rows}",
         f"- suspicious_timestamp_rows: {suspicious_timestamp_rows}",
         f"- direct_meal_rows: {direct_meal_rows}",
@@ -541,33 +582,64 @@ def build_therapy_research_frame(
     frame = frame.sort_values("timestamp").reset_index(drop=True)
     frame = _assign_segments(frame, segments)
 
+    explicit_source_available = bool(getattr(dataset, "explicit_carb_source_available", False))
+    if "explicit_carb_grams" not in frame.columns:
+        if explicit_source_available:
+            legacy_carb = pd.to_numeric(_column_or_default(frame, "carb_grams"), errors="coerce")
+            frame["explicit_carb_grams"] = legacy_carb.where(legacy_carb.gt(0), np.nan)
+        else:
+            frame["explicit_carb_grams"] = np.nan
+    if "explicit_meal_event" not in frame.columns:
+        if explicit_source_available:
+            frame["explicit_meal_event"] = pd.to_numeric(frame["explicit_carb_grams"], errors="coerce").fillna(0.0).gt(0).astype(float)
+        else:
+            frame["explicit_meal_event"] = np.nan
+    if "minutes_since_last_explicit_meal" not in frame.columns:
+        if explicit_source_available:
+            explicit_meal_event_series = pd.to_numeric(frame["explicit_meal_event"], errors="coerce").fillna(0.0)
+            last_explicit_meal_ts = pd.to_datetime(frame["timestamp"], errors="coerce").where(explicit_meal_event_series.gt(0)).ffill()
+            frame["minutes_since_last_explicit_meal"] = (
+                pd.to_datetime(frame["timestamp"], errors="coerce") - pd.to_datetime(last_explicit_meal_ts, errors="coerce")
+            ).dt.total_seconds().div(60.0)
+        else:
+            frame["minutes_since_last_explicit_meal"] = np.nan
+    frame["explicit_carb_source_available"] = int(explicit_source_available)
+    if "meal_truth_status" not in frame.columns:
+        explicit_event_series = pd.to_numeric(frame["explicit_meal_event"], errors="coerce")
+        frame["meal_truth_status"] = np.where(
+            explicit_event_series.fillna(0.0).gt(0),
+            "observed_explicit",
+            np.where(frame["explicit_carb_source_available"].astype(int).eq(1), "missing_from_source", "unavailable"),
+        )
+
     for column in ["carb_roll_sum_120m", "iob_roll_sum_120m", "iob_roll_sum_60m", "minutes_since_last_meal", "bolus_units", "glucose"]:
         if column not in frame.columns:
             frame[column] = 0.0
-    meal_event = pd.to_numeric(_column_or_default(frame, "meal_event"), errors="coerce").fillna(0.0)
-    carb_roll_sum_120m = pd.to_numeric(frame["carb_roll_sum_120m"], errors="coerce").fillna(0.0)
-    minutes_since_last_meal = pd.to_numeric(frame["minutes_since_last_meal"], errors="coerce")
+    explicit_meal_event = pd.to_numeric(_column_or_default(frame, "explicit_meal_event", default=np.nan), errors="coerce")
+    explicit_carb_grams = pd.to_numeric(_column_or_default(frame, "explicit_carb_grams", default=np.nan), errors="coerce")
+    minutes_since_last_explicit_meal = pd.to_numeric(_column_or_default(frame, "minutes_since_last_explicit_meal", default=np.nan), errors="coerce")
     bolus_units = pd.to_numeric(frame["bolus_units"], errors="coerce").fillna(0.0)
     glucose = pd.to_numeric(frame["glucose"], errors="coerce").fillna(np.nan)
     iob_roll_sum_120m = pd.to_numeric(frame["iob_roll_sum_120m"], errors="coerce").fillna(0.0)
 
-    meal_signal_available = bool(meal_event.gt(0).any() or carb_roll_sum_120m.gt(0).any())
+    meal_signal_available = bool(
+        frame["explicit_carb_source_available"].astype(int).eq(1).any()
+        and (explicit_meal_event.fillna(0.0).gt(0).any() or explicit_carb_grams.fillna(0.0).gt(0).any())
+    )
     direct_meal_signal = (
-        meal_event.gt(0)
-        | carb_roll_sum_120m.gt(10.0)
-        | (minutes_since_last_meal.le(30).fillna(False) if meal_signal_available else pd.Series(False, index=frame.index, dtype=bool))
+        explicit_meal_event.fillna(0.0).gt(0)
+        | explicit_carb_grams.fillna(0.0).gt(0)
+        | (minutes_since_last_explicit_meal.le(30).fillna(False) if meal_signal_available else pd.Series(False, index=frame.index, dtype=bool))
     )
     frame = _classify_bolus_proxy(frame, direct_meal_signal=direct_meal_signal, mode=meal_proxy_mode)
     if meal_signal_available:
         recent_meal = (
             direct_meal_signal
             | frame["meal_proxy_event"].astype(int).eq(1)
-            | minutes_since_last_meal.le(120).fillna(False)
-            | carb_roll_sum_120m.gt(10.0)
+            | minutes_since_last_explicit_meal.le(120).fillna(False)
         )
         fasting_like = (
-            minutes_since_last_meal.ge(240).fillna(False)
-            & carb_roll_sum_120m.le(10.0)
+            minutes_since_last_explicit_meal.ge(240).fillna(False)
             & frame["meal_proxy_event"].astype(int).eq(0)
         )
     else:
@@ -582,8 +654,12 @@ def build_therapy_research_frame(
         bolus_units.gt(0)
         | iob_roll_sum_120m.gt(1.5)
     ).astype(int)
+    frame["workout_summary_trustworthy"] = _workout_summary_trustworthy(frame)
     frame["recent_exercise_context"] = (
-        _column_or_default(frame, "recent_workout_12h").astype(float).gt(0)
+        (
+            pd.to_numeric(_column_or_default(frame, "recent_workout_12h"), errors="coerce").fillna(0.0).gt(0)
+            & frame["workout_summary_trustworthy"].eq(1)
+        )
         | pd.to_numeric(_column_or_default(frame, "health_activity_roll_sum_60m"), errors="coerce").fillna(0.0).gt(0.0)
     ).astype(int)
     frame["basal_context"] = (
@@ -615,7 +691,10 @@ def build_therapy_research_frame(
     frame["therapy_stable_epoch"] = _therapy_epoch_ids(frame)
     frame["high_iob_state"] = iob_roll_sum_120m.gt(1.5).astype(int)
     frame["stacked_bolus_state"] = bolus_units.gt(0.2).rolling(12, min_periods=1).sum().gt(1.0).astype(int)
-    frame["recent_therapy_transition"] = _column_or_default(frame, "basal_schedule_change").astype(float).rolling(12, min_periods=1).max().fillna(0.0).gt(0).astype(int)
+    basal_rate = pd.to_numeric(_column_or_default(frame, "basal_units_per_hour"), errors="coerce")
+    basal_rate_step_change = basal_rate.diff().abs().fillna(0.0)
+    frame["meaningful_basal_rate_change"] = basal_rate_step_change.ge(MEANINGFUL_BASAL_RATE_CHANGE_THRESHOLD).astype(int)
+    frame["recent_therapy_transition"] = frame["meaningful_basal_rate_change"].astype(int)
     frame["closed_loop_confounding_flag"] = (
         frame["high_iob_state"].eq(1)
         | frame["stacked_bolus_state"].eq(1)
@@ -1833,8 +1912,8 @@ def build_meal_event_registry(
     ordered["timestamp"] = pd.to_datetime(ordered["timestamp"], errors="coerce")
     ordered = ordered.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=False)
     explicit_signal = (
-        pd.to_numeric(_column_or_default(ordered, "meal_event"), errors="coerce").fillna(0.0).gt(0)
-        | pd.to_numeric(_column_or_default(ordered, "carb_grams"), errors="coerce").fillna(0.0).gt(0)
+        pd.to_numeric(_column_or_default(ordered, "explicit_meal_event", default=np.nan), errors="coerce").fillna(0.0).gt(0)
+        | pd.to_numeric(_column_or_default(ordered, "explicit_carb_grams", default=np.nan), errors="coerce").fillna(0.0).gt(0)
     )
     proxy_signal = pd.to_numeric(_column_or_default(ordered, "meal_proxy_event"), errors="coerce").fillna(0.0).gt(0)
     candidates = ordered.loc[explicit_signal | proxy_signal].copy()
@@ -1847,11 +1926,11 @@ def build_meal_event_registry(
     for cluster_id, cluster in candidates.groupby("meal_cluster_id", dropna=False):
         cluster = cluster.copy()
         cluster["explicit_signal"] = (
-            pd.to_numeric(_column_or_default(cluster, "meal_event"), errors="coerce").fillna(0.0).gt(0)
-            | pd.to_numeric(_column_or_default(cluster, "carb_grams"), errors="coerce").fillna(0.0).gt(0)
+            pd.to_numeric(_column_or_default(cluster, "explicit_meal_event", default=np.nan), errors="coerce").fillna(0.0).gt(0)
+            | pd.to_numeric(_column_or_default(cluster, "explicit_carb_grams", default=np.nan), errors="coerce").fillna(0.0).gt(0)
         ).astype(int)
         cluster["proxy_signal"] = pd.to_numeric(_column_or_default(cluster, "meal_proxy_event"), errors="coerce").fillna(0.0).gt(0).astype(int)
-        cluster["ranking_stated_carbs"] = pd.to_numeric(_column_or_default(cluster, "carb_grams"), errors="coerce").fillna(0.0)
+        cluster["ranking_stated_carbs"] = pd.to_numeric(_column_or_default(cluster, "explicit_carb_grams", default=np.nan), errors="coerce").fillna(0.0)
         cluster["ranking_bolus"] = pd.to_numeric(_column_or_default(cluster, "bolus_units"), errors="coerce").fillna(0.0)
         cluster["ranking_proxy_confidence"] = pd.to_numeric(_column_or_default(cluster, "meal_proxy_confidence"), errors="coerce").fillna(0.0)
         selected = cluster.sort_values(
@@ -1861,7 +1940,7 @@ def build_meal_event_registry(
         explicit_rows = int(cluster["explicit_signal"].sum())
         proxy_rows = int(cluster["proxy_signal"].sum())
         evidence_source = "explicit_and_proxy" if explicit_rows and proxy_rows else "explicit_logged" if explicit_rows else "proxy_only"
-        stated_carbs = pd.to_numeric(pd.Series([selected.get("carb_grams")]), errors="coerce").iloc[0]
+        stated_carbs = pd.to_numeric(pd.Series([selected.get("explicit_carb_grams")]), errors="coerce").iloc[0]
         rows.append(
             {
                 "meal_id": f"meal_{int(cluster_id):04d}",
@@ -1880,341 +1959,268 @@ def build_meal_event_registry(
     return pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
 
 
-def build_meal_window_dataset(
+def build_first_meal_clean_window_registry(
     research_frame: pd.DataFrame,
-    meal_event_registry: pd.DataFrame,
     *,
     premeal_minutes: int = 30,
     postmeal_minutes: int = 180,
 ) -> pd.DataFrame:
     columns = [
+        "candidate_id",
         "meal_id",
+        "date",
         "timestamp",
         "segment",
-        "evidence_source",
+        "candidate_status",
+        "included",
+        "exclusion_reasons",
+        "explicit_carb_source_available",
+        "meal_truth_status",
         "stated_carbs",
-        "bolus_units_window",
-        "iob_at_start",
+        "bolus_units",
         "premeal_glucose",
-        "peak_glucose_180m",
-        "peak_delta_180m",
-        "positive_auc_180m",
-        "window_complete",
-        "confounding_grade",
+        "premeal_delta_30m",
+        "premeal_iob",
+        "recent_workout_6h",
+        "closed_loop_confounding_premeal",
+        "prior_bolus_4h",
+        "postmeal_additional_bolus_120m",
+        "cgm_coverage_fraction",
+        "missing_cgm_first_90m",
+        "window_row_count",
         "source_quality_grade",
-        "recent_exercise_context",
-        "sleep_deficit_flag",
-        "hrv_latest_window",
-        "heart_rate_avg_latest_window",
-        "hrv_minutes_since_last",
-        "resting_heart_rate_minutes_since_last",
-        "missing_cgm_fraction",
-        "suppression_reason",
     ]
-    if research_frame.empty or meal_event_registry.empty:
+    if research_frame.empty:
         return pd.DataFrame(columns=columns)
 
     ordered = research_frame.copy()
     ordered["timestamp"] = pd.to_datetime(ordered["timestamp"], errors="coerce")
     ordered = ordered.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-    step_minutes = 5.0
-    if len(ordered) > 1:
-        deltas = ordered["timestamp"].diff().dt.total_seconds().div(60.0).dropna()
-        if not deltas.empty:
-            step_minutes = float(max(deltas.median(), 1.0))
+    ordered["date"] = ordered["timestamp"].dt.normalize()
+    morning_candidates = ordered.loc[
+        ordered["therapy_segment"].astype(str).eq("morning")
+        & pd.to_numeric(_column_or_default(ordered, "bolus_units"), errors="coerce").fillna(0.0).ge(1.5)
+    ].copy()
+    if morning_candidates.empty:
+        return pd.DataFrame(columns=columns)
 
+    candidate_rows = morning_candidates.groupby("date", as_index=False).head(1).copy().reset_index(drop=True)
     rows: list[dict[str, Any]] = []
-    for meal in meal_event_registry.itertuples(index=False):
-        timestamp = pd.Timestamp(meal.timestamp)
+    for candidate_index, candidate in enumerate(candidate_rows.itertuples(index=False), start=1):
+        timestamp = pd.Timestamp(candidate.timestamp)
         pre = ordered.loc[
             ordered["timestamp"].ge(timestamp - pd.Timedelta(minutes=premeal_minutes))
             & ordered["timestamp"].lt(timestamp)
         ].copy()
-        post = ordered.loc[
-            ordered["timestamp"].ge(timestamp)
+        evaluation_window = ordered.loc[
+            ordered["timestamp"].ge(timestamp - pd.Timedelta(minutes=premeal_minutes))
             & ordered["timestamp"].le(timestamp + pd.Timedelta(minutes=postmeal_minutes))
         ].copy()
-        if post.empty:
-            continue
-        meal_row = ordered.loc[ordered["timestamp"].eq(timestamp)].head(1)
-        meal_row = post.head(1) if meal_row.empty else meal_row
-        def _meal_row_value(column: str, default: float) -> float:
-            if column not in meal_row.columns:
-                return float(default)
-            return float(pd.to_numeric(meal_row[column], errors="coerce").fillna(default).iloc[0])
-        premeal_glucose = pd.to_numeric(pre.get("glucose"), errors="coerce").median()
-        if pd.isna(premeal_glucose):
-            premeal_glucose = _meal_row_value("glucose", float("nan"))
-        post_glucose = pd.to_numeric(post.get("glucose"), errors="coerce")
-        peak_glucose = float(post_glucose.max()) if post_glucose.notna().any() else float("nan")
-        peak_delta = float(max(peak_glucose - premeal_glucose, 0.0)) if np.isfinite(premeal_glucose) and np.isfinite(peak_glucose) else float("nan")
-        positive_auc = float(np.maximum(post_glucose.fillna(premeal_glucose) - premeal_glucose, 0.0).sum() * step_minutes / 60.0)
-        bolus_units_window = float(
-            pd.to_numeric(
-                ordered.loc[
-                    ordered["timestamp"].ge(timestamp - pd.Timedelta(minutes=15))
-                    & ordered["timestamp"].le(timestamp + pd.Timedelta(minutes=30)),
-                    "bolus_units",
-                ],
-                errors="coerce",
-            ).fillna(0.0).sum()
-        )
-        iob_at_start = _meal_row_value("iob_units", 0.0)
-        missing_cgm_fraction = float(pd.to_numeric(post.get("missing_cgm"), errors="coerce").fillna(0.0).mean())
-        workout_plausible = bool(_meal_row_value("workout_summary_plausible", 1.0) > 0)
-        hrv_freshness = _meal_row_value("hrv_minutes_since_last", 1e6)
-        resting_hr_freshness = _meal_row_value("resting_heart_rate_minutes_since_last", 1e6)
-        closed_loop_flag = bool(pd.to_numeric(post.get("closed_loop_confounding_flag"), errors="coerce").fillna(0.0).max() > 0)
-        recent_exercise = bool(_meal_row_value("recent_exercise_context", 0.0) > 0)
-        if closed_loop_flag or iob_at_start > 3.0:
-            confounding_grade = "high"
-        elif recent_exercise or bolus_units_window > 10.0:
-            confounding_grade = "moderate"
-        else:
-            confounding_grade = "low"
-        if missing_cgm_fraction > 0 or not workout_plausible:
-            source_quality_grade = "degraded"
-        elif hrv_freshness > 24 * 60 and resting_hr_freshness > 7 * 24 * 60:
-            source_quality_grade = "limited"
-        else:
-            source_quality_grade = "good"
-        window_complete = bool(len(pre) >= max(int(premeal_minutes / step_minutes / 2), 3) and len(post) >= max(int(postmeal_minutes / step_minutes * 0.7), 12))
-        suppression_reason = ""
-        if bolus_units_window < 0.5:
-            suppression_reason = "no_meaningful_bolus"
-        elif not window_complete:
-            suppression_reason = "incomplete_window"
-        elif confounding_grade == "high":
-            suppression_reason = "high_closed_loop_confounding"
-        elif source_quality_grade == "degraded":
-            suppression_reason = "source_quality_degraded"
+        post_early = ordered.loc[
+            ordered["timestamp"].ge(timestamp)
+            & ordered["timestamp"].le(timestamp + pd.Timedelta(minutes=90))
+        ].copy()
+        prior_bolus_window = ordered.loc[
+            ordered["timestamp"].ge(timestamp - pd.Timedelta(hours=4))
+            & ordered["timestamp"].lt(timestamp)
+        ].copy()
+        post_bolus_window = ordered.loc[
+            ordered["timestamp"].gt(timestamp)
+            & ordered["timestamp"].le(timestamp + pd.Timedelta(minutes=120))
+        ].copy()
+
+        pre_glucose_series = pd.to_numeric(pre.get("glucose"), errors="coerce").dropna()
+        anchor_glucose = float(pd.to_numeric(pd.Series([getattr(candidate, "glucose", np.nan)]), errors="coerce").iloc[0])
+        premeal_glucose = float(pre_glucose_series.iloc[-1]) if not pre_glucose_series.empty else anchor_glucose
+        premeal_start_glucose = float(pre_glucose_series.iloc[0]) if not pre_glucose_series.empty else float("nan")
+        premeal_delta_30m = float(premeal_glucose - premeal_start_glucose) if np.isfinite(premeal_glucose) and np.isfinite(premeal_start_glucose) else float("nan")
+
+        premeal_iob_series = pd.to_numeric(pre.get("iob_units"), errors="coerce").dropna()
+        premeal_iob = float(premeal_iob_series.iloc[-1]) if not premeal_iob_series.empty else float(pd.to_numeric(pd.Series([getattr(candidate, "iob_units", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+        workout_summary_trustworthy = bool(pd.to_numeric(pd.Series([getattr(candidate, "workout_summary_trustworthy", 1.0)]), errors="coerce").fillna(1.0).iloc[0] > 0)
+        recent_workout_6h_raw = bool(pd.to_numeric(pd.Series([getattr(candidate, "recent_workout_6h", 0.0)]), errors="coerce").fillna(0.0).iloc[0] > 0)
+        recent_workout_6h = recent_workout_6h_raw and workout_summary_trustworthy
+        meaningful_basal_transition_premeal = bool(pd.to_numeric(pre.get("meaningful_basal_rate_change"), errors="coerce").fillna(0.0).max() > 0)
+        stacked_bolus_premeal = bool(pd.to_numeric(pre.get("stacked_bolus_state"), errors="coerce").fillna(0.0).max() > 0)
+        closed_loop_confounding_premeal = meaningful_basal_transition_premeal or stacked_bolus_premeal
+        prior_bolus_4h = bool(pd.to_numeric(prior_bolus_window.get("bolus_units"), errors="coerce").fillna(0.0).ge(0.5).any())
+        postmeal_additional_bolus_120m = bool(pd.to_numeric(post_bolus_window.get("bolus_units"), errors="coerce").fillna(0.0).ge(0.5).any())
+        cgm_coverage_fraction = float(1.0 - pd.to_numeric(evaluation_window.get("missing_cgm"), errors="coerce").fillna(1.0).mean()) if not evaluation_window.empty else 0.0
+        missing_cgm_first_90m = bool(pd.to_numeric(post_early.get("missing_cgm"), errors="coerce").fillna(0.0).gt(0).any())
+        source_quality_grade = "good" if cgm_coverage_fraction >= 0.9 and not missing_cgm_first_90m else "degraded"
+        exclusion_reasons: list[str] = []
+        if prior_bolus_4h:
+            exclusion_reasons.append("recent_bolus_4h")
+        if not np.isfinite(premeal_iob) or premeal_iob >= 1.0:
+            exclusion_reasons.append("high_premeal_iob")
+        if not np.isfinite(premeal_glucose) or premeal_glucose < 80.0 or premeal_glucose > 130.0:
+            exclusion_reasons.append("premeal_bg_out_of_range")
+        if not np.isfinite(premeal_delta_30m) or abs(premeal_delta_30m) > 20.0:
+            exclusion_reasons.append("steep_premeal_slope")
+        if recent_workout_6h:
+            exclusion_reasons.append("recent_workout_6h")
+        if closed_loop_confounding_premeal:
+            exclusion_reasons.append("closed_loop_confounding_premeal")
+        if postmeal_additional_bolus_120m:
+            exclusion_reasons.append("postmeal_additional_bolus_120m")
+        if cgm_coverage_fraction < 0.9:
+            exclusion_reasons.append("poor_cgm_coverage")
+        if missing_cgm_first_90m:
+            exclusion_reasons.append("missing_cgm_first_90m")
+
+        stated_carbs = pd.to_numeric(pd.Series([getattr(candidate, "explicit_carb_grams", np.nan)]), errors="coerce").iloc[0]
         rows.append(
             {
-                "meal_id": meal.meal_id,
+                "candidate_id": f"first_meal_{candidate_index:04d}",
+                "meal_id": f"first_meal_{candidate_index:04d}",
+                "date": pd.Timestamp(candidate.date),
                 "timestamp": timestamp,
-                "segment": meal.segment,
-                "evidence_source": meal.evidence_source,
-                "stated_carbs": meal.stated_carbs,
-                "bolus_units_window": bolus_units_window,
-                "iob_at_start": iob_at_start,
+                "segment": str(getattr(candidate, "therapy_segment", "")),
+                "candidate_status": "accepted" if not exclusion_reasons else "rejected",
+                "included": int(not exclusion_reasons),
+                "exclusion_reasons": "|".join(exclusion_reasons),
+                "explicit_carb_source_available": int(pd.to_numeric(pd.Series([getattr(candidate, "explicit_carb_source_available", 0)]), errors="coerce").fillna(0.0).iloc[0] > 0),
+                "meal_truth_status": str(getattr(candidate, "meal_truth_status", "unavailable")),
+                "stated_carbs": None if pd.isna(stated_carbs) else float(stated_carbs),
+                "bolus_units": float(pd.to_numeric(pd.Series([getattr(candidate, "bolus_units", 0.0)]), errors="coerce").fillna(0.0).iloc[0]),
                 "premeal_glucose": float(premeal_glucose) if np.isfinite(premeal_glucose) else float("nan"),
-                "peak_glucose_180m": peak_glucose,
-                "peak_delta_180m": peak_delta,
-                "positive_auc_180m": positive_auc,
-                "window_complete": int(window_complete),
-                "confounding_grade": confounding_grade,
+                "premeal_delta_30m": premeal_delta_30m,
+                "premeal_iob": premeal_iob,
+                "recent_workout_6h": int(recent_workout_6h),
+                "closed_loop_confounding_premeal": int(closed_loop_confounding_premeal),
+                "prior_bolus_4h": int(prior_bolus_4h),
+                "postmeal_additional_bolus_120m": int(postmeal_additional_bolus_120m),
+                "cgm_coverage_fraction": cgm_coverage_fraction,
+                "missing_cgm_first_90m": int(missing_cgm_first_90m),
+                "window_row_count": int(len(evaluation_window)),
                 "source_quality_grade": source_quality_grade,
-                "recent_exercise_context": int(recent_exercise),
-                "sleep_deficit_flag": int(_meal_row_value("sleep_deficit_flag", 0.0)),
-                "hrv_latest_window": _meal_row_value("hrv_latest", 0.0) if hrv_freshness <= 24 * 60 else 0.0,
-                "heart_rate_avg_latest_window": _meal_row_value("heart_rate_avg_latest", 0.0),
-                "hrv_minutes_since_last": hrv_freshness,
-                "resting_heart_rate_minutes_since_last": resting_hr_freshness,
-                "missing_cgm_fraction": missing_cgm_fraction,
-                "suppression_reason": suppression_reason,
             }
         )
     return pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
 
 
-def _latent_meal_gate(meal_windows: pd.DataFrame) -> tuple[pd.DataFrame, str]:
-    logged_meals = int(pd.to_numeric(meal_windows.get("stated_carbs"), errors="coerce").notna().sum()) if not meal_windows.empty else 0
-    proxy_only_meals = int(meal_windows.get("evidence_source", pd.Series(dtype=str)).astype(str).eq("proxy_only").sum()) if not meal_windows.empty else 0
-    complete_windows = int(pd.to_numeric(meal_windows.get("window_complete"), errors="coerce").fillna(0.0).sum()) if not meal_windows.empty else 0
-    trainable_windows = int(
-        (
-            pd.to_numeric(meal_windows.get("window_complete"), errors="coerce").fillna(0.0).gt(0)
-            & pd.to_numeric(meal_windows.get("bolus_units_window"), errors="coerce").fillna(0.0).ge(0.5)
-            & meal_windows.get("confounding_grade", pd.Series(dtype=str)).astype(str).ne("high")
-        ).sum()
-    ) if not meal_windows.empty else 0
-    degraded_fraction = float(meal_windows.get("source_quality_grade", pd.Series(dtype=str)).astype(str).eq("degraded").mean()) if not meal_windows.empty else 1.0
-    if degraded_fraction > 0.2:
-        source_quality_status = "degraded"
-    elif meal_windows.empty:
-        source_quality_status = "failed"
+def build_first_meal_exclusion_summary(first_meal_windows: pd.DataFrame) -> pd.DataFrame:
+    if first_meal_windows.empty:
+        return pd.DataFrame([{"reason": "no_candidates", "count": 0}])
+    counts: dict[str, int] = {}
+    for reason_string in first_meal_windows["exclusion_reasons"].astype(str):
+        if not reason_string:
+            continue
+        for reason in [item for item in reason_string.split("|") if item]:
+            counts[reason] = counts.get(reason, 0) + 1
+    if not counts:
+        return pd.DataFrame([{"reason": "accepted_without_exclusions", "count": int(first_meal_windows["included"].sum())}])
+    return pd.DataFrame([{"reason": reason, "count": count} for reason, count in sorted(counts.items())])
+
+
+def _render_meal_truth_semantics_report(
+    dataset: AnalysisReadyHealthDataset,
+    research_frame: pd.DataFrame,
+) -> str:
+    status_counts = research_frame.get("meal_truth_status", pd.Series(dtype=str)).astype(str).value_counts(dropna=False).to_dict() if not research_frame.empty else {}
+    lines = [
+        "# Meal Truth Semantics Report",
+        "",
+        f"- explicit_carb_source_available: {bool(getattr(dataset, 'explicit_carb_source_available', False))}",
+        f"- observed_explicit_rows: {int(status_counts.get('observed_explicit', 0))}",
+        f"- missing_from_source_rows: {int(status_counts.get('missing_from_source', 0))}",
+        f"- unavailable_rows: {int(status_counts.get('unavailable', 0))}",
+        "",
+        "## Interpretation",
+        "",
+        "- `explicit_carb_grams` and `explicit_meal_event` represent observed explicit carb truth when it exists.",
+        "- Legacy `carb_grams`, `meal_event`, and `minutes_since_last_meal` are retained for compatibility but must not be interpreted as observed truth when explicit carb source data is unavailable.",
+        "- When Tandem/tconnectsync does not provide explicit carb records, meal truth is marked as `unavailable` and downstream meal research should rely on proxy logic only for cohorting, not for observed truth claims.",
+        "",
+        "## Row Counts",
+        "",
+        "| meal_truth_status | count |",
+        "| --- | ---: |",
+    ]
+    if status_counts:
+        for status, count in sorted(status_counts.items()):
+            lines.append(f"| {status} | {int(count)} |")
     else:
-        source_quality_status = "good"
-    high_confounding_fraction = float(meal_windows.get("confounding_grade", pd.Series(dtype=str)).astype(str).eq("high").mean()) if not meal_windows.empty else 1.0
-    if high_confounding_fraction >= 0.5:
-        confounding_risk = "high"
-    elif high_confounding_fraction >= 0.2:
-        confounding_risk = "moderate"
-    else:
-        confounding_risk = "low"
-    if trainable_windows >= 12 and logged_meals >= 12:
-        identifiability = "prior_informed"
-        gate_status = "research_only"
-    elif trainable_windows >= 18 and proxy_only_meals >= 12:
-        identifiability = "response_inferred"
-        gate_status = "diagnostics_only"
-    elif complete_windows >= 8:
-        identifiability = "weakly_identified"
-        gate_status = "diagnostics_only"
-    else:
-        identifiability = "not_identified"
-        gate_status = "diagnostics_only"
+        lines.append("| none | 0 |")
+    return "\n".join(lines) + "\n"
+
+
+def _latent_meal_gate(
+    dataset: AnalysisReadyHealthDataset,
+    first_meal_windows: pd.DataFrame,
+    *,
+    research_scope: str,
+) -> tuple[pd.DataFrame, str]:
+    evaluated_candidates = int(len(first_meal_windows))
+    accepted_windows = int(pd.to_numeric(first_meal_windows.get("included"), errors="coerce").fillna(0.0).sum()) if not first_meal_windows.empty else 0
+    accepted_fraction = float(accepted_windows / evaluated_candidates) if evaluated_candidates else 0.0
+    source_quality_status = "good" if accepted_windows > 0 else "limited" if evaluated_candidates > 0 else "failed"
+    cohort_status = "ready_for_latent_fit" if accepted_windows > 0 else "no_clean_windows_identified"
     gate = pd.DataFrame(
         [
             {
-                "parameter": "I/C ratio",
-                "estimand": "latent meal carbs + effective I/C",
-                "identifiability": identifiability,
-                "gate_status": gate_status,
+                "research_scope": research_scope,
+                "explicit_carb_source_available": bool(getattr(dataset, "explicit_carb_source_available", False)),
+                "latent_fit_status": "intentionally_skipped_foundation_mode",
+                "evaluated_candidates": evaluated_candidates,
+                "accepted_windows": accepted_windows,
+                "accepted_fraction": accepted_fraction,
                 "source_quality_status": source_quality_status,
-                "closed_loop_confounding_risk": confounding_risk,
-                "meal_windows": int(len(meal_windows)),
-                "logged_meals": logged_meals,
-                "proxy_only_meals": proxy_only_meals,
-                "complete_windows": complete_windows,
-                "trainable_windows": trainable_windows,
+                "cohort_status": cohort_status,
             }
         ]
     )
     lines = [
         "# Latent Meal Research Gate",
         "",
+        f"- research_scope: {research_scope}",
+        f"- explicit_carb_source_available: {bool(getattr(dataset, 'explicit_carb_source_available', False))}",
+        "- latent_fit_status: intentionally_skipped_foundation_mode",
+        f"- evaluated_candidates: {evaluated_candidates}",
+        f"- accepted_windows: {accepted_windows}",
+        f"- accepted_fraction: {accepted_fraction:.3f}",
         f"- source_quality_status: {source_quality_status}",
-        f"- closed_loop_confounding_risk: {confounding_risk}",
-        f"- meal_windows: {int(len(meal_windows))}",
-        f"- logged_meals: {logged_meals}",
-        f"- proxy_only_meals: {proxy_only_meals}",
-        f"- complete_windows: {complete_windows}",
-        f"- trainable_windows: {trainable_windows}",
+        f"- cohort_status: {cohort_status}",
         "",
-        "## Parameter Gate",
+        "## Foundation Gate",
         "",
-        "| parameter | estimand | identifiability | gate_status | source_quality_status | closed_loop_confounding_risk |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "| research_scope | explicit_carb_source_available | latent_fit_status | evaluated_candidates | accepted_windows | source_quality_status | cohort_status |",
+        "| --- | --- | --- | ---: | ---: | --- | --- |",
+        f"| {research_scope} | {str(bool(getattr(dataset, 'explicit_carb_source_available', False))).lower()} | intentionally_skipped_foundation_mode | {evaluated_candidates} | {accepted_windows} | {source_quality_status} | {cohort_status} |",
     ]
-    row = gate.iloc[0]
-    lines.append(
-        f"| {row['parameter']} | {row['estimand']} | {row['identifiability']} | {row['gate_status']} | {row['source_quality_status']} | {row['closed_loop_confounding_risk']} |"
-    )
     return gate, "\n".join(lines) + "\n"
 
 
-def _response_feature_frame(meal_windows: pd.DataFrame) -> pd.DataFrame:
-    out = meal_windows.copy()
-    out["confounding_is_low"] = out.get("confounding_grade", pd.Series(dtype=str)).astype(str).eq("low").astype(float)
-    out["source_quality_is_good"] = out.get("source_quality_grade", pd.Series(dtype=str)).astype(str).eq("good").astype(float)
-    return out
-
-
-def _render_latent_meal_window_audit(meal_windows: pd.DataFrame) -> str:
-    lines = [
-        "# Meal Window Audit",
-        "",
-        f"- meal_window_count: {len(meal_windows)}",
-        f"- complete_windows: {int(pd.to_numeric(meal_windows.get('window_complete'), errors='coerce').fillna(0.0).sum()) if not meal_windows.empty else 0}",
-        "",
-        "| confounding_grade | count | mean_peak_delta_180m | mean_positive_auc_180m |",
-        "| --- | ---: | ---: | ---: |",
-    ]
-    if meal_windows.empty:
-        lines.append("| none | 0 | 0.000 | 0.000 |")
-    else:
-        grouped = (
-            meal_windows.groupby("confounding_grade", as_index=False)
-            .agg(
-                count=("meal_id", "size"),
-                mean_peak_delta_180m=("peak_delta_180m", "mean"),
-                mean_positive_auc_180m=("positive_auc_180m", "mean"),
-            )
-            .sort_values("confounding_grade")
-        )
-        for row in grouped.itertuples(index=False):
-            lines.append(
-                f"| {row.confounding_grade} | {int(row.count)} | {float(row.mean_peak_delta_180m):.3f} | {float(row.mean_positive_auc_180m):.3f} |"
-            )
-    return "\n".join(lines) + "\n"
-
-
-def _render_latent_meal_fit_summary(
-    *,
-    gate: pd.DataFrame,
-    reference_ic: float,
-    carb_model: dict[str, Any] | None,
-    selected_model: str,
-    selected_peak_delta_mae: float | None,
+def _render_latent_meal_window_audit(
+    first_meal_windows: pd.DataFrame,
+    exclusion_summary: pd.DataFrame,
 ) -> str:
-    training_rows = 0 if carb_model is None else int(carb_model.get("training_rows", 0))
-    residual_rmse = None if carb_model is None else carb_model.get("residual_rmse")
+    accepted = first_meal_windows.loc[pd.to_numeric(first_meal_windows.get("included"), errors="coerce").fillna(0.0).gt(0)].copy() if not first_meal_windows.empty else pd.DataFrame()
     lines = [
-        "# Latent Meal Fit Summary",
+        "# First Meal Clean Window Audit",
         "",
-        "- This workflow is a latent meal deconvolution approximation intended for research and diagnostics.",
-        "- Logged carbs are treated as noisy priors when present, not exact truth.",
-        f"- selected_model: {selected_model}",
-        f"- reference_ic_ratio: {reference_ic:.3f}",
-        f"- training_meals: {training_rows}",
-        f"- carb_model_residual_rmse: {'NA' if residual_rmse is None or pd.isna(residual_rmse) else f'{float(residual_rmse):.3f}'}",
-        f"- selected_peak_delta_mae: {'NA' if selected_peak_delta_mae is None or pd.isna(selected_peak_delta_mae) else f'{float(selected_peak_delta_mae):.3f}'}",
+        f"- evaluated_candidates: {int(len(first_meal_windows))}",
+        f"- accepted_windows: {int(len(accepted))}",
+        f"- accepted_fraction: {float(len(accepted) / len(first_meal_windows)):.3f}" if len(first_meal_windows) else "- accepted_fraction: 0.000",
         "",
-        "## Gate Snapshot",
+        "## Exclusion Summary",
         "",
-        "| parameter | identifiability | gate_status | closed_loop_confounding_risk |",
-        "| --- | --- | --- | --- |",
+        "| reason | count |",
+        "| --- | ---: |",
     ]
-    if gate.empty:
-        lines.append("| I/C ratio | not_identified | diagnostics_only | high |")
+    if exclusion_summary.empty:
+        lines.append("| none | 0 |")
     else:
-        row = gate.iloc[0]
-        lines.append(
-            f"| {row['parameter']} | {row['identifiability']} | {row['gate_status']} | {row['closed_loop_confounding_risk']} |"
-        )
-    return "\n".join(lines) + "\n"
-
-
-def _render_latent_meal_confidence_report(posterior_meals: pd.DataFrame) -> str:
-    lines = [
-        "# Latent Meal Confidence Report",
-        "",
-        "| evidence_source | count | mean_accuracy_score | high_confidence_fraction |",
-        "| --- | ---: | ---: | ---: |",
-    ]
-    if posterior_meals.empty:
-        lines.append("| none | 0 | 0.000 | 0.000 |")
-        return "\n".join(lines) + "\n"
-    grouped = (
-        posterior_meals.groupby("evidence_source", as_index=False)
-        .agg(
-            count=("meal_id", "size"),
-            mean_accuracy_score=("carb_accuracy_score", "mean"),
-            high_confidence_fraction=("carb_accuracy_score", lambda s: float(pd.to_numeric(s, errors="coerce").fillna(0.0).ge(0.75).mean())),
-        )
-        .sort_values("evidence_source")
-    )
-    for row in grouped.itertuples(index=False):
-        lines.append(
-            f"| {row.evidence_source} | {int(row.count)} | {float(row.mean_accuracy_score):.3f} | {float(row.high_confidence_fraction):.3f} |"
-        )
-    return "\n".join(lines) + "\n"
-
-
-def _render_latent_meal_model_comparison(model_comparison: pd.DataFrame) -> str:
-    lines = [
-        "# Latent Meal Model Comparison",
-        "",
-        "- Retrospective comparison is anchored on logged meals and post-meal peak-delta explanation.",
-        "",
-        "| model | meal_count | stated_carb_mae | peak_delta_mae | peak_delta_correlation | selected |",
-        "| --- | ---: | ---: | ---: | ---: | --- |",
-    ]
-    if model_comparison.empty:
-        lines.append("| none | 0 | NA | NA | NA | no |")
-        return "\n".join(lines) + "\n"
-    for row in model_comparison.itertuples(index=False):
-        lines.append(
-            "| {model} | {meal_count} | {carb_mae} | {peak_mae} | {corr} | {selected} |".format(
-                model=row.model,
-                meal_count=int(row.meal_count),
-                carb_mae="NA" if pd.isna(row.stated_carb_mae) else f"{float(row.stated_carb_mae):.3f}",
-                peak_mae="NA" if pd.isna(row.peak_delta_mae) else f"{float(row.peak_delta_mae):.3f}",
-                corr="NA" if pd.isna(row.peak_delta_correlation) else f"{float(row.peak_delta_correlation):.3f}",
-                selected="yes" if bool(row.selected) else "no",
+        for row in exclusion_summary.itertuples(index=False):
+            lines.append(f"| {row.reason} | {int(row.count)} |")
+    lines.extend(["", "## Accepted Examples", "", "| candidate_id | timestamp | premeal_glucose | premeal_iob | cgm_coverage_fraction |", "| --- | --- | ---: | ---: | ---: |"])
+    if accepted.empty:
+        lines.append("| none | none | NA | NA | NA |")
+    else:
+        for row in accepted.head(10).itertuples(index=False):
+            lines.append(
+                f"| {row.candidate_id} | {row.timestamp} | {'NA' if pd.isna(row.premeal_glucose) else f'{float(row.premeal_glucose):.1f}'} | {'NA' if pd.isna(row.premeal_iob) else f'{float(row.premeal_iob):.2f}'} | {float(row.cgm_coverage_fraction):.3f} |"
             )
-        )
     return "\n".join(lines) + "\n"
 
 
@@ -2223,180 +2229,16 @@ def run_latent_meal_icr_research(
     *,
     segments: tuple[TherapySegment, ...] | None = None,
     meal_proxy_mode: str = "strict",
+    research_scope: str = "foundation",
 ) -> LatentMealResearchResult:
+    if research_scope != "foundation":
+        raise NotImplementedError("not_yet_implemented: research_scope='full' is reserved for later latent meal fitting work")
     segments = segments or parse_therapy_segments()
     research_frame = build_therapy_research_frame(dataset, segments=segments, meal_proxy_mode=meal_proxy_mode)
     meal_event_registry = build_meal_event_registry(research_frame)
-    meal_windows = build_meal_window_dataset(research_frame, meal_event_registry)
-    gate, gate_markdown = _latent_meal_gate(meal_windows)
-
-    feature_frame = _response_feature_frame(meal_windows)
-    training_mask = (
-        pd.to_numeric(feature_frame.get("stated_carbs"), errors="coerce").notna()
-        & pd.to_numeric(feature_frame.get("window_complete"), errors="coerce").fillna(0.0).gt(0)
-        & pd.to_numeric(feature_frame.get("bolus_units_window"), errors="coerce").fillna(0.0).ge(0.5)
-        & feature_frame.get("confounding_grade", pd.Series(dtype=str)).astype(str).ne("high")
-    )
-    training = feature_frame.loc[training_mask].copy()
-    ic_series = (
-        pd.to_numeric(training.get("stated_carbs"), errors="coerce")
-        / pd.to_numeric(training.get("bolus_units_window"), errors="coerce").replace(0.0, np.nan)
-    )
-    reference_ic = float(np.nanmedian(ic_series.to_numpy(dtype=float))) if np.isfinite(np.nanmedian(ic_series.to_numpy(dtype=float))) else 12.0
-    if not np.isfinite(reference_ic):
-        reference_ic = 12.0
-    reference_ic = float(np.clip(reference_ic, 4.0, 40.0))
-
-    carb_model_features = [
-        "bolus_units_window",
-        "iob_at_start",
-        "premeal_glucose",
-        "peak_delta_180m",
-        "positive_auc_180m",
-        "recent_exercise_context",
-        "sleep_deficit_flag",
-        "hrv_latest_window",
-        "heart_rate_avg_latest_window",
-        "confounding_is_low",
-        "source_quality_is_good",
-    ]
-    carb_model = _fit_ridge_regression(
-        training,
-        feature_columns=carb_model_features,
-        target_column="stated_carbs",
-        alpha=4.0,
-    )
-    response_model = _fit_ridge_regression(
-        training.assign(candidate_carbs=pd.to_numeric(training.get("stated_carbs"), errors="coerce").fillna(0.0)),
-        feature_columns=["candidate_carbs", "bolus_units_window", "premeal_glucose"],
-        target_column="peak_delta_180m",
-        alpha=2.0,
-    )
-
-    windows = feature_frame.copy()
-    windows["bolus_reference_carbs"] = np.clip(
-        pd.to_numeric(windows.get("bolus_units_window"), errors="coerce").fillna(0.0) * reference_ic,
-        0.0,
-        250.0,
-    )
-    stated_carbs = pd.to_numeric(windows.get("stated_carbs"), errors="coerce")
-    windows["stated_prior_blend_carbs"] = stated_carbs.fillna(windows["bolus_reference_carbs"])
-    response_adjusted_raw = _predict_ridge_regression(carb_model, windows.loc[:, carb_model_features]) if carb_model is not None else np.array([], dtype=float)
-    if len(response_adjusted_raw) != len(windows):
-        response_adjusted_raw = windows["bolus_reference_carbs"].to_numpy(dtype=float)
-    raw_response_series = pd.Series(np.clip(response_adjusted_raw, 0.0, 250.0), index=windows.index, dtype=float)
-    prior_weight = np.where(
-        stated_carbs.notna(),
-        np.where(
-            windows.get("confounding_grade", pd.Series(dtype=str)).astype(str).eq("low"),
-            0.65,
-            np.where(windows.get("confounding_grade", pd.Series(dtype=str)).astype(str).eq("moderate"), 0.45, 0.25),
-        ),
-        0.0,
-    )
-    windows["latent_response_adjusted_carbs"] = np.clip(
-        np.where(stated_carbs.notna(), prior_weight * stated_carbs.fillna(0.0) + (1.0 - prior_weight) * raw_response_series, raw_response_series),
-        0.0,
-        250.0,
-    )
-
-    eval_logged = windows.loc[stated_carbs.notna()].copy()
-    comparison_rows: list[dict[str, Any]] = []
-    selected_model = "latent_response_adjusted"
-    selected_peak_delta_mae = None
-    for model_name, carb_column in [
-        ("bolus_reference", "bolus_reference_carbs"),
-        ("stated_prior_blend", "stated_prior_blend_carbs"),
-        ("latent_response_adjusted", "latent_response_adjusted_carbs"),
-    ]:
-        peak_delta_predictions = np.full(len(eval_logged), np.nan, dtype=float)
-        if response_model is not None and not eval_logged.empty:
-            prediction_input = eval_logged.assign(candidate_carbs=pd.to_numeric(eval_logged[carb_column], errors="coerce").fillna(0.0))
-            peak_delta_predictions = _predict_ridge_regression(response_model, prediction_input)
-        actual_peak_delta = pd.to_numeric(eval_logged.get("peak_delta_180m"), errors="coerce")
-        carb_predictions = pd.to_numeric(eval_logged.get(carb_column), errors="coerce")
-        peak_delta_mae = float(np.nanmean(np.abs(peak_delta_predictions - actual_peak_delta.to_numpy(dtype=float)))) if len(eval_logged) else float("nan")
-        if len(eval_logged) > 1 and np.isfinite(actual_peak_delta).sum() > 1 and np.isfinite(peak_delta_predictions).sum() > 1:
-            peak_delta_correlation = float(np.corrcoef(actual_peak_delta.to_numpy(dtype=float), peak_delta_predictions)[0, 1])
-        else:
-            peak_delta_correlation = float("nan")
-        stated_carb_mae = float(np.nanmean(np.abs(carb_predictions.to_numpy(dtype=float) - stated_carbs.loc[eval_logged.index].to_numpy(dtype=float)))) if len(eval_logged) else float("nan")
-        comparison_rows.append(
-            {
-                "model": model_name,
-                "meal_count": int(len(eval_logged)),
-                "stated_carb_mae": stated_carb_mae,
-                "peak_delta_mae": peak_delta_mae,
-                "peak_delta_correlation": peak_delta_correlation,
-                "selected": False,
-            }
-        )
-    model_comparison = pd.DataFrame(comparison_rows)
-    if not model_comparison.empty:
-        model_comparison = model_comparison.sort_values(["peak_delta_mae", "stated_carb_mae"], na_position="last").reset_index(drop=True)
-        model_comparison.loc[0, "selected"] = True
-        selected_model = str(model_comparison.iloc[0]["model"])
-        selected_peak_delta_mae = None if pd.isna(model_comparison.iloc[0]["peak_delta_mae"]) else float(model_comparison.iloc[0]["peak_delta_mae"])
-
-    selected_carb_column = {
-        "bolus_reference": "bolus_reference_carbs",
-        "stated_prior_blend": "stated_prior_blend_carbs",
-        "latent_response_adjusted": "latent_response_adjusted_carbs",
-    }.get(selected_model, "latent_response_adjusted_carbs")
-    residual_scale = float(carb_model.get("residual_rmse", 18.0)) if carb_model is not None else 18.0
-    residual_scale = float(max(residual_scale, 12.0))
-
-    posterior_rows: list[dict[str, Any]] = []
-    for row in windows.itertuples(index=False):
-        latent_carbs = float(pd.to_numeric(pd.Series([getattr(row, selected_carb_column)]), errors="coerce").fillna(0.0).iloc[0])
-        stated_value = pd.to_numeric(pd.Series([getattr(row, "stated_carbs")]), errors="coerce").iloc[0]
-        raw_discrepancy = abs(latent_carbs - float(stated_value)) if pd.notna(stated_value) else residual_scale
-        quality_multiplier = 1.0 if getattr(row, "source_quality_grade") == "good" else 0.75 if getattr(row, "source_quality_grade") == "limited" else 0.45
-        confounding_multiplier = 1.0 if getattr(row, "confounding_grade") == "low" else 0.7 if getattr(row, "confounding_grade") == "moderate" else 0.35
-        if pd.notna(stated_value):
-            carb_accuracy_score = float(np.clip(np.exp(-raw_discrepancy / residual_scale) * quality_multiplier * confounding_multiplier, 0.0, 1.0))
-        else:
-            carb_accuracy_score = float(np.clip(0.45 * quality_multiplier * confounding_multiplier, 0.0, 0.5))
-        latent_lower = max(latent_carbs - 1.64 * residual_scale, 0.0)
-        latent_upper = latent_carbs + 1.64 * residual_scale
-        bolus_units = float(pd.to_numeric(pd.Series([getattr(row, "bolus_units_window")]), errors="coerce").fillna(0.0).iloc[0])
-        if bolus_units >= 0.5:
-            ic_mean = latent_carbs / bolus_units
-            ic_lower = latent_lower / bolus_units
-            ic_upper = latent_upper / bolus_units
-        else:
-            ic_mean = float("nan")
-            ic_lower = float("nan")
-            ic_upper = float("nan")
-        if getattr(row, "suppression_reason"):
-            identifiability_status = "not_identified" if getattr(row, "suppression_reason") in {"no_meaningful_bolus", "incomplete_window"} else "weakly_identified"
-        elif pd.notna(stated_value):
-            identifiability_status = "prior_informed"
-        elif getattr(row, "confounding_grade") == "low":
-            identifiability_status = "response_inferred"
-        else:
-            identifiability_status = "weakly_identified"
-        posterior_rows.append(
-            {
-                "meal_id": getattr(row, "meal_id"),
-                "timestamp": getattr(row, "timestamp"),
-                "segment": getattr(row, "segment"),
-                "evidence_source": getattr(row, "evidence_source"),
-                "stated_carbs": None if pd.isna(stated_value) else float(stated_value),
-                "latent_carbs_posterior_mean": latent_carbs,
-                "latent_carbs_lower": latent_lower,
-                "latent_carbs_upper": latent_upper,
-                "carb_accuracy_score": carb_accuracy_score,
-                "ic_posterior_mean": ic_mean,
-                "ic_lower": ic_lower,
-                "ic_upper": ic_upper,
-                "confounding_grade": getattr(row, "confounding_grade"),
-                "source_quality_grade": getattr(row, "source_quality_grade"),
-                "identifiability_status": identifiability_status,
-                "suppression_reason": getattr(row, "suppression_reason") or "",
-            }
-        )
-    posterior_meals = pd.DataFrame(posterior_rows).sort_values("timestamp").reset_index(drop=True)
+    meal_windows = build_first_meal_clean_window_registry(research_frame)
+    first_meal_exclusion_summary = build_first_meal_exclusion_summary(meal_windows)
+    gate, gate_markdown = _latent_meal_gate(dataset, meal_windows, research_scope=research_scope)
 
     return LatentMealResearchResult(
         prepared_dataset=dataset,
@@ -2404,21 +2246,18 @@ def run_latent_meal_icr_research(
         research_gate=gate,
         meal_event_registry=meal_event_registry,
         meal_windows=meal_windows,
-        posterior_meals=posterior_meals,
-        model_comparison=model_comparison,
+        first_meal_exclusion_summary=first_meal_exclusion_summary,
+        posterior_meals=pd.DataFrame(columns=["meal_id", "timestamp", "segment", "stated_carbs", "latent_carbs_posterior_mean", "carb_accuracy_score"]),
+        model_comparison=pd.DataFrame(columns=["model", "meal_count", "stated_carb_mae", "peak_delta_mae", "peak_delta_correlation", "selected"]),
         research_gate_markdown=gate_markdown,
-        meal_window_audit_markdown=_render_latent_meal_window_audit(meal_windows),
-        fit_summary_markdown=_render_latent_meal_fit_summary(
-            gate=gate,
-            reference_ic=reference_ic,
-            carb_model=carb_model,
-            selected_model=selected_model,
-            selected_peak_delta_mae=selected_peak_delta_mae,
-        ),
-        confidence_report_markdown=_render_latent_meal_confidence_report(posterior_meals),
-        model_comparison_markdown=_render_latent_meal_model_comparison(model_comparison),
+        meal_truth_semantics_report_markdown=_render_meal_truth_semantics_report(dataset, research_frame),
+        meal_window_audit_markdown=_render_latent_meal_window_audit(meal_windows, first_meal_exclusion_summary),
+        fit_summary_markdown="",
+        confidence_report_markdown="",
+        model_comparison_markdown="",
         segments=segments,
         meal_proxy_mode=meal_proxy_mode,
+        research_scope=research_scope,
     )
 
 
@@ -2430,20 +2269,266 @@ def write_latent_meal_research_artifacts(
     root.mkdir(parents=True, exist_ok=True)
     paths = {
         "research_gate": root / "latent_meal_research_gate.md",
+        "meal_truth_semantics_report": root / "meal_truth_semantics_report.md",
         "meal_event_registry": root / "meal_event_registry.csv",
-        "meal_window_audit": root / "meal_window_audit.md",
-        "fit_summary": root / "latent_meal_fit_summary.md",
-        "posterior_meals": root / "latent_meal_posterior_meals.csv",
-        "confidence_report": root / "latent_meal_confidence_report.md",
-        "model_comparison": root / "latent_meal_model_comparison.md",
+        "first_meal_clean_window_registry": root / "first_meal_clean_window_registry.csv",
+        "first_meal_clean_window_audit": root / "first_meal_clean_window_audit.md",
+        "first_meal_exclusion_summary": root / "first_meal_exclusion_summary.csv",
     }
     paths["research_gate"].write_text(result.research_gate_markdown, encoding="utf-8")
+    paths["meal_truth_semantics_report"].write_text(result.meal_truth_semantics_report_markdown, encoding="utf-8")
     result.meal_event_registry.to_csv(paths["meal_event_registry"], index=False)
-    paths["meal_window_audit"].write_text(result.meal_window_audit_markdown, encoding="utf-8")
-    paths["fit_summary"].write_text(result.fit_summary_markdown, encoding="utf-8")
-    result.posterior_meals.to_csv(paths["posterior_meals"], index=False)
-    paths["confidence_report"].write_text(result.confidence_report_markdown, encoding="utf-8")
-    paths["model_comparison"].write_text(result.model_comparison_markdown, encoding="utf-8")
+    result.meal_windows.to_csv(paths["first_meal_clean_window_registry"], index=False)
+    paths["first_meal_clean_window_audit"].write_text(result.meal_window_audit_markdown, encoding="utf-8")
+    result.first_meal_exclusion_summary.to_csv(paths["first_meal_exclusion_summary"], index=False)
+    return paths
+
+
+def _evenly_spaced_background_days(
+    day_summary: pd.DataFrame,
+    *,
+    excluded_dates: set[pd.Timestamp],
+    background_days: int,
+) -> pd.DataFrame:
+    if background_days <= 0 or day_summary.empty:
+        return pd.DataFrame(columns=["date", "row_count", "bolus_rows", "selection_type", "selection_reason"])
+    eligible = day_summary.loc[~day_summary["date"].isin(excluded_dates)].copy()
+    if eligible.empty:
+        return pd.DataFrame(columns=["date", "row_count", "bolus_rows", "selection_type", "selection_reason"])
+    eligible = eligible.sort_values("date").reset_index(drop=True)
+    picks = min(int(background_days), len(eligible))
+    indices = np.linspace(0, len(eligible) - 1, num=picks).round().astype(int)
+    indices = sorted(set(int(index) for index in indices))
+    background = eligible.iloc[indices].copy().reset_index(drop=True)
+    background["selection_type"] = "background"
+    background["selection_reason"] = "evenly_spaced_non_candidate_day"
+    return background
+
+
+def _render_latent_meal_fixture_summary(
+    *,
+    source_result: LatentMealResearchResult,
+    fixture_result: LatentMealResearchResult,
+    selected_day_manifest: pd.DataFrame,
+    background_days_requested: int,
+    seed: int,
+) -> str:
+    source_frame = source_result.research_frame.copy()
+    fixture_frame = fixture_result.research_frame.copy()
+    source_day_count = int(pd.to_datetime(source_frame.get("timestamp"), errors="coerce").dt.normalize().nunique()) if not source_frame.empty else 0
+    fixture_day_count = int(pd.to_datetime(fixture_frame.get("timestamp"), errors="coerce").dt.normalize().nunique()) if not fixture_frame.empty else 0
+    source_candidate_days = int(pd.to_datetime(source_result.meal_windows.get("date"), errors="coerce").nunique()) if not source_result.meal_windows.empty else 0
+    fixture_candidate_days = int(pd.to_datetime(fixture_result.meal_windows.get("date"), errors="coerce").nunique()) if not fixture_result.meal_windows.empty else 0
+    background_selected = int(selected_day_manifest["selection_type"].astype(str).eq("background").sum()) if not selected_day_manifest.empty else 0
+    source_exclusions = (
+        source_result.first_meal_exclusion_summary.set_index("reason")["count"].to_dict()
+        if not source_result.first_meal_exclusion_summary.empty
+        else {}
+    )
+    fixture_exclusions = (
+        fixture_result.first_meal_exclusion_summary.set_index("reason")["count"].to_dict()
+        if not fixture_result.first_meal_exclusion_summary.empty
+        else {}
+    )
+    all_reasons = sorted(set(source_exclusions) | set(fixture_exclusions))
+    lines = [
+        "# Latent Meal Representative Fixture",
+        "",
+        f"- source_rows: {int(len(source_result.prepared_dataset.frame))}",
+        f"- fixture_rows: {int(len(fixture_result.prepared_dataset.frame))}",
+        f"- source_days: {source_day_count}",
+        f"- fixture_days: {fixture_day_count}",
+        f"- source_candidate_days: {source_candidate_days}",
+        f"- fixture_candidate_days: {fixture_candidate_days}",
+        f"- candidate_day_retention: {float(fixture_candidate_days / source_candidate_days):.3f}" if source_candidate_days else "- candidate_day_retention: NA",
+        f"- background_days_requested: {int(background_days_requested)}",
+        f"- background_days_selected: {background_selected}",
+        f"- explicit_carb_source_available: {bool(getattr(source_result.prepared_dataset, 'explicit_carb_source_available', False))}",
+        f"- seed: {int(seed)}",
+        "",
+        "## Exclusion Coverage",
+        "",
+        "| reason | source_count | fixture_count | retained |",
+        "| --- | ---: | ---: | --- |",
+    ]
+    if not all_reasons:
+        lines.append("| none | 0 | 0 | NA |")
+    else:
+        for reason in all_reasons:
+            source_count = int(source_exclusions.get(reason, 0))
+            fixture_count = int(fixture_exclusions.get(reason, 0))
+            retained = "yes" if fixture_count > 0 else "no"
+            lines.append(f"| {reason} | {source_count} | {fixture_count} | {retained} |")
+    lines.extend(
+        [
+            "",
+            "## Selected Days",
+            "",
+            "| date | selection_type | selection_reason | row_count | bolus_rows | candidate_id | source_quality_grade | exclusion_reasons |",
+            "| --- | --- | --- | ---: | ---: | --- | --- | --- |",
+        ]
+    )
+    if selected_day_manifest.empty:
+        lines.append("| none | none | none | 0 | 0 | none | none | none |")
+    else:
+        for row in selected_day_manifest.sort_values("date").itertuples(index=False):
+            lines.append(
+                f"| {pd.Timestamp(row.date).date()} | {row.selection_type} | {row.selection_reason} | {int(row.row_count)} | {int(row.bolus_rows)} | {getattr(row, 'candidate_id', '') or ''} | {getattr(row, 'source_quality_grade', '') or ''} | {getattr(row, 'exclusion_reasons', '') or ''} |"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def build_representative_latent_meal_fixture(
+    dataset: AnalysisReadyHealthDataset,
+    *,
+    segments: tuple[TherapySegment, ...] | None = None,
+    meal_proxy_mode: str = "strict",
+    background_days: int = 7,
+    seed: int = 17,
+) -> LatentMealFixtureResult:
+    if background_days < 0:
+        raise ValueError("background_days must be >= 0")
+    segments = segments or parse_therapy_segments()
+    source_result = run_latent_meal_icr_research(
+        dataset,
+        segments=segments,
+        meal_proxy_mode=meal_proxy_mode,
+        research_scope="foundation",
+    )
+    research_frame = source_result.research_frame.copy()
+    if research_frame.empty:
+        selected_day_manifest = pd.DataFrame(
+            columns=[
+                "date",
+                "selection_type",
+                "selection_reason",
+                "row_count",
+                "bolus_rows",
+                "candidate_id",
+                "source_quality_grade",
+                "exclusion_reasons",
+            ]
+        )
+        fixture_dataset = replace(dataset, frame=dataset.frame.iloc[0:0].copy())
+        fixture_result = run_latent_meal_icr_research(
+            fixture_dataset,
+            segments=segments,
+            meal_proxy_mode=meal_proxy_mode,
+            research_scope="foundation",
+        )
+        summary_markdown = _render_latent_meal_fixture_summary(
+            source_result=source_result,
+            fixture_result=fixture_result,
+            selected_day_manifest=selected_day_manifest,
+            background_days_requested=background_days,
+            seed=seed,
+        )
+        return LatentMealFixtureResult(
+            source_result=source_result,
+            fixture_result=fixture_result,
+            fixture_dataset=fixture_dataset,
+            selected_day_manifest=selected_day_manifest,
+            summary_markdown=summary_markdown,
+            background_days_requested=background_days,
+            seed=seed,
+        )
+
+    ordered = research_frame.copy()
+    ordered["date"] = pd.to_datetime(ordered["timestamp"], errors="coerce").dt.normalize()
+    ordered = ordered.dropna(subset=["date"]).reset_index(drop=True)
+    day_summary = (
+        ordered.groupby("date", as_index=False)
+        .agg(
+            row_count=("timestamp", "size"),
+            bolus_rows=("bolus_units", lambda s: int(pd.to_numeric(s, errors="coerce").fillna(0.0).gt(0).sum())),
+        )
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+    candidate_manifest = source_result.meal_windows.copy()
+    if candidate_manifest.empty:
+        candidate_manifest = pd.DataFrame(columns=["date", "candidate_id", "source_quality_grade", "exclusion_reasons"])
+    else:
+        candidate_manifest = candidate_manifest.loc[:, [column for column in ["date", "candidate_id", "source_quality_grade", "exclusion_reasons"] if column in candidate_manifest.columns]].copy()
+        candidate_manifest["date"] = pd.to_datetime(candidate_manifest["date"], errors="coerce").dt.normalize()
+        candidate_manifest = candidate_manifest.dropna(subset=["date"]).drop_duplicates(subset=["date"], keep="first")
+    candidate_manifest = candidate_manifest.merge(day_summary, on="date", how="left")
+    candidate_manifest["selection_type"] = "candidate"
+    candidate_manifest["selection_reason"] = "first_meal_candidate_day"
+    excluded_dates = set(candidate_manifest["date"].dropna().tolist())
+    background_manifest = _evenly_spaced_background_days(
+        day_summary,
+        excluded_dates=excluded_dates,
+        background_days=background_days,
+    )
+    if not background_manifest.empty:
+        background_manifest["candidate_id"] = ""
+        background_manifest["source_quality_grade"] = ""
+        background_manifest["exclusion_reasons"] = ""
+    selected_day_manifest = pd.concat([candidate_manifest, background_manifest], ignore_index=True, sort=False)
+    selected_day_manifest = selected_day_manifest.loc[:, [
+        "date",
+        "selection_type",
+        "selection_reason",
+        "row_count",
+        "bolus_rows",
+        "candidate_id",
+        "source_quality_grade",
+        "exclusion_reasons",
+    ]].sort_values(["date", "selection_type"]).reset_index(drop=True)
+
+    selected_dates = set(pd.to_datetime(selected_day_manifest["date"], errors="coerce").dropna().tolist())
+    subset_frame = dataset.frame.copy()
+    subset_frame = subset_frame.loc[
+        pd.to_datetime(subset_frame["timestamp"], errors="coerce").dt.normalize().isin(selected_dates)
+    ].copy().reset_index(drop=True)
+    fixture_dataset = replace(dataset, frame=subset_frame)
+    fixture_result = run_latent_meal_icr_research(
+        fixture_dataset,
+        segments=segments,
+        meal_proxy_mode=meal_proxy_mode,
+        research_scope="foundation",
+    )
+    summary_markdown = _render_latent_meal_fixture_summary(
+        source_result=source_result,
+        fixture_result=fixture_result,
+        selected_day_manifest=selected_day_manifest,
+        background_days_requested=background_days,
+        seed=seed,
+    )
+    return LatentMealFixtureResult(
+        source_result=source_result,
+        fixture_result=fixture_result,
+        fixture_dataset=fixture_dataset,
+        selected_day_manifest=selected_day_manifest,
+        summary_markdown=summary_markdown,
+        background_days_requested=background_days,
+        seed=seed,
+    )
+
+
+def write_representative_latent_meal_fixture_artifacts(
+    result: LatentMealFixtureResult,
+    report_dir: str | Path,
+    *,
+    prepared_csv_path: str | Path | None = None,
+) -> dict[str, Path]:
+    root = Path(report_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "fixture_summary": root / "latent_meal_fixture_summary.md",
+        "selected_day_manifest": root / "latent_meal_fixture_day_manifest.csv",
+    }
+    if prepared_csv_path is not None:
+        paths["prepared_model_data"] = Path(prepared_csv_path)
+        paths["prepared_model_data"].parent.mkdir(parents=True, exist_ok=True)
+        result.fixture_dataset.frame.to_csv(paths["prepared_model_data"], index=False)
+    else:
+        paths["prepared_model_data"] = root / "prepared_model_data_5min.csv"
+        result.fixture_dataset.frame.to_csv(paths["prepared_model_data"], index=False)
+    paths["fixture_summary"].write_text(result.summary_markdown, encoding="utf-8")
+    result.selected_day_manifest.to_csv(paths["selected_day_manifest"], index=False)
+    paths.update(write_latent_meal_research_artifacts(result.fixture_result, root))
     return paths
 
 
@@ -2607,6 +2692,7 @@ def _synthetic_base_dataset(
         config=FeatureConfig(horizon_minutes=30),
         mode="apple_enriched" if apple else "tandem_only",
         apple_available=apple,
+        explicit_carb_source_available=bool(explicit_carbs and not proxy_only),
     )
 
 
@@ -2663,6 +2749,7 @@ def validate_therapy_infra(
                 config=dataset.config,
                 mode="tandem_only",
                 apple_available=False,
+                explicit_carb_source_available=dataset.explicit_carb_source_available,
             )
             ablated = run_therapy_research(
                 no_apple_dataset,
@@ -2833,11 +2920,13 @@ def summarize_overnight_basal_evidence(result: TherapyResearchResult) -> tuple[d
 
 __all__ = [
     "DEFAULT_SEGMENT_SPEC",
+    "LatentMealFixtureResult",
     "LatentMealResearchResult",
     "TherapyInfraValidationResult",
     "TherapyResearchResult",
     "TherapySegment",
     "build_meal_event_registry",
+    "build_representative_latent_meal_fixture",
     "build_therapy_feature_registry",
     "build_therapy_research_frame",
     "build_source_report_cards",
@@ -2848,6 +2937,7 @@ __all__ = [
     "summarize_overnight_basal_evidence",
     "validate_therapy_infra",
     "write_latent_meal_research_artifacts",
+    "write_representative_latent_meal_fixture_artifacts",
     "write_therapy_infra_validation_artifacts",
     "write_therapy_research_artifacts",
 ]

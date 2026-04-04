@@ -70,6 +70,7 @@ class AnalysisReadyHealthDataset:
     config: FeatureConfig
     mode: str = "tandem_only"
     apple_available: bool = False
+    explicit_carb_source_available: bool = False
 
 
 @dataclass(frozen=True)
@@ -1039,10 +1040,31 @@ def build_analysis_ready_health_dataset(
     config: FeatureConfig | None = None,
 ) -> AnalysisReadyHealthDataset:
     feature_frame = build_feature_frame(tandem_data, config or FeatureConfig())
+    explicit_carb_source_available = bool(not tandem_data.carbs.empty)
+    feature_frame_frame = feature_frame.frame.copy()
+    if not feature_frame_frame.empty:
+        explicit_carb = pd.to_numeric(feature_frame_frame.get("carb_grams"), errors="coerce") if "carb_grams" in feature_frame_frame.columns else pd.Series(np.nan, index=feature_frame_frame.index, dtype=float)
+        if explicit_carb_source_available:
+            explicit_meal_event = explicit_carb.fillna(0.0).gt(0).astype(float)
+            last_explicit_meal_ts = feature_frame_frame["timestamp"].where(explicit_meal_event.astype(bool)).ffill()
+            minutes_since_last_explicit_meal = (
+                pd.to_datetime(feature_frame_frame["timestamp"], errors="coerce") - pd.to_datetime(last_explicit_meal_ts, errors="coerce")
+            ).dt.total_seconds().div(60.0)
+            meal_truth_status = np.where(explicit_meal_event.gt(0), "observed_explicit", "missing_from_source")
+            feature_frame_frame["explicit_carb_grams"] = explicit_carb.where(explicit_carb.gt(0), np.nan)
+            feature_frame_frame["explicit_meal_event"] = explicit_meal_event
+            feature_frame_frame["minutes_since_last_explicit_meal"] = minutes_since_last_explicit_meal
+            feature_frame_frame["meal_truth_status"] = meal_truth_status
+        else:
+            feature_frame_frame["explicit_carb_grams"] = np.nan
+            feature_frame_frame["explicit_meal_event"] = np.nan
+            feature_frame_frame["minutes_since_last_explicit_meal"] = np.nan
+            feature_frame_frame["meal_truth_status"] = "unavailable"
+        feature_frame_frame["explicit_carb_source_available"] = int(explicit_carb_source_available)
     apple_available = has_apple_health_data(health_data)
-    if feature_frame.frame.empty:
+    if feature_frame_frame.empty:
         return AnalysisReadyHealthDataset(
-            frame=feature_frame.frame.copy(),
+            frame=feature_frame_frame,
             feature_columns=list(feature_frame.feature_columns),
             tandem_feature_columns=list(feature_frame.feature_columns),
             health_feature_columns=[],
@@ -1051,10 +1073,11 @@ def build_analysis_ready_health_dataset(
             config=feature_frame.config,
             mode="apple_enriched" if apple_available else "tandem_only",
             apple_available=apple_available,
+            explicit_carb_source_available=explicit_carb_source_available,
         )
     if not apple_available:
         return AnalysisReadyHealthDataset(
-            frame=feature_frame.frame.copy(),
+            frame=feature_frame_frame,
             feature_columns=list(feature_frame.feature_columns),
             tandem_feature_columns=list(feature_frame.feature_columns),
             health_feature_columns=[],
@@ -1063,13 +1086,14 @@ def build_analysis_ready_health_dataset(
             config=feature_frame.config,
             mode="tandem_only",
             apple_available=False,
+            explicit_carb_source_available=explicit_carb_source_available,
         )
     context_frame, health_feature_columns = build_health_context_frame(
-        feature_frame.frame,
+        feature_frame_frame,
         health_data,
         freq=feature_frame.config.freq,
     )
-    combined = feature_frame.frame.merge(context_frame, on="timestamp", how="left")
+    combined = feature_frame_frame.merge(context_frame, on="timestamp", how="left")
     health_feature_columns = [column for column in dict.fromkeys(health_feature_columns) if column in combined.columns]
     if health_feature_columns:
         combined[health_feature_columns] = combined[health_feature_columns].apply(pd.to_numeric, errors="coerce").fillna(0.0)
@@ -1084,6 +1108,7 @@ def build_analysis_ready_health_dataset(
         config=feature_frame.config,
         mode="apple_enriched",
         apple_available=True,
+        explicit_carb_source_available=explicit_carb_source_available,
     )
 
 

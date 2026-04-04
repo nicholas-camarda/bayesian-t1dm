@@ -15,7 +15,7 @@ from bayesian_t1dm.therapy_research import TherapyInfraValidationResult, Therapy
 
 
 def _latest_log_dir(runtime_root: Path, command: str) -> Path:
-    latest = json.loads((runtime_root / "output" / "logs" / command / "latest.json").read_text(encoding="utf-8"))
+    latest = json.loads((runtime_root / "logs" / command / "latest.json").read_text(encoding="utf-8"))
     return Path(latest["run_dir"])
 
 
@@ -226,7 +226,7 @@ def test_collect_command_uses_api_client_by_default(tmp_path, monkeypatch):
     assert any(call[0] == "export" for call in client.calls)
     assert (client.workspace.cloud_raw / "tconnectsync").exists()
     assert (client.workspace.cloud_raw / "tconnectsync" / "2024-01-01__2024-01-01" / "window_manifest.csv").exists()
-    assert (client.workspace.reports / "tandem_acquisition_summary.md").exists()
+    assert (client.workspace.output_source / "tandem_acquisition_summary.md").exists()
 
 
 def test_collect_command_writes_redacted_run_logs(tmp_path, monkeypatch):
@@ -292,7 +292,7 @@ def test_backfill_command_continues_on_partial_window(tmp_path, monkeypatch):
     export_calls = [call for call in client.calls if call[0] == "export"]
     assert len(export_calls) == 2
     assert (client.workspace.cloud_raw / "tandem_export_manifest.csv").exists()
-    assert (client.workspace.reports / "tandem_acquisition_summary.md").exists()
+    assert (client.workspace.output_source / "tandem_acquisition_summary.md").exists()
 
 
 def test_ingest_command_defaults_report_to_runtime_output(tmp_path, tandem_fixture_dir, monkeypatch):
@@ -314,10 +314,10 @@ def test_ingest_command_defaults_report_to_runtime_output(tmp_path, tandem_fixtu
     )
 
     assert exit_code == 0
-    assert (runtime_root / "output" / "coverage.md").exists()
-    assert (runtime_root / "output" / "coverage_review.html").exists()
+    assert (runtime_root / "output" / "source" / "coverage.md").exists()
+    assert (runtime_root / "output" / "source" / "coverage_review.html").exists()
     assert (cloud_root / "data" / "raw" / "tandem_export_manifest.csv").exists()
-    coverage_text = (runtime_root / "output" / "coverage.md").read_text(encoding="utf-8")
+    coverage_text = (runtime_root / "output" / "source" / "coverage.md").read_text(encoding="utf-8")
     assert "[coverage_review_html](coverage_review.html)" in coverage_text
 
 
@@ -343,7 +343,7 @@ def test_normalize_raw_command_rebuilds_archived_window(tmp_path, monkeypatch):
 
     assert exit_code == 0
     assert (cloud_root / "data" / "raw" / "tconnectsync" / "2024-05-01__2024-05-03" / "window_manifest.csv").exists()
-    assert (runtime_root / "output" / "normalize_raw_summary.md").exists()
+    assert (runtime_root / "output" / "source" / "normalize_raw_summary.md").exists()
 
 
 class _FailIfFitModel:
@@ -382,15 +382,16 @@ def test_run_skip_recommendations_writes_skipped_policy(tmp_path, tandem_fixture
     )
 
     assert exit_code == 0
-    report_json = tmp_path / "runtime" / "output" / "run_summary.json"
+    report_json = tmp_path / "runtime" / "cache" / "forecast" / "run_summary.json"
     payload = json.loads(report_json.read_text(encoding="utf-8"))
     assert payload["fit_diagnostics"] is None
     assert payload["data_quality"]["status"] in {"good", "degraded"}
     assert payload["recommendation_policy"]["status"] == "skipped"
     assert payload["recommendation_policy"]["reasons"] == ["skipped_by_flag"]
-    assert (tmp_path / "runtime" / "output" / "run_review.html").exists()
-    report_text = (tmp_path / "runtime" / "output" / "run_summary.md").read_text(encoding="utf-8")
-    assert "[run_review_html](run_review.html)" in report_text
+    assert (tmp_path / "runtime" / "output" / "forecast_review.html").exists()
+    assert (tmp_path / "runtime" / "output" / "forecast" / "forecast_review.html").exists()
+    report_text = (tmp_path / "runtime" / "output" / "forecast" / "run_summary.md").read_text(encoding="utf-8")
+    assert "[forecast_review_html](forecast_review.html)" in report_text
     run_dir = _latest_log_dir(tmp_path / "runtime", "run")
     events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
     assert any(event["event"] == "command.stage.start" and event["stage"] == "run.walk_forward" for event in events)
@@ -591,16 +592,89 @@ def test_research_latent_meal_icr_command_writes_artifacts_and_review(tmp_path, 
 
     assert exit_code == 0
     assert (report_dir / "latent_meal_research_gate.md").exists()
+    assert (report_dir / "meal_truth_semantics_report.md").exists()
     assert (report_dir / "meal_event_registry.csv").exists()
-    assert (report_dir / "meal_window_audit.md").exists()
-    assert (report_dir / "latent_meal_fit_summary.md").exists()
-    assert (report_dir / "latent_meal_posterior_meals.csv").exists()
-    assert (report_dir / "latent_meal_confidence_report.md").exists()
-    assert (report_dir / "latent_meal_model_comparison.md").exists()
+    assert (report_dir / "first_meal_clean_window_registry.csv").exists()
+    assert (report_dir / "first_meal_clean_window_audit.md").exists()
+    assert (report_dir / "first_meal_exclusion_summary.csv").exists()
     assert review_html.exists()
 
 
-def test_status_command_writes_curated_latest_outputs_and_run_bundle(tmp_path, monkeypatch):
+def test_research_latent_meal_icr_full_scope_errors_cleanly(tmp_path, monkeypatch):
+    workspace_root = tmp_path / "repo"
+    workspace_root.mkdir()
+    dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
+    preparation = ModelDataPreparationResult(
+        dataset=dataset,
+        apple_available=True,
+        apple_span_start=pd.Timestamp("2025-01-01 00:00:00"),
+        apple_span_end=pd.Timestamp("2025-01-07 23:55:00"),
+        tandem_span_before_start=pd.Timestamp("2025-01-01 00:00:00"),
+        tandem_span_before_end=pd.Timestamp("2025-01-07 23:55:00"),
+        tandem_span_after_start=pd.Timestamp("2025-01-01 00:00:00"),
+        tandem_span_after_end=pd.Timestamp("2025-01-07 23:55:00"),
+        requested_tandem_start=pd.Timestamp("2025-01-01 00:00:00"),
+        requested_tandem_end=pd.Timestamp("2025-01-07 23:55:00"),
+        overlap_start=pd.Timestamp("2025-01-01 00:00:00"),
+        overlap_end=pd.Timestamp("2025-01-07 23:55:00"),
+        final_dataset_start=pd.Timestamp("2025-01-01 00:00:00"),
+        final_dataset_end=pd.Timestamp("2025-01-07 23:55:00"),
+        final_row_count=len(dataset.frame),
+    )
+    monkeypatch.setattr(cli, "_prepare_model_data", lambda args, paths, session=None: preparation)
+
+    try:
+        main(
+            [
+                "--root",
+                str(workspace_root),
+                "research-latent-meal-icr",
+                "--research-scope",
+                "full",
+            ]
+        )
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("Expected parser error for full research scope")
+
+
+def test_build_latent_meal_fixture_command_writes_fixture_bundle(tmp_path):
+    workspace_root = tmp_path / "repo"
+    workspace_root.mkdir()
+    prepared_csv = tmp_path / "prepared_model_data_5min.csv"
+    output_dir = tmp_path / "latent_meal_fixture"
+    review_html = output_dir / "latent_meal_review.html"
+    dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
+    dataset.frame.to_csv(prepared_csv, index=False)
+
+    exit_code = main(
+        [
+            "--root",
+            str(workspace_root),
+            "build-latent-meal-fixture",
+            "--prepared-csv",
+            str(prepared_csv),
+            "--output-dir",
+            str(output_dir),
+            "--review-html",
+            str(review_html),
+            "--background-days",
+            "2",
+        ]
+    )
+
+    assert exit_code == 0
+    assert (output_dir / "prepared_model_data_5min.csv").exists()
+    assert (output_dir / "latent_meal_fixture_summary.md").exists()
+    assert (output_dir / "latent_meal_fixture_day_manifest.csv").exists()
+    assert (output_dir / "latent_meal_research_gate.md").exists()
+    assert (output_dir / "meal_truth_semantics_report.md").exists()
+    assert (output_dir / "first_meal_clean_window_registry.csv").exists()
+    assert review_html.exists()
+
+
+def test_status_command_writes_curated_latest_outputs_and_cache_artifacts(tmp_path, monkeypatch):
     workspace_root = tmp_path / "repo"
     workspace_root.mkdir()
     cloud_root = tmp_path / "cloud"
@@ -667,20 +741,18 @@ def test_status_command_writes_curated_latest_outputs_and_run_bundle(tmp_path, m
     )
 
     assert exit_code == 0
-    current_payload = json.loads((output_root / "current_status.json").read_text(encoding="utf-8"))
+    current_payload = json.loads((runtime_root / "cache" / "status" / "current_status.json").read_text(encoding="utf-8"))
     assert current_payload["overall_state"] == "blocked"
     assert (output_root / "current_status.html").exists()
-    assert (output_root / "therapy_evidence_review.html").exists()
-    assert (output_root / "run_review.html").exists()
+    assert (output_root / "therapy_review.html").exists()
+    assert (output_root / "forecast_review.html").exists()
     assert not (output_root / "old_artifact.md").exists()
-
-    latest = json.loads((output_root / "latest_run.json").read_text(encoding="utf-8"))
-    run_dir = Path(latest["run_dir"])
-    assert (run_dir / "status" / "current_status.html").exists()
-    assert (run_dir / "therapy" / "therapy_evidence_review.html").exists()
-    assert (run_dir / "forecast" / "run_review.html").exists()
-    assert (run_dir / "supporting" / "model_data_preparation.md").exists()
-    assert (run_dir / "logs" / "events.jsonl").exists()
+    assert (output_root / "therapy" / "therapy_review.html").exists()
+    assert (output_root / "forecast" / "forecast_review.html").exists()
+    assert (output_root / "therapy" / "model_data_preparation.md").exists()
+    assert (runtime_root / "cache" / "prepared" / "prepared_model_data_5min.csv").exists()
+    assert (runtime_root / "cache" / "forecast" / "run_summary.json").exists()
+    assert _latest_log_dir(runtime_root, "status").joinpath("events.jsonl").exists()
 
 
 def test_ingest_failure_is_logged(tmp_path, tandem_fixture_dir, monkeypatch):

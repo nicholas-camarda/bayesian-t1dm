@@ -501,7 +501,7 @@ def setup_run_logging(
     started_at = _utc_timestamp()
     timestamp = started_at.replace("-", "").replace(":", "").replace("Z", "Z").replace("T", "T")
     run_id = f"{timestamp}_{os.getpid()}"
-    command_logs_dir = paths.reports / "logs" / command
+    command_logs_dir = paths.logs / command
     console_level_name = "WARNING" if quiet else log_level.upper()
     file_level_name = log_level.upper()
 

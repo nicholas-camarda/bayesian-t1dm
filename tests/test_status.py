@@ -8,7 +8,7 @@ import pandas as pd
 from bayesian_t1dm.features import FeatureConfig
 from bayesian_t1dm.health_auto_export import AnalysisReadyHealthDataset, ModelDataPreparationResult
 from bayesian_t1dm.paths import ProjectPaths
-from bayesian_t1dm.status import cleanup_legacy_top_level_output, create_status_bundle, derive_current_status, finalize_status_logs, publish_latest_entrypoints, write_status_json
+from bayesian_t1dm.status import cleanup_legacy_top_level_output, derive_current_status, finalize_status_logs, publish_html_entrypoint, reset_output_directory, write_status_json
 from bayesian_t1dm.therapy_research import TherapyInfraValidationResult, TherapyResearchResult
 
 
@@ -258,7 +258,7 @@ def test_derive_current_status_marks_overnight_or_confounding_case_as_blocked():
     assert "high_closed_loop_confounding" in codes
 
 
-def test_output_cleanup_and_latest_publish_use_bundle_layout(tmp_path):
+def test_output_cleanup_moves_top_level_clutter_into_quarantine(tmp_path):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     paths = ProjectPaths.from_root(repo_root, runtime_root=tmp_path / "runtime", cloud_root=tmp_path / "cloud").ensure()
@@ -272,34 +272,28 @@ def test_output_cleanup_and_latest_publish_use_bundle_layout(tmp_path):
     assert not (paths.reports / "old.csv").exists()
     moved = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert len(moved["moved"]) == 2
+    assert manifest_path.parent == paths.quarantine
 
-    bundle = create_status_bundle(paths, "run123")
-    log_dir = paths.reports / "logs" / "status" / "run123"
+    log_dir = paths.logs / "status" / "run123"
     log_dir.mkdir(parents=True, exist_ok=True)
     (log_dir / "events.jsonl").write_text("{}\n", encoding="utf-8")
-    finalize_status_logs(bundle, log_dir)
-    assert (bundle.logs_dir / "events.jsonl").exists()
+    assert finalize_status_logs(paths, log_dir) == log_dir
 
-    top_level_status_html = paths.reports / "current_status.html"
-    top_level_status_json = paths.reports / "current_status.json"
-    top_level_therapy_html = paths.reports / "therapy_evidence_review.html"
-    top_level_forecast_html = paths.reports / "run_review.html"
-    for path in [top_level_status_html, top_level_status_json, top_level_therapy_html, top_level_forecast_html]:
-        path.write_text("x", encoding="utf-8")
-    payload = {"overall_state": "blocked", "headline": "Blocked", "generated_at": "2026-04-02T00:00:00Z"}
-    latest = publish_latest_entrypoints(
-        paths=paths,
-        run_id="run123",
-        payload=payload,
-        bundle=bundle,
-        top_level_status_html=top_level_status_html,
-        top_level_status_json=top_level_status_json,
-        top_level_therapy_html=top_level_therapy_html,
-        top_level_forecast_html=top_level_forecast_html,
-    )
-    latest_payload = json.loads(latest.read_text(encoding="utf-8"))
-    assert latest_payload["run_dir"] == str(bundle.root)
-    assert latest_payload["artifacts"]["current_status_html"] == str(top_level_status_html)
+    source_html = paths.output_forecast / "forecast_review.html"
+    source_html.write_text("<html>forecast</html>", encoding="utf-8")
+    published = publish_html_entrypoint(source_html, paths.reports / "forecast_review.html")
+    assert published.read_text(encoding="utf-8") == "<html>forecast</html>"
+
+
+def test_reset_output_directory_replaces_stale_contents(tmp_path):
+    directory = tmp_path / "output" / "forecast"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "stale.md").write_text("stale", encoding="utf-8")
+
+    reset_output_directory(directory)
+
+    assert directory.exists()
+    assert list(directory.iterdir()) == []
 
 
 def test_write_status_json_persists_expected_keys(tmp_path):

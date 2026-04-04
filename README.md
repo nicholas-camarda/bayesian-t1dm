@@ -71,11 +71,10 @@ bayesian-t1dm status
 This is now the main front door. It refreshes data prep, therapy research, therapy infra validation, and forecast validation, then writes:
 
 - `~/ProjectsRuntime/bayesian-t1dm/output/current_status.html`
-- `~/ProjectsRuntime/bayesian-t1dm/output/current_status.json`
-- `~/ProjectsRuntime/bayesian-t1dm/output/therapy_evidence_review.html`
-- `~/ProjectsRuntime/bayesian-t1dm/output/run_review.html`
-
-It also stores the full dated run bundle under `~/ProjectsRuntime/bayesian-t1dm/output/runs/<run_id>/`.
+- `~/ProjectsRuntime/bayesian-t1dm/output/therapy_review.html`
+- `~/ProjectsRuntime/bayesian-t1dm/output/forecast_review.html`
+- supporting workflow directories under `~/ProjectsRuntime/bayesian-t1dm/output/`
+- machine-oriented JSON/CSV artifacts under `~/ProjectsRuntime/bayesian-t1dm/cache/`
 
 2. Build or refresh the analysis-ready dataset only:
 
@@ -83,7 +82,7 @@ It also stores the full dated run bundle under `~/ProjectsRuntime/bayesian-t1dm/
 bayesian-t1dm prepare-model-data
 ```
 
-This writes the current 5-minute prepared dataset and preparation report under `~/ProjectsRuntime/bayesian-t1dm/output/`.
+This writes the preparation report under `~/ProjectsRuntime/bayesian-t1dm/output/prepare/` and the prepared dataset under `~/ProjectsRuntime/bayesian-t1dm/cache/prepared/`.
 It automatically aligns already-imported Apple Health context to Tandem timestamps when overlap exists and records the overlap window in `model_data_preparation.md`.
 
 3. Build the therapy drill-down dashboard only:
@@ -116,7 +115,15 @@ This generates deeper therapy research outputs, but it is not the primary dashbo
 bayesian-t1dm research-latent-meal-icr
 ```
 
-This keeps the main therapy workflow unchanged and writes separate research artifacts for meal-event assembly, meal-window audits, latent carb estimates, effective I/C estimates, and confidence reporting.
+This keeps the main therapy workflow unchanged and currently runs the strict foundation phase: honest meal-truth semantics, meal-event assembly, and a conservative first-meal clean-window cohort audit. It does not fit latent carbs or effective I/C yet.
+
+7. Use `build-latent-meal-fixture` when you want a fast representative prepared-data subset for latent meal debugging:
+
+```bash
+bayesian-t1dm build-latent-meal-fixture
+```
+
+This writes a smaller prepared dataset plus fresh foundation artifacts while retaining all current first-meal candidate days and a small set of evenly spaced non-candidate background days.
 
 ## Quickstart
 
@@ -241,8 +248,11 @@ bayesian-t1dm validate-raw
 # generate supporting therapy research artifacts
 bayesian-t1dm research-therapy-settings
 
-# generate experimental latent meal / I:C research artifacts
+# generate experimental latent meal foundation artifacts
 bayesian-t1dm research-latent-meal-icr
+
+# build a fast representative latent meal debugging fixture
+bayesian-t1dm build-latent-meal-fixture
 
 bayesian-t1dm validate-therapy-infra
 ```
@@ -280,7 +290,7 @@ Canonical current-status workflow:
 
 1. `bayesian-t1dm status`
 2. open `~/ProjectsRuntime/bayesian-t1dm/output/current_status.html`
-3. drill into `therapy_evidence_review.html` or `run_review.html` only when you need the supporting detail
+3. drill into `therapy_review.html` or `forecast_review.html` only when you need the supporting detail
 
 This keeps raw-window repair, coverage review, and predictive validation separate from recommendation generation.
 
@@ -306,7 +316,7 @@ Canonical therapy evidence workflow:
 2. `bayesian-t1dm import-health-auto-export --input ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data` when new bundles need to be imported
 3. `bayesian-t1dm prepare-model-data`
 4. `bayesian-t1dm review-therapy-evidence`
-5. review `therapy_evidence_review.html` first, then inspect the linked supporting artifacts if you need to go deeper
+5. review `therapy_review.html` first, then inspect the linked supporting artifacts if you need to go deeper
 
 What each step does:
 
@@ -391,31 +401,26 @@ The pipeline produces:
 
 Default runtime review artifacts:
 
-- `coverage.md`
-- `coverage_review.html`
-- `model_data_preparation.md`
-- `prepared_model_data_5min.csv`
-- `analysis_ready_health_5min.csv`
-- `health_feature_screening.md`
-- `health_feature_scores.csv`
-- `therapy_feature_audit.md`
-- `therapy_feature_registry.csv`
-- `therapy_research_gate.md`
-- `meal_proxy_audit.md`
-- `therapy_model_comparison.md`
-- `therapy_segment_evidence.csv`
-- `therapy_recommendation_research.md`
-- `tandem_source_report_card.md`
-- `apple_source_report_card.md`
-- `source_numeric_summary.csv`
-- `source_missingness_summary.csv`
-- `therapy_infra_validation.md`
-- `therapy_synthetic_results.csv`
-- `therapy_synthetic_recommendation_audit.md`
-- `therapy_evidence_review.html`
-- `run_summary.md`
-- `run_summary.json`
-- `run_review.html`
+- top-level human-facing entrypoints:
+  - `current_status.html`
+  - `therapy_review.html`
+  - `forecast_review.html`
+- workflow directories:
+  - `output/source/`
+  - `output/prepare/`
+  - `output/therapy/`
+  - `output/forecast/`
+  - `output/latent_meal/`
+  - `output/fixture/`
+- cache directories:
+  - `cache/prepared/`
+  - `cache/analysis_ready/`
+  - `cache/latent_meal/`
+  - `cache/forecast/`
+  - `cache/status/`
+  - `cache/prepare/`
+- logs:
+  - `logs/<command>/`
 
 ## Limitations
 
@@ -433,9 +438,9 @@ Treat predictive discrimination, interval calibration, and recommendation confid
 - `run` may perform multiple expensive fits because walk-forward evaluation is time-aware.
 - `--skip-recommendations` is the preferred fast path for real-data validation.
 - incomplete source windows remain reviewable, but they suppress recommendations by policy.
-- `run_summary.json` includes fit diagnostics and recommendation-policy status.
-- `therapy_evidence_review.html` is the primary therapy-facing visual review artifact.
-- `coverage_review.html` and `run_review.html` remain the primary operational review artifacts for raw coverage and forecasting behavior.
+- `cache/forecast/run_summary.json` includes fit diagnostics and recommendation-policy status.
+- `therapy_review.html` is the primary therapy-facing visual review artifact.
+- `coverage_review.html` and `forecast_review.html` remain the primary operational review artifacts for raw coverage and forecasting behavior.
 - recommendation records include `confidence` and `flags` so low-signal cases are explicit in machine-readable output.
 - An empty recommendation list can mean no scenario cleared the gain threshold, or that recommendations were intentionally suppressed or skipped.
 

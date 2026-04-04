@@ -11,12 +11,15 @@ from bayesian_t1dm.cli import main
 from bayesian_t1dm.health_auto_export import AnalysisReadyHealthDataset
 from bayesian_t1dm.features import FeatureConfig
 from bayesian_t1dm.therapy_research import (
+    build_representative_latent_meal_fixture,
+    build_first_meal_clean_window_registry,
     build_therapy_research_frame,
     parse_model_list,
     parse_therapy_segments,
     run_latent_meal_icr_research,
     run_therapy_research,
     write_latent_meal_research_artifacts,
+    write_representative_latent_meal_fixture_artifacts,
     validate_therapy_infra,
     _synthetic_base_dataset,
 )
@@ -152,6 +155,7 @@ def _build_prepared_dataset(*, apple: bool) -> AnalysisReadyHealthDataset:
         config=FeatureConfig(horizon_minutes=30),
         mode="apple_enriched" if apple else "tandem_only",
         apple_available=apple,
+        explicit_carb_source_available=True,
     )
 
 
@@ -168,6 +172,10 @@ def test_build_therapy_research_frame_assigns_segments_and_contexts():
     assert "overnight_hrv_interaction" in research_frame.columns
     assert "meal_proxy_event" in research_frame.columns
     assert "therapy_stable_epoch" in research_frame.columns
+    assert "explicit_carb_grams" in research_frame.columns
+    assert "explicit_meal_event" in research_frame.columns
+    assert "meal_truth_status" in research_frame.columns
+    assert set(research_frame["meal_truth_status"]) >= {"observed_explicit", "missing_from_source"}
 
 
 def test_build_therapy_research_frame_handles_missing_meal_signal_without_marking_all_rows_as_meals():
@@ -193,6 +201,7 @@ def test_build_therapy_research_frame_handles_missing_meal_signal_without_markin
         config=dataset.config,
         mode=dataset.mode,
         apple_available=dataset.apple_available,
+        explicit_carb_source_available=dataset.explicit_carb_source_available,
     )
 
     research_frame = build_therapy_research_frame(dataset, segments=parse_therapy_segments())
@@ -252,20 +261,22 @@ def test_run_latent_meal_icr_research_builds_explicit_meal_outputs(tmp_path):
     assert not result.research_gate.empty
     assert not result.meal_event_registry.empty
     assert not result.meal_windows.empty
-    assert not result.posterior_meals.empty
-    assert not result.model_comparison.empty
-    assert {"meal_id", "stated_carbs", "latent_carbs_posterior_mean", "carb_accuracy_score", "ic_posterior_mean"}.issubset(result.posterior_meals.columns)
+    assert result.posterior_meals.empty
+    assert result.model_comparison.empty
+    assert not result.first_meal_exclusion_summary.empty
     assert "Latent Meal Research Gate" in result.research_gate_markdown
-    assert "Latent Meal Fit Summary" in result.fit_summary_markdown
-    assert "Latent Meal Confidence Report" in result.confidence_report_markdown
+    assert "Meal Truth Semantics Report" in result.meal_truth_semantics_report_markdown
+    assert "First Meal Clean Window Audit" in result.meal_window_audit_markdown
 
     paths = write_latent_meal_research_artifacts(result, tmp_path / "latent")
     assert paths["research_gate"].exists()
+    assert paths["meal_truth_semantics_report"].exists()
     assert paths["meal_event_registry"].exists()
-    assert paths["posterior_meals"].exists()
+    assert paths["first_meal_clean_window_registry"].exists()
+    assert paths["first_meal_exclusion_summary"].exists()
 
 
-def test_run_latent_meal_icr_research_caps_proxy_only_confidence():
+def test_run_latent_meal_icr_research_returns_honest_empty_or_strict_results():
     dataset = _synthetic_base_dataset(apple=False, explicit_carbs=False, proxy_only=True)
 
     result = run_latent_meal_icr_research(
@@ -274,10 +285,123 @@ def test_run_latent_meal_icr_research_caps_proxy_only_confidence():
         meal_proxy_mode="strict",
     )
 
-    assert not result.meal_event_registry.empty
-    assert not result.posterior_meals.empty
-    assert result.posterior_meals["stated_carbs"].isna().all()
-    assert result.posterior_meals["carb_accuracy_score"].max() <= 0.5
+    assert result.research_scope == "foundation"
+    assert "explicit_carb_source_available: False" in result.meal_truth_semantics_report_markdown
+    assert "latent_fit_status: intentionally_skipped_foundation_mode" in result.research_gate_markdown
+    assert result.posterior_meals.empty
+
+
+def test_run_latent_meal_icr_research_full_scope_not_implemented():
+    dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
+
+    try:
+        run_latent_meal_icr_research(
+            dataset,
+            segments=parse_therapy_segments(),
+            meal_proxy_mode="strict",
+            research_scope="full",
+        )
+    except NotImplementedError as exc:
+        assert "not_yet_implemented" in str(exc)
+    else:
+        raise AssertionError("Expected NotImplementedError for full scope")
+
+
+def test_build_representative_latent_meal_fixture_retains_candidate_days_and_selects_background_days(tmp_path):
+    dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
+    frame = dataset.frame.copy()
+    all_dates = sorted(pd.to_datetime(frame["timestamp"], errors="coerce").dt.normalize().dropna().unique())
+    suppressed_dates = set(all_dates[-2:])
+    timestamp_series = pd.to_datetime(frame["timestamp"], errors="coerce")
+    morning_mask = (
+        timestamp_series.dt.normalize().isin(suppressed_dates)
+        & (((timestamp_series.dt.hour * 60) + timestamp_series.dt.minute) >= 360)
+        & (((timestamp_series.dt.hour * 60) + timestamp_series.dt.minute) < 660)
+    )
+    frame.loc[morning_mask, "meal_event"] = 0.0
+    frame.loc[morning_mask, "carb_grams"] = 0.0
+    frame.loc[morning_mask, "bolus_units"] = 0.0
+    frame["carb_roll_sum_60m"] = frame["carb_grams"].rolling(12, min_periods=1).sum()
+    frame["carb_roll_sum_120m"] = frame["carb_grams"].rolling(24, min_periods=1).sum()
+    frame["minutes_since_last_meal"] = (
+        frame["timestamp"] - frame["timestamp"].where(frame["meal_event"].gt(0)).ffill()
+    ).dt.total_seconds().div(60.0).fillna(1e6)
+    frame["insulin_activity_units"] = frame["bolus_units"].rolling(12, min_periods=1).sum() / 6.0
+    frame["iob_units"] = frame["bolus_units"].rolling(24, min_periods=1).sum()
+    frame["iob_roll_sum_60m"] = frame["iob_units"].rolling(12, min_periods=1).sum()
+    frame["iob_roll_sum_120m"] = frame["iob_units"].rolling(24, min_periods=1).sum()
+    frame["carb_bolus_interaction_60m"] = frame["carb_roll_sum_60m"] * frame["bolus_units"]
+    frame["carb_iob_interaction_60m"] = frame["carb_roll_sum_60m"] * frame["iob_units"]
+    dataset = AnalysisReadyHealthDataset(
+        frame=frame,
+        feature_columns=dataset.feature_columns,
+        tandem_feature_columns=dataset.tandem_feature_columns,
+        health_feature_columns=dataset.health_feature_columns,
+        target_column=dataset.target_column,
+        horizon_minutes=dataset.horizon_minutes,
+        config=dataset.config,
+        mode=dataset.mode,
+        apple_available=dataset.apple_available,
+        explicit_carb_source_available=dataset.explicit_carb_source_available,
+    )
+
+    fixture = build_representative_latent_meal_fixture(
+        dataset,
+        segments=parse_therapy_segments(),
+        meal_proxy_mode="strict",
+        background_days=2,
+        seed=11,
+    )
+
+    source_candidate_days = int(pd.to_datetime(fixture.source_result.meal_windows["date"], errors="coerce").nunique())
+    fixture_candidate_days = int(pd.to_datetime(fixture.fixture_result.meal_windows["date"], errors="coerce").nunique())
+    background_selected = int(fixture.selected_day_manifest["selection_type"].astype(str).eq("background").sum())
+
+    assert source_candidate_days == fixture_candidate_days
+    assert background_selected == 2
+    assert "candidate_day_retention: 1.000" in fixture.summary_markdown
+
+    paths = write_representative_latent_meal_fixture_artifacts(fixture, tmp_path / "fixture")
+    assert paths["prepared_model_data"].exists()
+    assert paths["fixture_summary"].exists()
+    assert paths["selected_day_manifest"].exists()
+    assert paths["research_gate"].exists()
+
+
+def test_first_meal_registry_ignores_implausible_workout_flags_and_schedule_change_only():
+    dataset = _build_prepared_dataset(apple=True)
+    frame = dataset.frame.copy()
+    frame["recent_workout_6h"] = 1
+    frame["recent_workout_12h"] = 1
+    frame["workout_count_24h"] = 1000.0
+    frame["workout_duration_sum_24h"] = 1000.0 * 3600.0
+    frame["workout_summary_plausible"] = 0
+    frame["health_activity_roll_sum_60m"] = 0.0
+    frame["basal_schedule_change"] = 1
+    frame["minutes_since_basal_change"] = 0.0
+    # Keep basal stable so schedule-change proxy alone should not trigger premeal closed-loop confounding.
+    morning_mask = pd.to_datetime(frame["timestamp"], errors="coerce").dt.hour.lt(11)
+    frame.loc[morning_mask, "basal_units_per_hour"] = 0.8
+    dataset = AnalysisReadyHealthDataset(
+        frame=frame,
+        feature_columns=dataset.feature_columns,
+        tandem_feature_columns=dataset.tandem_feature_columns,
+        health_feature_columns=dataset.health_feature_columns,
+        target_column=dataset.target_column,
+        horizon_minutes=dataset.horizon_minutes,
+        config=dataset.config,
+        mode=dataset.mode,
+        apple_available=dataset.apple_available,
+        explicit_carb_source_available=dataset.explicit_carb_source_available,
+    )
+
+    research_frame = build_therapy_research_frame(dataset, segments=parse_therapy_segments(), meal_proxy_mode="strict")
+    windows = build_first_meal_clean_window_registry(research_frame)
+
+    assert len(windows) == 2
+    assert windows["recent_workout_6h"].sum() == 0
+    assert windows["closed_loop_confounding_premeal"].sum() == 0
+    assert windows["included"].sum() == 2
 
 
 def test_strict_meal_proxy_only_creates_high_confidence_meal_contexts():
@@ -299,6 +423,7 @@ def test_strict_meal_proxy_only_creates_high_confidence_meal_contexts():
         config=dataset.config,
         mode=dataset.mode,
         apple_available=dataset.apple_available,
+        explicit_carb_source_available=dataset.explicit_carb_source_available,
     )
     research_frame = build_therapy_research_frame(dataset, segments=parse_therapy_segments(), meal_proxy_mode="strict")
 

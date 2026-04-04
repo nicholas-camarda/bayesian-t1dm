@@ -283,7 +283,7 @@ Canonical therapy evidence flow:
 1. `bayesian-t1dm normalize-raw`
 2. `bayesian-t1dm prepare-model-data --apple-input ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data`
 3. `bayesian-t1dm review-therapy-evidence`
-4. review `therapy_evidence_review.html` first, then inspect linked artifacts for detail
+4. review `therapy_review.html` first, then inspect linked artifacts for detail
 
 Step-by-step behavior:
 
@@ -301,14 +301,14 @@ Workflow crosswalk:
 | Step | Question | Main artifact(s) | Main code path(s) | Interpretation |
 | --- | --- | --- | --- | --- |
 | `normalize-raw` | Did we correctly rebuild normalized Tandem windows? | `normalize_raw_summary.md` | `src/bayesian_t1dm/acquisition.py::normalize_tconnectsync_archive` | Confirms raw-to-normalized reconstruction before modeling. |
-| `prepare-model-data` | What data spans are available and aligned? | `model_data_preparation.md`, `prepared_model_data_5min.csv` | `src/bayesian_t1dm/cli.py::_prepare_model_data`, `src/bayesian_t1dm/health_auto_export.py::build_prepared_model_dataset` | Establishes the final Tandem-aligned modeling grid and overlap logic. |
+| `prepare-model-data` | What data spans are available and aligned? | `output/prepare/model_data_preparation.md`, `cache/prepared/prepared_model_data_5min.csv` | `src/bayesian_t1dm/cli.py::_prepare_model_data`, `src/bayesian_t1dm/health_auto_export.py::build_prepared_model_dataset` | Establishes the final Tandem-aligned modeling grid and overlap logic. |
 | `research-therapy-settings` | What therapy contexts and identifiability gates are available? | `therapy_research_gate.md`, `therapy_feature_audit.md`, `therapy_model_comparison.md` | `src/bayesian_t1dm/therapy_research.py::build_therapy_research_frame`, `src/bayesian_t1dm/therapy_research.py::run_therapy_research` | Shows whether basal / I:C / ISF are directly observed, proxy-supported, weakly identified, or blocked. |
 | `validate-therapy-infra` | Does the therapy workflow recover known truth and suppress itself correctly? | `therapy_infra_validation.md`, `therapy_synthetic_results.csv` | `src/bayesian_t1dm/therapy_research.py::validate_therapy_infra` | Tests truth-recovery and false-positive suppression, not just predictive fit. |
-| `review-therapy-evidence` | What is actually happening with overnight basal evidence in the current data? | `therapy_evidence_review.html` | `src/bayesian_t1dm/review.py::write_therapy_evidence_review_html` | Primary therapy-facing explanation surface. |
+| `review-therapy-evidence` | What is actually happening with overnight basal evidence in the current data? | `output/therapy/therapy_review.html` | `src/bayesian_t1dm/review.py::write_therapy_evidence_review_html` | Primary therapy-facing explanation surface. |
 
 ## Output Contract
 
-`run_summary.json` includes:
+`cache/forecast/run_summary.json` includes:
 
 - `data_quality` with `good`, `degraded`, or `broken` source status
 - `walk_forward` aggregate and per-fold metrics
@@ -333,19 +333,19 @@ Recommendation output is policy-gated. The pipeline suppresses recommendations w
 In addition to markdown and JSON summaries, the active pipeline writes self-contained interactive HTML review artifacts:
 
 - `coverage_review.html` from `ingest`
-- `run_review.html` from `run`
+- `forecast_review.html` from `run`
 
 These are the primary visual inspection surfaces for active-pipeline review. They combine source completeness, walk-forward behavior, baseline comparison, and sampler diagnostics in one place.
 
 Apple Health-specific working artifacts:
 
 - `import-health-auto-export` writes per-bundle manifests under `data/raw/health_auto_export/<export_id>/health_auto_export_manifest.csv`
-- `prepare-model-data` writes `model_data_preparation.md` and `prepared_model_data_5min.csv` under the runtime output directory by default
-- `build-health-analysis-ready` writes a wide Tandem-aligned 5-minute table, by default under `~/ProjectsRuntime/bayesian-t1dm/output/analysis_ready_health_5min.csv`
-- `screen-health-features` writes `health_feature_screening.md` and `health_feature_scores.csv` under the runtime output directory
-- `research-therapy-settings` writes `therapy_research_gate.md`, `meal_proxy_audit.md`, `therapy_feature_audit.md`, `therapy_feature_registry.csv`, `therapy_model_comparison.md`, `therapy_segment_evidence.csv`, `therapy_recommendation_research.md`, `tandem_source_report_card.md`, `apple_source_report_card.md`, `source_numeric_summary.csv`, and `source_missingness_summary.csv`
-- `validate-therapy-infra` writes `therapy_infra_validation.md`, `therapy_synthetic_results.csv`, and `therapy_synthetic_recommendation_audit.md`
-- `review-therapy-evidence` writes `therapy_evidence_review.html`, which links the preparation, therapy-research, source-report, and validation artifacts into one therapy-facing explanation surface
+- `prepare-model-data` writes `model_data_preparation.md` under `output/prepare/` and `prepared_model_data_5min.csv` under `cache/prepared/`
+- `build-health-analysis-ready` writes a wide Tandem-aligned 5-minute table under `cache/analysis_ready/analysis_ready_health_5min.csv` and a short summary under `output/prepare/`
+- `screen-health-features` writes `health_feature_screening.md` under `output/prepare/` and `health_feature_scores.csv` under `cache/prepare/`
+- `research-therapy-settings` writes its research artifacts under `output/therapy/`
+- `validate-therapy-infra` writes `therapy_infra_validation.md`, `therapy_synthetic_results.csv`, and `therapy_synthetic_recommendation_audit.md` under `output/therapy/validation/`
+- `review-therapy-evidence` writes `output/therapy/therapy_review.html` and publishes the latest top-level `output/therapy_review.html`
 
 ## Assumptions and Failure Modes
 
