@@ -36,7 +36,7 @@ def cleanup_legacy_top_level_output(paths: ProjectPaths, *, keep_names: set[str]
     extras = [item for item in sorted(paths.reports.iterdir(), key=lambda candidate: candidate.name) if item.name not in keep]
     if not extras:
         return None
-    legacy_root = paths.quarantine
+    legacy_root = paths.legacy_output_archive
     if legacy_root.exists():
         shutil.rmtree(legacy_root)
     legacy_root.mkdir(parents=True, exist_ok=True)

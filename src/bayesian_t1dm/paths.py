@@ -25,7 +25,8 @@ class ProjectPaths:
     cache_forecast: Path
     cache_status: Path
     logs: Path
-    quarantine: Path
+    runtime_archive: Path
+    legacy_output_archive: Path
     archive: Path
     runtime: Path
     cloud_root: Path
@@ -66,7 +67,8 @@ class ProjectPaths:
             cache_forecast=runtime_path / "cache" / "forecast",
             cache_status=runtime_path / "cache" / "status",
             logs=runtime_path / "logs",
-            quarantine=runtime_path / "quarantine" / "legacy_output",
+            runtime_archive=runtime_path / "archive",
+            legacy_output_archive=runtime_path / "archive" / "legacy_output",
             archive=root_path / "archive",
             runtime=runtime_path,
             cloud_root=cloud_path,
@@ -93,7 +95,8 @@ class ProjectPaths:
             self.cache_forecast,
             self.cache_status,
             self.logs,
-            self.quarantine,
+            self.runtime_archive,
+            self.legacy_output_archive,
             self.cloud_root,
             self.cloud_raw,
             self.cloud_output,

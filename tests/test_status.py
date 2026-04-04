@@ -258,7 +258,7 @@ def test_derive_current_status_marks_overnight_or_confounding_case_as_blocked():
     assert "high_closed_loop_confounding" in codes
 
 
-def test_output_cleanup_moves_top_level_clutter_into_quarantine(tmp_path):
+def test_output_cleanup_moves_top_level_clutter_into_runtime_archive(tmp_path):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     paths = ProjectPaths.from_root(repo_root, runtime_root=tmp_path / "runtime", cloud_root=tmp_path / "cloud").ensure()
@@ -272,7 +272,7 @@ def test_output_cleanup_moves_top_level_clutter_into_quarantine(tmp_path):
     assert not (paths.reports / "old.csv").exists()
     moved = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert len(moved["moved"]) == 2
-    assert manifest_path.parent == paths.quarantine
+    assert manifest_path.parent == paths.legacy_output_archive
 
     log_dir = paths.logs / "status" / "run123"
     log_dir.mkdir(parents=True, exist_ok=True)
