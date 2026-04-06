@@ -257,44 +257,38 @@ Operational notes:
 - `bayesian-t1dm run --skip-recommendations` is the preferred fast path when validating real data because it avoids the final full-data recommendation fit.
 - Modest MAE improvement over persistence is not enough for recommendation use if interval coverage is poor.
 
-Canonical real-data review flow:
+Canonical research loop:
 
-1. `bayesian-t1dm normalize-raw`
-2. `bayesian-t1dm ingest`
-3. `bayesian-t1dm run --skip-recommendations`
+1. `bayesian-t1dm normalize-raw` when raw Tandem payloads have changed or need repair.
+2. `bayesian-t1dm prepare-model-data` to refresh the prepared dataset and the machine artifacts under `cache/`.
+3. `bayesian-t1dm research-latent-meal-icr --research-scope foundation` to inspect honest meal-truth semantics and first-meal clean-window readiness.
+4. `bayesian-t1dm research-latent-meal-icr --research-scope full` only after the foundation cohort is actually ready for latent fitting.
+5. `bayesian-t1dm status` when you want the combined snapshot across therapy, forecast, and latent-meal lanes.
+6. `bayesian-t1dm run --skip-recommendations` only as a secondary forecast diagnostic.
+7. `bayesian-t1dm review-therapy-evidence` only when you need secondary therapy identifiability context.
 
-Canonical default model-data flow:
+Artifact reading order:
 
-1. `bayesian-t1dm normalize-raw`
-2. `bayesian-t1dm prepare-model-data --apple-input ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data`
-3. `bayesian-t1dm screen-health-features`
-4. `bayesian-t1dm run --skip-recommendations`
-5. `bayesian-t1dm run`
+1. `current_status.html` for the combined overview.
+2. `therapy_review.html` for secondary therapy identifiability.
+3. `forecast_review.html` for secondary forecast diagnostics.
+4. `output/latent_meal/` and `output/fixture/` for the scientific priority lane.
 
-Canonical Tandem-only fallback flow:
-
-1. `bayesian-t1dm normalize-raw`
-2. `bayesian-t1dm prepare-model-data`
-3. `bayesian-t1dm run --skip-recommendations`
-4. `bayesian-t1dm run`
-
-Canonical therapy evidence flow:
-
-1. `bayesian-t1dm normalize-raw`
-2. `bayesian-t1dm prepare-model-data --apple-input ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data`
-3. `bayesian-t1dm review-therapy-evidence`
-4. review `therapy_review.html` first, then inspect linked artifacts for detail
+If the latent-meal foundation cohort is blocked or empty, debug cohort quality, source truth, and freshness first. Do not treat that as a model-fitting failure.
 
 Step-by-step behavior:
 
 1. `normalize-raw` rebuilds normalized Tandem tables from archived `tconnectsync` raw payloads.
 2. `prepare-model-data` imports Apple Health bundles when provided, computes Apple/Tandem overlap, backfills Tandem history when needed, and writes a prepared 5-minute model dataset. If Apple Health is absent, it falls back cleanly to Tandem-only preparation and targets roughly one year of Tandem history by default.
-3. `screen-health-features` consumes that prepared dataset and skips cleanly when Apple Health is absent.
-4. `run --skip-recommendations` is the preferred fast validation path because it exercises walk-forward prediction without the final recommendation fit.
-5. `run` executes the full modeling and recommendation stack using the same prepared dataset contract: Apple-enriched when Apple data exists, Tandem-only otherwise.
-6. `research-therapy-settings` runs a distinct research-grade therapy workflow: it starts with a methodological gate, builds fasting, meal, and correction contexts, creates strict meal-bolus proxy features when explicit carbs are absent, audits Apple/Tandem feature engineering, compares Bayesian, linear, segmented, tree-boosted, and ensemble-style candidates, and writes segment-level recommendation evidence for basal and I/C ratio. Sensitivity factor remains staged and suppressed by default in the current implementation.
-7. `validate-therapy-infra` runs a synthetic truth-recovery suite against the same therapy research contract. It checks basal direction recovery, proxy-only conservatism, Apple-helpful vs Apple-null behavior, and suppression under corrupted or low-identifiability scenarios.
-8. `review-therapy-evidence` is the therapy-facing orchestration command. It prepares the model dataset, writes the therapy research and validation artifacts, computes the overnight basal evidence summary, and renders one interactive HTML page that explains what is identifiable, what is blocked, and where in the code and artifacts the logic lives.
+3. `research-latent-meal-icr --research-scope foundation` audits meal-truth semantics, builds the first-meal clean-window cohort, and tells you whether the accepted cohort is ready for Phase C. This is the main scientific checkpoint.
+4. `research-latent-meal-icr --research-scope full` runs the constrained first-meal latent-response approximation on accepted windows only and writes research-only posterior, confidence, and model-comparison artifacts.
+5. `status` refreshes the combined snapshot and publishes the latest top-level HTML entrypoints, but it is still a combined overview rather than the primary scientific loop.
+6. `screen-health-features` consumes the prepared dataset and skips cleanly when Apple Health is absent.
+7. `run --skip-recommendations` is the preferred fast validation path for forecast behavior because it exercises walk-forward prediction without the final recommendation fit.
+8. `run` executes the full modeling and recommendation stack using the same prepared dataset contract: Apple-enriched when Apple data exists, Tandem-only otherwise.
+9. `research-therapy-settings` runs a distinct research-grade therapy workflow: it starts with a methodological gate, builds fasting, meal, and correction contexts, creates strict meal-bolus proxy features when explicit carbs are absent, audits Apple/Tandem feature engineering, compares Bayesian, linear, segmented, tree-boosted, and ensemble-style candidates, and writes segment-level recommendation evidence for basal and I/C ratio. Sensitivity factor remains staged and suppressed by default in the current implementation.
+10. `validate-therapy-infra` runs a synthetic truth-recovery suite against the same therapy research contract. It checks basal direction recovery, proxy-only conservatism, Apple-helpful vs Apple-null behavior, and suppression under corrupted or low-identifiability scenarios.
+11. `review-therapy-evidence` is the therapy-facing orchestration command. It prepares the model dataset, writes the therapy research and validation artifacts, computes the overnight basal evidence summary, and renders one interactive HTML page that explains what is identifiable, what is blocked, and where in the code and artifacts the logic lives.
 
 Workflow crosswalk:
 
@@ -302,9 +296,13 @@ Workflow crosswalk:
 | --- | --- | --- | --- | --- |
 | `normalize-raw` | Did we correctly rebuild normalized Tandem windows? | `normalize_raw_summary.md` | `src/bayesian_t1dm/acquisition.py::normalize_tconnectsync_archive` | Confirms raw-to-normalized reconstruction before modeling. |
 | `prepare-model-data` | What data spans are available and aligned? | `output/prepare/model_data_preparation.md`, `cache/prepared/prepared_model_data_5min.csv` | `src/bayesian_t1dm/cli.py::_prepare_model_data`, `src/bayesian_t1dm/health_auto_export.py::build_prepared_model_dataset` | Establishes the final Tandem-aligned modeling grid and overlap logic. |
+| `research-latent-meal-icr --research-scope foundation` | Is the first-meal cohort ready for Phase C? | `output/latent_meal/latent_meal_research_gate.md`, `output/latent_meal/first_meal_clean_window_audit.md` | `src/bayesian_t1dm/therapy_research.py::run_latent_meal_icr_research` | Main scientific checkpoint for latent-meal readiness. |
+| `research-latent-meal-icr --research-scope full` | Does the accepted first-meal cohort support useful latent meal fitting yet? | `output/latent_meal/latent_meal_fit_summary.md`, `output/latent_meal/latent_meal_posterior_meals.csv`, `output/latent_meal/latent_meal_model_comparison.md` | `src/bayesian_t1dm/therapy_research.py::run_latent_meal_icr_research` | Research-only constrained latent-response fit on accepted windows. |
+| `status` | What is the combined current state across lanes? | `current_status.html`, `therapy_review.html`, `forecast_review.html` | `src/bayesian_t1dm/status.py::derive_current_status` | Combined overview, not the primary science loop. |
+| `run --skip-recommendations` | Does walk-forward forecasting still behave sensibly? | `forecast_review.html`, `cache/forecast/run_summary.json` | `src/bayesian_t1dm/report.py::build_run_summary`, `src/bayesian_t1dm/review.py::write_run_review_html` | Secondary forecast diagnostic. |
 | `research-therapy-settings` | What therapy contexts and identifiability gates are available? | `therapy_research_gate.md`, `therapy_feature_audit.md`, `therapy_model_comparison.md` | `src/bayesian_t1dm/therapy_research.py::build_therapy_research_frame`, `src/bayesian_t1dm/therapy_research.py::run_therapy_research` | Shows whether basal / I:C / ISF are directly observed, proxy-supported, weakly identified, or blocked. |
 | `validate-therapy-infra` | Does the therapy workflow recover known truth and suppress itself correctly? | `therapy_infra_validation.md`, `therapy_synthetic_results.csv` | `src/bayesian_t1dm/therapy_research.py::validate_therapy_infra` | Tests truth-recovery and false-positive suppression, not just predictive fit. |
-| `review-therapy-evidence` | What is actually happening with overnight basal evidence in the current data? | `output/therapy/therapy_review.html` | `src/bayesian_t1dm/review.py::write_therapy_evidence_review_html` | Primary therapy-facing explanation surface. |
+| `review-therapy-evidence` | What is actually happening with overnight basal evidence in the current data? | `output/therapy/therapy_review.html` | `src/bayesian_t1dm/review.py::write_therapy_evidence_review_html` | Secondary therapy-facing explanation surface. |
 
 ## Output Contract
 
@@ -332,8 +330,10 @@ Recommendation output is policy-gated. The pipeline suppresses recommendations w
 
 In addition to markdown and JSON summaries, the active pipeline writes self-contained interactive HTML review artifacts:
 
+- `current_status.html` from `status`
 - `coverage_review.html` from `ingest`
 - `forecast_review.html` from `run`
+- `therapy_review.html` from `review-therapy-evidence` / `status`
 
 These are the primary visual inspection surfaces for active-pipeline review. They combine source completeness, walk-forward behavior, baseline comparison, and sampler diagnostics in one place.
 
@@ -343,6 +343,8 @@ Apple Health-specific working artifacts:
 - `prepare-model-data` writes `model_data_preparation.md` under `output/prepare/` and `prepared_model_data_5min.csv` under `cache/prepared/`
 - `build-health-analysis-ready` writes a wide Tandem-aligned 5-minute table under `cache/analysis_ready/analysis_ready_health_5min.csv` and a short summary under `output/prepare/`
 - `screen-health-features` writes `health_feature_screening.md` under `output/prepare/` and `health_feature_scores.csv` under `cache/prepare/`
+- `research-latent-meal-icr` writes foundation or full-scope latent-meal artifacts under `output/latent_meal/`
+- `build-latent-meal-fixture` writes the fixture audit bundle under `output/fixture/` and the reduced prepared dataset under `cache/latent_meal/`
 - `research-therapy-settings` writes its research artifacts under `output/therapy/`
 - `validate-therapy-infra` writes `therapy_infra_validation.md`, `therapy_synthetic_results.csv`, and `therapy_synthetic_recommendation_audit.md` under `output/therapy/validation/`
 - `review-therapy-evidence` writes `output/therapy/therapy_review.html` and publishes the latest top-level `output/therapy_review.html`

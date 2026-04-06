@@ -2224,6 +2224,574 @@ def _render_latent_meal_window_audit(
     return "\n".join(lines) + "\n"
 
 
+def _safe_median(series: pd.Series, *, default: float) -> float:
+    numeric = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if numeric.empty:
+        return float(default)
+    return float(numeric.median())
+
+
+def _safe_correlation(left: pd.Series, right: pd.Series) -> float:
+    frame = pd.DataFrame({"left": pd.to_numeric(left, errors="coerce"), "right": pd.to_numeric(right, errors="coerce")}).dropna()
+    if len(frame) < 2:
+        return float("nan")
+    if frame["left"].nunique() < 2 or frame["right"].nunique() < 2:
+        return float("nan")
+    return float(frame["left"].corr(frame["right"]))
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return float(min(max(value, lower), upper))
+
+
+def _accepted_first_meal_window_metrics(
+    research_frame: pd.DataFrame,
+    meal_event_registry: pd.DataFrame,
+    meal_windows: pd.DataFrame,
+    *,
+    premeal_minutes: int = 30,
+    postmeal_minutes: int = 180,
+) -> pd.DataFrame:
+    columns = [
+        "meal_id",
+        "candidate_id",
+        "timestamp",
+        "segment",
+        "evidence_source",
+        "explicit_carb_source_available",
+        "meal_truth_status",
+        "stated_carbs",
+        "bolus_units",
+        "meal_proxy_confidence",
+        "premeal_glucose",
+        "premeal_iob",
+        "observed_peak_glucose",
+        "observed_peak_delta",
+        "observed_auc_above_baseline",
+        "observed_mean_glucose_180m",
+        "observed_cgm_points",
+        "cgm_coverage_fraction",
+        "source_quality_grade",
+        "sleep_deficit_flag",
+        "recent_exercise_context",
+        "post_workout_meal_context",
+        "overnight_hrv_interaction",
+        "in_sleep_heart_rate_interaction",
+    ]
+    if research_frame.empty or meal_windows.empty:
+        return pd.DataFrame(columns=columns)
+    accepted = meal_windows.loc[pd.to_numeric(meal_windows.get("included"), errors="coerce").fillna(0.0).gt(0)].copy()
+    if accepted.empty:
+        return pd.DataFrame(columns=columns)
+
+    ordered = research_frame.copy()
+    ordered["timestamp"] = pd.to_datetime(ordered["timestamp"], errors="coerce")
+    ordered = ordered.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    events = meal_event_registry.copy()
+    if not events.empty:
+        events["timestamp"] = pd.to_datetime(events["timestamp"], errors="coerce")
+        events = events.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+
+    rows: list[dict[str, Any]] = []
+    for row in accepted.itertuples(index=False):
+        anchor_time = pd.Timestamp(row.timestamp)
+        pre = ordered.loc[
+            ordered["timestamp"].ge(anchor_time - pd.Timedelta(minutes=premeal_minutes))
+            & ordered["timestamp"].lt(anchor_time)
+        ].copy()
+        post = ordered.loc[
+            ordered["timestamp"].ge(anchor_time)
+            & ordered["timestamp"].le(anchor_time + pd.Timedelta(minutes=postmeal_minutes))
+        ].copy()
+        if post.empty:
+            continue
+        anchor_candidates = ordered.loc[
+            ordered["timestamp"].ge(anchor_time - pd.Timedelta(minutes=5))
+            & ordered["timestamp"].le(anchor_time + pd.Timedelta(minutes=5))
+        ].copy()
+        anchor_row = anchor_candidates.iloc[0] if not anchor_candidates.empty else post.iloc[0]
+
+        pre_glucose_series = pd.to_numeric(pre.get("glucose"), errors="coerce").dropna()
+        baseline_glucose = (
+            float(row.premeal_glucose)
+            if np.isfinite(pd.to_numeric(pd.Series([row.premeal_glucose]), errors="coerce").iloc[0])
+            else float(pre_glucose_series.iloc[-1]) if not pre_glucose_series.empty else float(pd.to_numeric(pd.Series([anchor_row.get("glucose")]), errors="coerce").fillna(np.nan).iloc[0])
+        )
+        post_glucose = pd.to_numeric(post.get("glucose"), errors="coerce")
+        if post_glucose.notna().any():
+            peak_idx = int(post_glucose.idxmax())
+            peak_glucose = float(post_glucose.loc[peak_idx])
+            peak_delta = float(peak_glucose - baseline_glucose) if np.isfinite(baseline_glucose) else float("nan")
+            auc_above_baseline = float((post_glucose.sub(baseline_glucose).clip(lower=0.0).fillna(0.0) * (5.0 / 60.0)).sum())
+            mean_glucose_180m = float(post_glucose.mean())
+        else:
+            peak_glucose = float("nan")
+            peak_delta = float("nan")
+            auc_above_baseline = float("nan")
+            mean_glucose_180m = float("nan")
+
+        evidence_source = "proxy_only"
+        if not events.empty:
+            same_day = events.loc[events["timestamp"].dt.normalize().eq(anchor_time.normalize())].copy()
+            if not same_day.empty:
+                nearest_idx = (same_day["timestamp"] - anchor_time).abs().idxmin()
+                if abs(pd.Timedelta(same_day.loc[nearest_idx, "timestamp"] - anchor_time)) <= pd.Timedelta(minutes=90):
+                    evidence_source = str(same_day.loc[nearest_idx, "evidence_source"])
+        if evidence_source == "proxy_only" and pd.notna(row.stated_carbs) and float(row.stated_carbs) > 0:
+            evidence_source = "explicit_logged"
+
+        rows.append(
+            {
+                "meal_id": str(row.meal_id),
+                "candidate_id": str(row.candidate_id),
+                "timestamp": anchor_time,
+                "segment": str(row.segment),
+                "evidence_source": evidence_source,
+                "explicit_carb_source_available": int(row.explicit_carb_source_available),
+                "meal_truth_status": str(row.meal_truth_status),
+                "stated_carbs": None if pd.isna(row.stated_carbs) else float(row.stated_carbs),
+                "bolus_units": float(row.bolus_units),
+                "meal_proxy_confidence": float(pd.to_numeric(pd.Series([anchor_row.get("meal_proxy_confidence")]), errors="coerce").fillna(0.0).iloc[0]),
+                "premeal_glucose": baseline_glucose,
+                "premeal_iob": float(row.premeal_iob),
+                "observed_peak_glucose": peak_glucose,
+                "observed_peak_delta": peak_delta,
+                "observed_auc_above_baseline": auc_above_baseline,
+                "observed_mean_glucose_180m": mean_glucose_180m,
+                "observed_cgm_points": int(post_glucose.notna().sum()),
+                "cgm_coverage_fraction": float(row.cgm_coverage_fraction),
+                "source_quality_grade": str(row.source_quality_grade),
+                "sleep_deficit_flag": int(pd.to_numeric(pd.Series([anchor_row.get("sleep_deficit_flag")]), errors="coerce").fillna(0.0).iloc[0] > 0),
+                "recent_exercise_context": int(pd.to_numeric(pd.Series([anchor_row.get("recent_exercise_context")]), errors="coerce").fillna(0.0).iloc[0] > 0),
+                "post_workout_meal_context": int(pd.to_numeric(pd.Series([anchor_row.get("post_workout_meal_context")]), errors="coerce").fillna(0.0).iloc[0] > 0),
+                "overnight_hrv_interaction": float(pd.to_numeric(pd.Series([anchor_row.get("overnight_hrv_interaction")]), errors="coerce").fillna(0.0).iloc[0]),
+                "in_sleep_heart_rate_interaction": float(pd.to_numeric(pd.Series([anchor_row.get("in_sleep_heart_rate_interaction")]), errors="coerce").fillna(0.0).iloc[0]),
+            }
+        )
+    return pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+
+
+def _latent_meal_reference_parameters(window_metrics: pd.DataFrame) -> dict[str, float]:
+    if window_metrics.empty:
+        return {
+            "icr_prior": 10.0,
+            "peak_per_carb": 1.0,
+            "auc_per_carb": 2.0,
+        }
+    bolus_units = pd.to_numeric(window_metrics.get("bolus_units"), errors="coerce").replace(0.0, np.nan)
+    stated_carbs = pd.to_numeric(window_metrics.get("stated_carbs"), errors="coerce")
+    stated_icr = stated_carbs.div(bolus_units)
+    icr_prior = _safe_median(stated_icr.loc[stated_icr.gt(3.0) & stated_icr.lt(30.0)], default=10.0)
+    bolus_reference = bolus_units.fillna(0.0) * icr_prior
+    peak_per_carb = _safe_median(
+        pd.to_numeric(window_metrics.get("observed_peak_delta"), errors="coerce").div(bolus_reference.replace(0.0, np.nan)),
+        default=4.0,
+    )
+    auc_per_carb = _safe_median(
+        pd.to_numeric(window_metrics.get("observed_auc_above_baseline"), errors="coerce").div(bolus_reference.replace(0.0, np.nan)),
+        default=8.0,
+    )
+    return {
+        "icr_prior": _clamp(icr_prior, 4.0, 20.0),
+        "peak_per_carb": _clamp(peak_per_carb, 0.5, 12.0),
+        "auc_per_carb": _clamp(auc_per_carb, 0.5, 30.0),
+    }
+
+
+def _estimate_latent_carbs_for_model(
+    window_metrics: pd.DataFrame,
+    *,
+    model_name: str,
+    params: dict[str, float],
+) -> pd.Series:
+    bolus_units = pd.to_numeric(window_metrics.get("bolus_units"), errors="coerce").fillna(0.0)
+    stated_carbs = pd.to_numeric(window_metrics.get("stated_carbs"), errors="coerce")
+    peak_delta = pd.to_numeric(window_metrics.get("observed_peak_delta"), errors="coerce")
+    auc_above_baseline = pd.to_numeric(window_metrics.get("observed_auc_above_baseline"), errors="coerce")
+    bolus_reference = bolus_units * float(params["icr_prior"])
+    stated_prior_blend = np.where(stated_carbs.notna() & stated_carbs.gt(0), 0.7 * stated_carbs + 0.3 * bolus_reference, bolus_reference)
+    response_signal = auc_above_baseline.div(float(params["auc_per_carb"])).replace([np.inf, -np.inf], np.nan)
+    peak_signal = peak_delta.div(float(params["peak_per_carb"])).replace([np.inf, -np.inf], np.nan)
+    response_adjusted = 0.55 * response_signal.fillna(bolus_reference) + 0.25 * peak_signal.fillna(bolus_reference) + 0.20 * bolus_reference
+    if stated_carbs.notna().any():
+        response_adjusted = np.where(stated_carbs.notna() & stated_carbs.gt(0), 0.2 * stated_carbs + 0.8 * response_adjusted, response_adjusted)
+    if model_name == "bolus_reference":
+        latent = bolus_reference
+    elif model_name == "stated_prior_blend":
+        latent = stated_prior_blend
+    elif model_name == "response_adjusted":
+        latent = response_adjusted
+    else:
+        raise ValueError(f"Unknown latent meal model: {model_name}")
+    return pd.Series(latent, index=window_metrics.index, dtype=float).clip(lower=1.0)
+
+
+def _latent_meal_model_comparison(window_metrics: pd.DataFrame) -> tuple[pd.DataFrame, str, dict[str, float]]:
+    columns = ["model", "meal_count", "stated_carb_mae", "peak_delta_mae", "peak_delta_correlation", "selected"]
+    if window_metrics.empty:
+        return pd.DataFrame(columns=columns), "bolus_reference", _latent_meal_reference_parameters(window_metrics)
+    models = ["bolus_reference", "stated_prior_blend", "response_adjusted"]
+    rows: list[dict[str, Any]] = []
+    for model_name in models:
+        peak_errors: list[float] = []
+        stated_errors: list[float] = []
+        correlations: list[float] = []
+        for holdout_index in window_metrics.index:
+            train = window_metrics.loc[window_metrics.index != holdout_index].copy()
+            if train.empty:
+                train = window_metrics.copy()
+            params = _latent_meal_reference_parameters(train)
+            latent_train = _estimate_latent_carbs_for_model(train, model_name=model_name, params=params)
+            peak_scale = _safe_median(
+                pd.to_numeric(train.get("observed_peak_delta"), errors="coerce").div(latent_train.replace(0.0, np.nan)),
+                default=float(params["peak_per_carb"]),
+            )
+            holdout = window_metrics.loc[[holdout_index]].copy()
+            latent_holdout = _estimate_latent_carbs_for_model(holdout, model_name=model_name, params=params)
+            predicted_peak = float(latent_holdout.iloc[0] * peak_scale)
+            observed_peak = float(pd.to_numeric(holdout["observed_peak_delta"], errors="coerce").iloc[0])
+            if np.isfinite(observed_peak):
+                peak_errors.append(abs(predicted_peak - observed_peak))
+            stated_carbs = pd.to_numeric(holdout["stated_carbs"], errors="coerce").iloc[0]
+            if np.isfinite(stated_carbs):
+                stated_errors.append(abs(float(latent_holdout.iloc[0]) - float(stated_carbs)))
+            correlations.append(
+                _safe_correlation(
+                    pd.Series([float(latent_holdout.iloc[0])]),
+                    pd.Series([observed_peak]),
+                )
+            )
+        full_params = _latent_meal_reference_parameters(window_metrics)
+        latent_full = _estimate_latent_carbs_for_model(window_metrics, model_name=model_name, params=full_params)
+        rows.append(
+            {
+                "model": model_name,
+                "meal_count": int(len(window_metrics)),
+                "stated_carb_mae": float(np.mean(stated_errors)) if stated_errors else float("nan"),
+                "peak_delta_mae": float(np.mean(peak_errors)) if peak_errors else float("nan"),
+                "peak_delta_correlation": _safe_correlation(latent_full, pd.to_numeric(window_metrics.get("observed_peak_delta"), errors="coerce")),
+                "selected": False,
+            }
+        )
+    comparison = pd.DataFrame(rows, columns=columns)
+    if comparison["stated_carb_mae"].notna().any():
+        selected_index = (
+            comparison.assign(
+                _sort_peak=comparison["peak_delta_mae"].fillna(np.inf),
+                _sort_stated=comparison["stated_carb_mae"].fillna(np.inf),
+            )
+            .sort_values(["_sort_peak", "_sort_stated", "model"])
+            .index[0]
+        )
+    else:
+        selected_index = (
+            comparison.assign(_sort_peak=comparison["peak_delta_mae"].fillna(np.inf))
+            .sort_values(["_sort_peak", "model"])
+            .index[0]
+        )
+    selected_model = str(comparison.loc[selected_index, "model"])
+    comparison.loc[selected_index, "selected"] = True
+    selected_params = _latent_meal_reference_parameters(window_metrics)
+    return comparison, selected_model, selected_params
+
+
+def _build_latent_meal_posterior_meals(
+    window_metrics: pd.DataFrame,
+    *,
+    model_name: str,
+    params: dict[str, float],
+) -> pd.DataFrame:
+    columns = [
+        "meal_id",
+        "timestamp",
+        "segment",
+        "evidence_source",
+        "stated_carbs",
+        "bolus_reference_carbs",
+        "stated_prior_blend_carbs",
+        "latent_response_adjusted_carbs",
+        "latent_carbs_posterior_mean",
+        "latent_carbs_lower",
+        "latent_carbs_upper",
+        "carb_accuracy_score",
+        "ic_posterior_mean",
+        "ic_lower",
+        "ic_upper",
+        "confounding_grade",
+        "source_quality_grade",
+        "identifiability_status",
+        "suppression_reason",
+        "observed_peak_delta",
+        "observed_auc_above_baseline",
+        "selected_model",
+    ]
+    if window_metrics.empty:
+        return pd.DataFrame(columns=columns)
+    window_metrics = window_metrics.copy()
+    bolus_units = pd.to_numeric(window_metrics.get("bolus_units"), errors="coerce").fillna(0.0)
+    stated_carbs = pd.to_numeric(window_metrics.get("stated_carbs"), errors="coerce")
+    peak_delta = pd.to_numeric(window_metrics.get("observed_peak_delta"), errors="coerce")
+    bolus_reference = bolus_units * float(params["icr_prior"])
+    stated_prior_blend = _estimate_latent_carbs_for_model(window_metrics, model_name="stated_prior_blend", params=params)
+    response_adjusted = _estimate_latent_carbs_for_model(window_metrics, model_name="response_adjusted", params=params)
+    latent_mean = _estimate_latent_carbs_for_model(window_metrics, model_name=model_name, params=params)
+    peak_scale = _safe_median(peak_delta.div(latent_mean.replace(0.0, np.nan)), default=float(params["peak_per_carb"]))
+    predicted_peak = latent_mean * peak_scale
+    residual = (peak_delta - predicted_peak).abs()
+    carb_scale_from_peak = residual.div(max(peak_scale, 1e-6)).replace([np.inf, -np.inf], np.nan)
+    base_uncertainty = np.maximum(latent_mean * 0.18, carb_scale_from_peak.fillna(latent_mean * 0.12))
+    explicit_available = window_metrics["explicit_carb_source_available"].astype(int).eq(1)
+    interval_width = np.where(explicit_available, 1.1, 1.35) * base_uncertainty
+    latent_lower = np.maximum(1.0, latent_mean - interval_width)
+    latent_upper = latent_mean + interval_width
+
+    stated_gap = (latent_mean - stated_carbs).abs()
+    prior_gap = (latent_mean - bolus_reference).abs()
+    carb_accuracy_score = np.where(
+        stated_carbs.notna() & stated_carbs.gt(0),
+        np.exp(-stated_gap / np.maximum(15.0, stated_carbs.fillna(0.0) * 0.35)),
+        0.75 * np.exp(-prior_gap / np.maximum(12.0, bolus_reference * 0.30)),
+    )
+    carb_accuracy_score = pd.Series(carb_accuracy_score, index=window_metrics.index, dtype=float).clip(lower=0.0, upper=1.0)
+
+    relative_interval = (latent_upper - latent_lower) / latent_mean.replace(0.0, np.nan)
+    identifiability_status = []
+    suppression_reason = []
+    ic_mean = []
+    ic_lower = []
+    ic_upper = []
+    confounding_grade = []
+    for idx in window_metrics.index:
+        reasons: list[str] = []
+        if str(window_metrics.loc[idx, "source_quality_grade"]) != "good":
+            reasons.append("degraded_source_quality")
+        if bool(pd.to_numeric(pd.Series([window_metrics.loc[idx, "recent_exercise_context"]]), errors="coerce").fillna(0.0).iloc[0] > 0):
+            reasons.append("exercise_context")
+        if not np.isfinite(float(peak_delta.loc[idx])) or float(peak_delta.loc[idx]) < 20.0:
+            reasons.append("weak_postmeal_signal")
+        if float(relative_interval.loc[idx]) > 0.70:
+            reasons.append("wide_posterior_interval")
+        if float(bolus_units.loc[idx]) < 2.0:
+            reasons.append("small_bolus_anchor")
+        if reasons:
+            if "degraded_source_quality" in reasons or "weak_postmeal_signal" in reasons:
+                identifiability_status.append("not_identified")
+            else:
+                identifiability_status.append("weakly_identified")
+            suppression_reason.append("|".join(reasons))
+            ic_mean.append(float("nan"))
+            ic_lower.append(float("nan"))
+            ic_upper.append(float("nan"))
+        else:
+            identifiability_status.append("proxy_supported" if not bool(explicit_available.loc[idx]) else "directly_observed")
+            suppression_reason.append("")
+            ic_mean.append(float(latent_mean.loc[idx] / max(float(bolus_units.loc[idx]), 1e-6)))
+            ic_lower.append(float(latent_lower.loc[idx] / max(float(bolus_units.loc[idx]), 1e-6)))
+            ic_upper.append(float(latent_upper.loc[idx] / max(float(bolus_units.loc[idx]), 1e-6)))
+        if "exercise_context" in reasons:
+            confounding_grade.append("moderate")
+        elif reasons:
+            confounding_grade.append("low_to_moderate")
+        else:
+            confounding_grade.append("low")
+
+    posterior = pd.DataFrame(
+        {
+            "meal_id": window_metrics["meal_id"].astype(str),
+            "timestamp": window_metrics["timestamp"],
+            "segment": window_metrics["segment"].astype(str),
+            "evidence_source": window_metrics["evidence_source"].astype(str),
+            "stated_carbs": stated_carbs,
+            "bolus_reference_carbs": bolus_reference,
+            "stated_prior_blend_carbs": stated_prior_blend,
+            "latent_response_adjusted_carbs": response_adjusted,
+            "latent_carbs_posterior_mean": latent_mean,
+            "latent_carbs_lower": latent_lower,
+            "latent_carbs_upper": latent_upper,
+            "carb_accuracy_score": carb_accuracy_score,
+            "ic_posterior_mean": pd.Series(ic_mean, index=window_metrics.index, dtype=float),
+            "ic_lower": pd.Series(ic_lower, index=window_metrics.index, dtype=float),
+            "ic_upper": pd.Series(ic_upper, index=window_metrics.index, dtype=float),
+            "confounding_grade": pd.Series(confounding_grade, index=window_metrics.index, dtype=str),
+            "source_quality_grade": window_metrics["source_quality_grade"].astype(str),
+            "identifiability_status": pd.Series(identifiability_status, index=window_metrics.index, dtype=str),
+            "suppression_reason": pd.Series(suppression_reason, index=window_metrics.index, dtype=str),
+            "observed_peak_delta": peak_delta,
+            "observed_auc_above_baseline": pd.to_numeric(window_metrics.get("observed_auc_above_baseline"), errors="coerce"),
+            "selected_model": model_name,
+        }
+    ).sort_values("timestamp").reset_index(drop=True)
+    return posterior
+
+
+def _render_full_latent_meal_gate(
+    dataset: AnalysisReadyHealthDataset,
+    meal_windows: pd.DataFrame,
+    posterior_meals: pd.DataFrame,
+    *,
+    research_scope: str,
+) -> tuple[pd.DataFrame, str]:
+    accepted_windows = int(pd.to_numeric(meal_windows.get("included"), errors="coerce").fillna(0.0).sum()) if not meal_windows.empty else 0
+    reportable_ic = int(posterior_meals["ic_posterior_mean"].notna().sum()) if not posterior_meals.empty else 0
+    source_quality_status = "good" if accepted_windows > 0 else "limited"
+    rows = [
+        {
+            "parameter": "latent_carbs",
+            "estimand": "first-meal latent carb exposure",
+            "identifiability": "proxy_supported" if accepted_windows > 0 else "not_identified",
+            "gate_status": "research_enabled" if accepted_windows > 0 else "diagnostics_only",
+            "source_quality_status": source_quality_status,
+            "closed_loop_confounding_risk": "controlled_by_clean_window_gate",
+        },
+        {
+            "parameter": "carb_entry_confidence",
+            "estimand": "carb-entry consistency score",
+            "identifiability": "proxy_supported" if accepted_windows > 0 else "not_identified",
+            "gate_status": "research_enabled" if accepted_windows > 0 else "diagnostics_only",
+            "source_quality_status": source_quality_status,
+            "closed_loop_confounding_risk": "controlled_by_clean_window_gate",
+        },
+        {
+            "parameter": "morning_icr",
+            "estimand": "effective morning I/C on clean first-meal windows",
+            "identifiability": "weakly_identified" if reportable_ic > 0 else "not_identified",
+            "gate_status": "research_enabled" if reportable_ic > 0 else "diagnostics_only",
+            "source_quality_status": source_quality_status,
+            "closed_loop_confounding_risk": "controlled_by_clean_window_gate",
+        },
+    ]
+    gate = pd.DataFrame(rows)
+    lines = [
+        "# Latent Meal Research Gate",
+        "",
+        f"- research_scope: {research_scope}",
+        f"- explicit_carb_source_available: {bool(getattr(dataset, 'explicit_carb_source_available', False))}",
+        f"- accepted_windows: {accepted_windows}",
+        f"- reportable_morning_ic_windows: {reportable_ic}",
+        f"- source_quality_status: {source_quality_status}",
+        "",
+        "## Parameter Gate",
+        "",
+        "| parameter | estimand | identifiability | gate_status | source_quality_status | closed_loop_confounding_risk |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for row in gate.itertuples(index=False):
+        lines.append(
+            f"| {row.parameter} | {row.estimand} | {row.identifiability} | {row.gate_status} | {row.source_quality_status} | {row.closed_loop_confounding_risk} |"
+        )
+    return gate, "\n".join(lines) + "\n"
+
+
+def _render_latent_meal_fit_summary(
+    window_metrics: pd.DataFrame,
+    posterior_meals: pd.DataFrame,
+    model_comparison: pd.DataFrame,
+    *,
+    selected_model: str,
+    params: dict[str, float],
+) -> str:
+    selected_row = model_comparison.loc[model_comparison["selected"].astype(bool)].head(1)
+    peak_mae = float(selected_row["peak_delta_mae"].iloc[0]) if not selected_row.empty and pd.notna(selected_row["peak_delta_mae"].iloc[0]) else float("nan")
+    reportable_ic = int(posterior_meals["ic_posterior_mean"].notna().sum()) if not posterior_meals.empty else 0
+    lines = [
+        "# Latent Meal Fit Summary",
+        "",
+        "- fit_family: constrained_latent_response_approximation",
+        f"- selected_model: {selected_model}",
+        f"- meal_count: {int(len(window_metrics))}",
+        f"- reportable_morning_ic_windows: {reportable_ic}",
+        f"- cohort_icr_prior: {float(params['icr_prior']):.3f}",
+        f"- cohort_peak_per_carb: {float(params['peak_per_carb']):.3f}",
+        f"- cohort_auc_per_carb: {float(params['auc_per_carb']):.3f}",
+        f"- leave_one_window_out_peak_delta_mae: {'NA' if not np.isfinite(peak_mae) else f'{peak_mae:.3f}'}",
+        "",
+        "## Interpretation",
+        "",
+        "- This is a research-only constrained latent-response approximation on accepted first-meal windows, not a fully Bayesian posterior engine.",
+        "- Latent carb estimates are anchored by bolus and post-meal glucose response; exact carb truth remains unobserved when explicit carb source data is unavailable.",
+        "- Morning effective I/C is only reported for windows with sufficiently narrow posterior intervals and low residual confounding.",
+        "",
+        "## Accepted Window Preview",
+        "",
+        "| meal_id | timestamp | evidence_source | latent_carbs | ic_posterior_mean | identifiability_status |",
+        "| --- | --- | --- | ---: | ---: | --- |",
+    ]
+    if posterior_meals.empty:
+        lines.append("| none | none | none | NA | NA | none |")
+    else:
+        for row in posterior_meals.head(10).itertuples(index=False):
+            lines.append(
+                f"| {row.meal_id} | {row.timestamp} | {row.evidence_source} | {float(row.latent_carbs_posterior_mean):.2f} | {'NA' if pd.isna(row.ic_posterior_mean) else f'{float(row.ic_posterior_mean):.2f}'} | {row.identifiability_status} |"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def _render_latent_meal_confidence_report(posterior_meals: pd.DataFrame) -> str:
+    lines = [
+        "# Latent Meal Confidence Report",
+        "",
+    ]
+    if posterior_meals.empty:
+        lines.extend(
+            [
+                "- meal_count: 0",
+                "",
+                "No posterior meals were generated.",
+            ]
+        )
+        return "\n".join(lines) + "\n"
+    confidence = pd.to_numeric(posterior_meals["carb_accuracy_score"], errors="coerce").fillna(0.0)
+    tiers = pd.Series(
+        np.where(confidence >= 0.8, "high", np.where(confidence >= 0.6, "medium", "low")),
+        index=posterior_meals.index,
+        dtype=str,
+    )
+    tier_counts = tiers.value_counts().to_dict()
+    evidence_counts = posterior_meals["evidence_source"].astype(str).value_counts().to_dict()
+    lines.extend(
+        [
+            f"- meal_count: {int(len(posterior_meals))}",
+            f"- high_confidence_windows: {int(tier_counts.get('high', 0))}",
+            f"- medium_confidence_windows: {int(tier_counts.get('medium', 0))}",
+            f"- low_confidence_windows: {int(tier_counts.get('low', 0))}",
+            "",
+            "## Evidence Sources",
+            "",
+            "| evidence_source | count |",
+            "| --- | ---: |",
+        ]
+    )
+    for evidence_source, count in sorted(evidence_counts.items()):
+        lines.append(f"| {evidence_source} | {int(count)} |")
+    lines.extend(
+        [
+            "",
+            "## Notes",
+            "",
+            "- Accuracy scores compare latent carb exposure to the best available auxiliary anchor.",
+            "- When explicit carb source data is unavailable, scores are capped and should be interpreted as consistency-with-prior rather than correctness against ground truth.",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _render_latent_meal_model_comparison(model_comparison: pd.DataFrame) -> str:
+    lines = [
+        "# Latent Meal Model Comparison",
+        "",
+        "| model | meal_count | stated_carb_mae | peak_delta_mae | peak_delta_correlation | selected |",
+        "| --- | ---: | ---: | ---: | ---: | --- |",
+    ]
+    if model_comparison.empty:
+        lines.append("| none | 0 | NA | NA | NA | no |")
+        return "\n".join(lines) + "\n"
+    for row in model_comparison.itertuples(index=False):
+        lines.append(
+            f"| {row.model} | {int(row.meal_count)} | {'NA' if pd.isna(row.stated_carb_mae) else f'{float(row.stated_carb_mae):.3f}'} | {'NA' if pd.isna(row.peak_delta_mae) else f'{float(row.peak_delta_mae):.3f}'} | {'NA' if pd.isna(row.peak_delta_correlation) else f'{float(row.peak_delta_correlation):.3f}'} | {'yes' if bool(row.selected) else 'no'} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
 def run_latent_meal_icr_research(
     dataset: AnalysisReadyHealthDataset,
     *,
@@ -2231,15 +2799,40 @@ def run_latent_meal_icr_research(
     meal_proxy_mode: str = "strict",
     research_scope: str = "foundation",
 ) -> LatentMealResearchResult:
-    if research_scope != "foundation":
-        raise NotImplementedError("not_yet_implemented: research_scope='full' is reserved for later latent meal fitting work")
+    if research_scope not in {"foundation", "full"}:
+        raise ValueError(f"Unsupported research_scope: {research_scope}")
     segments = segments or parse_therapy_segments()
     research_frame = build_therapy_research_frame(dataset, segments=segments, meal_proxy_mode=meal_proxy_mode)
     meal_event_registry = build_meal_event_registry(research_frame)
     meal_windows = build_first_meal_clean_window_registry(research_frame)
     first_meal_exclusion_summary = build_first_meal_exclusion_summary(meal_windows)
-    gate, gate_markdown = _latent_meal_gate(dataset, meal_windows, research_scope=research_scope)
+    if research_scope == "foundation":
+        gate, gate_markdown = _latent_meal_gate(dataset, meal_windows, research_scope=research_scope)
 
+        return LatentMealResearchResult(
+            prepared_dataset=dataset,
+            research_frame=research_frame,
+            research_gate=gate,
+            meal_event_registry=meal_event_registry,
+            meal_windows=meal_windows,
+            first_meal_exclusion_summary=first_meal_exclusion_summary,
+            posterior_meals=pd.DataFrame(columns=["meal_id", "timestamp", "segment", "stated_carbs", "latent_carbs_posterior_mean", "carb_accuracy_score"]),
+            model_comparison=pd.DataFrame(columns=["model", "meal_count", "stated_carb_mae", "peak_delta_mae", "peak_delta_correlation", "selected"]),
+            research_gate_markdown=gate_markdown,
+            meal_truth_semantics_report_markdown=_render_meal_truth_semantics_report(dataset, research_frame),
+            meal_window_audit_markdown=_render_latent_meal_window_audit(meal_windows, first_meal_exclusion_summary),
+            fit_summary_markdown="",
+            confidence_report_markdown="",
+            model_comparison_markdown="",
+            segments=segments,
+            meal_proxy_mode=meal_proxy_mode,
+            research_scope=research_scope,
+        )
+
+    window_metrics = _accepted_first_meal_window_metrics(research_frame, meal_event_registry, meal_windows)
+    model_comparison, selected_model, params = _latent_meal_model_comparison(window_metrics)
+    posterior_meals = _build_latent_meal_posterior_meals(window_metrics, model_name=selected_model, params=params)
+    gate, gate_markdown = _render_full_latent_meal_gate(dataset, meal_windows, posterior_meals, research_scope=research_scope)
     return LatentMealResearchResult(
         prepared_dataset=dataset,
         research_frame=research_frame,
@@ -2247,14 +2840,20 @@ def run_latent_meal_icr_research(
         meal_event_registry=meal_event_registry,
         meal_windows=meal_windows,
         first_meal_exclusion_summary=first_meal_exclusion_summary,
-        posterior_meals=pd.DataFrame(columns=["meal_id", "timestamp", "segment", "stated_carbs", "latent_carbs_posterior_mean", "carb_accuracy_score"]),
-        model_comparison=pd.DataFrame(columns=["model", "meal_count", "stated_carb_mae", "peak_delta_mae", "peak_delta_correlation", "selected"]),
+        posterior_meals=posterior_meals,
+        model_comparison=model_comparison,
         research_gate_markdown=gate_markdown,
         meal_truth_semantics_report_markdown=_render_meal_truth_semantics_report(dataset, research_frame),
         meal_window_audit_markdown=_render_latent_meal_window_audit(meal_windows, first_meal_exclusion_summary),
-        fit_summary_markdown="",
-        confidence_report_markdown="",
-        model_comparison_markdown="",
+        fit_summary_markdown=_render_latent_meal_fit_summary(
+            window_metrics,
+            posterior_meals,
+            model_comparison,
+            selected_model=selected_model,
+            params=params,
+        ),
+        confidence_report_markdown=_render_latent_meal_confidence_report(posterior_meals),
+        model_comparison_markdown=_render_latent_meal_model_comparison(model_comparison),
         segments=segments,
         meal_proxy_mode=meal_proxy_mode,
         research_scope=research_scope,
@@ -2267,20 +2866,38 @@ def write_latent_meal_research_artifacts(
 ) -> dict[str, Path]:
     root = Path(report_dir)
     root.mkdir(parents=True, exist_ok=True)
+    if result.research_scope == "foundation":
+        paths = {
+            "research_gate": root / "latent_meal_research_gate.md",
+            "meal_truth_semantics_report": root / "meal_truth_semantics_report.md",
+            "meal_event_registry": root / "meal_event_registry.csv",
+            "first_meal_clean_window_registry": root / "first_meal_clean_window_registry.csv",
+            "first_meal_clean_window_audit": root / "first_meal_clean_window_audit.md",
+            "first_meal_exclusion_summary": root / "first_meal_exclusion_summary.csv",
+        }
+        paths["research_gate"].write_text(result.research_gate_markdown, encoding="utf-8")
+        paths["meal_truth_semantics_report"].write_text(result.meal_truth_semantics_report_markdown, encoding="utf-8")
+        result.meal_event_registry.to_csv(paths["meal_event_registry"], index=False)
+        result.meal_windows.to_csv(paths["first_meal_clean_window_registry"], index=False)
+        paths["first_meal_clean_window_audit"].write_text(result.meal_window_audit_markdown, encoding="utf-8")
+        result.first_meal_exclusion_summary.to_csv(paths["first_meal_exclusion_summary"], index=False)
+        return paths
     paths = {
         "research_gate": root / "latent_meal_research_gate.md",
-        "meal_truth_semantics_report": root / "meal_truth_semantics_report.md",
         "meal_event_registry": root / "meal_event_registry.csv",
-        "first_meal_clean_window_registry": root / "first_meal_clean_window_registry.csv",
-        "first_meal_clean_window_audit": root / "first_meal_clean_window_audit.md",
-        "first_meal_exclusion_summary": root / "first_meal_exclusion_summary.csv",
+        "meal_window_audit": root / "meal_window_audit.md",
+        "fit_summary": root / "latent_meal_fit_summary.md",
+        "posterior_meals": root / "latent_meal_posterior_meals.csv",
+        "confidence_report": root / "latent_meal_confidence_report.md",
+        "model_comparison": root / "latent_meal_model_comparison.md",
     }
     paths["research_gate"].write_text(result.research_gate_markdown, encoding="utf-8")
-    paths["meal_truth_semantics_report"].write_text(result.meal_truth_semantics_report_markdown, encoding="utf-8")
     result.meal_event_registry.to_csv(paths["meal_event_registry"], index=False)
-    result.meal_windows.to_csv(paths["first_meal_clean_window_registry"], index=False)
-    paths["first_meal_clean_window_audit"].write_text(result.meal_window_audit_markdown, encoding="utf-8")
-    result.first_meal_exclusion_summary.to_csv(paths["first_meal_exclusion_summary"], index=False)
+    paths["meal_window_audit"].write_text(result.meal_window_audit_markdown, encoding="utf-8")
+    paths["fit_summary"].write_text(result.fit_summary_markdown, encoding="utf-8")
+    result.posterior_meals.to_csv(paths["posterior_meals"], index=False)
+    paths["confidence_report"].write_text(result.confidence_report_markdown, encoding="utf-8")
+    paths["model_comparison"].write_text(result.model_comparison_markdown, encoding="utf-8")
     return paths
 
 

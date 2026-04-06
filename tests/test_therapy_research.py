@@ -159,6 +159,42 @@ def _build_prepared_dataset(*, apple: bool) -> AnalysisReadyHealthDataset:
     )
 
 
+def _build_clean_first_meal_dataset(*, apple: bool, explicit_carbs: bool) -> AnalysisReadyHealthDataset:
+    dataset = _build_prepared_dataset(apple=apple)
+    frame = dataset.frame.copy()
+    frame["recent_workout_6h"] = 0
+    frame["recent_workout_12h"] = 0
+    frame["workout_count_24h"] = 0.0
+    frame["workout_duration_sum_24h"] = 0.0
+    frame["workout_summary_plausible"] = 1
+    frame["health_activity_roll_sum_60m"] = 0.0
+    frame["basal_schedule_change"] = 0
+    frame["minutes_since_basal_change"] = 1e6
+    morning_mask = pd.to_datetime(frame["timestamp"], errors="coerce").dt.hour.lt(11)
+    frame.loc[morning_mask, "basal_units_per_hour"] = 0.8
+    if not explicit_carbs:
+        frame["meal_event"] = 0.0
+        frame["carb_grams"] = 0.0
+        frame["carb_roll_sum_60m"] = 0.0
+        frame["carb_roll_sum_120m"] = 0.0
+        frame["minutes_since_last_meal"] = 0.0
+        explicit_carb_source_available = False
+    else:
+        explicit_carb_source_available = True
+    return AnalysisReadyHealthDataset(
+        frame=frame,
+        feature_columns=dataset.feature_columns,
+        tandem_feature_columns=dataset.tandem_feature_columns,
+        health_feature_columns=dataset.health_feature_columns,
+        target_column=dataset.target_column,
+        horizon_minutes=dataset.horizon_minutes,
+        config=dataset.config,
+        mode=dataset.mode,
+        apple_available=dataset.apple_available,
+        explicit_carb_source_available=explicit_carb_source_available,
+    )
+
+
 def test_build_therapy_research_frame_assigns_segments_and_contexts():
     dataset = _build_prepared_dataset(apple=True)
     segments = parse_therapy_segments()
@@ -291,20 +327,41 @@ def test_run_latent_meal_icr_research_returns_honest_empty_or_strict_results():
     assert result.posterior_meals.empty
 
 
-def test_run_latent_meal_icr_research_full_scope_not_implemented():
-    dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
+def test_run_latent_meal_icr_research_full_scope_builds_posterior_outputs():
+    dataset = _build_clean_first_meal_dataset(apple=True, explicit_carbs=True)
 
-    try:
-        run_latent_meal_icr_research(
-            dataset,
-            segments=parse_therapy_segments(),
-            meal_proxy_mode="strict",
-            research_scope="full",
-        )
-    except NotImplementedError as exc:
-        assert "not_yet_implemented" in str(exc)
-    else:
-        raise AssertionError("Expected NotImplementedError for full scope")
+    result = run_latent_meal_icr_research(
+        dataset,
+        segments=parse_therapy_segments(),
+        meal_proxy_mode="strict",
+        research_scope="full",
+    )
+
+    assert result.research_scope == "full"
+    assert not result.posterior_meals.empty
+    assert not result.model_comparison.empty
+    assert int(result.model_comparison["selected"].sum()) == 1
+    assert "Latent Meal Fit Summary" in result.fit_summary_markdown
+    assert "Latent Meal Confidence Report" in result.confidence_report_markdown
+    assert "Latent Meal Model Comparison" in result.model_comparison_markdown
+    assert {"latent_carbs", "carb_entry_confidence", "morning_icr"}.issubset(set(result.research_gate["parameter"]))
+
+
+def test_run_latent_meal_icr_research_full_scope_caps_proxy_only_confidence():
+    dataset = _build_clean_first_meal_dataset(apple=False, explicit_carbs=False)
+
+    result = run_latent_meal_icr_research(
+        dataset,
+        segments=parse_therapy_segments(),
+        meal_proxy_mode="strict",
+        research_scope="full",
+    )
+
+    assert not result.posterior_meals.empty
+    assert float(result.posterior_meals["carb_accuracy_score"].max()) <= 0.75 + 1e-9
+    assert set(result.posterior_meals["evidence_source"]) == {"proxy_only"}
+    selected = result.model_comparison.loc[result.model_comparison["selected"].astype(bool)].iloc[0]
+    assert float(selected["peak_delta_mae"]) == float(result.model_comparison["peak_delta_mae"].min())
 
 
 def test_build_representative_latent_meal_fixture_retains_candidate_days_and_selects_background_days(tmp_path):

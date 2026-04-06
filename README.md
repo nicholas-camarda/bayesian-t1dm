@@ -43,6 +43,7 @@ What is currently in place:
 - recommendation suppression policy tied to validation quality and signal availability
 - test fixtures and validation checks
 - technical documentation with equations and definitions
+- overwrite-in-place runtime output with human-facing `output/`, machine `cache/`, and separate `logs/`
 
 What still needs refinement:
 
@@ -60,70 +61,70 @@ Supported collection path:
 
 ## Start Here
 
-If you only need the current active workflow, use these commands:
+If you are doing science work, use this loop:
 
-1. Run the primary status workflow:
-
-```bash
-bayesian-t1dm status
-```
-
-This is now the main front door. It refreshes data prep, therapy research, therapy infra validation, and forecast validation, then writes:
-
-- `~/ProjectsRuntime/bayesian-t1dm/output/current_status.html`
-- `~/ProjectsRuntime/bayesian-t1dm/output/therapy_review.html`
-- `~/ProjectsRuntime/bayesian-t1dm/output/forecast_review.html`
-- supporting workflow directories under `~/ProjectsRuntime/bayesian-t1dm/output/`
-- machine-oriented JSON/CSV artifacts under `~/ProjectsRuntime/bayesian-t1dm/cache/`
-
-2. Build or refresh the analysis-ready dataset only:
+1. Refresh the prepared dataset.
 
 ```bash
 bayesian-t1dm prepare-model-data
 ```
 
 This writes the preparation report under `~/ProjectsRuntime/bayesian-t1dm/output/prepare/` and the prepared dataset under `~/ProjectsRuntime/bayesian-t1dm/cache/prepared/`.
-It automatically aligns already-imported Apple Health context to Tandem timestamps when overlap exists and records the overlap window in `model_data_preparation.md`.
 
-3. Build the therapy drill-down dashboard only:
+2. Inspect the latent-meal foundation.
 
 ```bash
-bayesian-t1dm review-therapy-evidence
+bayesian-t1dm research-latent-meal-icr --research-scope foundation
 ```
 
-This is the therapy evidence drill-down behind the main status page.
+This is the primary scientific lane. It audits meal-truth semantics, assembles first-meal candidates, and tells you whether the accepted cohort is ready for Phase C fitting.
 
-4. Build the forecasting and validation drill-down only:
+If the foundation gate is healthy, move to the strict Phase C fit:
+
+```bash
+bayesian-t1dm research-latent-meal-icr --research-scope full
+```
+
+This runs the constrained first-meal latent-response approximation on accepted windows only and writes research-only posterior summaries, confidence summaries, and model comparison artifacts.
+
+3. Refresh the combined snapshot when you want the whole repo summarized in one place.
+
+```bash
+bayesian-t1dm status
+```
+
+This publishes `~/ProjectsRuntime/bayesian-t1dm/output/current_status.html` plus the latest `therapy_review.html` and `forecast_review.html`. It is the combined overview, not the scientific starting point.
+
+4. Use the forecast diagnostic only when you want a secondary validation readout.
 
 ```bash
 bayesian-t1dm run --skip-recommendations
 ```
 
-This is the forecasting/validation drill-down behind the main status page.
+This is the secondary forecast/validation lane. It is useful for checking walk-forward behavior, but it is not the main science loop.
 
-5. Use `research-therapy-settings` only when you want supporting research artifacts:
-
-```bash
-bayesian-t1dm research-therapy-settings
-```
-
-This generates deeper therapy research outputs, but it is not the primary dashboard entrypoint.
-
-6. Use `research-latent-meal-icr` when you want the experimental meal deconvolution workflow:
+5. Use the therapy drill-down only when you need identifiability context.
 
 ```bash
-bayesian-t1dm research-latent-meal-icr
+bayesian-t1dm review-therapy-evidence
 ```
 
-This keeps the main therapy workflow unchanged and currently runs the strict foundation phase: honest meal-truth semantics, meal-event assembly, and a conservative first-meal clean-window cohort audit. It does not fit latent carbs or effective I/C yet.
+This is a secondary diagnostics surface for basal and meal-linked identifiability.
 
-7. Use `build-latent-meal-fixture` when you want a fast representative prepared-data subset for latent meal debugging:
+6. Use the fixture builder when you want a fast representative latent-meal subset.
 
 ```bash
 bayesian-t1dm build-latent-meal-fixture
 ```
 
-This writes a smaller prepared dataset plus fresh foundation artifacts while retaining all current first-meal candidate days and a small set of evenly spaced non-candidate background days.
+This keeps all first-meal candidates and a small number of background days while shrinking the prepared data for debugging.
+
+The runtime layout is intentionally boring now:
+
+- top-level human-facing entrypoints live in `~/ProjectsRuntime/bayesian-t1dm/output/`
+- machine-oriented summaries live in `~/ProjectsRuntime/bayesian-t1dm/cache/`
+- logs live in `~/ProjectsRuntime/bayesian-t1dm/logs/`
+- legacy clutter is archived once under `~/ProjectsRuntime/bayesian-t1dm/archive/legacy_output`
 
 ## Quickstart
 
@@ -248,8 +249,9 @@ bayesian-t1dm validate-raw
 # generate supporting therapy research artifacts
 bayesian-t1dm research-therapy-settings
 
-# generate experimental latent meal foundation artifacts
-bayesian-t1dm research-latent-meal-icr
+# generate experimental latent meal artifacts
+bayesian-t1dm research-latent-meal-icr --research-scope foundation
+bayesian-t1dm research-latent-meal-icr --research-scope full
 
 # build a fast representative latent meal debugging fixture
 bayesian-t1dm build-latent-meal-fixture

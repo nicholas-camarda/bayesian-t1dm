@@ -758,16 +758,30 @@ def _latent_meal_banner(result: LatentMealResearchResult) -> str:
         status = "broken"
         headline = "Latent meal foundation status unavailable."
     else:
-        gate_row = result.research_gate.iloc[0]
-        accepted_windows = int(gate_row.get("accepted_windows") or 0)
-        evaluated_candidates = int(gate_row.get("evaluated_candidates") or 0)
-        explicit_available = bool(gate_row.get("explicit_carb_source_available"))
-        status = "good" if accepted_windows > 0 else "degraded" if evaluated_candidates > 0 else "broken"
-        headline = (
-            f"Foundation scope: <code>{html.escape(str(gate_row.get('research_scope') or 'foundation'))}</code>. "
-            f"Accepted first-meal windows: <code>{accepted_windows}</code> / <code>{evaluated_candidates}</code>. "
-            f"Explicit carb source available: <code>{str(explicit_available).lower()}</code>."
-        )
+        if str(getattr(result, "research_scope", "foundation")) == "foundation":
+            gate_row = result.research_gate.iloc[0]
+            accepted_windows = int(gate_row.get("accepted_windows") or 0)
+            evaluated_candidates = int(gate_row.get("evaluated_candidates") or 0)
+            explicit_available = bool(gate_row.get("explicit_carb_source_available"))
+            status = "good" if accepted_windows > 0 else "degraded" if evaluated_candidates > 0 else "broken"
+            headline = (
+                f"Foundation scope: <code>{html.escape(str(gate_row.get('research_scope') or 'foundation'))}</code>. "
+                f"Accepted first-meal windows: <code>{accepted_windows}</code> / <code>{evaluated_candidates}</code>. "
+                f"Explicit carb source available: <code>{str(explicit_available).lower()}</code>."
+            )
+        else:
+            explicit_available = bool(getattr(result.prepared_dataset, "explicit_carb_source_available", False))
+            reportable_ic = int(result.posterior_meals["ic_posterior_mean"].notna().sum()) if not result.posterior_meals.empty else 0
+            accepted_windows = int(pd.to_numeric(result.meal_windows.get("included"), errors="coerce").fillna(0.0).sum()) if not result.meal_windows.empty else 0
+            selected_model_rows = result.model_comparison.loc[result.model_comparison["selected"].astype(bool)] if not result.model_comparison.empty else pd.DataFrame()
+            selected_model = str(selected_model_rows.iloc[0]["model"]) if not selected_model_rows.empty else "unknown"
+            status = "good" if reportable_ic > 0 else "degraded" if accepted_windows > 0 else "broken"
+            headline = (
+                f"Full latent-meal scope on <code>{accepted_windows}</code> accepted first-meal windows. "
+                f"Selected model: <code>{html.escape(selected_model)}</code>. "
+                f"Reportable morning I/C windows: <code>{reportable_ic}</code>. "
+                f"Explicit carb source available: <code>{str(explicit_available).lower()}</code>."
+            )
     return (
         f"<div class='banner {html.escape(status)}'>"
         f"{headline}"

@@ -47,6 +47,7 @@ from .health_auto_export import (
 from .ingest import IngestedData, TandemCoverage, build_export_manifest, load_tandem_exports, summarize_coverage, summarize_export_manifest, summarize_tandem_raw_dir, summarize_tandem_raw_source, write_export_manifest
 from .insulin import insulin_action_curve, expand_bolus_to_grid
 from .model import BayesianGlucoseModel, FitDiagnostics, ModelFit, ScenarioForecast, extract_fit_diagnostics
+from .promotion_policy import GateCheckResult, PromotionTransition, ReadinessDecision, TrustLevel, UniversalReadinessInputs, compare_promotion, evaluate_universal_readiness
 from .quality import DataQualitySummary, assess_data_quality
 from .recommend import Recommendation, RecommendationPolicy, Scenario, build_recommendation_policy, recommend_setting_changes
 from .report import build_run_summary, write_json_report, write_markdown_report
@@ -90,11 +91,14 @@ __all__ = [
     "ExportWindow",
     "FitDiagnostics",
     "FoldResult",
+    "GateCheckResult",
     "NormalizedWindowResult",
     "IngestedData",
     "DataQualitySummary",
     "ModelFit",
+    "PromotionTransition",
     "RawApiArtifact",
+    "ReadinessDecision",
     "Recommendation",
     "RecommendationPolicy",
     "StepLogger",
@@ -108,6 +112,8 @@ __all__ = [
     "TherapyResearchResult",
     "TherapyInfraValidationResult",
     "TherapySegment",
+    "TrustLevel",
+    "UniversalReadinessInputs",
     "WalkForwardSplit",
     "DEFAULT_SEGMENT_SPEC",
     "backfill_tandem_exports",
@@ -125,7 +131,9 @@ __all__ = [
     "build_source_report_cards",
     "export_daily_timeline_window",
     "calibration_summary",
+    "compare_promotion",
     "extract_fit_diagnostics",
+    "evaluate_universal_readiness",
     "generate_export_windows",
     "discover_health_auto_export_bundles",
     "discover_health_auto_export_bundle",

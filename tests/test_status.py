@@ -272,6 +272,7 @@ def test_output_cleanup_moves_top_level_clutter_into_runtime_archive(tmp_path):
     assert not (paths.reports / "old.csv").exists()
     moved = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert len(moved["moved"]) == 2
+    assert moved["migrated_logs"] == []
     assert manifest_path.parent == paths.legacy_output_archive
 
     log_dir = paths.logs / "status" / "run123"
@@ -283,6 +284,25 @@ def test_output_cleanup_moves_top_level_clutter_into_runtime_archive(tmp_path):
     source_html.write_text("<html>forecast</html>", encoding="utf-8")
     published = publish_html_entrypoint(source_html, paths.reports / "forecast_review.html")
     assert published.read_text(encoding="utf-8") == "<html>forecast</html>"
+
+
+def test_output_cleanup_migrates_legacy_output_logs_into_runtime_logs(tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    paths = ProjectPaths.from_root(repo_root, runtime_root=tmp_path / "runtime", cloud_root=tmp_path / "cloud").ensure()
+    legacy_log_dir = paths.reports / "logs" / "status" / "run123"
+    legacy_log_dir.mkdir(parents=True, exist_ok=True)
+    (legacy_log_dir / "events.jsonl").write_text("{}\n", encoding="utf-8")
+    (paths.reports / "logs" / "status" / "latest.json").write_text('{"run_dir":"old"}\n', encoding="utf-8")
+
+    manifest_path = cleanup_legacy_top_level_output(paths)
+
+    assert manifest_path is not None
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert len(payload["migrated_logs"]) == 2
+    assert not (paths.reports / "logs").exists()
+    assert (paths.logs / "status" / "run123" / "events.jsonl").exists()
+    assert (paths.logs / "status" / "latest.json").exists()
 
 
 def test_reset_output_directory_replaces_stale_contents(tmp_path):

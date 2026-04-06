@@ -31,22 +31,67 @@ def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _next_available_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    counter = 2
+    while True:
+        candidate = path.with_name(f"{stem}_{counter}{suffix}")
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def migrate_legacy_output_logs(paths: ProjectPaths) -> list[dict[str, str]]:
+    legacy_logs_root = paths.reports / "logs"
+    if not legacy_logs_root.exists():
+        return []
+    migrated: list[dict[str, str]] = []
+    for command_dir in sorted(legacy_logs_root.iterdir(), key=lambda candidate: candidate.name):
+        destination_command_dir = paths.logs / command_dir.name
+        if command_dir.is_dir():
+            destination_command_dir.mkdir(parents=True, exist_ok=True)
+            for child in sorted(command_dir.iterdir(), key=lambda candidate: candidate.name):
+                destination = _next_available_path(destination_command_dir / child.name)
+                shutil.move(str(child), str(destination))
+                migrated.append({"source": str(child), "destination": str(destination)})
+        else:
+            destination = _next_available_path(paths.logs / command_dir.name)
+            shutil.move(str(command_dir), str(destination))
+            migrated.append({"source": str(command_dir), "destination": str(destination)})
+    shutil.rmtree(legacy_logs_root)
+    return migrated
+
+
 def cleanup_legacy_top_level_output(paths: ProjectPaths, *, keep_names: set[str] | None = None) -> Path | None:
+    migrated_logs = migrate_legacy_output_logs(paths)
     keep = set(keep_names or set()) | TOP_LEVEL_ENTRYPOINTS
     extras = [item for item in sorted(paths.reports.iterdir(), key=lambda candidate: candidate.name) if item.name not in keep]
-    if not extras:
+    if not extras and not migrated_logs:
         return None
     legacy_root = paths.legacy_output_archive
-    if legacy_root.exists():
-        shutil.rmtree(legacy_root)
     legacy_root.mkdir(parents=True, exist_ok=True)
     moved: list[dict[str, str]] = []
     for item in extras:
-        destination = legacy_root / item.name
+        destination = _next_available_path(legacy_root / item.name)
         shutil.move(str(item), str(destination))
         moved.append({"source": str(item), "destination": str(destination)})
     manifest_path = legacy_root / "legacy_cleanup_manifest.json"
-    manifest_path.write_text(json.dumps({"moved": moved, "moved_at": _utc_timestamp()}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "moved": moved,
+                "migrated_logs": migrated_logs,
+                "moved_at": _utc_timestamp(),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     return manifest_path
 
 

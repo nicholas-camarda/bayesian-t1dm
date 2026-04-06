@@ -600,9 +600,11 @@ def test_research_latent_meal_icr_command_writes_artifacts_and_review(tmp_path, 
     assert review_html.exists()
 
 
-def test_research_latent_meal_icr_full_scope_errors_cleanly(tmp_path, monkeypatch):
+def test_research_latent_meal_icr_full_scope_writes_outputs(tmp_path, monkeypatch):
     workspace_root = tmp_path / "repo"
     workspace_root.mkdir()
+    report_dir = tmp_path / "latent_meal_full"
+    review_html = report_dir / "latent_meal_review.html"
     dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
     preparation = ModelDataPreparationResult(
         dataset=dataset,
@@ -623,20 +625,29 @@ def test_research_latent_meal_icr_full_scope_errors_cleanly(tmp_path, monkeypatc
     )
     monkeypatch.setattr(cli, "_prepare_model_data", lambda args, paths, session=None: preparation)
 
-    try:
-        main(
-            [
-                "--root",
-                str(workspace_root),
-                "research-latent-meal-icr",
-                "--research-scope",
-                "full",
-            ]
-        )
-    except SystemExit as exc:
-        assert exc.code == 2
-    else:
-        raise AssertionError("Expected parser error for full research scope")
+    exit_code = main(
+        [
+            "--root",
+            str(workspace_root),
+            "research-latent-meal-icr",
+            "--research-scope",
+            "full",
+            "--report-dir",
+            str(report_dir),
+            "--review-html",
+            str(review_html),
+        ]
+    )
+
+    assert exit_code == 0
+    assert (report_dir / "latent_meal_research_gate.md").exists()
+    assert (report_dir / "meal_event_registry.csv").exists()
+    assert (report_dir / "meal_window_audit.md").exists()
+    assert (report_dir / "latent_meal_fit_summary.md").exists()
+    assert (report_dir / "latent_meal_posterior_meals.csv").exists()
+    assert (report_dir / "latent_meal_confidence_report.md").exists()
+    assert (report_dir / "latent_meal_model_comparison.md").exists()
+    assert review_html.exists()
 
 
 def test_build_latent_meal_fixture_command_writes_fixture_bundle(tmp_path):

@@ -865,8 +865,6 @@ def _dispatch_command(
         return 0
 
     if args.command == "research-latent-meal-icr":
-        if args.research_scope != "foundation":
-            parser.error("not_yet_implemented: --research-scope full is reserved for later latent meal fitting work")
         if _path_matches(args.report_dir, paths.output_latent_meal):
             _prepare_runtime_output(paths, paths.output_latent_meal)
         _, result = _run_latent_meal_analysis(args=args, paths=paths, session=session)
