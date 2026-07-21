@@ -43,12 +43,12 @@ Recommended environment variables:
 
 Storage convention:
 
-- code: `~/Projects/bayesian-t1dm`
-- runtime outputs, scratch space, and intermediate artifacts: `~/ProjectsRuntime/bayesian-t1dm`
+- code: `~/Workspaces/bayesian-t1dm/source`
+- runtime outputs, scratch space, and intermediate artifacts: `~/Workspaces/bayesian-t1dm/runtime`
 - cloud project home: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm`
 - scraped/raw acquisition data: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw`
 - final published outputs: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/output`
-- default working summaries: `~/ProjectsRuntime/bayesian-t1dm/output`
+- default working summaries: `~/Workspaces/bayesian-t1dm/runtime/output`
 
 Raw discovery rules:
 

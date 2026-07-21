@@ -29,6 +29,7 @@ def test_predict_uses_posterior_samples(tandem_fixture_dir):
                 "beta": (("chain", "draw", "beta_dim_0"), np.array([[[0.1, -0.1], [0.2, -0.2]]])),
                 "latent": (("chain", "draw", "latent_dim_0"), np.array([[[0.0, 0.1, 0.2], [0.1, 0.0, -0.1]]])),
                 "rho": (("chain", "draw"), np.array([[0.9, 0.8]])),
+                "sigma_state": (("chain", "draw"), np.array([[0.1, 0.1]])),
                 "sigma_obs": (("chain", "draw"), np.array([[1.0, 1.0]])),
             }
         )
@@ -52,7 +53,7 @@ def test_predict_uses_posterior_samples(tandem_fixture_dir):
     assert prediction["upper"].ge(prediction["lower"]).all()
 
 
-def _make_minimal_fit(*, sigma_obs: float) -> ModelFit:
+def _make_minimal_fit(*, sigma_obs: float, sigma_state: float = 0.0) -> ModelFit:
     feature_columns = ["x"]
     feature_means = pd.Series({"x": 0.0})
     feature_scales = pd.Series({"x": 1.0})
@@ -63,6 +64,7 @@ def _make_minimal_fit(*, sigma_obs: float) -> ModelFit:
                 "beta": (("chain", "draw", "beta_dim_0"), np.array([[[0.0], [0.0], [0.0]]])),
                 "latent": (("chain", "draw", "latent_dim_0"), np.array([[[0.0], [0.0], [0.0]]])),
                 "rho": (("chain", "draw"), np.array([[0.0, 0.0, 0.0]])),
+                "sigma_state": (("chain", "draw"), np.array([[sigma_state, sigma_state, sigma_state]])),
                 "sigma_obs": (("chain", "draw"), np.array([[sigma_obs, sigma_obs, sigma_obs]])),
             }
         )
@@ -85,6 +87,17 @@ def test_predict_intervals_widen_with_sigma_obs():
 
     narrow = model.predict(_make_minimal_fit(sigma_obs=0.0), features)
     wide = model.predict(_make_minimal_fit(sigma_obs=1.0), features)
+
+    assert float((narrow["upper"] - narrow["lower"]).mean()) == 0.0
+    assert float((wide["upper"] - wide["lower"]).mean()) > 0.0
+
+
+def test_predict_intervals_widen_with_state_innovation():
+    features = pd.DataFrame({"x": np.zeros(5, dtype=float)})
+    model = BayesianGlucoseModel(draws=10, tune=10, chains=1, random_seed=123)
+
+    narrow = model.predict(_make_minimal_fit(sigma_obs=0.0, sigma_state=0.0), features)
+    wide = model.predict(_make_minimal_fit(sigma_obs=0.0, sigma_state=1.0), features)
 
     assert float((narrow["upper"] - narrow["lower"]).mean()) == 0.0
     assert float((wide["upper"] - wide["lower"]).mean()) > 0.0

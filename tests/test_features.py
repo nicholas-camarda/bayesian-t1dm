@@ -53,6 +53,29 @@ def test_build_feature_frame_tracks_cgm_gaps_and_drops_imputed_targets():
     assert frame.frame["target_glucose"].notna().all()
 
 
+def test_build_feature_frame_excludes_invalid_cgm_from_observed_and_targets():
+    data = IngestedData(
+        cgm=_frame(
+            {
+                "timestamp": pd.to_datetime(["2023-06-01 00:00:00", "2023-06-01 00:05:00", "2023-06-01 00:10:00"]),
+                "glucose": [100.0, 0.0, 110.0],
+                "source_file": ["fixture.csv"] * 3,
+            }
+        ),
+    )
+
+    frame = build_feature_frame(
+        data,
+        FeatureConfig(horizon_minutes=5, cgm_lags=(5,), rolling_windows_minutes=(30,), activity_windows_minutes=(30,), carb_windows_minutes=(30,)),
+    )
+
+    invalid_row = frame.frame.loc[frame.frame["timestamp"] == pd.Timestamp("2023-06-01 00:05:00")].iloc[0]
+    assert pd.isna(invalid_row["glucose_observed"])
+    assert invalid_row["cgm_invalid"] == 1
+    assert invalid_row["target_glucose"] == pytest.approx(110.0)
+    assert not frame.frame["target_glucose"].eq(0.0).any()
+
+
 def test_build_feature_frame_adds_basal_and_meal_exposures():
     data = IngestedData(
         cgm=_frame(

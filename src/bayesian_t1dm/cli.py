@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
 import shutil
@@ -29,7 +30,6 @@ from .health_auto_export import (
     has_apple_health_data,
     import_health_auto_export_batch,
     summarize_apple_health_span,
-    summarize_tandem_data_span,
     screen_health_features,
     write_health_screening_report,
     write_model_data_preparation_report,
@@ -40,7 +40,7 @@ from .ingest import build_export_manifest, load_tandem_exports, summarize_covera
 from .model import BayesianGlucoseModel
 from .observability import LoggingSession, setup_run_logging
 from .paths import ProjectPaths
-from .quality import assess_data_quality
+from .quality import assess_data_quality, assess_prepared_feature_plausibility
 from .recommend import RecommendationPolicy, recommend_setting_changes
 from .report import build_run_summary, write_json_report, write_markdown_report
 from .review import write_coverage_review_html, write_current_status_html, write_latent_meal_review_html, write_run_review_html, write_therapy_evidence_review_html
@@ -48,6 +48,8 @@ from .features import FeatureFrame
 from .status import cleanup_legacy_top_level_output, derive_current_status, finalize_status_logs, publish_html_entrypoint, reset_output_directory, write_status_json
 from .therapy_research import (
     build_representative_latent_meal_fixture,
+    extract_latent_meal_therapy_settings_from_tandem_raw,
+    load_latent_meal_therapy_settings,
     parse_model_list,
     parse_therapy_segments,
     run_latent_meal_icr_research,
@@ -139,6 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
     latent_meal.add_argument("--env-file", default=None, help="Optional .env file with Tandem credentials")
     latent_meal.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
     latent_meal.add_argument("--research-scope", choices=["foundation", "full"], default="foundation")
+    latent_meal.add_argument("--therapy-settings", default=None, help="Optional JSON override for I:C, correction factor, target, insulin action, and carb absorption priors; full scope auto-extracts Tandem settings when omitted")
 
     latent_fixture = add_command("build-latent-meal-fixture", "Build a representative prepared-data fixture for latent meal foundation debugging")
     latent_fixture.add_argument("--prepared-csv", default=None, help="Prepared model dataset CSV to subset; defaults to the runtime prepared_model_data_5min.csv")
@@ -231,6 +234,19 @@ def _coerce_date_bounds(
     return pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize()
 
 
+def _summarize_required_tandem_span(data: IngestedData) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    timestamps: list[pd.Series] = []
+    for frame in [data.cgm, data.bolus]:
+        if not frame.empty and "timestamp" in frame.columns:
+            timestamps.append(pd.to_datetime(frame["timestamp"], errors="coerce"))
+    if not timestamps:
+        return None, None
+    combined = pd.concat(timestamps, ignore_index=True).dropna()
+    if combined.empty:
+        return None, None
+    return pd.Timestamp(combined.min()), pd.Timestamp(combined.max())
+
+
 def _build_feature_frame_from_prepared(dataset) -> FeatureFrame:
     return FeatureFrame(
         frame=dataset.frame,
@@ -303,7 +319,7 @@ def _prepare_model_data(
                 message="Loading Tandem plus already-imported Apple Health inputs.",
             )
         health_before = load_tandem_exports(raw_root, include_health_auto_export=True)
-        tandem_span_before_start, tandem_span_before_end = summarize_tandem_data_span(tandem_before)
+        tandem_span_before_start, tandem_span_before_end = _summarize_required_tandem_span(tandem_before)
         apple_available = has_apple_health_data(health_before)
         apple_span_start, apple_span_end = summarize_apple_health_span(health_before)
     if session is not None:
@@ -455,7 +471,19 @@ def _prepare_model_data(
             health_data=health_after,
             config=FeatureConfig(horizon_minutes=args.horizon),
         )
-        tandem_span_after_start, tandem_span_after_end = summarize_tandem_data_span(tandem_after)
+        data_quality, _ = assess_data_quality(raw_root, export_manifest=export_manifest)
+        plausibility_status, plausibility_reasons = assess_prepared_feature_plausibility(dataset.frame)
+        data_quality = replace(
+            data_quality,
+            normalized_plausibility_status=plausibility_status,
+            normalized_plausibility_reasons=plausibility_reasons,
+        )
+        dataset = replace(
+            dataset,
+            source_quality_status=data_quality.status,
+            normalized_plausibility_status=data_quality.normalized_plausibility_status,
+        )
+        tandem_span_after_start, tandem_span_after_end = _summarize_required_tandem_span(tandem_after)
         apple_span_start, apple_span_end = summarize_apple_health_span(health_after)
     overlap_start, overlap_end = intersect_spans(
         apple_span_start,
@@ -584,6 +612,12 @@ def _build_forecast_summary(
         write_export_manifest(export_manifest, args.manifest)
         coverage = summarize_coverage(data)
         data_quality, quality_rows = assess_data_quality(args.raw, export_manifest=export_manifest)
+        plausibility_status, plausibility_reasons = assess_prepared_feature_plausibility(feature_frame.frame)
+        data_quality = replace(
+            data_quality,
+            normalized_plausibility_status=plausibility_status,
+            normalized_plausibility_reasons=plausibility_reasons,
+        )
     if args.chains < 2:
         warnings.warn(
             f"--chains={args.chains} may produce unreliable diagnostics; use at least 2 chains for MCMC.",
@@ -619,8 +653,8 @@ def _build_forecast_summary(
                 feature_frame.frame,
                 walk_forward=walk_forward,
                 data_quality=data_quality,
-                carbs_present=not data.carbs.empty,
-                activity_present=not data.activity.empty,
+                carbs_present=bool(getattr(prepared, "explicit_carb_source_available", False)),
+                activity_present=not data.activity.empty or not data.health_activity.empty,
             )
     return build_run_summary(
         coverage=coverage,
@@ -639,6 +673,14 @@ def _run_latent_meal_analysis(
     paths: ProjectPaths,
     session: LoggingSession | None = None,
 ):
+    therapy_settings = None
+    if getattr(args, "therapy_settings", None):
+        therapy_settings = load_latent_meal_therapy_settings(args.therapy_settings)
+    elif getattr(args, "research_scope", "foundation") == "full":
+        therapy_settings = extract_latent_meal_therapy_settings_from_tandem_raw(
+            args.raw,
+            segments=parse_therapy_segments(args.segments),
+        )
     with _session_stage(session, "latent_meal.prepare_data"):
         preparation = _prepare_model_data(args=args, paths=paths, session=session)
     with _session_stage(session, "latent_meal.research"):
@@ -647,6 +689,7 @@ def _run_latent_meal_analysis(
             segments=parse_therapy_segments(args.segments),
             meal_proxy_mode=args.meal_proxy_mode,
             research_scope=args.research_scope,
+            therapy_settings=therapy_settings,
         )
     return preparation, result
 
@@ -869,7 +912,7 @@ def _dispatch_command(
             _prepare_runtime_output(paths, paths.output_latent_meal)
         _, result = _run_latent_meal_analysis(args=args, paths=paths, session=session)
         with session.stage("latent_meal.write_artifacts", report_dir=args.report_dir, review_html=args.review_html):
-            write_latent_meal_research_artifacts(result, args.report_dir)
+            write_latent_meal_research_artifacts(result, args.report_dir, cache_dir=paths.cache_latent_meal)
             write_latent_meal_review_html(
                 result,
                 args.review_html,

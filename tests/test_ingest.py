@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from bayesian_t1dm.ingest import (
+    IngestedData,
     build_export_manifest,
     discover_source_files,
     load_tandem_exports,
@@ -229,3 +230,77 @@ def test_export_manifest_detects_gap_duplicate_and_out_of_order(tandem_fixture_d
     assert summary["out_of_order_windows"] >= 1
     assert summary["incomplete_windows"] >= 1
     assert not summary["is_complete"]
+
+
+def test_load_tandem_exports_dedupes_overlapping_normalized_windows(tmp_path):
+    raw = tmp_path / "raw"
+    for window_id in ["2024-06-01__2024-06-01", "2024-06-01__2024-06-02"]:
+        normalized = raw / "tconnectsync" / window_id / "normalized"
+        normalized.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(
+            {
+                "timestamp": ["2024-06-01T00:00:00"],
+                "glucose": [100.0],
+                "source_file": [f"tconnectsync::{window_id}::tconnectsync"],
+                "source_label": ["tconnectsync"],
+            }
+        ).to_csv(normalized / "cgm.csv", index=False)
+        pd.DataFrame(
+            {
+                "timestamp": ["2024-06-01T08:00:00"],
+                "bolus_units": [2.0],
+                "raw_bolus_units": [2.0],
+                "source_event_id": ["bolus-a"],
+                "source_file": [f"tconnectsync::{window_id}::tconnectsync"],
+                "source_label": ["tconnectsync"],
+            }
+        ).to_csv(normalized / "bolus.csv", index=False)
+        pd.DataFrame(
+            {
+                "start_timestamp": ["2024-06-01T00:00:00"],
+                "end_timestamp": ["2024-06-02T00:00:00"],
+                "basal_units_per_hour": [0.8],
+                "source_file": [f"tconnectsync::{window_id}::tconnectsync"],
+                "source_label": ["tconnectsync"],
+            }
+        ).to_csv(normalized / "basal.csv", index=False)
+        pd.DataFrame(
+            {
+                "normalized_path": [
+                    str(normalized / "cgm.csv"),
+                    str(normalized / "bolus.csv"),
+                    str(normalized / "basal.csv"),
+                ]
+            }
+        ).to_csv(raw / "tconnectsync" / window_id / "window_manifest.csv", index=False)
+
+    data = load_tandem_exports(raw)
+
+    assert len(data.cgm) == 1
+    assert len(data.bolus) == 1
+    assert data.bolus["bolus_units"].sum() == pytest.approx(2.0)
+    assert len(data.basal) == 1
+
+
+def test_manifest_source_order_uses_tconnectsync_window_dates():
+    ingested = IngestedData(
+        cgm=pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2024-06-01", "2024-05-01"]),
+                "glucose": [100.0, 101.0],
+                "source_file": [
+                    "tconnectsync::2024-06-01__2024-06-01::tconnectsync",
+                    "tconnectsync::2024-05-01__2024-05-01::tconnectsync",
+                ],
+            }
+        ),
+        source_files=[
+            Path("/tmp/raw/tconnectsync/2024-06-01__2024-06-01/normalized/cgm.csv"),
+            Path("/tmp/raw/tconnectsync/2024-05-01__2024-05-01/normalized/cgm.csv"),
+        ],
+    )
+
+    manifest = build_export_manifest(ingested)
+
+    orders = dict(zip(manifest["source_file"], manifest["source_order"]))
+    assert orders["tconnectsync::2024-05-01__2024-05-01::tconnectsync"] < orders["tconnectsync::2024-06-01__2024-06-01::tconnectsync"]

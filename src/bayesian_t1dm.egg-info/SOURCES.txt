@@ -10,11 +10,14 @@ src/bayesian_t1dm/ingest.py
 src/bayesian_t1dm/insulin.py
 src/bayesian_t1dm/io.py
 src/bayesian_t1dm/model.py
+src/bayesian_t1dm/observability.py
 src/bayesian_t1dm/paths.py
+src/bayesian_t1dm/promotion_policy.py
 src/bayesian_t1dm/quality.py
 src/bayesian_t1dm/recommend.py
 src/bayesian_t1dm/report.py
 src/bayesian_t1dm/review.py
+src/bayesian_t1dm/status.py
 src/bayesian_t1dm/therapy_research.py
 src/bayesian_t1dm.egg-info/PKG-INFO
 src/bayesian_t1dm.egg-info/SOURCES.txt
@@ -31,8 +34,11 @@ tests/test_health_auto_export.py
 tests/test_ingest.py
 tests/test_insulin.py
 tests/test_model.py
+tests/test_observability.py
 tests/test_paths.py
+tests/test_promotion_policy.py
 tests/test_realistic_smoke.py
 tests/test_recommend.py
 tests/test_report.py
+tests/test_status.py
 tests/test_therapy_research.py

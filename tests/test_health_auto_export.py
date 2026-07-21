@@ -7,7 +7,8 @@ import pandas as pd
 
 from bayesian_t1dm.cli import main
 from bayesian_t1dm.features import FeatureConfig, build_feature_frame
-from bayesian_t1dm.ingest import load_tandem_exports
+from bayesian_t1dm.health_auto_export import build_analysis_ready_health_dataset, build_health_context_frame
+from bayesian_t1dm.ingest import IngestedData, load_tandem_exports
 
 
 def _build_health_auto_export_payload(
@@ -102,7 +103,7 @@ def _build_health_auto_export_payload(
             {
                 "name": "blood_glucose",
                 "units": "mg/dL",
-                "data": [{"date": "2025-05-24 00:00:00 -0400", "qty": 111, "source": "Dexcom G6"}],
+                "data": [{"date": "2025-05-24 00:02:00 -0400", "qty": 111, "source": "Dexcom G6"}],
             }
         )
     return {
@@ -263,6 +264,7 @@ def test_import_health_auto_export_command_archives_and_normalizes_bundle(tmp_pa
     assert (archive_root / "raw" / "HealthAutoExport-2025-05-24-2025-05-24.json").exists()
     assert (archive_root / "raw" / "Walk-Route-20250524_060000.gpx").exists()
     assert (archive_root / "normalized" / "activity.csv").exists()
+    assert (archive_root / "normalized" / "cgm.csv").exists()
     assert (archive_root / "normalized" / "health_measurements.csv").exists()
     assert (archive_root / "normalized" / "sleep.csv").exists()
     assert (archive_root / "normalized" / "workouts.csv").exists()
@@ -271,6 +273,9 @@ def test_import_health_auto_export_command_archives_and_normalizes_bundle(tmp_pa
     assert {"bundle_timestamp", "source_json_filename", "covered_start_date", "covered_end_date"}.issubset(manifest_frame.columns)
 
     data = load_tandem_exports(cloud_root / "data" / "raw", include_health_auto_export=True)
+    assert len(data.cgm) == 1
+    assert float(data.cgm["glucose"].iloc[0]) == 111.0
+    assert set(data.cgm["glucose_source"]) == {"apple_health_blood_glucose"}
     assert len(data.health_activity) == 3
     assert len(data.health_measurements) > 0
     assert len(data.sleep) == 1
@@ -323,6 +328,11 @@ def test_load_tandem_exports_unifies_and_dedupes_health_auto_export(tmp_path, mo
     activity = data.health_activity.loc[pd.to_datetime(data.health_activity["timestamp"]) == pd.Timestamp("2025-05-24 00:00:00")]
     assert len(activity) == 1
     assert float(activity["activity_value"].iloc[0]) == 100.0
+
+    glucose = data.cgm.loc[pd.to_datetime(data.cgm["timestamp"]) == pd.Timestamp("2025-05-24 00:00:00")]
+    assert len(glucose) == 1
+    assert float(glucose["glucose"].iloc[0]) == 111.0
+    assert glucose["source_device"].iloc[0] == "Dexcom G6"
 
     sleep = data.sleep.loc[pd.to_datetime(data.sleep["date"]) == pd.Timestamp("2025-05-24")]
     assert len(sleep) == 1
@@ -393,6 +403,50 @@ def test_build_health_analysis_ready_command_writes_tandem_aligned_dataset(tmp_p
     assert float(first_row["prior_night_total_sleep_hours"]) == 8.2
     assert int(first_row["in_sleep"]) == 1
     assert float(first_row["hrv_latest"]) == 55.0
+
+
+def test_analysis_ready_dataset_uses_apple_glucose_to_fill_tandem_cgm_gaps():
+    tandem_data = IngestedData(
+        cgm=pd.DataFrame(
+            {
+                "timestamp": [pd.Timestamp("2025-05-24 00:00:00"), pd.Timestamp("2025-05-24 00:10:00")],
+                "glucose": [100.0, 120.0],
+                "glucose_source": ["egv_estimatedGlucoseValue", "egv_estimatedGlucoseValue"],
+            }
+        ),
+        bolus=pd.DataFrame({"timestamp": [pd.Timestamp("2025-05-24 00:00:00")], "bolus_units": [1.0]}),
+    )
+    health_data = IngestedData(
+        cgm=pd.DataFrame(
+            {
+                "timestamp": [pd.Timestamp("2025-05-24 00:07:00")],
+                "glucose": [111.0],
+                "glucose_source": ["apple_health_blood_glucose"],
+                "source_device": ["Dexcom G7"],
+            }
+        ),
+        health_measurements=pd.DataFrame(
+            {
+                "timestamp": [pd.Timestamp("2025-05-24 00:00:00")],
+                "metric": ["heart_rate_variability"],
+                "stat": ["value"],
+                "value": [40.0],
+                "unit": ["ms"],
+                "source_file": ["HealthAutoExport.json"],
+                "source_device": ["Apple Watch"],
+            }
+        ),
+    )
+
+    dataset = build_analysis_ready_health_dataset(
+        tandem_data=tandem_data,
+        health_data=health_data,
+        config=FeatureConfig(horizon_minutes=5),
+    )
+
+    row_0005 = dataset.frame.loc[dataset.frame["timestamp"].eq(pd.Timestamp("2025-05-24 00:05:00"))].iloc[0]
+    assert int(row_0005["missing_cgm"]) == 0
+    assert float(row_0005["glucose_observed"]) == 111.0
 
 
 def test_build_health_analysis_ready_command_computes_plausible_workout_windows(tmp_path, monkeypatch):
@@ -472,6 +526,40 @@ def test_build_health_analysis_ready_command_computes_plausible_workout_windows(
     assert int(row_1900["recent_workout_6h"]) == 1
     assert float(row_1900["workout_count_24h"]) == 2.0
     assert int(row_1900["workout_summary_plausible"]) == 1
+
+
+def test_workout_recency_flags_use_elapsed_time_across_timestamp_gaps():
+    base_frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2025-01-01 06:00:00",
+                    "2025-01-01 11:59:00",
+                    "2025-01-01 19:01:00",
+                ]
+            )
+        }
+    )
+    workouts = pd.DataFrame(
+        {
+            "start_timestamp": [pd.Timestamp("2025-01-01 05:30:00")],
+            "end_timestamp": [pd.Timestamp("2025-01-01 06:00:00")],
+            "duration_seconds": [1800.0],
+            "distance_value": [0.0],
+            "active_energy_value": [120.0],
+            "avg_heart_rate": [120.0],
+            "max_heart_rate": [140.0],
+        }
+    )
+
+    context, _ = build_health_context_frame(base_frame, IngestedData(workouts=workouts), freq="1min")
+
+    row_1159 = context.loc[context["timestamp"].eq(pd.Timestamp("2025-01-01 11:59:00"))].iloc[0]
+    row_1901 = context.loc[context["timestamp"].eq(pd.Timestamp("2025-01-01 19:01:00"))].iloc[0]
+    assert float(row_1159["minutes_since_last_workout"]) == 359.0
+    assert int(row_1159["recent_workout_6h"]) == 1
+    assert float(row_1901["minutes_since_last_workout"]) == 781.0
+    assert int(row_1901["recent_workout_12h"]) == 0
 
 
 def test_screen_health_features_command_writes_scores_and_report(tmp_path, monkeypatch):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -257,9 +258,45 @@ def _build_manifest_row(kind: str, frame: pd.DataFrame, source_order: int, sourc
     }
 
 
+def _source_order_key(source: str | Path) -> tuple[pd.Timestamp, str]:
+    text = str(source)
+    match = re.search(r"(\d{4}-\d{2}-\d{2})__(\d{4}-\d{2}-\d{2})", text)
+    if match:
+        return pd.Timestamp(match.group(1)), text
+    path = Path(text)
+    return pd.Timestamp.max, path.name
+
+
+def _source_order_map(source_files: Iterable[Path]) -> dict[str, int]:
+    mapping: dict[str, int] = {}
+    for index, source in enumerate(sorted(source_files, key=_source_order_key)):
+        path = Path(source)
+        keys = {path.name, str(path)}
+        if path.parent.name == "normalized":
+            window_id = path.parent.parent.name
+            keys.add(f"tconnectsync::{window_id}::tconnectsync")
+        for key in keys:
+            mapping.setdefault(str(key), index)
+    return mapping
+
+
+def _source_order_for(source_file: str, source_order_map: dict[str, int]) -> int:
+    if source_file in source_order_map:
+        return source_order_map[source_file]
+    key = _source_order_key(source_file)
+    if key[0] != pd.Timestamp.max:
+        earlier = 0
+        for candidate in source_order_map:
+            candidate_key = _source_order_key(candidate)
+            if candidate_key[0] != pd.Timestamp.max and candidate_key[0] < key[0]:
+                earlier += 1
+        return earlier
+    return len(source_order_map)
+
+
 def build_export_manifest(data: IngestedData) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
-    source_order_map = {Path(source).name: index for index, source in enumerate(data.source_files)}
+    source_order_map = _source_order_map(data.source_files)
     for kind, frame in data.all_tables().items():
         if frame.empty or "source_file" not in frame.columns:
             continue
@@ -274,7 +311,7 @@ def build_export_manifest(data: IngestedData) -> pd.DataFrame:
                 _build_manifest_row(
                     kind=kind,
                     frame=group,
-                    source_order=source_order_map.get(str(source_file), len(source_order_map)),
+                    source_order=_source_order_for(str(source_file), source_order_map),
                     source_file=str(source_file),
                     source_sheet=None if source_sheet is None or (isinstance(source_sheet, float) and np.isnan(source_sheet)) else str(source_sheet),
                 )
@@ -349,6 +386,8 @@ def _manifest_declared_source_files(raw_dir: str | Path) -> list[Path]:
                                 candidates.append(normalized_path)
             for candidate in candidates:
                 candidate_path = Path(candidate).expanduser()
+                if not candidate_path.is_absolute():
+                    candidate_path = manifest.parent / candidate_path
                 if candidate_path.exists():
                     discovered.append(candidate_path)
         except Exception:
@@ -713,15 +752,17 @@ def _load_canonical_normalized_table(path: Path) -> tuple[str, pd.DataFrame] | N
 
     if stem == "cgm" and {"timestamp", "glucose"} <= set(frame.columns):
         out = frame.copy()
-        out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
+        out["timestamp"] = _parse_datetime(out["timestamp"])
         out["glucose"] = pd.to_numeric(out["glucose"], errors="coerce")
         out = out.dropna(subset=["timestamp", "glucose"]).reset_index(drop=True)
         return "cgm", out
 
     if stem == "bolus" and {"timestamp", "bolus_units"} <= set(frame.columns):
         out = frame.copy()
-        out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
+        out["timestamp"] = _parse_datetime(out["timestamp"])
         out["bolus_units"] = pd.to_numeric(out["bolus_units"], errors="coerce")
+        if "raw_bolus_units" in out.columns:
+            out["raw_bolus_units"] = pd.to_numeric(out["raw_bolus_units"], errors="coerce")
         if "carb_grams" in out.columns:
             out["carb_grams"] = pd.to_numeric(out["carb_grams"], errors="coerce")
         out = out.dropna(subset=["timestamp", "bolus_units"]).reset_index(drop=True)
@@ -729,27 +770,96 @@ def _load_canonical_normalized_table(path: Path) -> tuple[str, pd.DataFrame] | N
 
     if stem == "basal" and {"start_timestamp", "end_timestamp", "basal_units_per_hour"} <= set(frame.columns):
         out = frame.copy()
-        out["start_timestamp"] = pd.to_datetime(out["start_timestamp"], errors="coerce")
-        out["end_timestamp"] = pd.to_datetime(out["end_timestamp"], errors="coerce")
+        out["start_timestamp"] = _parse_datetime(out["start_timestamp"])
+        out["end_timestamp"] = _parse_datetime(out["end_timestamp"])
         out["basal_units_per_hour"] = pd.to_numeric(out["basal_units_per_hour"], errors="coerce")
         out = out.dropna(subset=["start_timestamp", "end_timestamp", "basal_units_per_hour"]).reset_index(drop=True)
         return "basal", out
 
     if stem == "activity" and {"timestamp", "activity_value"} <= set(frame.columns):
         out = frame.copy()
-        out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
+        out["timestamp"] = _parse_datetime(out["timestamp"])
         out["activity_value"] = pd.to_numeric(out["activity_value"], errors="coerce")
         out = out.dropna(subset=["timestamp", "activity_value"]).reset_index(drop=True)
         return "activity", out
 
     if stem == "carbs" and {"timestamp", "carb_grams"} <= set(frame.columns):
         out = frame.copy()
-        out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
+        out["timestamp"] = _parse_datetime(out["timestamp"])
         out["carb_grams"] = pd.to_numeric(out["carb_grams"], errors="coerce")
         out = out.dropna(subset=["timestamp", "carb_grams"]).reset_index(drop=True)
         return "carbs", out
 
     return None
+
+
+def _dedupe_canonical_events(kind: str, frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    out = frame.copy()
+    if kind in {"cgm", "bolus", "carbs", "activity"} and "timestamp" in out.columns:
+        out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
+    if kind == "basal":
+        for column in ["start_timestamp", "end_timestamp"]:
+            if column in out.columns:
+                out[column] = pd.to_datetime(out[column], errors="coerce")
+
+    if kind == "cgm" and {"timestamp", "glucose"} <= set(out.columns):
+        out["glucose"] = pd.to_numeric(out["glucose"], errors="coerce")
+        out = out.dropna(subset=["timestamp", "glucose"])
+        if "glucose_source" in out.columns:
+            priority_map = {
+                "egv_estimatedGlucoseValue": 0,
+                "bg": 1,
+                "glucose": 2,
+                "apple_health_blood_glucose": 3,
+            }
+            out["_glucose_priority"] = out["glucose_source"].map(priority_map).fillna(len(priority_map)).astype(int)
+        else:
+            out["_glucose_priority"] = len({"egv_estimatedGlucoseValue": 0, "bg": 1, "glucose": 2, "apple_health_blood_glucose": 3})
+        sort_cols = [column for column in ["timestamp", "source_file", "source_label", "glucose_source"] if column in out.columns]
+        sort_cols = ["timestamp", "_glucose_priority", *[column for column in sort_cols if column != "timestamp"]]
+        out = out.sort_values(sort_cols, na_position="last")
+        duplicate_counts = out.groupby("timestamp").size()
+        out = out.drop_duplicates(subset=["timestamp"], keep="first").reset_index(drop=True)
+        out["duplicate_count"] = out["timestamp"].map(duplicate_counts).fillna(1).astype(int)
+        return out.drop(columns=["_glucose_priority"])
+
+    if kind == "bolus" and {"timestamp", "bolus_units"} <= set(out.columns):
+        out["bolus_units"] = pd.to_numeric(out["bolus_units"], errors="coerce")
+        out = out.dropna(subset=["timestamp", "bolus_units"])
+        subset = [
+            column
+            for column in [
+                "timestamp",
+                "bolus_units",
+                "raw_bolus_units",
+                "source_event_id",
+                "source_event_name",
+                "pump_serial",
+                "tconnect_device_id",
+            ]
+            if column in out.columns
+        ]
+        return out.drop_duplicates(subset=subset, keep="first").reset_index(drop=True)
+
+    if kind == "basal" and {"start_timestamp", "end_timestamp", "basal_units_per_hour"} <= set(out.columns):
+        out["basal_units_per_hour"] = pd.to_numeric(out["basal_units_per_hour"], errors="coerce")
+        out = out.dropna(subset=["start_timestamp", "end_timestamp", "basal_units_per_hour"])
+        subset = [
+            column
+            for column in ["start_timestamp", "end_timestamp", "basal_units_per_hour", "pump_serial", "tconnect_device_id"]
+            if column in out.columns
+        ]
+        return out.drop_duplicates(subset=subset, keep="first").reset_index(drop=True)
+
+    if kind == "activity" and {"timestamp", "activity_value"} <= set(out.columns):
+        out["activity_value"] = pd.to_numeric(out["activity_value"], errors="coerce")
+        out = out.dropna(subset=["timestamp", "activity_value"])
+        subset = [column for column in ["timestamp", "activity_value", "source_file", "source_label"] if column in out.columns]
+        return out.drop_duplicates(subset=subset, keep="first").reset_index(drop=True)
+
+    return out.drop_duplicates().reset_index(drop=True)
 
 
 def load_tandem_exports(raw_dir: str | Path, *, include_health_auto_export: bool = False) -> IngestedData:
@@ -895,6 +1005,10 @@ def load_tandem_exports(raw_dir: str | Path, *, include_health_auto_export: bool
         ),
         source_files=source_files,
     )
+    ingested.cgm = _dedupe_canonical_events("cgm", ingested.cgm)
+    ingested.bolus = _dedupe_canonical_events("bolus", ingested.bolus)
+    ingested.basal = _dedupe_canonical_events("basal", ingested.basal)
+    ingested.activity = _dedupe_canonical_events("activity", ingested.activity)
     if carb_frames:
         carbs = pd.concat(carb_frames, ignore_index=True, sort=False)
         if "timestamp" in carbs.columns:
@@ -908,11 +1022,13 @@ def load_tandem_exports(raw_dir: str | Path, *, include_health_auto_export: bool
         if dedupe_subset:
             carbs = carbs.drop_duplicates(subset=dedupe_subset, keep="first")
         carbs = carbs.drop(columns=[column for column in ["_carb_source_priority"] if column in carbs.columns])
-        ingested.carbs = carbs.reset_index(drop=True)
+        ingested.carbs = _dedupe_canonical_events("carbs", carbs.reset_index(drop=True))
     if include_health_auto_export:
         from .health_auto_export import load_health_auto_export_tables
 
         health_tables = load_health_auto_export_tables(raw_path)
+        if not health_tables["cgm"].empty:
+            ingested.cgm = _dedupe_canonical_events("cgm", pd.concat([ingested.cgm, health_tables["cgm"]], ignore_index=True, sort=False))
         ingested.health_activity = health_tables["health_activity"]
         ingested.health_measurements = health_tables["health_measurements"]
         ingested.sleep = health_tables["sleep"]

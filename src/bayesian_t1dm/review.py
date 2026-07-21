@@ -959,13 +959,15 @@ def _latent_meal_posterior_html(result: LatentMealResearchResult) -> str:
     if result.posterior_meals.empty:
         return "<div class='section'><h2>Posterior Meals</h2><div class='empty-state'>No posterior meal estimates were generated.</div></div>"
     top = result.posterior_meals.copy()
-    top["abs_gap"] = (
-        pd.to_numeric(top["latent_carbs_posterior_mean"], errors="coerce")
-        - pd.to_numeric(top["stated_carbs"], errors="coerce")
-    ).abs()
-    top = top.sort_values(["carb_accuracy_score", "timestamp"], ascending=[False, True]).head(15)
+    confidence_column = "confidence" if "confidence" in top.columns else "carb_accuracy_score"
+    top = top.sort_values([confidence_column, "timestamp"], ascending=[False, True]).head(15)
     rows = []
     for row in top.itertuples(index=False):
+        lower_90 = getattr(row, "latent_carb_lower_90", getattr(row, "latent_carbs_lower", float("nan")))
+        upper_90 = getattr(row, "latent_carb_upper_90", getattr(row, "latent_carbs_upper", float("nan")))
+        median = getattr(row, "latent_carb_median", getattr(row, "latent_carbs_posterior_mean", float("nan")))
+        confidence = getattr(row, "confidence", getattr(row, "carb_accuracy_score", float("nan")))
+        flags = getattr(row, "flags", getattr(row, "suppression_reason", ""))
         rows.append(
             "<tr>"
             f"<td>{html.escape(str(row.meal_id))}</td>"
@@ -973,10 +975,11 @@ def _latent_meal_posterior_html(result: LatentMealResearchResult) -> str:
             f"<td>{html.escape(str(row.segment))}</td>"
             f"<td>{html.escape(str(row.evidence_source))}</td>"
             f"<td>{'NA' if pd.isna(row.stated_carbs) else f'{float(row.stated_carbs):.1f}'}</td>"
-            f"<td>{float(row.latent_carbs_posterior_mean):.1f}</td>"
-            f"<td>{float(row.carb_accuracy_score):.3f}</td>"
+            f"<td>{float(median):.1f}</td>"
+            f"<td>[{float(lower_90):.1f}, {float(upper_90):.1f}]</td>"
+            f"<td>{float(confidence):.3f}</td>"
             f"<td>{html.escape(str(row.identifiability_status))}</td>"
-            f"<td>{html.escape(str(row.suppression_reason or 'none'))}</td>"
+            f"<td>{html.escape(str(flags or 'none'))}</td>"
             "</tr>"
         )
     return "\n".join(
@@ -984,7 +987,7 @@ def _latent_meal_posterior_html(result: LatentMealResearchResult) -> str:
             "<div class='section'>",
             "<h2>Posterior Meals</h2>",
             "<table>",
-            "<thead><tr><th>meal_id</th><th>timestamp</th><th>segment</th><th>evidence</th><th>stated_carbs</th><th>latent_carbs</th><th>accuracy_score</th><th>identifiability</th><th>suppression</th></tr></thead>",
+            "<thead><tr><th>meal_id</th><th>timestamp</th><th>segment</th><th>evidence</th><th>stated_carbs</th><th>latent_carb_median</th><th>90% interval</th><th>confidence</th><th>identifiability</th><th>flags</th></tr></thead>",
             "<tbody>",
             *rows,
             "</tbody></table>",
@@ -1013,6 +1016,9 @@ def _latent_meal_artifact_index_html(
             "latent_meal_research_gate.md",
             "meal_event_registry.csv",
             "meal_window_audit.md",
+            "latent_meal_window_audit.csv",
+            "latent_carb_estimator_report.md",
+            "latent_carb_estimates.csv",
             "latent_meal_fit_summary.md",
             "latent_meal_posterior_meals.csv",
             "latent_meal_confidence_report.md",

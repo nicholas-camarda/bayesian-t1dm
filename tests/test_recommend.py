@@ -20,16 +20,20 @@ class DummyModel:
         for name, frame in scenarios:
             if name == "current":
                 loss = 25.0
+                mean = np.array([140.0, 142.0])
             elif name == "basal_minus_10":
                 loss = 16.0
+                mean = np.array([112.0, 113.0])
             elif name == "bolus_plus_10":
                 loss = 23.0
+                mean = np.array([130.0, 131.0])
             else:
                 loss = 28.0
+                mean = np.array([145.0, 146.0])
             outputs.append(
                 ScenarioForecast(
                     scenario_name=name,
-                    mean=np.array([110.0, 112.0]),
+                    mean=mean,
                     lower=np.array([100.0, 102.0]),
                     upper=np.array([120.0, 122.0]),
                     expected_loss=loss,
@@ -97,6 +101,8 @@ def _good_data_quality(**overrides) -> DataQualitySummary:
         incomplete_window_count=0,
         reason_counts={},
         evaluation_touches_incomplete_windows=False,
+        normalized_plausibility_status="good",
+        normalized_plausibility_reasons={},
     )
     base.update(overrides)
     return DataQualitySummary(**base)
@@ -132,10 +138,11 @@ class RecordingModel:
         outputs = []
         for name, frame in scenarios:
             self.frames_by_name[name] = frame.copy()
+            mean = np.array([140.0, 140.0]) if name == "current" else np.array([110.0, 112.0])
             outputs.append(
                 ScenarioForecast(
                     scenario_name=name,
-                    mean=np.array([110.0, 112.0]),
+                    mean=mean,
                     lower=np.array([100.0, 102.0]),
                     upper=np.array([120.0, 122.0]),
                     expected_loss=10.0 if name != "current" else 20.0,
@@ -237,12 +244,12 @@ def test_build_recommendation_policy_suppresses_bolus_and_icr_when_carbs_missing
         activity_present=True,
     )
 
-    assert policy.status == "generated"
+    assert policy.status == "suppressed"
     assert "missing_carbs" in policy.reasons
-    assert allowed == {"basal"}
+    assert allowed == set()
 
 
-def test_recommend_setting_changes_marks_basal_low_confidence_when_signal_is_low():
+def test_recommend_setting_changes_suppresses_all_when_meal_truth_is_missing():
     feature_frame = pd.DataFrame(
         {
             "timestamp": pd.to_datetime(["2023-06-01 00:00:00", "2023-06-01 00:05:00"]),
@@ -269,10 +276,10 @@ def test_recommend_setting_changes_marks_basal_low_confidence_when_signal_is_low
         min_expected_gain_mgdl=5.0,
     )
 
-    assert policy.status == "generated"
-    assert all(rec.setting == "basal" for rec in recommendations)
-    assert all(rec.confidence == "low" for rec in recommendations)
-    assert all("low_signal" in rec.flags for rec in recommendations)
+    assert policy.status == "suppressed"
+    assert recommendations == []
+    assert "missing_carbs" in policy.reasons
+    assert "low_signal" in policy.reasons
 
 
 def test_build_recommendation_policy_suppresses_on_incomplete_data():
@@ -286,3 +293,91 @@ def test_build_recommendation_policy_suppresses_on_incomplete_data():
 
     assert policy.status == "suppressed"
     assert "data_incomplete" in policy.reasons
+
+
+def test_build_recommendation_policy_suppresses_on_normalized_plausibility_failure():
+    policy, _ = build_recommendation_policy(
+        walk_forward=_healthy_walk_forward(),
+        fit_diagnostics=_healthy_fit_diagnostics(),
+        data_quality=_good_data_quality(normalized_plausibility_status="failed", normalized_plausibility_reasons={"implausible_iob_rows": 1}),
+        carbs_present=True,
+        activity_present=True,
+    )
+
+    assert policy.status == "suppressed"
+    assert "normalized_plausibility_failed" in policy.reasons
+
+
+def test_icr_scenario_direction_reduces_insulin_when_ratio_increases():
+    feature_frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2023-06-01 00:00:00", "2023-06-01 00:05:00"]),
+            "bolus_units": [2.0, 0.0],
+            "insulin_activity_units": [0.8, 0.4],
+            "iob_units": [1.5, 1.0],
+            "carb_grams": [20.0, 25.0],
+            "carb_roll_sum_60m": [20.0, 45.0],
+            "carb_bolus_interaction_60m": [40.0, 0.0],
+            "carb_iob_interaction_60m": [30.0, 45.0],
+            "target_glucose": [110.0, 112.0],
+        }
+    )
+    model = RecordingModel()
+    fit = SimpleNamespace(diagnostics=_healthy_fit_diagnostics())
+
+    recommend_setting_changes(
+        model,
+        fit,
+        feature_frame,
+        scenarios=[Scenario("icr_plus_10", icr_multiplier=1.1), Scenario("icr_minus_10", icr_multiplier=0.9)],
+        walk_forward=_healthy_walk_forward(),
+        data_quality=_good_data_quality(),
+        carbs_present=True,
+        activity_present=True,
+        min_expected_gain_mgdl=5.0,
+    )
+
+    assert model.frames_by_name["icr_plus_10"]["bolus_units"].iloc[0] == pytest.approx(2.0 / 1.1)
+    assert model.frames_by_name["icr_minus_10"]["bolus_units"].iloc[0] == pytest.approx(2.0 / 0.9)
+
+
+def test_low_posterior_probability_cannot_surface_recommendation():
+    class LowPosteriorModel:
+        def scenario_forecasts(self, fit, scenarios):
+            outputs = []
+            for name, _frame in scenarios:
+                mean = np.array([140.0, 112.0]) if name == "current" else np.array([110.0, 130.0])
+                outputs.append(
+                    ScenarioForecast(
+                        scenario_name=name,
+                        mean=mean,
+                        lower=mean - 5.0,
+                        upper=mean + 5.0,
+                        expected_loss=1.0,
+                    )
+                )
+            return outputs
+
+    feature_frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2023-06-01 00:00:00", "2023-06-01 00:05:00"]),
+            "target_glucose": [110.0, 110.0],
+            "bolus_units": [1.0, 0.0],
+        }
+    )
+    fit = SimpleNamespace(diagnostics=_healthy_fit_diagnostics())
+
+    recommendations, _, policy = recommend_setting_changes(
+        LowPosteriorModel(),
+        fit,
+        feature_frame,
+        scenarios=[Scenario("bolus_plus_10", bolus_multiplier=1.1)],
+        walk_forward=_healthy_walk_forward(),
+        data_quality=_good_data_quality(),
+        carbs_present=True,
+        activity_present=True,
+        min_expected_gain_mgdl=1.0,
+    )
+
+    assert policy.status == "generated"
+    assert recommendations == []

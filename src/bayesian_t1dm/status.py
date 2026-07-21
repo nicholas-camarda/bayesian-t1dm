@@ -191,7 +191,7 @@ def _therapy_blockers(research_result: TherapyResearchResult, overnight_summary:
                 "detail": "The current overnight evidence is heavily confounded by closed-loop behavior or proxy meal signal.",
             }
         )
-    if not gate.empty and gate["source_quality_status"].astype(str).isin({"degraded", "failed"}).any():
+    if not gate.empty and gate["source_quality_status"].astype(str).isin({"degraded", "failed", "broken"}).any():
         blockers.append(
             {
                 "code": "degraded_source_quality",
