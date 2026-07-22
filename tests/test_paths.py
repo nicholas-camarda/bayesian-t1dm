@@ -22,7 +22,7 @@ def test_pytest_process_unconditionally_isolates_home_runtime_and_cloud():
     assert paths.cloud_root == (test_home / "cloud").resolve()
 
 
-def test_project_paths_default_runtime_reports_and_cloud_raw(tmp_path):
+def test_project_paths_ensure_creates_runtime_paths_without_creating_cloud_paths(tmp_path):
     root = tmp_path / "bayesian-t1dm"
     root.mkdir()
 
@@ -36,7 +36,7 @@ def test_project_paths_default_runtime_reports_and_cloud_raw(tmp_path):
     assert paths.cloud_raw == tmp_path / "cloud" / "data" / "raw"
     assert paths.cloud_output == tmp_path / "cloud" / "output"
     assert paths.reports.exists()
-    assert paths.cloud_raw.exists()
+    assert not paths.cloud_root.exists()
 
 
 def test_project_paths_default_slug_survives_workspace_source_checkout(

@@ -112,10 +112,6 @@ class ProjectPaths:
             self.logs,
             self.runtime_archive,
             self.legacy_output_archive,
-            self.cloud_root,
-            self.cloud_raw,
-            self.cloud_output,
-            self.cloud_archive,
         ]:
             path.mkdir(parents=True, exist_ok=True)
         return self
