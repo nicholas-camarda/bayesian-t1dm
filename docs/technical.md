@@ -6,7 +6,7 @@ The active pipeline is:
 
 1. Tandem Mobi syncs to Tandem Source through the mobile app
 2. `tconnectsync` logs in to Tandem Source and queries API windows directly
-3. raw API responses are archived under `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/tconnectsync/<window_id>/raw/`
+3. raw API responses are archived under `~/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm/data/raw/tconnectsync/<window_id>/raw/`
 4. normalized CGM, bolus, basal, and activity tables are written beside the raw responses
 5. optional Health Auto Export bundles are archived under `data/raw/health_auto_export/<export_id>/...`
 6. imported Apple Health tables are unified with deterministic latest-export-wins overlap resolution
@@ -45,9 +45,9 @@ Storage convention:
 
 - code: `~/Workspaces/bayesian-t1dm/source`
 - runtime outputs, scratch space, and intermediate artifacts: `~/Workspaces/bayesian-t1dm/runtime`
-- cloud project home: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm`
-- scraped/raw acquisition data: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw`
-- final published outputs: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/output`
+- cloud project home: `~/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm`
+- scraped/raw acquisition data: `~/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm/data/raw`
+- final published outputs: `~/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm/output`
 - default working summaries: `~/Workspaces/bayesian-t1dm/runtime/output`
 
 Raw discovery rules:

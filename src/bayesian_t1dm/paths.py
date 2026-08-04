@@ -60,7 +60,8 @@ class ProjectPaths:
             / "Library"
             / "CloudStorage"
             / "OneDrive-Personal"
-            / "SideProjects"
+            / "Project Vault"
+            / "Personal Projects"
             / PROJECT_SLUG
         )
         return cls(

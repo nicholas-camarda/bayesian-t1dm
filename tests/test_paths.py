@@ -57,6 +57,7 @@ def test_project_paths_default_slug_survives_workspace_source_checkout(
         / "Library"
         / "CloudStorage"
         / "OneDrive-Personal"
-        / "SideProjects"
+        / "Project Vault"
+        / "Personal Projects"
         / "bayesian-t1dm"
     )

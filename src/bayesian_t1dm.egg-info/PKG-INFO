@@ -213,7 +213,7 @@ If you have new Health Auto Export bundles that have not been imported yet, run 
 
 ```bash
 bayesian-t1dm import-health-auto-export --input \
-  ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data
+  "$HOME/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm/data/raw/apple_health_data"
 ```
 
 Then rerun:
@@ -282,7 +282,7 @@ Use these less often, when needed:
 ```bash
 # import new Apple Health bundles
 bayesian-t1dm import-health-auto-export --input \
-  ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data
+  "$HOME/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm/data/raw/apple_health_data"
 
 # repair or inspect Tandem raw data
 bayesian-t1dm normalize-raw
@@ -342,7 +342,7 @@ This keeps raw-window repair, coverage review, and predictive validation separat
 Canonical Tandem + Apple Health workflow:
 
 1. `bayesian-t1dm normalize-raw`
-2. `bayesian-t1dm import-health-auto-export --input ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data` when new bundles need to be imported
+2. `bayesian-t1dm import-health-auto-export --input "$HOME/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm/data/raw/apple_health_data"` when new bundles need to be imported
 3. `bayesian-t1dm prepare-model-data`
 4. `bayesian-t1dm screen-health-features`
 5. `bayesian-t1dm run --skip-recommendations`
@@ -358,7 +358,7 @@ Canonical Tandem-only fallback workflow:
 Canonical therapy evidence workflow:
 
 1. `bayesian-t1dm normalize-raw`
-2. `bayesian-t1dm import-health-auto-export --input ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data` when new bundles need to be imported
+2. `bayesian-t1dm import-health-auto-export --input "$HOME/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm/data/raw/apple_health_data"` when new bundles need to be imported
 3. `bayesian-t1dm prepare-model-data`
 4. `bayesian-t1dm review-therapy-evidence`
 5. review `therapy_review.html` first, then inspect the linked supporting artifacts if you need to go deeper
@@ -396,7 +396,7 @@ Canonical project organization:
 
 - code: `~/Workspaces/bayesian-t1dm/source`
 - runtime outputs, scratch space, and intermediate artifacts: `~/Workspaces/bayesian-t1dm/runtime`
-- cloud project home: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm`
+- cloud project home: `~/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm`
 
 Within the cloud project home:
 
