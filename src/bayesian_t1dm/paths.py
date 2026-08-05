@@ -5,6 +5,9 @@ from pathlib import Path
 import os
 
 
+PROJECT_SLUG = "bayesian-t1dm"
+
+
 @dataclass(frozen=True)
 class ProjectPaths:
     root: Path
@@ -43,11 +46,24 @@ class ProjectPaths:
         cloud_root: str | Path | None = None,
     ) -> "ProjectPaths":
         root_path = Path(root or Path.cwd()).resolve()
-        slug = root_path.name
         runtime_env = runtime_root or os.getenv("BAYESIAN_T1DM_RUNTIME_ROOT")
         cloud_env = cloud_root or os.getenv("BAYESIAN_T1DM_CLOUD_ROOT")
-        runtime_path = Path(runtime_env).expanduser().resolve() if runtime_env else Path.home() / "ProjectsRuntime" / slug
-        cloud_path = Path(cloud_env).expanduser().resolve() if cloud_env else Path.home() / "Library" / "CloudStorage" / "OneDrive-Personal" / "SideProjects" / slug
+        runtime_path = (
+            Path(runtime_env).expanduser().resolve()
+            if runtime_env
+            else Path.home() / "Workspaces" / PROJECT_SLUG / "runtime"
+        )
+        cloud_path = (
+            Path(cloud_env).expanduser().resolve()
+            if cloud_env
+            else Path.home()
+            / "Library"
+            / "CloudStorage"
+            / "OneDrive-Personal"
+            / "Project Vault"
+            / "Personal Projects"
+            / PROJECT_SLUG
+        )
         return cls(
             root=root_path,
             raw=root_path / "data" / "raw",
@@ -97,10 +113,6 @@ class ProjectPaths:
             self.logs,
             self.runtime_archive,
             self.legacy_output_archive,
-            self.cloud_root,
-            self.cloud_raw,
-            self.cloud_output,
-            self.cloud_archive,
         ]:
             path.mkdir(parents=True, exist_ok=True)
         return self

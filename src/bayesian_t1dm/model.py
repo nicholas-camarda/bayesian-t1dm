@@ -250,6 +250,7 @@ class BayesianGlucoseModel:
         beta = self._stack_draws(posterior, "beta")
         latent = self._stack_draws(posterior, "latent")
         rho = self._stack_draws(posterior, "rho")
+        sigma_state = self._stack_draws(posterior, "sigma_state")
 
         if beta.ndim != 2:
             beta = np.reshape(beta, (beta.shape[0], -1))
@@ -267,7 +268,7 @@ class BayesianGlucoseModel:
         state = last_latent.copy()
         for t in range(n_obs):
             linear = intercept + (X[t] @ beta.T)
-            state = rho * state
+            state = rho * state + rng.normal(0.0, sigma_state, size=n_samples)
             mean[:, t] = (linear + state) * fit.target_scale + fit.target_mean
         # Add observation noise to each posterior draw before computing quantiles,
         # so that predictive intervals reflect full posterior predictive uncertainty.

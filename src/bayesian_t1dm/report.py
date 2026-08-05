@@ -60,6 +60,7 @@ def write_markdown_report(summary: dict[str, Any], path: str | Path) -> Path:
         lines.append("## Data Quality")
         data_quality = summary["data_quality"]
         lines.append(f"- status: {data_quality.get('status')}")
+        lines.append(f"- normalized_plausibility_status: {data_quality.get('normalized_plausibility_status')}")
         lines.append(f"- incomplete_window_count: {data_quality.get('incomplete_window_count')}")
         lines.append(
             f"- evaluation_touches_incomplete_windows: {data_quality.get('evaluation_touches_incomplete_windows')}"
@@ -72,6 +73,12 @@ def write_markdown_report(summary: dict[str, Any], path: str | Path) -> Path:
             lines.append(
                 "- reason_counts: "
                 + ", ".join(f"{key}={value}" for key, value in reason_counts.items())
+            )
+        plausibility_reasons = data_quality.get("normalized_plausibility_reasons") or {}
+        if plausibility_reasons:
+            lines.append(
+                "- normalized_plausibility_reasons: "
+                + ", ".join(f"{key}={value}" for key, value in plausibility_reasons.items())
             )
     if summary.get("walk_forward"):
         lines.append("")
@@ -86,18 +93,24 @@ def write_markdown_report(summary: dict[str, Any], path: str | Path) -> Path:
         folds = walk_forward.get("folds") or []
         if folds:
             lines.append("")
-            lines.append("| fold | n_train | n_test | model_mae | model_rmse | model_coverage | persistence_mae |")
-            lines.append("| ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+            lines.append("| fold | test_span | n_train | n_test | model_mae | model_rmse | model_coverage | interval_width | persistence_mae | missing_cgm | invalid_cgm | max_gap_min |")
+            lines.append("| ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
             for fold in folds:
                 lines.append(
-                    "| {fold} | {n_train} | {n_test} | {model_mae:.4f} | {model_rmse:.4f} | {model_coverage:.3f} | {persistence_mae:.4f} |".format(
+                    "| {fold} | {test_start} to {test_end} | {n_train} | {n_test} | {model_mae:.4f} | {model_rmse:.4f} | {model_coverage:.3f} | {interval_width:.2f} | {persistence_mae:.4f} | {missing_cgm:.3f} | {invalid_cgm:.3f} | {max_gap} |".format(
                         fold=int(fold.get("fold", 0)),
+                        test_start=fold.get("test_start_timestamp") or "NA",
+                        test_end=fold.get("test_end_timestamp") or "NA",
                         n_train=int(fold.get("n_train", 0)),
                         n_test=int(fold.get("n_test", 0)),
                         model_mae=float(fold.get("model_mae", float("nan"))),
                         model_rmse=float(fold.get("model_rmse", float("nan"))),
                         model_coverage=float(fold.get("model_coverage", float("nan"))),
+                        interval_width=float(fold.get("model_interval_width", float("nan"))),
                         persistence_mae=float(fold.get("persistence_mae", float("nan"))),
+                        missing_cgm=float(fold.get("missing_cgm_fraction") or 0.0),
+                        invalid_cgm=float(fold.get("invalid_cgm_fraction") or 0.0),
+                        max_gap="NA" if fold.get("max_timestamp_gap_minutes") is None else f"{float(fold['max_timestamp_gap_minutes']):.1f}",
                     )
                 )
             diagnostics_rows = [fold for fold in folds if fold.get("fit_diagnostics")]

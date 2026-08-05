@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -26,7 +26,7 @@ SUPPORTED_POINT_METRICS = {
 }
 SUPPORTED_INTERVAL_METRICS = {"sleep_analysis"}
 SUPPORTED_METRICS = SUPPORTED_POINT_METRICS | SUPPORTED_INTERVAL_METRICS | {"heart_rate"}
-IGNORED_GLUCOSE_METRICS = {"blood_glucose"}
+SUPPORTED_GLUCOSE_METRICS = {"blood_glucose"}
 EXPORT_ID_PATTERN = re.compile(r"HealthAutoExport_(\d{14})$")
 EXPORT_JSON_PATTERN = re.compile(r"HealthAutoExport-(\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2})\.json$")
 
@@ -71,6 +71,8 @@ class AnalysisReadyHealthDataset:
     mode: str = "tandem_only"
     apple_available: bool = False
     explicit_carb_source_available: bool = False
+    source_quality_status: str = "unknown"
+    normalized_plausibility_status: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -229,6 +231,27 @@ def _normalize_point_metric(metric_name: str, units: str | None, rows: Iterable[
     return pd.DataFrame(records)
 
 
+def _normalize_glucose_metric(rows: Iterable[dict[str, Any]], *, source_file: str) -> pd.DataFrame:
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        timestamp = _parse_timestamp(row.get("date"))
+        glucose = _safe_float(row.get("qty"))
+        if pd.isna(timestamp) or glucose is None:
+            continue
+        timestamp = timestamp.floor("5min")
+        records.append(
+            {
+                "timestamp": timestamp,
+                "glucose": glucose,
+                "source_file": source_file,
+                "source_label": "apple_health",
+                "glucose_source": "apple_health_blood_glucose",
+                "source_device": str(row.get("source") or ""),
+            }
+        )
+    return pd.DataFrame(records)
+
+
 def _normalize_heart_rate_metric(rows: Iterable[dict[str, Any]], *, units: str | None, source_file: str) -> pd.DataFrame:
     records: list[dict[str, Any]] = []
     for row in rows:
@@ -342,6 +365,7 @@ def _bundle_metadata_columns() -> list[str]:
 def _empty_health_tables() -> dict[str, pd.DataFrame]:
     metadata_columns = _bundle_metadata_columns()
     return {
+        "cgm": pd.DataFrame(columns=["timestamp", "glucose", "source_file", "source_label", "glucose_source", "source_device", *metadata_columns]),
         "health_activity": pd.DataFrame(columns=["timestamp", "activity_value", "source_file", "source_device", *metadata_columns]),
         "health_measurements": pd.DataFrame(
             columns=["timestamp", "metric", "stat", "value", "unit", "source_file", "source_device", *metadata_columns]
@@ -411,6 +435,7 @@ def _normalize_health_payload(payload: dict[str, Any], *, source_file: str) -> t
         raise ValueError("Health Auto Export payload metrics must be a list")
 
     tables = _empty_health_tables()
+    cgm_frames: list[pd.DataFrame] = []
     measurement_frames: list[pd.DataFrame] = []
     sleep_frames: list[pd.DataFrame] = []
     ignored_metrics: list[str] = []
@@ -425,8 +450,9 @@ def _normalize_health_payload(payload: dict[str, Any], *, source_file: str) -> t
         if not isinstance(rows, list):
             ignored_metrics.append(metric_name)
             continue
-        if metric_name in IGNORED_GLUCOSE_METRICS:
+        if metric_name in SUPPORTED_GLUCOSE_METRICS:
             glucose_present = True
+            cgm_frames.append(_normalize_glucose_metric(rows, source_file=source_file))
             continue
         if metric_name in SUPPORTED_POINT_METRICS:
             measurement_frames.append(_normalize_point_metric(metric_name, units, rows, source_file=source_file))
@@ -436,6 +462,13 @@ def _normalize_health_payload(payload: dict[str, Any], *, source_file: str) -> t
             sleep_frames.append(_normalize_sleep_metric(rows, source_file=source_file))
         else:
             ignored_metrics.append(metric_name)
+
+    if cgm_frames:
+        cgm = pd.concat(cgm_frames, ignore_index=True, sort=False)
+        cgm["timestamp"] = _parse_series(cgm["timestamp"])
+        cgm["glucose"] = pd.to_numeric(cgm["glucose"], errors="coerce")
+        cgm = cgm.dropna(subset=["timestamp", "glucose"]).reset_index(drop=True)
+        tables["cgm"] = cgm
 
     if measurement_frames:
         measurements = pd.concat(measurement_frames, ignore_index=True, sort=False)
@@ -591,6 +624,7 @@ def _canonicalize_health_table_types(kind: str, frame: pd.DataFrame) -> pd.DataF
             out[column] = _parse_series(out[column])
     for column in [
         "activity_value",
+        "glucose",
         "value",
         "total_sleep_hours",
         "in_bed_hours",
@@ -639,6 +673,9 @@ def _dedupe_canonical_health_table(kind: str, frame: pd.DataFrame) -> pd.DataFra
     if kind == "health_measurements":
         subset = ["timestamp", "metric", "stat", "source_device"]
         return out.drop_duplicates(subset=subset, keep="last").reset_index(drop=True)
+    if kind == "cgm":
+        subset = ["timestamp", "glucose", "source_device"]
+        return out.drop_duplicates(subset=subset, keep="last").reset_index(drop=True)
     if kind == "health_activity":
         subset = ["timestamp", "source_device"]
         return out.drop_duplicates(subset=subset, keep="last").reset_index(drop=True)
@@ -685,6 +722,54 @@ def load_unified_health_auto_export_tables(raw_dir: str | Path) -> dict[str, pd.
 
 def load_health_auto_export_tables(raw_dir: str | Path) -> dict[str, pd.DataFrame]:
     return load_unified_health_auto_export_tables(raw_dir)
+
+
+def _event_span(frame: pd.DataFrame, column: str) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    if frame.empty or column not in frame.columns:
+        return None, None
+    parsed = _parse_series(frame[column]).dropna()
+    if parsed.empty:
+        return None, None
+    return pd.Timestamp(parsed.min()), pd.Timestamp(parsed.max())
+
+
+def _tandem_glucose_modeling_span(data: IngestedData) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    spans = [
+        _event_span(data.cgm, "timestamp"),
+        _event_span(data.bolus, "timestamp"),
+    ]
+    starts = [start for start, _ in spans if start is not None]
+    ends = [end for _, end in spans if end is not None]
+    if not starts or not ends:
+        return None, None
+    return min(starts), max(ends)
+
+
+def _with_health_glucose_fill(tandem_data: IngestedData, health_data: IngestedData, *, freq: str) -> IngestedData:
+    if health_data.cgm.empty or "timestamp" not in health_data.cgm.columns or "glucose" not in health_data.cgm.columns:
+        return tandem_data
+    start, end = _tandem_glucose_modeling_span(tandem_data)
+    if start is None or end is None:
+        return tandem_data
+    tandem_cgm = tandem_data.cgm.copy()
+    health_cgm = health_data.cgm.copy()
+    tandem_timestamps = (
+        _parse_series(tandem_cgm["timestamp"], floor=freq).dropna()
+        if not tandem_cgm.empty and "timestamp" in tandem_cgm.columns
+        else pd.Series(dtype="datetime64[ns]")
+    )
+    occupied_timestamps = set(tandem_timestamps)
+    health_cgm["timestamp"] = _parse_series(health_cgm["timestamp"], floor=freq)
+    health_cgm["glucose"] = pd.to_numeric(health_cgm["glucose"], errors="coerce")
+    health_cgm = health_cgm.dropna(subset=["timestamp", "glucose"])
+    health_cgm = health_cgm.loc[
+        health_cgm["timestamp"].between(start.floor(freq), end.ceil(freq))
+        & ~health_cgm["timestamp"].isin(occupied_timestamps)
+    ].copy()
+    if health_cgm.empty:
+        return tandem_data
+    combined_cgm = pd.concat([tandem_cgm, health_cgm], ignore_index=True, sort=False)
+    return replace(tandem_data, cgm=combined_cgm)
 
 
 def has_apple_health_data(data: IngestedData) -> bool:
@@ -759,6 +844,8 @@ def _window_periods(window_minutes: int, *, step_minutes: int) -> int:
 def build_health_context_frame(base_frame: pd.DataFrame, data: IngestedData, *, freq: str = "5min") -> tuple[pd.DataFrame, list[str]]:
     out = base_frame.loc[:, ["timestamp"]].copy()
     out["timestamp"] = _parse_series(out["timestamp"])
+    out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce").astype("datetime64[ns]")
+    out = out.sort_values("timestamp").reset_index(drop=True)
 
     feature_columns: list[str] = []
     step_minutes = max(int(pd.Timedelta(freq).total_seconds() // 60), 1)
@@ -773,9 +860,13 @@ def build_health_context_frame(base_frame: pd.DataFrame, data: IngestedData, *, 
             out = out.merge(activity, on="timestamp", how="left")
             out["health_activity_value"] = out["health_activity_value"].fillna(0.0)
             for window in (30, 60, 120):
-                periods = max(int(window / step_minutes), 1)
                 column = f"health_activity_roll_sum_{window}m"
-                out[column] = out["health_activity_value"].rolling(periods, min_periods=1).sum()
+                out[column] = (
+                    out.set_index("timestamp")["health_activity_value"]
+                    .rolling(f"{window}min", min_periods=1)
+                    .sum()
+                    .to_numpy()
+                )
                 feature_columns.append(column)
             feature_columns.append("health_activity_value")
 
@@ -891,30 +982,19 @@ def build_health_context_frame(base_frame: pd.DataFrame, data: IngestedData, *, 
         for column in ["workout_event_count", "workout_duration_event", "workout_energy_event"]:
             out[column] = pd.to_numeric(out[column], errors="coerce").fillna(0.0)
 
-        out["recent_workout_6h"] = (
-            out["workout_event_count"].rolling(_window_periods(6 * 60, step_minutes=step_minutes), min_periods=1).sum().gt(0)
-        ).astype(int)
-        out["recent_workout_12h"] = (
-            out["workout_event_count"].rolling(_window_periods(12 * 60, step_minutes=step_minutes), min_periods=1).sum().gt(0)
-        ).astype(int)
-        out["workout_count_24h"] = out["workout_event_count"].rolling(
-            _window_periods(24 * 60, step_minutes=step_minutes),
-            min_periods=1,
-        ).sum()
-        out["workout_duration_sum_24h"] = out["workout_duration_event"].rolling(
-            _window_periods(24 * 60, step_minutes=step_minutes),
-            min_periods=1,
-        ).sum()
-        out["workout_active_energy_sum_24h"] = out["workout_energy_event"].rolling(
-            _window_periods(24 * 60, step_minutes=step_minutes),
-            min_periods=1,
-        ).sum()
+        indexed_workouts = out.set_index("timestamp")
+        out["workout_count_24h"] = indexed_workouts["workout_event_count"].rolling("24h", min_periods=1).sum().to_numpy()
+        out["workout_duration_sum_24h"] = indexed_workouts["workout_duration_event"].rolling("24h", min_periods=1).sum().to_numpy()
+        out["workout_active_energy_sum_24h"] = indexed_workouts["workout_energy_event"].rolling("24h", min_periods=1).sum().to_numpy()
         out["minutes_since_last_workout"] = out["minutes_since_last_workout"].fillna(1e6)
         out["workout_summary_plausible"] = (
             out["workout_count_24h"].le(12)
             & out["workout_duration_sum_24h"].le(24 * 60 * 60)
             & out["minutes_since_last_workout"].ge(0)
         ).astype(int)
+        workout_plausible = out["workout_summary_plausible"].eq(1)
+        out["recent_workout_6h"] = (out["minutes_since_last_workout"].le(6 * 60) & workout_plausible).astype(int)
+        out["recent_workout_12h"] = (out["minutes_since_last_workout"].le(12 * 60) & workout_plausible).astype(int)
         out = out.drop(columns=["_last_workout_end_timestamp", "workout_event_count", "workout_duration_event", "workout_energy_event"])
         feature_columns.extend(
             [
@@ -1039,7 +1119,9 @@ def build_analysis_ready_health_dataset(
     health_data: IngestedData,
     config: FeatureConfig | None = None,
 ) -> AnalysisReadyHealthDataset:
-    feature_frame = build_feature_frame(tandem_data, config or FeatureConfig())
+    resolved_config = config or FeatureConfig()
+    modeling_data = _with_health_glucose_fill(tandem_data, health_data, freq=resolved_config.freq)
+    feature_frame = build_feature_frame(modeling_data, resolved_config)
     explicit_carb_source_available = bool(not tandem_data.carbs.empty)
     feature_frame_frame = feature_frame.frame.copy()
     if not feature_frame_frame.empty:
@@ -1357,6 +1439,9 @@ def write_model_data_preparation_report(result: ModelDataPreparationResult, path
         f"- final_dataset_start: {result.final_dataset_start}",
         f"- final_dataset_end: {result.final_dataset_end}",
         f"- final_row_count: {result.final_row_count}",
+        f"- source_quality_status: {result.dataset.source_quality_status}",
+        f"- normalized_plausibility_status: {result.dataset.normalized_plausibility_status}",
+        f"- explicit_carb_source_available: {result.dataset.explicit_carb_source_available}",
         f"- health_features_included: {bool(result.dataset.health_feature_columns)}",
         f"- health_feature_count: {len(result.dataset.health_feature_columns)}",
         "",

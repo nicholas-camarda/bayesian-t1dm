@@ -1,19 +1,25 @@
 from __future__ import annotations
 
+from dataclasses import replace
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import bayesian_t1dm.cli as cli
 from bayesian_t1dm.cli import main
 from bayesian_t1dm.health_auto_export import AnalysisReadyHealthDataset
 from bayesian_t1dm.features import FeatureConfig
 from bayesian_t1dm.therapy_research import (
+    LatentMealTherapySettings,
     build_representative_latent_meal_fixture,
     build_first_meal_clean_window_registry,
+    build_latent_meal_tiered_window_registry,
     build_therapy_research_frame,
+    extract_latent_meal_therapy_settings_from_tandem_raw,
     parse_model_list,
     parse_therapy_segments,
     run_latent_meal_icr_research,
@@ -23,6 +29,70 @@ from bayesian_t1dm.therapy_research import (
     validate_therapy_infra,
     _synthetic_base_dataset,
 )
+
+
+def _latent_settings() -> LatentMealTherapySettings:
+    return LatentMealTherapySettings(
+        icr_grams_per_unit={"overnight": 12.0, "morning": 10.0, "afternoon": 11.0, "evening": 9.0},
+        correction_factor_mgdl_per_unit={"overnight": 45.0, "morning": 40.0, "afternoon": 45.0, "evening": 40.0},
+        target_glucose_mgdl=110.0,
+        insulin_action_minutes=300,
+        carb_absorption_minutes_prior=180,
+        max_plausible_meal_carbs=180.0,
+    )
+
+
+def _pump_event_metadata_payload() -> dict:
+    return {
+        "requested_end": "2026-03-31",
+        "selected_pump": {
+            "lastUpload": {
+                "lastUploadedAt": "2026-04-01T02:15:16.6",
+                "settings": {
+                    "profiles": {
+                        "activeIdp": 0,
+                        "profile": [
+                            {
+                                "idp": 0,
+                                "name": "Main",
+                                "insulinDuration": 300,
+                                "maxBolus": 25000,
+                                "tDependentSegs": [
+                                    {"startTime": 0, "carbRatio": 7000, "isf": 60, "targetBg": 110},
+                                    {"startTime": 300, "carbRatio": 7000, "isf": 65, "targetBg": 110},
+                                    {"startTime": 540, "carbRatio": 7000, "isf": 65, "targetBg": 110},
+                                    {"startTime": 900, "carbRatio": 6800, "isf": 60, "targetBg": 110},
+                                    {"startTime": 1140, "carbRatio": 6800, "isf": 60, "targetBg": 110},
+                                    {"startTime": 1260, "carbRatio": 7000, "isf": 58, "targetBg": 110},
+                                ],
+                            },
+                            {
+                                "idp": 1,
+                                "name": "Unused",
+                                "insulinDuration": 300,
+                                "maxBolus": 25000,
+                                "tDependentSegs": [{"startTime": 0, "carbRatio": 12000, "isf": 80, "targetBg": 120}],
+                            },
+                        ],
+                    },
+                    "pumpSettings": {"maxBolus": 25000},
+                },
+            }
+        },
+    }
+
+
+def _first_latent_carb_median(dataset: AnalysisReadyHealthDataset) -> float:
+    result = run_latent_meal_icr_research(
+        dataset,
+        segments=parse_therapy_segments(),
+        meal_proxy_mode="strict",
+        research_scope="full",
+        therapy_settings=_latent_settings(),
+    )
+    assert result.latent_carb_estimates is not None
+    assert not result.latent_carb_estimates.empty
+    return float(result.latent_carb_estimates.sort_values("meal_start")["latent_carb_median"].iloc[0])
 
 
 def _build_prepared_dataset(*, apple: bool) -> AnalysisReadyHealthDataset:
@@ -214,6 +284,35 @@ def test_build_therapy_research_frame_assigns_segments_and_contexts():
     assert set(research_frame["meal_truth_status"]) >= {"observed_explicit", "missing_from_source"}
 
 
+def test_build_therapy_research_frame_splits_step_activity_from_hard_exercise():
+    dataset = _build_prepared_dataset(apple=True)
+    frame = dataset.frame.copy()
+    frame["recent_workout_6h"] = 0
+    frame["recent_workout_12h"] = 0
+    frame["workout_summary_plausible"] = 1
+    frame["health_activity_roll_sum_60m"] = 0.0
+    frame.loc[[10, 11, 12], "health_activity_roll_sum_60m"] = [1.0, 600.0, 1200.0]
+    dataset = replace(dataset, frame=frame)
+
+    research_frame = build_therapy_research_frame(dataset, segments=parse_therapy_segments())
+
+    light = research_frame.loc[research_frame["timestamp"].eq(frame.loc[10, "timestamp"])].iloc[0]
+    moderate = research_frame.loc[research_frame["timestamp"].eq(frame.loc[11, "timestamp"])].iloc[0]
+    high = research_frame.loc[research_frame["timestamp"].eq(frame.loc[12, "timestamp"])].iloc[0]
+    assert int(light["light_activity_context"]) == 1
+    assert int(light["moderate_activity_context"]) == 0
+    assert int(light["high_activity_context"]) == 0
+    assert int(light["recent_exercise_context"]) == 0
+    assert int(moderate["light_activity_context"]) == 0
+    assert int(moderate["moderate_activity_context"]) == 1
+    assert int(moderate["high_activity_context"]) == 0
+    assert int(moderate["recent_exercise_context"]) == 0
+    assert int(high["light_activity_context"]) == 0
+    assert int(high["moderate_activity_context"]) == 0
+    assert int(high["high_activity_context"]) == 1
+    assert int(high["recent_exercise_context"]) == 1
+
+
 def test_build_therapy_research_frame_handles_missing_meal_signal_without_marking_all_rows_as_meals():
     dataset = _build_prepared_dataset(apple=True)
     frame = dataset.frame.copy()
@@ -335,10 +434,23 @@ def test_run_latent_meal_icr_research_full_scope_builds_posterior_outputs():
         segments=parse_therapy_segments(),
         meal_proxy_mode="strict",
         research_scope="full",
+        therapy_settings=_latent_settings(),
     )
 
     assert result.research_scope == "full"
     assert not result.posterior_meals.empty
+    assert result.latent_carb_estimates is not None
+    assert not result.latent_carb_estimates.empty
+    assert {
+        "latent_carb_median",
+        "latent_carb_lower_50",
+        "latent_carb_upper_50",
+        "latent_carb_lower_90",
+        "latent_carb_upper_90",
+        "absorption_minutes_mean",
+        "post_meal_control_success",
+        "confidence",
+    }.issubset(result.posterior_meals.columns)
     assert not result.model_comparison.empty
     assert int(result.model_comparison["selected"].sum()) == 1
     assert "Latent Meal Fit Summary" in result.fit_summary_markdown
@@ -355,13 +467,72 @@ def test_run_latent_meal_icr_research_full_scope_caps_proxy_only_confidence():
         segments=parse_therapy_segments(),
         meal_proxy_mode="strict",
         research_scope="full",
+        therapy_settings=_latent_settings(),
     )
 
     assert not result.posterior_meals.empty
     assert float(result.posterior_meals["carb_accuracy_score"].max()) <= 0.75 + 1e-9
+    assert float(result.posterior_meals["confidence"].max()) <= 0.75 + 1e-9
     assert set(result.posterior_meals["evidence_source"]) == {"proxy_only"}
     selected = result.model_comparison.loc[result.model_comparison["selected"].astype(bool)].iloc[0]
     assert float(selected["peak_delta_mae"]) == float(result.model_comparison["peak_delta_mae"].min())
+
+
+def test_latent_carb_light_activity_does_not_set_exercise_context():
+    dataset = _build_clean_first_meal_dataset(apple=True, explicit_carbs=False)
+    frame = dataset.frame.copy()
+    frame["health_activity_roll_sum_60m"] = 100.0
+    dataset = replace(dataset, frame=frame)
+
+    result = run_latent_meal_icr_research(
+        dataset,
+        segments=parse_therapy_segments(),
+        meal_proxy_mode="strict",
+        research_scope="full",
+        therapy_settings=_latent_settings(),
+    )
+
+    assert not result.posterior_meals.empty
+    flags = result.posterior_meals["flags"].astype(str)
+    assert not flags.str.contains("exercise_context", regex=False).any()
+    assert flags.str.contains("light_activity_context", regex=False).any()
+    assert int(pd.to_numeric(result.posterior_meals["recent_workout_context"], errors="coerce").fillna(0).sum()) == 0
+    assert int(pd.to_numeric(result.posterior_meals["high_activity_context"], errors="coerce").fillna(0).sum()) == 0
+
+
+def test_extract_latent_meal_therapy_settings_from_tandem_pump_metadata(tmp_path):
+    raw_dir = tmp_path / "raw" / "tconnectsync" / "2026-03-02__2026-03-31" / "raw"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "pump_event_metadata.json").write_text(json.dumps(_pump_event_metadata_payload()), encoding="utf-8")
+
+    settings = extract_latent_meal_therapy_settings_from_tandem_raw(tmp_path / "raw", segments=parse_therapy_segments())
+
+    assert settings.insulin_action_minutes == 300
+    assert settings.target_glucose_mgdl == pytest.approx(110.0)
+    assert settings.max_plausible_meal_carbs == pytest.approx(175.0)
+    assert settings.icr_grams_per_unit["morning"] == pytest.approx(7.0)
+    assert settings.icr_grams_per_unit["afternoon"] == pytest.approx((7.0 * 48 + 6.8 * 24) / 72)
+    assert settings.correction_factor_mgdl_per_unit["evening"] == pytest.approx((60.0 * 48 + 58.0 * 36) / 84)
+
+
+def test_latent_carb_estimator_directionality_with_insulin_and_glucose_response():
+    base = _build_clean_first_meal_dataset(apple=False, explicit_carbs=False)
+    base_median = _first_latent_carb_median(base)
+
+    more_insulin_frame = base.frame.copy()
+    bolus_mask = pd.to_numeric(more_insulin_frame["bolus_units"], errors="coerce").fillna(0.0).gt(0)
+    more_insulin_frame.loc[bolus_mask, "bolus_units"] *= 1.5
+    more_insulin_median = _first_latent_carb_median(replace(base, frame=more_insulin_frame))
+
+    larger_response_frame = base.frame.copy()
+    timestamps = pd.to_datetime(larger_response_frame["timestamp"], errors="coerce")
+    for meal_time in timestamps.loc[bolus_mask]:
+        response_mask = timestamps.ge(meal_time) & timestamps.le(meal_time + pd.Timedelta(minutes=180))
+        larger_response_frame.loc[response_mask, "glucose"] += 25.0
+    larger_response_median = _first_latent_carb_median(replace(base, frame=larger_response_frame))
+
+    assert more_insulin_median > base_median
+    assert larger_response_median > base_median
 
 
 def test_build_representative_latent_meal_fixture_retains_candidate_days_and_selects_background_days(tmp_path):
@@ -486,6 +657,37 @@ def test_strict_meal_proxy_only_creates_high_confidence_meal_contexts():
 
     assert research_frame["meal_proxy_event"].sum() > 0
     assert set(research_frame.loc[research_frame["meal_proxy_event"].eq(1), "bolus_proxy_class"]) == {"meal_like"}
+
+
+def test_latent_meal_tiered_window_registry_preserves_clean_gate_and_marks_relaxed_rows():
+    windows = pd.DataFrame(
+        {
+            "candidate_id": ["clean", "workout", "controller", "baseline", "exploratory", "bad_cgm"],
+            "included": [1, 0, 0, 0, 0, 0],
+            "exclusion_reasons": [
+                "",
+                "recent_workout_6h",
+                "recent_workout_6h|closed_loop_confounding_premeal",
+                "premeal_bg_out_of_range|steep_premeal_slope",
+                "postmeal_additional_bolus_120m|recent_bolus_4h",
+                "poor_cgm_coverage",
+            ],
+        }
+    )
+
+    tiered = build_latent_meal_tiered_window_registry(windows)
+
+    assert tiered["included"].tolist() == [1, 1, 1, 1, 1, 0]
+    assert tiered["clean_included"].tolist() == [1, 0, 0, 0, 0, 0]
+    assert tiered["analysis_tier"].tolist() == [
+        "clean_reference",
+        "workout_context_allowed",
+        "controller_context_allowed",
+        "baseline_drift_allowed",
+        "exploratory_cgm_quality_only",
+        "rejected",
+    ]
+    assert tiered.loc[tiered["candidate_id"].eq("bad_cgm"), "hard_exclusion_reasons"].iloc[0] == "poor_cgm_coverage"
 
 
 def test_research_therapy_settings_cli_writes_artifacts(tmp_path, monkeypatch):

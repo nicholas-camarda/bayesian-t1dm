@@ -7,7 +7,7 @@ name = "bayesian-t1dm"
 version = "0.1.0"
 description = "Bayesian forecasting and recommendation pipeline for personal T1DM data"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
   "numpy>=1.24",
   "pandas>=2.0",

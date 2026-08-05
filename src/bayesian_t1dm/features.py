@@ -90,6 +90,7 @@ def _aggregate_cgm(
     out["glucose_observed"] = np.nan
     out["glucose"] = np.nan
     out["missing_cgm"] = 1
+    out["cgm_invalid"] = 0
     out["minutes_since_last_cgm"] = np.nan
     if data.cgm.empty or "timestamp" not in data.cgm.columns or "glucose" not in data.cgm.columns:
         for threshold in gap_flag_thresholds_minutes:
@@ -98,10 +99,17 @@ def _aggregate_cgm(
 
     cgm = data.cgm.copy()
     cgm["timestamp"] = pd.to_datetime(cgm["timestamp"]).dt.floor(freq)
+    cgm["glucose"] = pd.to_numeric(cgm["glucose"], errors="coerce")
+    cgm["cgm_invalid"] = cgm["glucose"].isna() | cgm["glucose"].le(0.0) | cgm["glucose"].lt(40.0) | cgm["glucose"].gt(400.0)
+    invalid = cgm.groupby("timestamp", as_index=False).agg(cgm_invalid=("cgm_invalid", "sum"))
+    cgm = cgm.loc[~cgm["cgm_invalid"]].copy()
     cgm = cgm.groupby("timestamp", as_index=False).agg(glucose_observed=("glucose", "mean"))
     out = out.merge(cgm, on="timestamp", how="left")
     out["glucose_observed"] = out["glucose_observed_y"].combine_first(out["glucose_observed_x"]) if "glucose_observed_y" in out.columns else out["glucose_observed"]
     out = out.drop(columns=[column for column in ["glucose_observed_x", "glucose_observed_y"] if column in out.columns])
+    out = out.merge(invalid, on="timestamp", how="left", suffixes=("", "_agg"))
+    out["cgm_invalid"] = pd.to_numeric(out.get("cgm_invalid_agg", out["cgm_invalid"]), errors="coerce").fillna(0).astype(int)
+    out = out.drop(columns=[column for column in ["cgm_invalid_agg"] if column in out.columns])
     out["glucose"] = out["glucose_observed"]
     if fill_interior_only:
         out["glucose"] = out["glucose"].interpolate(method="linear", limit_area="inside")
@@ -354,6 +362,7 @@ def build_feature_frame(data: IngestedData, config: FeatureConfig | None = None)
         "is_weekend",
         "glucose",
         "missing_cgm",
+        "cgm_invalid",
         "minutes_since_last_cgm",
         "carb_grams",
         "meal_event",

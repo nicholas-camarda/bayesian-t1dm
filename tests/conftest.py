@@ -7,18 +7,21 @@ from pathlib import Path
 import pytest
 
 
-_test_home = Path(tempfile.gettempdir()) / "bayesian_t1dm_test_home"
-_test_cache = _test_home / "Library" / "Caches"
+_test_home = Path(tempfile.mkdtemp(prefix="bayesian_t1dm_pytest_"))
+_test_cache = _test_home / "cache"
 _test_mpl = _test_home / "matplotlib"
-_test_home.mkdir(parents=True, exist_ok=True)
-_test_cache.mkdir(parents=True, exist_ok=True)
-_test_mpl.mkdir(parents=True, exist_ok=True)
+_test_runtime = _test_home / "runtime"
+_test_cloud = _test_home / "cloud"
+for path in (_test_cache, _test_mpl, _test_runtime, _test_cloud):
+    path.mkdir(parents=True, exist_ok=True)
 
-os.environ.setdefault("HOME", str(_test_home))
-os.environ.setdefault("USERPROFILE", str(_test_home))
-os.environ.setdefault("XDG_CACHE_HOME", str(_test_cache))
-os.environ.setdefault("MPLCONFIGDIR", str(_test_mpl))
-os.environ.setdefault("PYTENSOR_FLAGS", f"compiledir={tempfile.gettempdir()}/bayesian_t1dm_pytensor")
+os.environ["HOME"] = str(_test_home)
+os.environ["USERPROFILE"] = str(_test_home)
+os.environ["XDG_CACHE_HOME"] = str(_test_cache)
+os.environ["MPLCONFIGDIR"] = str(_test_mpl)
+os.environ["BAYESIAN_T1DM_RUNTIME_ROOT"] = str(_test_runtime)
+os.environ["BAYESIAN_T1DM_CLOUD_ROOT"] = str(_test_cloud)
+os.environ["PYTENSOR_FLAGS"] = f"compiledir={_test_home / 'pytensor'}"
 
 
 @pytest.fixture(scope="session")

@@ -35,6 +35,14 @@ class FoldResult:
     model_rmse: float
     model_coverage: float
     persistence_mae: float
+    model_interval_width: float = float("nan")
+    test_start_timestamp: str | None = None
+    test_end_timestamp: str | None = None
+    max_timestamp_gap_minutes: float | None = None
+    timestamp_gap_count: int = 0
+    missing_cgm_fraction: float | None = None
+    invalid_cgm_fraction: float | None = None
+    source_window_ids: list[str] | None = None
     fit_diagnostics: FitDiagnostics | None = None
     prediction_trace: dict[str, list[object]] | None = None
 
@@ -189,6 +197,13 @@ def run_walk_forward(
         # Persistence baseline aligned to evaluated rows: predict target_glucose ~= current glucose.
         persistence_abs = np.abs(y_true - test_frame["glucose"].to_numpy(dtype=float))
         p_mae = float(np.nanmean(persistence_abs))
+        test_timestamps = pd.to_datetime(test_frame["timestamp"], errors="coerce") if "timestamp" in test_frame.columns else pd.Series(dtype="datetime64[ns]")
+        valid_timestamps = test_timestamps.dropna().sort_values()
+        gaps = valid_timestamps.diff().dropna().dt.total_seconds().div(60.0)
+        expected_step = step_minutes * 1.5
+        source_window_ids: list[str] | None = None
+        if "source_window_id" in test_frame.columns:
+            source_window_ids = sorted(test_frame["source_window_id"].dropna().astype(str).unique().tolist())
 
         fold_results.append(FoldResult(
             fold=fold_idx + 1,
@@ -198,6 +213,14 @@ def run_walk_forward(
             model_rmse=fold_cal.rmse,
             model_coverage=fold_cal.coverage,
             persistence_mae=p_mae,
+            model_interval_width=fold_cal.interval_width,
+            test_start_timestamp=None if valid_timestamps.empty else valid_timestamps.iloc[0].isoformat(),
+            test_end_timestamp=None if valid_timestamps.empty else valid_timestamps.iloc[-1].isoformat(),
+            max_timestamp_gap_minutes=None if gaps.empty else float(gaps.max()),
+            timestamp_gap_count=int(gaps.gt(expected_step).sum()) if not gaps.empty else 0,
+            missing_cgm_fraction=float(pd.to_numeric(test_frame["missing_cgm"], errors="coerce").fillna(0.0).mean()) if "missing_cgm" in test_frame.columns else None,
+            invalid_cgm_fraction=float(pd.to_numeric(test_frame["cgm_invalid"], errors="coerce").fillna(0.0).gt(0).mean()) if "cgm_invalid" in test_frame.columns else None,
+            source_window_ids=source_window_ids,
             fit_diagnostics=getattr(fit, "diagnostics", None),
             prediction_trace={
                 "timestamps": [timestamp.isoformat() for timestamp in pd.to_datetime(test_frame["timestamp"], errors="coerce")],

@@ -5,6 +5,7 @@ from datetime import date
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 import bayesian_t1dm.acquisition as acquisition
 from bayesian_t1dm.acquisition import (
@@ -63,6 +64,67 @@ class FakeTConnectSyncAdapter:
     def fetch_window_payloads(self, *, window=None, download_dir=None, timezone=None, pump_serial=None):
         self.calls.append(("fetch", getattr(window, "window_id", None)))
         return self.payloads
+
+
+class _FakeTandemSourceEvent:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
+
+    def todict(self) -> dict[str, object]:
+        return dict(self.payload)
+
+
+class _FakeTandemSourceMultiDeviceAdapter:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str, str, object]] = []
+        self.metadata = [
+            {
+                "serialNumber": "90723647",
+                "tconnectDeviceId": "723357",
+                "minDateWithEvents": "2023-01-01T00:00:00",
+                "maxDateWithEvents": "2025-08-27T11:54:42",
+                "lastUpload": {"lastUploadedAt": "2025-08-27T16:04:01"},
+            },
+            {
+                "serialNumber": "1453346",
+                "tconnectDeviceId": "1032256",
+                "minDateWithEvents": "2020-01-15T00:00:00",
+                "maxDateWithEvents": "2026-04-22T14:22:38",
+                "lastUpload": {"lastUploadedAt": "2026-04-22T18:23:18"},
+            },
+        ]
+        self.events = {
+            "723357": [
+                _FakeTandemSourceEvent(
+                    {
+                        "id": 279,
+                        "name": "LID_BASAL_DELIVERY",
+                        "eventTimestamp": "2025-07-10T00:00:00-04:00",
+                        "commandedRate": 700,
+                    }
+                ),
+                _FakeTandemSourceEvent(
+                    {
+                        "id": 280,
+                        "name": "LID_BOLUS_DELIVERY",
+                        "eventTimestamp": "2025-07-10T08:00:00-04:00",
+                        "deliveredTotal": 2500,
+                    }
+                ),
+            ],
+            "1032256": [],
+        }
+
+    def pump_event_metadata(self):
+        return self.metadata
+
+    def pump_events_raw(self, device_id, min_date=None, max_date=None, event_ids_filter=None):
+        self.calls.append(("raw", str(device_id), str(min_date), str(max_date), event_ids_filter))
+        return f"raw-{device_id}-{min_date}-{max_date}"
+
+    def pump_events(self, device_id, min_date=None, max_date=None, fetch_all_event_types=False):
+        self.calls.append(("events", str(device_id), str(min_date), str(max_date), fetch_all_event_types))
+        return self.events.get(str(device_id), [])
 
 
 def _workspace(tmp_path: Path) -> ProjectPaths:
@@ -129,6 +191,34 @@ def test_tconnectsync_client_archives_raw_payloads_and_normalizes_outputs(tmp_pa
     assert "-04:00" not in cgm_text
     assert adapter.calls[0][0] == "fetch"
     assert adapter.calls[0][1] == window.window_id
+
+
+def test_tconnectsync_client_queries_all_window_overlapping_devices(tmp_path):
+    workspace = _workspace(tmp_path)
+    window = ExportWindow(date(2025, 7, 5), date(2025, 8, 3))
+    adapter = _FakeTandemSourceMultiDeviceAdapter()
+    client = TConnectSyncSourceClient(workspace, adapter=adapter, timezone="America/New_York")
+
+    result = client.export_daily_timeline_window(window, workspace.runtime / "downloads")
+
+    assert result.row_counts["bolus"] == 1
+    assert result.row_counts["basal"] == 1
+    queried_devices = {call[1] for call in adapter.calls if call[0] == "events"}
+    assert queried_devices == {"723357", "1032256"}
+
+    normalized_root = workspace.cloud_raw / "tconnectsync" / window.window_id / "normalized"
+    bolus = pd.read_csv(normalized_root / "bolus.csv")
+    basal = pd.read_csv(normalized_root / "basal.csv")
+    assert bolus["pump_serial"].astype(str).tolist() == ["90723647"]
+    assert bolus["tconnect_device_id"].astype(str).tolist() == ["723357"]
+    assert basal["pump_serial"].astype(str).tolist() == ["90723647"]
+    assert basal["tconnect_device_id"].astype(str).tolist() == ["723357"]
+
+    raw_root = workspace.cloud_raw / "tconnectsync" / window.window_id / "raw"
+    metadata = json.loads((raw_root / "pump_event_metadata.json").read_text(encoding="utf-8"))
+    assert {str(pump["tconnectDeviceId"]) for pump in metadata["selected_pumps"]} == {"723357", "1032256"}
+    assert (raw_root / "pump_events_raw_90723647_723357.txt").exists()
+    assert (raw_root / "pump_events_raw_1453346_1032256.txt").exists()
 
 
 def test_normalize_tconnectsync_archive_rebuilds_window_and_is_idempotent(tmp_path):
@@ -201,6 +291,136 @@ def test_tconnectsync_payloads_build_canonical_carb_table_from_explicit_meals(tm
     assert ingested.carbs.iloc[0]["carb_grams"] == 45.0
     assert ingested.carbs.iloc[0]["source_label"] == "meal"
     assert summary["row_counts"]["carbs"] == 1
+
+
+def test_normalize_tconnectsync_rejects_out_of_window_rows_and_records_timezone():
+    window = ExportWindow(date(2024, 6, 1), date(2024, 6, 1))
+    payloads = {
+        "cgm": [
+            {"eventDateTime": "2024-05-31T23:55:00-04:00", "egv_estimatedGlucoseValue": 99},
+            {"eventDateTime": "2024-06-01T00:00:00-04:00", "egv_estimatedGlucoseValue": 100},
+            {"eventDateTime": "2024-06-02T00:00:00-04:00", "egv_estimatedGlucoseValue": 101},
+        ],
+        "bolus": [{"completionDateTime": "2024-06-01T08:00:00-04:00", "actualTotalBolusRequested": 2.0}],
+        "basal": [{"startDateTime": "2024-06-01T00:00:00-04:00", "endDateTime": "2024-06-02T00:00:00-04:00", "basalRate": 0.75}],
+        "activity": [{"startDateTime": "2024-06-02T00:05:00-04:00", "steps": 100}],
+    }
+
+    ingested, summary = normalize_tconnectsync_payloads(payloads, window=window, endpoint_family="tconnectsync", timezone="America/New_York")
+
+    assert summary["timezone"] == "America/New_York"
+    assert summary["rejected_counts"]["cgm"] == 2
+    assert summary["rejected_counts"]["activity"] == 1
+    assert ingested.cgm["timestamp"].tolist() == [pd.Timestamp("2024-06-01 00:00:00")]
+    assert ingested.activity.empty
+
+
+def test_normalize_tconnectsync_cumulative_bolus_progress_is_incremental():
+    window = ExportWindow(date(2024, 6, 1), date(2024, 6, 1))
+    payloads = {
+        "cgm": [{"eventDateTime": "2024-06-01T00:00:00", "egv_estimatedGlucoseValue": 120}],
+        "bolus": [
+            {"completionDateTime": "2024-06-01T08:00:00", "actualTotalBolusRequested": 1.0, "source_event_name": "bolus-a"},
+            {"completionDateTime": "2024-06-01T08:05:00", "actualTotalBolusRequested": 2.0, "source_event_name": "bolus-a"},
+            {"completionDateTime": "2024-06-01T08:10:00", "actualTotalBolusRequested": 3.0, "source_event_name": "bolus-a"},
+        ],
+        "basal": [],
+        "activity": [],
+    }
+
+    ingested, _ = normalize_tconnectsync_payloads(payloads, window=window, endpoint_family="tconnectsync", timezone="America/New_York")
+
+    assert ingested.bolus["bolus_units"].sum() == pytest.approx(3.0)
+    assert ingested.bolus["raw_bolus_units"].max() == pytest.approx(3.0)
+
+
+def test_normalize_tconnectsync_dedupes_repeated_bolus_lifecycle_records():
+    window = ExportWindow(date(2024, 3, 24), date(2024, 3, 24))
+    payloads = {
+        "cgm": [{"eventDateTime": "2024-03-24T00:00:00", "egv_estimatedGlucoseValue": 120}],
+        "bolus": [
+            {
+                "completionDateTime": "2024-03-24T15:05:00",
+                "actualTotalBolusRequested": 0.0,
+                "source_event_name": "LID_BOLUS_DELIVERY",
+                "source_seq_num": 520852,
+                "bolus_id": 1621,
+                "pump_serial": "90723647",
+                "tconnect_device_id": "723357",
+            },
+            {
+                "completionDateTime": "2024-03-24T15:10:00",
+                "actualTotalBolusRequested": 11.61,
+                "source_event_name": "LID_BOLUS_DELIVERY",
+                "source_seq_num": 520868,
+                "bolus_id": 1621,
+                "pump_serial": "90723647",
+                "tconnect_device_id": "723357",
+            },
+            {
+                "completionDateTime": "2024-03-24T15:05:00",
+                "actualTotalBolusRequested": 0.0,
+                "source_event_name": "LID_BOLUS_DELIVERY",
+                "source_seq_num": 520852,
+                "bolus_id": 1621,
+                "pump_serial": "90723647",
+                "tconnect_device_id": "723357",
+            },
+            {
+                "completionDateTime": "2024-03-24T15:10:00",
+                "actualTotalBolusRequested": 11.61,
+                "source_event_name": "LID_BOLUS_DELIVERY",
+                "source_seq_num": 520868,
+                "bolus_id": 1621,
+                "pump_serial": "90723647",
+                "tconnect_device_id": "723357",
+            },
+            {
+                "completionDateTime": "2024-03-24T18:00:00",
+                "actualTotalBolusRequested": 0.0,
+                "source_event_name": "LID_BOLUS_DELIVERY",
+                "source_seq_num": 520900,
+                "bolus_id": 1622,
+                "pump_serial": "90723647",
+                "tconnect_device_id": "723357",
+            },
+            {
+                "completionDateTime": "2024-03-24T18:05:00",
+                "actualTotalBolusRequested": 3.0,
+                "source_event_name": "LID_BOLUS_DELIVERY",
+                "source_seq_num": 520901,
+                "bolus_id": 1622,
+                "pump_serial": "90723647",
+                "tconnect_device_id": "723357",
+            },
+        ],
+        "basal": [],
+        "activity": [],
+    }
+
+    ingested, _ = normalize_tconnectsync_payloads(payloads, window=window, endpoint_family="tconnectsync", timezone="America/New_York")
+
+    assert ingested.bolus["bolus_units"].sum() == pytest.approx(14.61)
+    assert ingested.bolus["bolus_units"].max() == pytest.approx(11.61)
+    assert len(ingested.bolus) == 2
+
+
+def test_normalize_tconnectsync_preserves_dst_fallback_offsets_for_review():
+    window = ExportWindow(date(2024, 11, 3), date(2024, 11, 3))
+    payloads = {
+        "cgm": [
+            {"eventDateTime": "2024-11-03T01:30:00-04:00", "egv_estimatedGlucoseValue": 110},
+            {"eventDateTime": "2024-11-03T01:30:00-05:00", "egv_estimatedGlucoseValue": 111},
+        ],
+        "bolus": [],
+        "basal": [],
+        "activity": [],
+    }
+
+    ingested, _ = normalize_tconnectsync_payloads(payloads, window=window, endpoint_family="tconnectsync", timezone="America/New_York")
+
+    assert len(ingested.cgm) == 2
+    assert ingested.manifest.loc[ingested.manifest["kind"].eq("cgm"), "has_duplicates"].iloc[0]
 
 
 def test_load_tandem_exports_reads_normalized_paths_from_manifest(tmp_path):

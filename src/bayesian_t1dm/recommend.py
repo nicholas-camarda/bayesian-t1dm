@@ -51,7 +51,7 @@ def _apply_scenario(frame: pd.DataFrame, scenario: Scenario) -> pd.DataFrame:
     if "bolus_units" in out.columns:
         out["bolus_units"] = out["bolus_units"] * scenario.bolus_multiplier
         if scenario.icr_multiplier != 1.0:
-            out["bolus_units"] = out["bolus_units"] * scenario.icr_multiplier
+            out["bolus_units"] = out["bolus_units"] * (1.0 / scenario.icr_multiplier)
     return recompute_scenario_features(out)
 
 
@@ -117,9 +117,18 @@ def build_recommendation_policy(
         if not np.isfinite(walk_forward.aggregate_persistence_mae) or aggregate.mae > 0.90 * walk_forward.aggregate_persistence_mae:
             validation_passed = False
             reasons.append("mae_not_meaningfully_better_than_persistence")
-    if data_quality is not None and data_quality.status != "good":
+    if data_quality is None:
+        validation_passed = False
+        reasons.append("data_quality_missing")
+    elif data_quality.status != "good":
         validation_passed = False
         reasons.append("data_incomplete")
+    elif data_quality.normalized_plausibility_status != "good":
+        validation_passed = False
+        if data_quality.normalized_plausibility_status == "unknown":
+            reasons.append("normalized_plausibility_unknown")
+        else:
+            reasons.append("normalized_plausibility_failed")
 
     if fit_diagnostics is None:
         sampler_passed = False
@@ -146,13 +155,13 @@ def build_recommendation_policy(
             reasons.append("sampler_ess_too_low")
 
     if not carbs_present:
-        allowed_settings.discard("bolus")
-        allowed_settings.discard("I/C ratio")
+        allowed_settings.clear()
         reasons.append("missing_carbs")
     if not activity_present:
         reasons.append("low_signal")
+        allowed_settings.clear()
 
-    signal_passed = bool(allowed_settings)
+    signal_passed = bool(allowed_settings) and carbs_present and activity_present
     status = "generated" if validation_passed and sampler_passed and signal_passed else "suppressed"
     return (
         RecommendationPolicy(
@@ -228,13 +237,14 @@ def recommend_setting_changes(
     forecast_inputs = [(baseline_scenario.name, _apply_scenario(feature_frame, baseline_scenario))]
     forecast_inputs.extend((scenario.name, _apply_scenario(feature_frame, scenario)) for scenario in scenarios)
     forecasts = model.scenario_forecasts(fit, forecast_inputs)
-    baseline = forecasts[0].expected_loss if forecasts else np.nan
     recommendations: list[Recommendation] = []
     baseline_forecast = forecasts[0] if forecasts else None
     for scenario, forecast in zip(scenarios, forecasts[1:]):
-        if not np.isfinite(forecast.expected_loss):
+        if baseline_forecast is None:
             continue
-        gain = baseline - forecast.expected_loss
+        current_loss = np.abs(baseline_forecast.mean - target_bg)
+        candidate_loss = np.abs(forecast.mean - target_bg)
+        gain = float(np.mean(current_loss) - np.mean(candidate_loss))
         if gain < min_expected_gain_mgdl:
             continue
         direction = "decrease" if scenario.basal_multiplier < 1 or scenario.bolus_multiplier < 1 or scenario.icr_multiplier < 1 else "increase"
@@ -247,12 +257,9 @@ def recommend_setting_changes(
         else:
             setting = "I/C ratio"
             change_percent = round(abs(scenario.icr_multiplier - 1.0) * 100.0, 6)
-        if baseline_forecast is not None:
-            current_loss = np.abs(baseline_forecast.mean - target_bg)
-            candidate_loss = np.abs(forecast.mean - target_bg)
-            posterior_probability_better = float(np.mean(candidate_loss < current_loss))
-        else:
-            posterior_probability_better = float("nan")
+        posterior_probability_better = float(np.mean(candidate_loss < current_loss))
+        if posterior_probability_better < 0.75:
+            continue
         flags = _recommendation_flags(carbs_present=carbs_present, activity_present=activity_present)
         recommendations.append(
             Recommendation(
@@ -261,7 +268,7 @@ def recommend_setting_changes(
                 change_percent=change_percent,
                 expected_gain_mgdl=gain,
                 posterior_probability_better=posterior_probability_better,
-                rationale=f"{scenario.name} lowers expected post-meal deviation from target.",
+                rationale=f"{scenario.name} is a diagnostic sensitivity scenario with lower predicted deviation from target.",
                 scenario_name=scenario.name,
                 confidence=_recommendation_confidence(
                     posterior_probability_better,

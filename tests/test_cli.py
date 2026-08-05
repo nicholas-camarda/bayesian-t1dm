@@ -605,6 +605,40 @@ def test_research_latent_meal_icr_full_scope_writes_outputs(tmp_path, monkeypatc
     workspace_root.mkdir()
     report_dir = tmp_path / "latent_meal_full"
     review_html = report_dir / "latent_meal_review.html"
+    raw_root = tmp_path / "raw"
+    metadata_dir = raw_root / "tconnectsync" / "2026-03-02__2026-03-31" / "raw"
+    metadata_dir.mkdir(parents=True)
+    (metadata_dir / "pump_event_metadata.json").write_text(
+        json.dumps(
+            {
+                "requested_end": "2026-03-31",
+                "selected_pump": {
+                    "lastUpload": {
+                        "lastUploadedAt": "2026-04-01T02:15:16.6",
+                        "settings": {
+                            "profiles": {
+                                "activeIdp": 0,
+                                "profile": [
+                                    {
+                                        "idp": 0,
+                                        "name": "Main",
+                                        "insulinDuration": 300,
+                                        "maxBolus": 25000,
+                                        "tDependentSegs": [
+                                            {"startTime": 0, "carbRatio": 7000, "isf": 60, "targetBg": 110},
+                                            {"startTime": 900, "carbRatio": 6800, "isf": 60, "targetBg": 110},
+                                        ],
+                                    }
+                                ],
+                            },
+                            "pumpSettings": {"maxBolus": 25000},
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
     preparation = ModelDataPreparationResult(
         dataset=dataset,
@@ -630,6 +664,8 @@ def test_research_latent_meal_icr_full_scope_writes_outputs(tmp_path, monkeypatc
             "--root",
             str(workspace_root),
             "research-latent-meal-icr",
+            "--raw",
+            str(raw_root),
             "--research-scope",
             "full",
             "--report-dir",
@@ -643,10 +679,17 @@ def test_research_latent_meal_icr_full_scope_writes_outputs(tmp_path, monkeypatc
     assert (report_dir / "latent_meal_research_gate.md").exists()
     assert (report_dir / "meal_event_registry.csv").exists()
     assert (report_dir / "meal_window_audit.md").exists()
+    assert (report_dir / "latent_meal_window_audit.csv").exists()
+    assert (report_dir / "latent_carb_estimator_report.md").exists()
+    assert (report_dir / "latent_carb_estimates.csv").exists()
     assert (report_dir / "latent_meal_fit_summary.md").exists()
     assert (report_dir / "latent_meal_posterior_meals.csv").exists()
     assert (report_dir / "latent_meal_confidence_report.md").exists()
     assert (report_dir / "latent_meal_model_comparison.md").exists()
+    cache_dir = cli.ProjectPaths.from_root(workspace_root).cache_latent_meal
+    assert (cache_dir / "latent_carb_estimates.csv").exists()
+    assert (cache_dir / "therapy_settings_used.json").exists()
+    assert (cache_dir / "latent_carb_posterior_samples.parquet").exists()
     assert review_html.exists()
 
 

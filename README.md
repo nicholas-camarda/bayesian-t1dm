@@ -69,7 +69,7 @@ If you are doing science work, use this loop:
 bayesian-t1dm prepare-model-data
 ```
 
-This writes the preparation report under `~/ProjectsRuntime/bayesian-t1dm/output/prepare/` and the prepared dataset under `~/ProjectsRuntime/bayesian-t1dm/cache/prepared/`.
+This writes the preparation report under `~/Workspaces/bayesian-t1dm/runtime/output/prepare/` and the prepared dataset under `~/Workspaces/bayesian-t1dm/runtime/cache/prepared/`.
 
 2. Inspect the latent-meal foundation.
 
@@ -85,7 +85,32 @@ If the foundation gate is healthy, move to the strict Phase C fit:
 bayesian-t1dm research-latent-meal-icr --research-scope full
 ```
 
-This runs the constrained first-meal latent-response approximation on accepted windows only and writes research-only posterior summaries, confidence summaries, and model comparison artifacts.
+This runs the proxy-only latent carb estimator on accepted windows only and writes research-only posterior carb-equivalent estimates with credible intervals. The workflow extracts the active Tandem pump profile from `raw/pump_event_metadata.json` and records the exact I:C ratios, correction factors, target glucose, insulin action duration, absorption prior, and maximum plausible meal size used for the run.
+
+Use `--therapy-settings path/to/therapy_settings.json` only when you want to override the extracted Tandem profile. Minimal override JSON:
+
+```json
+{
+  "icr_grams_per_unit": {
+    "overnight": 12.0,
+    "morning": 10.0,
+    "afternoon": 11.0,
+    "evening": 9.0
+  },
+  "correction_factor_mgdl_per_unit": {
+    "overnight": 45.0,
+    "morning": 40.0,
+    "afternoon": 45.0,
+    "evening": 40.0
+  },
+  "target_glucose_mgdl": 110.0,
+  "insulin_action_minutes": 300,
+  "carb_absorption_minutes_prior": 180,
+  "max_plausible_meal_carbs": 180
+}
+```
+
+The first artifact to inspect is `~/Workspaces/bayesian-t1dm/runtime/output/latent_meal/latent_meal_review.html`. The downstream analysis table is `~/Workspaces/bayesian-t1dm/runtime/cache/latent_meal/latent_carb_estimates.csv`. The exact priors used for a run are recorded in `~/Workspaces/bayesian-t1dm/runtime/cache/latent_meal/therapy_settings_used.json`.
 
 3. Refresh the combined snapshot when you want the whole repo summarized in one place.
 
@@ -93,7 +118,7 @@ This runs the constrained first-meal latent-response approximation on accepted w
 bayesian-t1dm status
 ```
 
-This publishes `~/ProjectsRuntime/bayesian-t1dm/output/current_status.html` plus the latest `therapy_review.html` and `forecast_review.html`. It is the combined overview, not the scientific starting point.
+This publishes `~/Workspaces/bayesian-t1dm/runtime/output/current_status.html` plus the latest `therapy_review.html` and `forecast_review.html`. It is the combined overview, not the scientific starting point.
 
 4. Use the forecast diagnostic only when you want a secondary validation readout.
 
@@ -121,10 +146,10 @@ This keeps all first-meal candidates and a small number of background days while
 
 The runtime layout is intentionally boring now:
 
-- top-level human-facing entrypoints live in `~/ProjectsRuntime/bayesian-t1dm/output/`
-- machine-oriented summaries live in `~/ProjectsRuntime/bayesian-t1dm/cache/`
-- logs live in `~/ProjectsRuntime/bayesian-t1dm/logs/`
-- legacy clutter is archived once under `~/ProjectsRuntime/bayesian-t1dm/archive/legacy_output`
+- top-level human-facing entrypoints live in `~/Workspaces/bayesian-t1dm/runtime/output/`
+- machine-oriented summaries live in `~/Workspaces/bayesian-t1dm/runtime/cache/`
+- logs live in `~/Workspaces/bayesian-t1dm/runtime/logs/`
+- legacy clutter is archived once under `~/Workspaces/bayesian-t1dm/runtime/archive/legacy_output`
 
 ## Quickstart
 
@@ -170,7 +195,7 @@ If you have new Health Auto Export bundles that have not been imported yet, run 
 
 ```bash
 bayesian-t1dm import-health-auto-export --input \
-  ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data
+  "$HOME/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm/data/raw/apple_health_data"
 ```
 
 Then rerun:
@@ -239,7 +264,7 @@ Use these less often, when needed:
 ```bash
 # import new Apple Health bundles
 bayesian-t1dm import-health-auto-export --input \
-  ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data
+  "$HOME/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm/data/raw/apple_health_data"
 
 # repair or inspect Tandem raw data
 bayesian-t1dm normalize-raw
@@ -291,7 +316,7 @@ Canonical repair/review workflow:
 Canonical current-status workflow:
 
 1. `bayesian-t1dm status`
-2. open `~/ProjectsRuntime/bayesian-t1dm/output/current_status.html`
+2. open `~/Workspaces/bayesian-t1dm/runtime/output/current_status.html`
 3. drill into `therapy_review.html` or `forecast_review.html` only when you need the supporting detail
 
 This keeps raw-window repair, coverage review, and predictive validation separate from recommendation generation.
@@ -299,7 +324,7 @@ This keeps raw-window repair, coverage review, and predictive validation separat
 Canonical Tandem + Apple Health workflow:
 
 1. `bayesian-t1dm normalize-raw`
-2. `bayesian-t1dm import-health-auto-export --input ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data` when new bundles need to be imported
+2. `bayesian-t1dm import-health-auto-export --input "$HOME/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm/data/raw/apple_health_data"` when new bundles need to be imported
 3. `bayesian-t1dm prepare-model-data`
 4. `bayesian-t1dm screen-health-features`
 5. `bayesian-t1dm run --skip-recommendations`
@@ -315,7 +340,7 @@ Canonical Tandem-only fallback workflow:
 Canonical therapy evidence workflow:
 
 1. `bayesian-t1dm normalize-raw`
-2. `bayesian-t1dm import-health-auto-export --input ~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm/data/raw/apple_health_data` when new bundles need to be imported
+2. `bayesian-t1dm import-health-auto-export --input "$HOME/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm/data/raw/apple_health_data"` when new bundles need to be imported
 3. `bayesian-t1dm prepare-model-data`
 4. `bayesian-t1dm review-therapy-evidence`
 5. review `therapy_review.html` first, then inspect the linked supporting artifacts if you need to go deeper
@@ -325,8 +350,8 @@ What each step does:
 1. `normalize-raw` rebuilds normalized Tandem tables from archived raw API payloads.
 2. `prepare-model-data` reuses already-imported Apple Health tables from the canonical raw tree by default, computes Apple/Tandem overlap, backfills Tandem data when needed, and writes the prepared 5-minute model dataset plus a preparation report. Use `import-health-auto-export` first when you have new bundles to ingest.
 3. `screen-health-features` evaluates Apple context features against Tandem glucose targets using the unified prepared dataset and skips cleanly when Apple Health is absent.
-4. `run --skip-recommendations` is the preferred fast validation path because it checks walk-forward forecasting without paying for the final recommendation fit.
-5. `run` performs the full modeling and recommendation pipeline. It now uses the same prepared dataset contract: Apple-enriched when Apple data exists, Tandem-only otherwise.
+4. `run --skip-recommendations` is a forecast diagnostic. It checks walk-forward forecasting, raw source quality, normalized plausibility, and sampler/report wiring; it is not proof that the real-data pipeline is valid for therapy recommendations.
+5. `run` performs the forecasting lane and suppresses decision-support recommendations unless raw source quality, normalized bolus/IOB plausibility, CGM validity, timezone provenance, explicit meal truth, walk-forward performance, interval coverage, and sampler diagnostics all pass.
 6. `research-therapy-settings` runs a separate research-grade workflow for basal schedule, I/C ratio, and later sensitivity factor analysis. It starts with a methodological gate, builds strict meal-bolus proxy features when explicit carbs are absent, writes Tandem and Apple source report cards, compares candidate models, and writes human-reviewable segment-level evidence rather than auto-changing settings.
 7. `validate-therapy-infra` runs synthetic truth-recovery scenarios against the same therapy research stack so the infrastructure has to recover known therapy directions and suppress itself in corrupted or weak-identifiability cases.
 8. `review-therapy-evidence` orchestrates the current therapy-facing workflow and writes an interactive HTML review page focused on overnight basal identifiability, evidence quality, exclusion reasons, supporting artifacts, and code-path traceability.
@@ -351,15 +376,15 @@ bayesian-t1dm run --skip-recommendations --eval-folds 2 --draws 200 --tune 200 -
 
 Canonical project organization:
 
-- code: `~/Projects/bayesian-t1dm`
-- runtime outputs, scratch space, and intermediate artifacts: `~/ProjectsRuntime/bayesian-t1dm`
-- cloud project home: `~/Library/CloudStorage/OneDrive-Personal/SideProjects/bayesian-t1dm`
+- code: `~/Workspaces/bayesian-t1dm/source`
+- runtime outputs, scratch space, and intermediate artifacts: `~/Workspaces/bayesian-t1dm/runtime`
+- cloud project home: `~/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm`
 
 Within the cloud project home:
 
 - scraped/raw acquisition data lives under `data/raw/`
 - final published outputs belong under `output/`
-- routine working summaries now default to `~/ProjectsRuntime/bayesian-t1dm/output/`
+- routine working summaries default to `~/Workspaces/bayesian-t1dm/runtime/output/`
 - cloud `output/` should be used for intentional published/final artifacts rather than default working reports
 
 Within the cloud raw tree, the acquisition flow writes:
@@ -398,8 +423,9 @@ The pipeline produces:
 - sampler diagnostics for every walk-forward fit and the final fit
 - explicit data-quality summaries showing whether source windows are good, degraded, or broken
 - recommendation policy metadata showing whether recommendations were generated, suppressed, or skipped
-- recommendation summaries for human review when the validation and sampler gates pass, including per-recommendation confidence and warning flags
-- runtime reports under `~/ProjectsRuntime/bayesian-t1dm/output/` by default
+- recommendation summaries for human review only when raw source quality, normalized plausibility, validation, explicit meal truth, and sampler gates pass, including per-recommendation confidence and warning flags
+- runtime reports under `~/Workspaces/bayesian-t1dm/runtime/output/` by default
+- quality fields separate raw source completeness, normalized feature plausibility, cohort/window coverage, forecast validation, and recommendation eligibility; do not treat one green field as substituting for the others
 
 Default runtime review artifacts:
 

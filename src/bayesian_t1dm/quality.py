@@ -29,6 +29,8 @@ class DataQualitySummary:
     incomplete_window_count: int
     reason_counts: dict[str, int]
     evaluation_touches_incomplete_windows: bool
+    normalized_plausibility_status: str = "unknown"
+    normalized_plausibility_reasons: dict[str, int] | None = None
 
 
 def _coerce_bool(value: Any) -> bool:
@@ -45,9 +47,15 @@ def _parse_timestamp_utc(value: Any) -> pd.Timestamp | pd.NaT:
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return pd.NaT
     try:
-        return pd.to_datetime(value, errors="coerce", utc=True)
+        timestamp = pd.to_datetime(value, errors="coerce")
     except Exception:
         return pd.NaT
+    if pd.isna(timestamp):
+        return pd.NaT
+    stamp = pd.Timestamp(timestamp)
+    if stamp.tzinfo is not None:
+        return stamp.tz_localize(None)
+    return stamp
 
 
 def _iso_or_none(value: Any) -> str | None:
@@ -238,6 +246,14 @@ def _read_window_quality_rows(raw_dir: str | Path) -> pd.DataFrame:
                     has_overlap=_coerce_bool(row.get("has_overlap")),
                     payload_sha256=None if pd.isna(row.get("payload_sha256")) else row.get("payload_sha256"),
                     required=required,
+                    extra_fields={
+                        "provenance_manifest": "window",
+                        **{
+                            key: row.get(key)
+                            for key in ["timezone", "rejected_row_count"]
+                            if key in row and not pd.isna(row.get(key))
+                        },
+                    },
                 )
             )
     return pd.DataFrame(rows)
@@ -282,6 +298,7 @@ def _fallback_quality_rows_from_export_manifest(
             "has_duplicates": _coerce_bool(row.get("has_duplicates")),
             "payload_sha256": None,
             "completeness_reasons": json.dumps(reasons),
+            "provenance_manifest": "export",
         }
         rows.append(quality_row)
     return pd.DataFrame(rows)
@@ -319,6 +336,13 @@ def assess_data_quality(
                 reasons = []
             for reason in reasons:
                 window_reasons.add(str(reason))
+        requires_timezone = "provenance_manifest" in window_rows.columns and window_rows["provenance_manifest"].astype(str).eq("window").any()
+        if requires_timezone and ("timezone" not in window_rows.columns or window_rows["timezone"].isna().all()):
+            window_reasons.add("missing_timezone_provenance")
+        if "rejected_row_count" in window_rows.columns:
+            rejected_rows = pd.to_numeric(window_rows["rejected_row_count"], errors="coerce").fillna(0).sum()
+            if rejected_rows > 0:
+                window_reasons.add("out_of_window_rows_rejected")
         if window_reasons:
             incomplete_windows.add(str(window_id))
             aggregated_reasons.update(window_reasons)
@@ -345,3 +369,39 @@ def assess_data_quality(
         ),
         quality_rows.sort_values(["window_id", "kind"]).reset_index(drop=True),
     )
+
+
+def assess_prepared_feature_plausibility(frame: pd.DataFrame) -> tuple[str, dict[str, int]]:
+    """Assess model-ready feature values for physiologically impossible inputs."""
+    reasons: Counter[str] = Counter()
+    if frame.empty:
+        reasons["prepared_frame_empty"] += 1
+
+    if "bolus_units" in frame.columns:
+        bolus = pd.to_numeric(frame["bolus_units"], errors="coerce").fillna(0.0)
+        reasons["negative_bolus_rows"] += int(bolus.lt(0).sum())
+        reasons["implausible_5min_bolus_rows"] += int(bolus.gt(25.0).sum())
+        if "timestamp" in frame.columns:
+            dates = pd.to_datetime(frame["timestamp"], errors="coerce").dt.date
+            daily = bolus.groupby(dates).sum()
+            reasons["implausible_daily_bolus_days"] += int(daily.gt(150.0).sum())
+
+    if "iob_units" in frame.columns:
+        iob = pd.to_numeric(frame["iob_units"], errors="coerce").fillna(0.0)
+        reasons["negative_iob_rows"] += int(iob.lt(0).sum())
+        reasons["implausible_iob_rows"] += int(iob.gt(50.0).sum())
+
+    if "glucose_observed" in frame.columns:
+        glucose = pd.to_numeric(frame["glucose_observed"], errors="coerce")
+        observed = glucose.dropna()
+        reasons["invalid_cgm_rows"] += int((observed.lt(40.0) | observed.gt(400.0)).sum())
+
+    if "cgm_invalid" in frame.columns:
+        reasons["invalid_cgm_rows"] += int(pd.to_numeric(frame["cgm_invalid"], errors="coerce").fillna(0.0).gt(0).sum())
+
+    if "minutes_since_last_cgm" in frame.columns:
+        gaps = pd.to_numeric(frame["minutes_since_last_cgm"], errors="coerce")
+        reasons["cgm_gap_ge_120m_rows"] += int(gaps.ge(120.0).sum())
+
+    clean_reasons = {key: int(value) for key, value in sorted(reasons.items()) if int(value) > 0}
+    return ("good" if not clean_reasons else "failed"), clean_reasons
