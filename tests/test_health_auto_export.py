@@ -240,65 +240,29 @@ def _write_tandem_cgm_export(raw_dir: Path) -> Path:
     return workbook
 
 
-def test_import_health_auto_export_command_archives_and_normalizes_bundle(tmp_path, monkeypatch):
-    workspace_root = tmp_path / "repo"
-    workspace_root.mkdir()
-    cloud_root = tmp_path / "cloud"
-    runtime_root = tmp_path / "runtime"
-    monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(cloud_root))
-    monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
-
-    bundle_dir = tmp_path / "HealthAutoExport_20260331133020"
-    _write_health_auto_export_bundle(
-        bundle_dir,
-        json_name="HealthAutoExport-2025-05-24-2025-05-24.json",
-        payload=_build_health_auto_export_payload(),
-    )
-
-    exit_code = main(["--root", str(workspace_root), "import-health-auto-export", "--input", str(bundle_dir)])
-
-    assert exit_code == 0
-    archive_root = cloud_root / "data" / "raw" / "health_auto_export" / bundle_dir.name
-    manifest = archive_root / "health_auto_export_manifest.csv"
-    assert manifest.exists()
-    assert (archive_root / "raw" / "HealthAutoExport-2025-05-24-2025-05-24.json").exists()
-    assert (archive_root / "raw" / "Walk-Route-20250524_060000.gpx").exists()
-    assert (archive_root / "normalized" / "activity.csv").exists()
-    assert (archive_root / "normalized" / "cgm.csv").exists()
-    assert (archive_root / "normalized" / "health_measurements.csv").exists()
-    assert (archive_root / "normalized" / "sleep.csv").exists()
-    assert (archive_root / "normalized" / "workouts.csv").exists()
-
-    manifest_frame = pd.read_csv(manifest)
-    assert {"bundle_timestamp", "source_json_filename", "covered_start_date", "covered_end_date"}.issubset(manifest_frame.columns)
-
-    data = load_tandem_exports(cloud_root / "data" / "raw", include_health_auto_export=True)
-    assert len(data.cgm) == 1
-    assert float(data.cgm["glucose"].iloc[0]) == 111.0
-    assert set(data.cgm["glucose_source"]) == {"apple_health_blood_glucose"}
-    assert len(data.health_activity) == 3
-    assert len(data.health_measurements) > 0
-    assert len(data.sleep) == 1
-    assert len(data.workouts) == 1
-    assert "blood_glucose" not in set(data.health_measurements["metric"])
+def _build_dataset(workspace_root: Path, raw_root: Path) -> Path:
+    """Run build-dataset on a raw tree and return the merged dataset folder."""
+    assert main(["--root", str(workspace_root), "build-dataset", "--raw", str(raw_root)]) == 0
+    return raw_root.parent / "merged"
 
 
-def test_import_health_auto_export_command_imports_all_bundles_under_parent(tmp_path, monkeypatch):
-    workspace_root = tmp_path / "repo"
-    workspace_root.mkdir()
-    cloud_root = tmp_path / "cloud"
-    runtime_root = tmp_path / "runtime"
-    monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(cloud_root))
-    monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
+def test_health_exports_are_read_where_dropped_and_identical_copies_count_once(tmp_path):
+    raw_root = tmp_path / "raw"
+    exports = raw_root / "health_auto_export"
+    _write_two_bundle_parent(exports)
+    # The same export dropped a second time, loose in the folder, must not double-count.
+    newest = next(exports.rglob("HealthAutoExport-2025-05-24-2026-03-31.json"))
+    (exports / newest.name).write_bytes(newest.read_bytes())
 
-    parent_dir = _write_two_bundle_parent(tmp_path / "apple-health-exports")
+    data = load_tandem_exports(raw_root, include_health_auto_export=True)
+    activity = data.health_activity.loc[pd.to_datetime(data.health_activity["timestamp"]) == pd.Timestamp("2025-05-24 00:00:00")]
+    assert len(activity) == 1 and float(activity["activity_value"].iloc[0]) == 100.0
+    assert len(data.workouts.loc[data.workouts["workout_id"] == "workout-1"]) == 1
 
-    exit_code = main(["--root", str(workspace_root), "import-health-auto-export", "--input", str(parent_dir)])
-
-    assert exit_code == 0
-    archive_root = cloud_root / "data" / "raw" / "health_auto_export"
-    assert (archive_root / "HealthAutoExport_20260331120000" / "health_auto_export_manifest.csv").exists()
-    assert (archive_root / "HealthAutoExport_20260331133020" / "health_auto_export_manifest.csv").exists()
+    moved = tmp_path / "moved" / "raw"
+    moved.parent.mkdir()
+    raw_root.rename(moved)
+    assert len(load_tandem_exports(moved, include_health_auto_export=True).health_activity) == len(data.health_activity)
 
 
 def test_load_tandem_exports_unifies_and_dedupes_health_auto_export(tmp_path, monkeypatch):
@@ -309,9 +273,7 @@ def test_load_tandem_exports_unifies_and_dedupes_health_auto_export(tmp_path, mo
     monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(cloud_root))
     monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
 
-    parent_dir = _write_two_bundle_parent(tmp_path / "apple-health-exports")
-    import_exit = main(["--root", str(workspace_root), "import-health-auto-export", "--input", str(parent_dir)])
-    assert import_exit == 0
+    _write_two_bundle_parent(cloud_root / "data" / "raw" / "health_auto_export")
 
     data = load_tandem_exports(cloud_root / "data" / "raw", include_health_auto_export=True)
 
@@ -323,7 +285,7 @@ def test_load_tandem_exports_unifies_and_dedupes_health_auto_export(tmp_path, mo
     ]
     assert len(measurement) == 1
     assert float(measurement["value"].iloc[0]) == 80.0
-    assert measurement["export_id"].iloc[0] == "HealthAutoExport_20260331133020"
+    assert measurement["export_id"].iloc[0] == "HealthAutoExport-2025-05-24-2026-03-31"
 
     activity = data.health_activity.loc[pd.to_datetime(data.health_activity["timestamp"]) == pd.Timestamp("2025-05-24 00:00:00")]
     assert len(activity) == 1
@@ -357,29 +319,11 @@ def test_build_health_analysis_ready_command_writes_tandem_aligned_dataset(tmp_p
     raw_root = cloud_root / "data" / "raw"
     raw_root.mkdir(parents=True, exist_ok=True)
     _write_tandem_cgm_export(raw_root)
-    parent_dir = _write_two_bundle_parent(tmp_path / "apple-health-exports")
-    import_exit = main(["--root", str(workspace_root), "import-health-auto-export", "--input", str(parent_dir)])
-    assert import_exit == 0
+    _write_two_bundle_parent(raw_root / "health_auto_export")
 
-    output = tmp_path / "analysis_ready_health_5min.csv"
-    exit_code = main(
-        [
-            "--root",
-            str(workspace_root),
-            "build-health-analysis-ready",
-            "--raw",
-            str(raw_root),
-            "--output",
-            str(output),
-            "--horizon",
-            "30",
-        ]
-    )
-
-    assert exit_code == 0
-    assert output.exists()
-
-    analysis_ready = pd.read_csv(output)
+    merged = _build_dataset(workspace_root, raw_root)
+    analysis_ready = pd.read_parquet(merged / "prepared_model_data_5min.parquet")
+    analysis_ready["timestamp"] = pd.to_datetime(analysis_ready["timestamp"]).astype(str)
     tandem_only = load_tandem_exports(raw_root, include_health_auto_export=False)
     expected = build_feature_frame(tandem_only, FeatureConfig(horizon_minutes=30)).frame
     pd.testing.assert_series_equal(
@@ -460,7 +404,7 @@ def test_build_health_analysis_ready_command_computes_plausible_workout_windows(
     raw_root = cloud_root / "data" / "raw"
     raw_root.mkdir(parents=True, exist_ok=True)
     _write_tandem_cgm_export(raw_root)
-    bundle_dir = tmp_path / "HealthAutoExport_20260331133020"
+    bundle_dir = raw_root / "health_auto_export" / "HealthAutoExport_20260331133020"
     _write_health_auto_export_bundle(
         bundle_dir,
         json_name="HealthAutoExport-2025-05-24-2025-05-24.json",
@@ -491,26 +435,9 @@ def test_build_health_analysis_ready_command_computes_plausible_workout_windows(
             ],
         ),
     )
-    import_exit = main(["--root", str(workspace_root), "import-health-auto-export", "--input", str(bundle_dir)])
-    assert import_exit == 0
-
-    output = tmp_path / "analysis_ready_health_5min.csv"
-    exit_code = main(
-        [
-            "--root",
-            str(workspace_root),
-            "build-health-analysis-ready",
-            "--raw",
-            str(raw_root),
-            "--output",
-            str(output),
-            "--horizon",
-            "30",
-        ]
-    )
-
-    assert exit_code == 0
-    analysis_ready = pd.read_csv(output)
+    merged = _build_dataset(workspace_root, raw_root)
+    analysis_ready = pd.read_parquet(merged / "prepared_model_data_5min.parquet")
+    analysis_ready["timestamp"] = pd.to_datetime(analysis_ready["timestamp"]).astype(str)
 
     row_0000 = analysis_ready.loc[analysis_ready["timestamp"] == "2025-05-24 00:00:00"].iloc[0]
     row_0700 = analysis_ready.loc[analysis_ready["timestamp"] == "2025-05-24 07:00:00"].iloc[0]
@@ -573,15 +500,12 @@ def test_screen_health_features_command_writes_scores_and_report(tmp_path, monke
     raw_root = cloud_root / "data" / "raw"
     raw_root.mkdir(parents=True, exist_ok=True)
     _write_tandem_cgm_export(raw_root)
-    bundle_dir = tmp_path / "HealthAutoExport_20260331133020"
     _write_health_auto_export_bundle(
-        bundle_dir,
+        raw_root / "health_auto_export" / "HealthAutoExport_20260331133020",
         json_name="HealthAutoExport-2025-05-24-2025-05-24.json",
         payload=_build_health_auto_export_payload(),
     )
-
-    import_exit = main(["--root", str(workspace_root), "import-health-auto-export", "--input", str(bundle_dir)])
-    assert import_exit == 0
+    _build_dataset(workspace_root, raw_root)
 
     report = tmp_path / "health_feature_screening.md"
     scores = tmp_path / "health_feature_scores.csv"
@@ -596,8 +520,6 @@ def test_screen_health_features_command_writes_scores_and_report(tmp_path, monke
             str(report),
             "--scores",
             str(scores),
-            "--horizon",
-            "30",
         ]
     )
 
@@ -627,6 +549,7 @@ def test_screen_health_features_without_apple_skips_cleanly(tmp_path, monkeypatc
     raw_root = cloud_root / "data" / "raw"
     raw_root.mkdir(parents=True, exist_ok=True)
     _write_tandem_cgm_export(raw_root)
+    _build_dataset(workspace_root, raw_root)
 
     report = tmp_path / "health_feature_screening.md"
     scores = tmp_path / "health_feature_scores.csv"
@@ -641,8 +564,6 @@ def test_screen_health_features_without_apple_skips_cleanly(tmp_path, monkeypatc
             str(report),
             "--scores",
             str(scores),
-            "--horizon",
-            "30",
         ]
     )
 
@@ -656,7 +577,7 @@ def test_screen_health_features_without_apple_skips_cleanly(tmp_path, monkeypatc
     assert "Apple Health not available; screening skipped." in text
 
 
-def test_prepare_model_data_with_apple_builds_enriched_dataset_and_report(tmp_path, monkeypatch):
+def test_build_dataset_with_apple_builds_enriched_dataset_and_reports(tmp_path, monkeypatch):
     workspace_root = tmp_path / "repo"
     workspace_root.mkdir()
     cloud_root = tmp_path / "cloud"
@@ -667,33 +588,15 @@ def test_prepare_model_data_with_apple_builds_enriched_dataset_and_report(tmp_pa
     raw_root = cloud_root / "data" / "raw"
     raw_root.mkdir(parents=True, exist_ok=True)
     _write_tandem_cgm_export(raw_root)
-    parent_dir = _write_two_bundle_parent(tmp_path / "apple-health-exports")
+    _write_two_bundle_parent(raw_root / "health_auto_export")
 
-    output = tmp_path / "prepared_model_data_5min.csv"
-    report = tmp_path / "model_data_preparation.md"
-    exit_code = main(
-        [
-            "--root",
-            str(workspace_root),
-            "prepare-model-data",
-            "--raw",
-            str(raw_root),
-            "--apple-input",
-            str(parent_dir),
-            "--output",
-            str(output),
-            "--report",
-            str(report),
-            "--skip-backfill",
-        ]
-    )
-
-    assert exit_code == 0
-    prepared = pd.read_csv(output)
+    merged = _build_dataset(workspace_root, raw_root)
+    prepared = pd.read_parquet(merged / "prepared_model_data_5min.parquet")
     assert "health_activity_value" in prepared.columns
     assert "prior_night_total_sleep_hours" in prepared.columns
-    text = report.read_text(encoding="utf-8")
+    text = (runtime_root / "output" / "prepare" / "model_data_preparation.md").read_text(encoding="utf-8")
     assert "- mode: apple_enriched" in text
     assert "- apple_available: True" in text
-    assert "- health_features_included: True" in text
     assert "- overlap_start: 2025-05-24 00:00:00" in text
+    validation = (merged / "validation_report.md").read_text(encoding="utf-8")
+    assert "Apple Health: 2 export files (2 distinct" in validation

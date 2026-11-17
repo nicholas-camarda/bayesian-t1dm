@@ -400,7 +400,7 @@ def test_run_latent_meal_icr_research_builds_explicit_meal_outputs(tmp_path):
     assert not result.first_meal_exclusion_summary.empty
     assert "Latent Meal Research Gate" in result.research_gate_markdown
     assert "Meal Truth Semantics Report" in result.meal_truth_semantics_report_markdown
-    assert "First Meal Clean Window Audit" in result.meal_window_audit_markdown
+    assert "Which Breakfasts Were Used" in result.meal_window_audit_markdown
 
     paths = write_latent_meal_research_artifacts(result, tmp_path / "latent")
     assert paths["research_gate"].exists()
@@ -704,7 +704,7 @@ def test_latent_meal_tiered_window_registry_preserves_clean_gate_and_marks_relax
 def test_research_therapy_settings_cli_writes_artifacts(tmp_path, monkeypatch):
     dataset = _build_prepared_dataset(apple=True)
     preparation = SimpleNamespace(dataset=dataset)
-    monkeypatch.setattr(cli, "_prepare_model_data", lambda args, paths, session=None: preparation)
+    monkeypatch.setattr(cli, "_load_dataset", lambda args, session=None: SimpleNamespace(preparation=preparation))
 
     report_dir = tmp_path / "reports"
     exit_code = main(
@@ -843,3 +843,65 @@ def test_window_trajectory_is_skipped_when_iob_bookkeeping_is_inconsistent():
     frame.loc[frame["timestamp"].gt(meal_time), "iob_units"] = 2.0
 
     assert _first_meal_window_trajectories(frame, pd.DataFrame({"meal_id": ["m1"], "timestamp": [meal_time]})) == {}
+
+
+def test_settings_come_from_the_newest_window_including_tconnectsync_3_pumper_json(tmp_path):
+    """Windows from tconnectsync 3.x store settings in pumper.json; the newest window wins over older 2.x snapshots."""
+    old_dir = tmp_path / "raw" / "tconnectsync" / "2026-03-02__2026-03-31" / "raw"
+    old_dir.mkdir(parents=True)
+    (old_dir / "pump_event_metadata.json").write_text(json.dumps(_pump_event_metadata_payload()), encoding="utf-8")
+    new_dir = tmp_path / "raw" / "tconnectsync" / "2026-10-19__2026-11-17" / "raw"
+    new_dir.mkdir(parents=True)
+    segments = [
+        {"startTime": 0, "basalRate": 700, "carbRatio": 7000, "targetBg": 110, "isf": 60, "status": []},
+        {"startTime": 300, "basalRate": 710, "carbRatio": 6500, "targetBg": 110, "isf": 65, "status": []},
+        {"startTime": 900, "basalRate": 710, "carbRatio": 6800, "targetBg": 110, "isf": 60, "status": []},
+    ]
+    pumper = {
+        "requested_end": "2026-11-17",
+        "selected_pump_serials": ["1453346"],
+        "pumper": {
+            "pumps": [
+                {
+                    "serialNumber": "1453346",
+                    "settings": {
+                        "uploadedTimeStamp": "2026-11-17T14:29:57Z",
+                        "details": {
+                            "profiles": {
+                                "activeIdp": 0,
+                                "profile": [{"idp": 0, "name": "Main", "insulinDuration": 300, "maxBolus": 25000, "timeDependentSegments": segments}],
+                            },
+                            "globalMaxBolusSettings": {"maxBolus": 25000},
+                        },
+                    },
+                },
+                # A pump not selected for this window is ignored even if it has settings.
+                {"serialNumber": "849064", "settings": {"details": {"profiles": {"activeIdp": 0, "profile": [{"idp": 0, "timeDependentSegments": [{"startTime": 0, "carbRatio": 20000, "isf": 90, "targetBg": 120}]}]}}}},
+            ]
+        },
+    }
+    (new_dir / "pumper.json").write_text(json.dumps(pumper), encoding="utf-8")
+
+    settings = extract_latent_meal_therapy_settings_from_tandem_raw(tmp_path / "raw", segments=parse_therapy_segments())
+
+    # Morning (06:00-11:00) falls in the 05:00 segment of the newest window: 6.5 g/U, not the old 7.0.
+    assert settings.icr_grams_per_unit["morning"] == pytest.approx(6.5)
+    assert settings.correction_factor_mgdl_per_unit["morning"] == pytest.approx(65.0)
+
+
+def test_rows_in_an_excluded_period_never_count_as_clean_basal_time():
+    from bayesian_t1dm.therapy_research import ExcludedPeriod, build_therapy_research_frame
+
+    dataset = _synthetic_base_dataset(apple=False, explicit_carbs=True)
+    stamps = pd.to_datetime(dataset.frame["timestamp"])
+    day = stamps.dt.normalize().iloc[len(stamps) // 2]
+    period = ExcludedPeriod(start=day, end=day + pd.Timedelta(days=1) - pd.Timedelta(seconds=1), reason="steroid injection")
+
+    without = build_therapy_research_frame(dataset)
+    with_exclusion = build_therapy_research_frame(dataset, excluded_periods=(period,))
+    inside = pd.to_datetime(with_exclusion["timestamp"]).dt.normalize().eq(day)
+
+    assert without.loc[inside, "basal_context"].sum() > 0, "the test day must have clean basal time to exclude"
+    assert with_exclusion.loc[inside, "basal_context"].sum() == 0
+    assert with_exclusion.loc[inside, "context_event_excluded"].eq(1).all()
+    pd.testing.assert_series_equal(with_exclusion.loc[~inside, "basal_context"], without.loc[~inside, "basal_context"])

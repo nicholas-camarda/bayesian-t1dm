@@ -11,11 +11,9 @@ import bayesian_t1dm.acquisition as acquisition
 from bayesian_t1dm.acquisition import (
     ExportWindow,
     NormalizedWindowResult,
-    RawApiArtifact,
     TandemCredentials,
     TConnectSyncSourceClient,
     backfill_tandem_exports,
-    collect_tandem_exports,
     normalize_tconnectsync_payloads,
 )
 from bayesian_t1dm.paths import ProjectPaths
@@ -74,57 +72,89 @@ class _FakeTandemSourceEvent:
         return dict(self.payload)
 
 
-class _FakeTandemSourceMultiDeviceAdapter:
+def _pump_log_event(code: int, when: str, seq: int, device: str, **properties) -> dict:
+    """One event shaped like the Tandem Source pump-logs response (tconnectsync 3.x)."""
+    return {
+        "deviceAssignmentId": device,
+        "eventCode": code,
+        "sequenceGroup": 0,
+        "sequenceNumber": seq,
+        "pumpDateTime": when,
+        "eventProperties": properties,
+        "estimatedDateTime": when + "Z",
+    }
+
+
+def _cgm_event(when: str, seq: int, device: str, glucose: int) -> dict:
+    return _pump_log_event(
+        399, when, seq, device,
+        algorithmState=0, cgmDataType=0, currentGlucoseDisplayValue=glucose, egvInfoBitmask=0,
+        egvTimeStamp=0, glucoseValueStatus=0, interval=5, rate=0, reservedD15=0, rssi=0,
+    )
+
+
+def _basal_event(when: str, seq: int, device: str, milliunits_per_hour: int) -> dict:
+    return _pump_log_event(
+        279, when, seq, device,
+        algorithmRate=milliunits_per_hour, commandedRate=milliunits_per_hour, commandedRateSource=0,
+        profileBasalRate=milliunits_per_hour, reservedA2=0, spareA3=0, tempRate=0,
+    )
+
+
+def _bolus_request_event(when: str, seq: int, device: str, bolus_id: int, carbs: int) -> dict:
+    return _pump_log_event(64, when, seq, device, bg=120, bolusId=bolus_id, bolusType=2, carbAmount=carbs, carbRatio=7000, correctionBolusIncluded=0, iob=0)
+
+
+def _bolus_delivery_event(when: str, seq: int, device: str, bolus_id: int, milliunits: int) -> dict:
+    return _pump_log_event(
+        280, when, seq, device,
+        bolusDeliveryStatus=0, bolusId=bolus_id, bolusSource=0, bolusType=2, correction=0, deliveredTotal=milliunits,
+        extendedDurationRequested=0, remoteId=0, requestedLater=0, requestedNow=milliunits,
+    )
+
+
+class _FakeTandemSourceV3Adapter:
+    """Stands in for tconnectsync 3.x ``TandemSourceApi``: get_pumper() and get_pump_logs()."""
+
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str, str, str, object]] = []
-        self.metadata = [
+        self.calls: list[tuple[str, str, str, object]] = []
+        self.pumps = [
             {
                 "serialNumber": "90723647",
-                "tconnectDeviceId": "723357",
-                "minDateWithEvents": "2023-01-01T00:00:00",
-                "maxDateWithEvents": "2025-08-27T11:54:42",
-                "lastUpload": {"lastUploadedAt": "2025-08-27T16:04:01"},
+                "assignmentId": "uuid-old",
+                "availableDataRange": {"start": "2023-01-01T00:00:00", "end": "2025-08-27T11:54:42"},
+                "settings": {"details": {}},
             },
             {
                 "serialNumber": "1453346",
-                "tconnectDeviceId": "1032256",
-                "minDateWithEvents": "2020-01-15T00:00:00",
-                "maxDateWithEvents": "2026-04-22T14:22:38",
-                "lastUpload": {"lastUploadedAt": "2026-04-22T18:23:18"},
+                "assignmentId": "uuid-mobi",
+                "availableDataRange": {"start": "2020-01-15T00:00:00", "end": "2026-11-17T14:07:39"},
+                "settings": {"details": {}},
+            },
+            {
+                "serialNumber": "849064",
+                "assignmentId": "uuid-retired",
+                "availableDataRange": {"start": "2021-01-02T00:00:00", "end": "2023-09-20T21:29:34"},
+                "settings": {"details": {}},
             },
         ]
         self.events = {
-            "723357": [
-                _FakeTandemSourceEvent(
-                    {
-                        "id": 279,
-                        "name": "LID_BASAL_DELIVERY",
-                        "eventTimestamp": "2025-07-10T00:00:00-04:00",
-                        "commandedRate": 700,
-                    }
-                ),
-                _FakeTandemSourceEvent(
-                    {
-                        "id": 280,
-                        "name": "LID_BOLUS_DELIVERY",
-                        "eventTimestamp": "2025-07-10T08:00:00-04:00",
-                        "deliveredTotal": 2500,
-                    }
-                ),
+            "uuid-old": [
+                _basal_event("2025-07-10T00:00:00", 1, "uuid-old", 700),
+                _bolus_request_event("2025-07-10T07:58:00", 2, "uuid-old", bolus_id=11, carbs=45),
+                _bolus_delivery_event("2025-07-10T08:00:00", 3, "uuid-old", bolus_id=11, milliunits=2500),
+                _cgm_event("2025-07-10T08:05:00", 4, "uuid-old", 140),
             ],
-            "1032256": [],
+            "uuid-mobi": [],
         }
 
-    def pump_event_metadata(self):
-        return self.metadata
+    def get_pumper(self):
+        return {"pumps": self.pumps}
 
-    def pump_events_raw(self, device_id, min_date=None, max_date=None, event_ids_filter=None):
-        self.calls.append(("raw", str(device_id), str(min_date), str(max_date), event_ids_filter))
-        return f"raw-{device_id}-{min_date}-{max_date}"
-
-    def pump_events(self, device_id, min_date=None, max_date=None, fetch_all_event_types=False):
-        self.calls.append(("events", str(device_id), str(min_date), str(max_date), fetch_all_event_types))
-        return self.events.get(str(device_id), [])
+    def get_pump_logs(self, device_id, min_date=None, max_date=None, event_ids_filter=None):
+        self.calls.append((str(device_id), str(min_date), str(max_date), event_ids_filter))
+        # The fake returns the same events for every page, so the collector must dedupe across pages.
+        return {"events": list(self.events.get(str(device_id), [])), "clockChanges": []}
 
 
 def _workspace(tmp_path: Path) -> ProjectPaths:
@@ -135,90 +165,47 @@ def _workspace(tmp_path: Path) -> ProjectPaths:
     return ProjectPaths.from_root(root, runtime_root=runtime_root, cloud_root=cloud_root).ensure()
 
 
-def test_tconnectsync_client_archives_raw_payloads_and_normalizes_outputs(tmp_path):
-    workspace = _workspace(tmp_path)
-    window = ExportWindow(date(2024, 5, 1), date(2024, 5, 3))
-    payloads = {
-        "cgm": [
-            {"eventDateTime": "2024-05-01T00:00:00", "egv_estimatedGlucoseValue": 110},
-            {"eventDateTime": "2024-05-01T00:05:00", "egv_estimatedGlucoseValue": 111},
-            {"eventDateTime": "2024-05-01T00:10:00", "egv_estimatedGlucoseValue": 112},
-        ],
-        "bolus": [
-            {"completionDateTime": "2024-05-01T08:05:00", "actualTotalBolusRequested": 4.0, "carbSize": 45},
-        ],
-        "basal": [
-            {"startDateTime": "2024-05-01T00:00:00", "endDateTime": "2024-05-02T00:00:00", "basalRate": 0.85},
-        ],
-        "activity": [
-            {"startDateTime": "2024-05-01T12:00:00", "steps": 1000},
-        ],
-    }
-    adapter = FakeTConnectSyncAdapter(payloads)
-    client = TConnectSyncSourceClient(workspace, adapter=adapter, timezone="America/New_York", pump_serial="123456")
-
-    result = client.export_daily_timeline_window(window, workspace.runtime / "downloads")
-    record = collect_tandem_exports(
-        client,
-        [window],
-        workspace,
-        TandemCredentials(email="me@example.com", password="secret", timezone="America/New_York", pump_serial="123456"),
-        resume=False,
-        strict=False,
-        manifest_path=workspace.cloud_raw / "tandem_export_manifest.csv",
-        report_path=workspace.reports / "tandem_acquisition_summary.md",
-    )[0]
-
-    assert isinstance(result, NormalizedWindowResult)
-    assert isinstance(result.raw_artifacts[0], RawApiArtifact)
-    assert not result.is_complete_window
-    assert result.row_counts["cgm"] == 3
-    assert result.row_counts["bolus"] == 1
-    assert result.row_counts["basal"] == 1
-    assert result.row_counts["activity"] == 1
-    assert result.manifest_path is not None and result.manifest_path.exists()
-    assert (workspace.cloud_raw / "tconnectsync" / window.window_id / "raw" / "cgm.json").exists()
-    assert (workspace.cloud_raw / "tconnectsync" / window.window_id / "normalized" / "cgm.csv").exists()
-    assert record.source_type == "api"
-    assert not record.is_complete_window
-    assert json.loads(record.raw_artifact_paths_json)
-    assert json.loads(record.normalized_paths_json)["cgm"].endswith("cgm.csv")
-    completeness = json.loads(record.completeness_json)
-    assert completeness["is_complete_window"] is False
-    assert "ends_early" in completeness["completeness_reasons"]
-    cgm_text = (workspace.cloud_raw / "tconnectsync" / window.window_id / "normalized" / "cgm.csv").read_text(encoding="utf-8")
-    assert "+00:00" not in cgm_text
-    assert "-04:00" not in cgm_text
-    assert adapter.calls[0][0] == "fetch"
-    assert adapter.calls[0][1] == window.window_id
-
-
-def test_tconnectsync_client_queries_all_window_overlapping_devices(tmp_path):
+def test_tconnectsync_client_queries_overlapping_pumps_and_archives_v3_responses(tmp_path):
     workspace = _workspace(tmp_path)
     window = ExportWindow(date(2025, 7, 5), date(2025, 8, 3))
-    adapter = _FakeTandemSourceMultiDeviceAdapter()
+    adapter = _FakeTandemSourceV3Adapter()
     client = TConnectSyncSourceClient(workspace, adapter=adapter, timezone="America/New_York")
 
     result = client.export_daily_timeline_window(window, workspace.runtime / "downloads")
 
+    # The retired 2023 pump does not overlap the window; the other two are both queried.
+    assert {call[0] for call in adapter.calls} == {"uuid-old", "uuid-mobi"}
+    # A 30-day window is paged in requests of at most 28 days, asking for every event type.
+    old_calls = [call for call in adapter.calls if call[0] == "uuid-old"]
+    assert [(call[1], call[2]) for call in old_calls] == [("2025-07-05", "2025-08-01"), ("2025-08-02", "2025-08-03")]
+    assert all(call[3] is None for call in old_calls)
+
+    # Events repeated across the two pages are counted once.
+    assert result.row_counts["cgm"] == 1
     assert result.row_counts["bolus"] == 1
     assert result.row_counts["basal"] == 1
-    queried_devices = {call[1] for call in adapter.calls if call[0] == "events"}
-    assert queried_devices == {"723357", "1032256"}
-
     normalized_root = workspace.cloud_raw / "tconnectsync" / window.window_id / "normalized"
+    assert pd.read_csv(normalized_root / "carbs.csv")["carb_grams"].tolist() == [45.0]
+    assert pd.read_csv(normalized_root / "cgm.csv")["glucose"].tolist() == [140]
     bolus = pd.read_csv(normalized_root / "bolus.csv")
-    basal = pd.read_csv(normalized_root / "basal.csv")
     assert bolus["pump_serial"].astype(str).tolist() == ["90723647"]
-    assert bolus["tconnect_device_id"].astype(str).tolist() == ["723357"]
-    assert basal["pump_serial"].astype(str).tolist() == ["90723647"]
-    assert basal["tconnect_device_id"].astype(str).tolist() == ["723357"]
+    assert bolus["tconnect_device_id"].astype(str).tolist() == ["uuid-old"]
 
     raw_root = workspace.cloud_raw / "tconnectsync" / window.window_id / "raw"
-    metadata = json.loads((raw_root / "pump_event_metadata.json").read_text(encoding="utf-8"))
-    assert {str(pump["tconnectDeviceId"]) for pump in metadata["selected_pumps"]} == {"723357", "1032256"}
-    assert (raw_root / "pump_events_raw_90723647_723357.txt").exists()
-    assert (raw_root / "pump_events_raw_1453346_1032256.txt").exists()
+    pumper = json.loads((raw_root / "pumper.json").read_text(encoding="utf-8"))
+    assert pumper["selected_pump_serials"] == ["1453346", "90723647"]
+    logs = json.loads((raw_root / "pump_logs_90723647_uuid-old.json").read_text(encoding="utf-8"))
+    assert len(logs["chunks"]) == 2 and logs["chunks"][0]["response"]["events"][0]["eventCode"] == 279
+    assert (raw_root / "pump_logs_1453346_uuid-mobi.json").exists()
+
+
+def test_tconnectsync_client_lists_a_requested_serial_first(tmp_path):
+    workspace = _workspace(tmp_path)
+    adapter = _FakeTandemSourceV3Adapter()
+    window = ExportWindow(date(2025, 7, 5), date(2025, 8, 3))
+    TConnectSyncSourceClient(workspace, adapter=adapter, pump_serial="90723647").export_daily_timeline_window(window, workspace.runtime / "downloads")
+    pumper = json.loads((workspace.cloud_raw / "tconnectsync" / window.window_id / "raw" / "pumper.json").read_text(encoding="utf-8"))
+    assert pumper["selected_pump_serials"] == ["90723647", "1453346"]
 
 
 def test_normalize_tconnectsync_archive_rebuilds_window_and_is_idempotent(tmp_path):
@@ -598,7 +585,6 @@ def test_archived_raw_pump_events_yield_carbs_on_normalize(tmp_path):
         ]
     )
     (raw_dir / "pump_events_raw_90723647_723357.txt").write_text(base64.b64encode(stream).decode() + "\n", encoding="utf-8")
-    (raw_dir / "pump_events_raw_1453346_1032256.txt").write_text("not base64 at all !!\n", encoding="utf-8")
     (raw_dir / "bolus.json").write_text("[]\n", encoding="utf-8")
 
     carbs = _decode_archived_pump_event_carbs(raw_dir)
@@ -611,7 +597,18 @@ def test_archived_raw_pump_events_yield_carbs_on_normalize(tmp_path):
     assert [record["carbs"] for record in payloads["carbs"]] == [48.0]
 
 
-def test_archived_carbs_are_not_decoded_when_window_already_has_a_carb_family(tmp_path):
+def test_unreadable_archived_pump_events_are_an_error_not_a_silent_skip(tmp_path):
+    from bayesian_t1dm.acquisition import AcquisitionError, _decode_archived_pump_event_carbs
+
+    raw_dir = tmp_path / "w" / "raw"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "pump_events_raw_1453346_1032256.txt").write_text("not base64 at all !!\n", encoding="utf-8")
+    with pytest.raises(AcquisitionError, match="not valid base64"):
+        _decode_archived_pump_event_carbs(raw_dir)
+
+
+def test_raw_pump_events_replace_a_stored_carb_payload(tmp_path):
+    """Carbs (and the settings in force) are always rebuilt from the raw events when a window has them."""
     import base64
 
     from bayesian_t1dm.acquisition import _load_archived_window_payloads
@@ -621,8 +618,59 @@ def test_archived_carbs_are_not_decoded_when_window_already_has_a_carb_family(tm
     request_time = int((pd.Timestamp("2025-07-10 07:58:00") - pd.Timestamp("2008-01-01")).total_seconds())
     stream = _bolus_request(request_time, 1, bolus_id=1, carbs=40) + _bolus_delivery(request_time + 60, 2, bolus_id=1, milliunits=4000)
     (raw_dir / "pump_events_raw_1_2.txt").write_text(base64.b64encode(stream).decode(), encoding="utf-8")
-    (raw_dir / "carbs.json").write_text('[{"eventDateTime": "2025-07-10T07:58:00", "carbs": 40}]\n', encoding="utf-8")
+    (raw_dir / "carbs.json").write_text('[{"eventDateTime": "2025-07-10T07:58:00", "carbs": 999}]\n', encoding="utf-8")
 
     payloads = _load_archived_window_payloads(raw_dir.parent)
 
-    assert payloads["carbs"] == [{"eventDateTime": "2025-07-10T07:58:00", "carbs": 40}]
+    assert [record["carbs"] for record in payloads["carbs"]] == [40.0]
+
+
+def test_v3_pump_logs_archive_yields_carbs_with_settings(tmp_path):
+    from bayesian_t1dm.acquisition import _load_archived_window_payloads
+
+    raw_dir = tmp_path / "w" / "raw"
+    raw_dir.mkdir(parents=True)
+    request = _bolus_request_event("2025-07-10T07:58:00", 2, "uuid", bolus_id=11, carbs=45)
+    request["eventProperties"]["carbRatio"] = 6500
+    msg2 = _pump_log_event(65, "2025-07-10T07:58:00", 3, "uuid", bolusId=11, selectedIob=0, options=0, standardPercent=100, duration=0, isf=65, targetBg=110, userOverride=0, declinedCorrection=0)
+    delivery = _bolus_delivery_event("2025-07-10T08:00:00", 4, "uuid", bolus_id=11, milliunits=6900)
+    chunk = {"start": "2025-07-10", "end": "2025-07-10", "response": {"events": [request, msg2, delivery], "clockChanges": []}}
+    (raw_dir / "pump_logs_1453346_uuid.json").write_text(json.dumps({"pump_serial": "1453346", "pump_device_id": "uuid", "chunks": [chunk, chunk]}), encoding="utf-8")
+    (raw_dir / "bolus.json").write_text("[]\n", encoding="utf-8")
+
+    carbs = _load_archived_window_payloads(raw_dir.parent)["carbs"]
+
+    assert len(carbs) == 1  # repeated across chunks, counted once
+    assert (carbs[0]["carbs"], carbs[0]["carb_ratio_g_per_unit"], carbs[0]["isf_mgdl_per_unit"]) == (45.0, 6.5, 65.0)
+    assert carbs[0]["pump_serial"] == "1453346"
+
+def test_carb_entries_carry_the_bolus_calculator_settings_in_force(tmp_path):
+    """Each logged meal keeps the carb ratio (MSG1), correction factor and target (MSG2) the pump used."""
+    from tconnectsync.eventparser.generic import Events
+
+    from bayesian_t1dm.acquisition import _tconnectsync_event_payloads
+
+    msg2 = _pump_log_event(
+        65, "2025-07-10T07:58:00", 3, "uuid",
+        bolusId=11, selectedIob=0, options=0, standardPercent=100, duration=0, isf=65, targetBg=110, userOverride=0, declinedCorrection=0,
+    )
+    events = list(
+        Events(
+            [
+                _bolus_request_event("2025-07-10T07:58:00", 2, "uuid", bolus_id=11, carbs=45) | {"eventProperties": {**_bolus_request_event("x", 2, "uuid", 11, 45)["eventProperties"], "carbRatio": 6500}},
+                msg2,
+                _bolus_delivery_event("2025-07-10T08:00:00", 4, "uuid", bolus_id=11, milliunits=6900),
+            ]
+        )
+    )
+    carbs = _tconnectsync_event_payloads(events)["carbs"]
+    assert len(carbs) == 1
+    assert carbs[0]["carbs"] == 45.0
+    assert carbs[0]["carb_ratio_g_per_unit"] == pytest.approx(6.5)
+    assert carbs[0]["isf_mgdl_per_unit"] == pytest.approx(65.0)
+    assert carbs[0]["target_bg_mgdl"] == pytest.approx(110.0)
+
+    window = ExportWindow(date(2025, 7, 10), date(2025, 7, 11))
+    ingested, _ = normalize_tconnectsync_payloads({"carbs": carbs}, window=window, endpoint_family="tconnectsync")
+    row = ingested.carbs.iloc[0]
+    assert (row["carb_ratio_g_per_unit"], row["isf_mgdl_per_unit"], row["target_bg_mgdl"]) == (6.5, 65.0, 110.0)

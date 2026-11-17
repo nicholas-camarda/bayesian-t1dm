@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import replace, dataclass, field
 from pathlib import Path
 from typing import Iterable
 
@@ -1035,18 +1035,26 @@ def load_tandem_exports(raw_dir: str | Path, *, include_health_auto_export: bool
             carbs = carbs.drop_duplicates(subset=dedupe_subset, keep="first")
         carbs = carbs.drop(columns=[column for column in ["_carb_source_priority"] if column in carbs.columns])
         ingested.carbs = _dedupe_canonical_events("carbs", carbs.reset_index(drop=True))
-    if include_health_auto_export:
-        from .health_auto_export import load_health_auto_export_tables
-
-        health_tables = load_health_auto_export_tables(raw_path)
-        if not health_tables["cgm"].empty:
-            ingested.cgm = _dedupe_canonical_events("cgm", pd.concat([ingested.cgm, health_tables["cgm"]], ignore_index=True, sort=False))
-        ingested.health_activity = health_tables["health_activity"]
-        ingested.health_measurements = health_tables["health_measurements"]
-        ingested.sleep = health_tables["sleep"]
-        ingested.workouts = health_tables["workouts"]
     ingested.manifest = build_export_manifest(ingested)
+    if include_health_auto_export:
+        return attach_health_auto_export(ingested, raw_path)
     return ingested
+
+
+def attach_health_auto_export(tandem: IngestedData, raw_dir: str | Path) -> IngestedData:
+    """Return a copy of the Tandem data with Apple Health tables added and Apple glucose merged into CGM."""
+    from .health_auto_export import load_health_auto_export_tables
+
+    health_tables = load_health_auto_export_tables(raw_dir)
+    merged = replace(tandem)
+    if not health_tables["cgm"].empty:
+        merged.cgm = _dedupe_canonical_events("cgm", pd.concat([tandem.cgm, health_tables["cgm"]], ignore_index=True, sort=False))
+    merged.health_activity = health_tables["health_activity"]
+    merged.health_measurements = health_tables["health_measurements"]
+    merged.sleep = health_tables["sleep"]
+    merged.workouts = health_tables["workouts"]
+    merged.manifest = build_export_manifest(merged)
+    return merged
 
 
 def summarize_coverage(data: IngestedData) -> TandemCoverage:

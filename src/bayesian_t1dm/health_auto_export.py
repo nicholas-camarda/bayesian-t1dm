@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
-import shutil
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
@@ -13,8 +13,6 @@ import pandas as pd
 from .evaluate import walk_forward_splits
 from .features import FeatureConfig, build_feature_frame
 from .ingest import IngestedData
-from .io import read_table
-from .paths import ProjectPaths
 
 
 SUPPORTED_POINT_METRICS = {
@@ -27,7 +25,6 @@ SUPPORTED_POINT_METRICS = {
 SUPPORTED_INTERVAL_METRICS = {"sleep_analysis"}
 SUPPORTED_METRICS = SUPPORTED_POINT_METRICS | SUPPORTED_INTERVAL_METRICS | {"heart_rate"}
 SUPPORTED_GLUCOSE_METRICS = {"blood_glucose"}
-EXPORT_ID_PATTERN = re.compile(r"HealthAutoExport_(\d{14})$")
 EXPORT_JSON_PATTERN = re.compile(r"HealthAutoExport-(\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2})\.json$")
 
 
@@ -37,22 +34,6 @@ class HealthAutoExportBundle:
     input_dir: Path
     json_path: Path
     gpx_paths: tuple[Path, ...]
-    bundle_timestamp: pd.Timestamp | None
-    source_json_filename: str
-    covered_start_date: pd.Timestamp | None
-    covered_end_date: pd.Timestamp | None
-
-
-@dataclass(frozen=True)
-class HealthAutoExportImportResult:
-    export_id: str
-    raw_json_path: Path
-    raw_gpx_paths: tuple[Path, ...]
-    normalized_paths: dict[str, str]
-    row_counts: dict[str, int]
-    ignored_metrics: tuple[str, ...]
-    glucose_present: bool
-    manifest_path: Path
     bundle_timestamp: pd.Timestamp | None
     source_json_filename: str
     covered_start_date: pd.Timestamp | None
@@ -132,16 +113,6 @@ def _safe_float(value: Any) -> float | None:
     return float(numeric)
 
 
-def _infer_bundle_timestamp(export_id: str) -> pd.Timestamp | None:
-    match = EXPORT_ID_PATTERN.fullmatch(export_id)
-    if not match:
-        return None
-    parsed = pd.to_datetime(match.group(1), format="%Y%m%d%H%M%S", errors="coerce")
-    if pd.isna(parsed):
-        return None
-    return pd.Timestamp(parsed)
-
-
 def _infer_covered_range(source_json_filename: str) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
     match = EXPORT_JSON_PATTERN.fullmatch(source_json_filename)
     if not match:
@@ -151,63 +122,6 @@ def _infer_covered_range(source_json_filename: str) -> tuple[pd.Timestamp | None
     start_value = None if pd.isna(start) else pd.Timestamp(start)
     end_value = None if pd.isna(end) else pd.Timestamp(end)
     return start_value, end_value
-
-
-def _discover_bundle_dirs(path: str | Path) -> list[Path]:
-    input_path = Path(path).expanduser().resolve()
-    if input_path.is_file():
-        input_path = input_path.parent
-    if not input_path.exists() or not input_path.is_dir():
-        raise ValueError(f"Health Auto Export input directory does not exist: {input_path}")
-
-    direct_json_paths = sorted(input_path.glob("HealthAutoExport-*.json"))
-    if direct_json_paths:
-        return [input_path]
-
-    child_dirs = sorted(
-        child
-        for child in input_path.iterdir()
-        if child.is_dir() and child.name.startswith("HealthAutoExport_") and any(child.glob("HealthAutoExport-*.json"))
-    )
-    if child_dirs:
-        return child_dirs
-    raise ValueError(f"No HealthAutoExport bundle directories were found under {input_path}")
-
-
-def discover_health_auto_export_bundle(path: str | Path) -> HealthAutoExportBundle:
-    bundle_dirs = _discover_bundle_dirs(path)
-    if len(bundle_dirs) != 1:
-        raise ValueError(f"Expected exactly one Health Auto Export bundle directory, found {len(bundle_dirs)} under {path}")
-
-    input_dir = bundle_dirs[0]
-    json_paths = sorted(input_dir.glob("HealthAutoExport-*.json"))
-    if len(json_paths) != 1:
-        raise ValueError(f"Expected exactly one HealthAutoExport-*.json file in {input_dir}, found {len(json_paths)}")
-
-    gpx_paths = tuple(sorted(input_dir.glob("*.gpx")))
-    source_json_filename = json_paths[0].name
-    covered_start_date, covered_end_date = _infer_covered_range(source_json_filename)
-    return HealthAutoExportBundle(
-        export_id=input_dir.name,
-        input_dir=input_dir,
-        json_path=json_paths[0],
-        gpx_paths=gpx_paths,
-        bundle_timestamp=_infer_bundle_timestamp(input_dir.name),
-        source_json_filename=source_json_filename,
-        covered_start_date=covered_start_date,
-        covered_end_date=covered_end_date,
-    )
-
-
-def discover_health_auto_export_bundles(path: str | Path) -> tuple[HealthAutoExportBundle, ...]:
-    return tuple(discover_health_auto_export_bundle(bundle_dir) for bundle_dir in _discover_bundle_dirs(path))
-
-
-def _copy_artifact(source: Path, destination: Path) -> Path:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if source.resolve() != destination.resolve():
-        shutil.copy2(source, destination)
-    return destination
 
 
 def _normalize_point_metric(metric_name: str, units: str | None, rows: Iterable[dict[str, Any]], *, source_file: str) -> pd.DataFrame:
@@ -491,130 +405,6 @@ def _normalize_health_payload(payload: dict[str, Any], *, source_file: str) -> t
     return tables, tuple(sorted(set(metric for metric in ignored_metrics if metric))), glucose_present
 
 
-def import_health_auto_export(path: str | Path, workspace: ProjectPaths) -> HealthAutoExportImportResult:
-    bundle = discover_health_auto_export_bundle(path)
-    archive_root = workspace.cloud_raw / "health_auto_export" / bundle.export_id
-    raw_root = archive_root / "raw"
-    normalized_root = archive_root / "normalized"
-    raw_root.mkdir(parents=True, exist_ok=True)
-    normalized_root.mkdir(parents=True, exist_ok=True)
-
-    raw_json_path = _copy_artifact(bundle.json_path, raw_root / bundle.json_path.name)
-    raw_gpx_paths = tuple(_copy_artifact(gpx_path, raw_root / gpx_path.name) for gpx_path in bundle.gpx_paths)
-
-    payload = _load_payload(bundle.json_path)
-    tables, ignored_metrics, glucose_present = _normalize_health_payload(payload, source_file=bundle.json_path.name)
-    tables = {kind: _attach_bundle_metadata(frame, bundle) for kind, frame in tables.items()}
-
-    normalized_paths: dict[str, str] = {}
-    row_counts: dict[str, int] = {}
-    for kind, frame in tables.items():
-        if frame.empty:
-            continue
-        filename = "activity.csv" if kind == "health_activity" else f"{kind}.csv"
-        output_path = normalized_root / filename
-        frame.to_csv(output_path, index=False)
-        normalized_paths[kind] = str(output_path)
-        row_counts[kind] = int(len(frame))
-
-    manifest_rows: list[dict[str, Any]] = [
-        {
-            "export_id": bundle.export_id,
-            "kind": "raw_json",
-            "raw_path": str(raw_json_path),
-            "normalized_path": "",
-            "row_count": 0,
-            "ignored_metrics": json.dumps(list(ignored_metrics)),
-            "glucose_present": glucose_present,
-            "bundle_timestamp": bundle.bundle_timestamp,
-            "source_json_filename": bundle.source_json_filename,
-            "covered_start_date": bundle.covered_start_date,
-            "covered_end_date": bundle.covered_end_date,
-        }
-    ]
-    manifest_rows.extend(
-        {
-            "export_id": bundle.export_id,
-            "kind": "raw_gpx",
-            "raw_path": str(path),
-            "normalized_path": "",
-            "row_count": 0,
-            "ignored_metrics": json.dumps(list(ignored_metrics)),
-            "glucose_present": glucose_present,
-            "bundle_timestamp": bundle.bundle_timestamp,
-            "source_json_filename": bundle.source_json_filename,
-            "covered_start_date": bundle.covered_start_date,
-            "covered_end_date": bundle.covered_end_date,
-        }
-        for path in raw_gpx_paths
-    )
-    manifest_rows.extend(
-        {
-            "export_id": bundle.export_id,
-            "kind": kind,
-            "raw_path": str(raw_json_path),
-            "normalized_path": normalized_path,
-            "row_count": row_counts[kind],
-            "ignored_metrics": json.dumps(list(ignored_metrics)),
-            "glucose_present": glucose_present,
-            "bundle_timestamp": bundle.bundle_timestamp,
-            "source_json_filename": bundle.source_json_filename,
-            "covered_start_date": bundle.covered_start_date,
-            "covered_end_date": bundle.covered_end_date,
-        }
-        for kind, normalized_path in normalized_paths.items()
-    )
-    manifest_path = archive_root / "health_auto_export_manifest.csv"
-    pd.DataFrame(manifest_rows).to_csv(manifest_path, index=False)
-
-    return HealthAutoExportImportResult(
-        export_id=bundle.export_id,
-        raw_json_path=raw_json_path,
-        raw_gpx_paths=raw_gpx_paths,
-        normalized_paths=normalized_paths,
-        row_counts=row_counts,
-        ignored_metrics=ignored_metrics,
-        glucose_present=glucose_present,
-        manifest_path=manifest_path,
-        bundle_timestamp=bundle.bundle_timestamp,
-        source_json_filename=bundle.source_json_filename,
-        covered_start_date=bundle.covered_start_date,
-        covered_end_date=bundle.covered_end_date,
-    )
-
-
-def import_health_auto_export_batch(path: str | Path, workspace: ProjectPaths) -> tuple[HealthAutoExportImportResult, ...]:
-    return tuple(import_health_auto_export(bundle.input_dir, workspace) for bundle in discover_health_auto_export_bundles(path))
-
-
-def _coerce_manifest_timestamp(value: Any) -> pd.Timestamp | None:
-    parsed = pd.to_datetime(value, errors="coerce")
-    if pd.isna(parsed):
-        return None
-    if isinstance(parsed, pd.Timestamp) and parsed.tzinfo is not None:
-        parsed = parsed.tz_localize(None)
-    return pd.Timestamp(parsed)
-
-
-def _attach_manifest_metadata(frame: pd.DataFrame, row: dict[str, Any]) -> pd.DataFrame:
-    if frame.empty:
-        return frame
-    out = frame.copy()
-    metadata_defaults = {
-        "export_id": str(row.get("export_id") or ""),
-        "export_timestamp": _coerce_manifest_timestamp(row.get("bundle_timestamp")),
-        "source_json_filename": str(row.get("source_json_filename") or ""),
-        "covered_start_date": _coerce_manifest_timestamp(row.get("covered_start_date")),
-        "covered_end_date": _coerce_manifest_timestamp(row.get("covered_end_date")),
-    }
-    for column, value in metadata_defaults.items():
-        if column not in out.columns:
-            out[column] = value
-        else:
-            out[column] = out[column].where(out[column].notna(), value)
-    return out
-
-
 def _canonicalize_health_table_types(kind: str, frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty:
         return frame
@@ -687,30 +477,52 @@ def _dedupe_canonical_health_table(kind: str, frame: pd.DataFrame) -> pd.DataFra
     return out.reset_index(drop=True)
 
 
-def load_unified_health_auto_export_tables(raw_dir: str | Path) -> dict[str, pd.DataFrame]:
-    raw_path = Path(raw_dir)
-    tables = _empty_health_tables()
-    if not raw_path.exists():
-        return tables
+def discover_health_export_files(raw_dir: str | Path) -> list[Path]:
+    """Every Health Auto Export JSON under ``<raw>/health_auto_export/``, wherever it was dropped."""
+    root = Path(raw_dir) / "health_auto_export"
+    if not root.exists():
+        return []
+    return sorted(root.rglob("HealthAutoExport-*.json"))
 
-    manifest_files = sorted(raw_path.rglob("health_auto_export_manifest.csv"))
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def load_unified_health_auto_export_tables(raw_dir: str | Path) -> dict[str, pd.DataFrame]:
+    """Read every Apple Health export JSON once and merge them.
+
+    The raw JSON is the source of truth; nothing is copied. Byte-identical files are read once.
+    Where exports overlap, the export covering the later end date wins for each timestamp and device.
+    """
+    tables = _empty_health_tables()
     collected: dict[str, list[pd.DataFrame]] = {key: [] for key in tables}
-    for manifest_path in manifest_files:
-        manifest = pd.read_csv(manifest_path)
-        if "normalized_path" not in manifest.columns or "kind" not in manifest.columns:
+    seen: set[str] = set()
+    for json_path in discover_health_export_files(raw_dir):
+        digest = _file_sha256(json_path)
+        if digest in seen:
             continue
-        for row in manifest.to_dict(orient="records"):
-            kind = str(row.get("kind") or "")
-            normalized_path = str(row.get("normalized_path") or "").strip()
-            if kind not in tables or not normalized_path:
+        seen.add(digest)
+        covered_start, covered_end = _infer_covered_range(json_path.name)
+        bundle = HealthAutoExportBundle(
+            export_id=json_path.stem,
+            input_dir=json_path.parent,
+            json_path=json_path,
+            gpx_paths=(),
+            bundle_timestamp=covered_end,
+            source_json_filename=json_path.name,
+            covered_start_date=covered_start,
+            covered_end_date=covered_end,
+        )
+        normalized, _, _ = _normalize_health_payload(_load_payload(json_path), source_file=json_path.name)
+        for kind, frame in normalized.items():
+            if kind not in collected or frame.empty:
                 continue
-            candidate = Path(normalized_path).expanduser()
-            if not candidate.exists():
-                continue
-            frame = read_table(candidate)
-            frame = _attach_manifest_metadata(frame, row)
-            frame = _canonicalize_health_table_types(kind, frame)
-            collected[kind].append(frame)
+            collected[kind].append(_canonicalize_health_table_types(kind, _attach_bundle_metadata(frame, bundle)))
 
     for kind, frames in collected.items():
         if not frames:

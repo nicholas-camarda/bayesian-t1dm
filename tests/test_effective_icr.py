@@ -120,8 +120,14 @@ def test_effective_icr_recovery_rejects_empty_runs():
         run_effective_icr_recovery(n_cohorts=0)
 
 
-def _simulated_breakfast_data(*, days: int, true_icr: float, log_carbs: bool, seed: int = 0) -> IngestedData:
-    """Raw-style tables for ``days`` days with one physically simulated 08:00 breakfast each."""
+def _simulated_breakfast_data(
+    *, days: int, true_icr: float, log_carbs: bool, seed: int = 0, pump_icr_by_day: list[float] | None = None
+) -> IngestedData:
+    """Raw-style tables for ``days`` days with one physically simulated 08:00 breakfast each.
+
+    With ``pump_icr_by_day`` the bolus follows that day's pump I:C and each carb entry records it,
+    as the bolus calculator does.
+    """
     rng = np.random.default_rng(seed)
     timestamps = pd.date_range("2025-03-01 00:00:00", periods=days * 288, freq="5min")
     glucose = np.full(len(timestamps), 110.0)
@@ -131,14 +137,18 @@ def _simulated_breakfast_data(*, days: int, true_icr: float, log_carbs: bool, se
     for day in range(days):
         start = day * 288 + 8 * 12
         carbs = float(rng.uniform(35.0, 75.0))
-        bolus_units = carbs / PROGRAMMED_ICR
+        pump_icr = PROGRAMMED_ICR if pump_icr_by_day is None else pump_icr_by_day[day]
+        bolus_units = carbs / pump_icr
         response = (CORRECTION_FACTOR / true_icr) * carbs * absorbed_fraction(window, shape=2.5, mean_minutes=70.0) - CORRECTION_FACTOR * bolus_units * _insulin_absorbed_fraction(window)
         glucose[start : start + len(window)] += response
         # Whatever the meal left behind persists until the pre-dawn reset, as it would without a correction.
         glucose[start + len(window) : (day + 1) * 288] += response[-1]
         bolus_rows.append({"timestamp": timestamps[start], "bolus_units": bolus_units})
         # Logged five minutes after the bolus: not the same 5-minute bin.
-        carb_rows.append({"timestamp": timestamps[start + 1], "carb_grams": carbs})
+        carb_row = {"timestamp": timestamps[start + 1], "carb_grams": carbs}
+        if pump_icr_by_day is not None:
+            carb_row |= {"carb_ratio_g_per_unit": pump_icr, "isf_mgdl_per_unit": CORRECTION_FACTOR, "target_bg_mgdl": 110.0}
+        carb_rows.append(carb_row)
     glucose = glucose + rng.normal(0.0, 1.5, size=len(glucose))
     cgm = pd.DataFrame({"timestamp": timestamps, "glucose": np.clip(glucose, 45.0, 395.0), "source_file": "sim.csv"})
     basal = pd.DataFrame(
@@ -157,7 +167,7 @@ def _simulated_breakfast_data(*, days: int, true_icr: float, log_carbs: bool, se
     )
 
 
-def _run_full(data: IngestedData):
+def _run_full(data: IngestedData, excluded_periods=()):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         dataset = build_analysis_ready_health_dataset(tandem_data=data, health_data=IngestedData(), config=FeatureConfig(horizon_minutes=30))
@@ -165,6 +175,7 @@ def _run_full(data: IngestedData):
             dataset,
             segments=parse_therapy_segments(),
             research_scope="full",
+            excluded_periods=excluded_periods,
             therapy_settings=LatentMealTherapySettings(
                 icr_grams_per_unit={"morning": PROGRAMMED_ICR},
                 correction_factor_mgdl_per_unit={"morning": CORRECTION_FACTOR},
@@ -176,7 +187,7 @@ def _run_full(data: IngestedData):
         )
 
 
-def test_pipeline_recovers_effective_icr_from_logged_breakfasts(tmp_path):
+def test_pipeline_recovers_effective_icr_from_logged_breakfasts(tmp_path, assert_answer_first_page):
     true_icr = 8.0
     result = _run_full(_simulated_breakfast_data(days=14, true_icr=true_icr, log_carbs=True))
 
@@ -195,15 +206,17 @@ def test_pipeline_recovers_effective_icr_from_logged_breakfasts(tmp_path):
     assert paths["effective_icr_evidence"].exists()
     report = paths["latent_carb_estimator_report"].read_text(encoding="utf-8")
     assert "## Effective I:C From Logged Meals" in report
-    assert "carbs_hit_harder_than_programmed" in report
+    assert "Carbs raise glucose more than the setting assumes" in report
 
     review = write_latent_meal_review_html(result, tmp_path / "latent" / "latent_meal_review.html").read_text(encoding="utf-8")
-    assert "How These Estimates Were Made" in review
-    assert "Effective I:C From Logged Meals" in review
-    assert "carbs_hit_harder_than_programmed" in review
+    assert "Is my morning I:C ratio right?" in review
+    assert "Carbs raise glucose more than the setting assumes" in review
+    assert f"Your pump is set to {morning['programmed_icr']:.1f}" in review
+    assert "<svg" in review and "carbs implied by your glucose" in review
+    assert_answer_first_page(review)
 
 
-def test_pipeline_says_icr_is_unassessable_without_logged_carbs(tmp_path):
+def test_pipeline_says_icr_is_unassessable_without_logged_carbs(tmp_path, assert_answer_first_page):
     result = _run_full(_simulated_breakfast_data(days=8, true_icr=8.0, log_carbs=False))
 
     evidence = result.effective_icr_evidence
@@ -222,10 +235,11 @@ def test_pipeline_says_icr_is_unassessable_without_logged_carbs(tmp_path):
 
     review = write_latent_meal_review_html(result, tmp_path / "latent" / "latent_meal_review.html").read_text(encoding="utf-8")
     assert "No accepted window has a logged carb count" in review
+    assert_answer_first_page(review)
 
 
 def test_cli_workflow_from_raw_tree_with_hand_kept_carb_log(tmp_path, monkeypatch):
-    """prepare-model-data -> research-latent-meal-icr on a raw tree laid out like the real archive."""
+    """build-dataset -> research-latent-meal-icr on a raw tree laid out like the real archive."""
     import json
 
     from bayesian_t1dm.cli import main
@@ -261,7 +275,7 @@ def test_cli_workflow_from_raw_tree_with_hand_kept_carb_log(tmp_path, monkeypatc
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        assert main(["--root", str(repo), "prepare-model-data", "--skip-backfill"]) == 0
+        assert main(["--root", str(repo), "build-dataset"]) == 0
         assert (
             main(
                 [
@@ -270,7 +284,6 @@ def test_cli_workflow_from_raw_tree_with_hand_kept_carb_log(tmp_path, monkeypatc
                     "research-latent-meal-icr",
                     "--research-scope",
                     "full",
-                    "--skip-backfill",
                     "--therapy-settings",
                     str(settings_path),
                 ]
@@ -293,3 +306,46 @@ def test_full_scope_without_pump_profile_explains_how_to_supply_settings(tmp_pat
 
     with pytest.raises(FileNotFoundError, match="--therapy-settings"):
         extract_latent_meal_therapy_settings_from_tandem_raw(tmp_path)
+
+
+def test_each_breakfast_is_judged_against_the_setting_in_force_and_reported_per_period():
+    """True sensitivity is 8 g/U throughout; the pump was set to 10 g/U, then corrected to 8 g/U."""
+    schedule = [10.0] * 12 + [8.0] * 12
+    result = _run_full(_simulated_breakfast_data(days=24, true_icr=8.0, log_carbs=True, seed=4, pump_icr_by_day=schedule))
+    evidence = result.effective_icr_evidence.set_index("programmed_icr")
+
+    assert list(evidence.index) == [10.0, 8.0]
+    assert evidence["settings_source"].eq("bolus calculator").all()
+    old, current = evidence.loc[10.0], evidence.loc[8.0]
+    assert not bool(old["is_current_setting"]) and bool(current["is_current_setting"])
+    assert old["status"] == "carbs_hit_harder_than_programmed"
+    assert old["effective_icr"] == pytest.approx(8.0, rel=0.1)
+    assert current["status"] == "consistent_with_programmed"
+    assert current["effective_icr"] == pytest.approx(8.0, rel=0.1)
+
+
+def test_breakfasts_inside_an_excluded_period_are_left_out(tmp_path):
+    from bayesian_t1dm.therapy_research import load_excluded_periods
+
+    (tmp_path / "context_events.csv").write_text(
+        "start_date,end_date,reason\n2025-03-03,2025-03-06,steroid injection\n", encoding="utf-8"
+    )
+    periods = load_excluded_periods(tmp_path)
+    assert len(periods) == 1 and periods[0].reason == "steroid injection"
+
+    result = _run_full(_simulated_breakfast_data(days=10, true_icr=8.0, log_carbs=True, seed=5), excluded_periods=periods)
+    windows = result.meal_windows
+    in_period = pd.to_datetime(windows["timestamp"]).dt.normalize().between(pd.Timestamp("2025-03-03"), pd.Timestamp("2025-03-06"))
+    assert in_period.sum() == 4
+    assert windows.loc[in_period, "exclusion_reasons"].str.contains("context_event_excluded").all()
+    tiers = windows.loc[in_period, "analysis_tier"] if "analysis_tier" in windows else pd.Series(["rejected"] * 4)
+    assert tiers.eq("rejected").all()
+    assert not windows.loc[~in_period, "exclusion_reasons"].fillna("").str.contains("context_event_excluded").any()
+
+
+def test_malformed_context_events_file_is_an_error(tmp_path):
+    from bayesian_t1dm.therapy_research import load_excluded_periods
+
+    (tmp_path / "context_events.csv").write_text("start_date,end_date,reason\n2025-03-06,2025-03-03,backwards\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid row"):
+        load_excluded_periods(tmp_path)

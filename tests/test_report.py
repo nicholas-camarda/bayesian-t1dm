@@ -169,7 +169,7 @@ def test_write_markdown_report_distinguishes_suppressed_recommendations(tmp_path
     assert "Recommendations were suppressed by policy." in text
 
 
-def test_review_html_writers_emit_expected_sections(tmp_path):
+def test_review_html_writers_emit_expected_sections(tmp_path, assert_answer_first_page):
     coverage = TandemCoverage(
         source_files=1,
         manifest_rows=3,
@@ -282,15 +282,19 @@ def test_review_html_writers_emit_expected_sections(tmp_path):
 
     coverage_text = coverage_path.read_text(encoding="utf-8")
     run_text = run_path.read_text(encoding="utf-8")
-    assert "Window Timeline" in coverage_text
-    assert "Completeness Reasons" in coverage_text
-    assert "Latest Window" in coverage_text
-    assert "Recommendation Policy" in run_text
-    assert "Recommendations were suppressed by policy." in run_text
-    assert "Final Fit Diagnostics" in run_text
+    assert "Is the Tandem data complete?" in coverage_text
+    assert "1 of 1 download windows" in coverage_text
+    assert "data ends earlier than requested" in coverage_text
+    assert "Can the model forecast glucose 30 minutes ahead?" in run_text
+    # 10.0 vs 14.0 mg/dL is a 29% improvement, past the 10% bar.
+    assert "Beats the simple baseline" in run_text
+    assert "some Tandem data windows are incomplete" in run_text
+    assert "model fitting checks" in run_text.lower()
+    for text in (coverage_text, run_text):
+        assert_answer_first_page(text)
 
 
-def test_write_therapy_evidence_review_html_emits_expected_sections(tmp_path):
+def test_write_therapy_evidence_review_html_emits_expected_sections(tmp_path, assert_answer_first_page):
     dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
     preparation = ModelDataPreparationResult(
         dataset=dataset,
@@ -319,7 +323,39 @@ def test_write_therapy_evidence_review_html_emits_expected_sections(tmp_path):
     out_path = write_therapy_evidence_review_html(preparation, research_result, tmp_path / "therapy_evidence_review.html", validation_result=validation_result)
     text = out_path.read_text(encoding="utf-8")
 
-    assert "Therapy Data Timeline" in text
-    assert "Workflow Crosswalk" in text
-    assert "Overnight Basal Proof" in text
-    assert "Supporting Artifacts" in text
+    assert "Is there enough data to judge my overnight basal?" in text
+    assert "clean nights" in text
+    assert "Files behind this page" in text
+    assert "behaved correctly in" in text
+    assert_answer_first_page(text)
+
+
+
+def test_forecast_verdict_follows_the_ten_percent_rule_and_sampler_checks():
+    from bayesian_t1dm.report_page import forecast_verdict, sampler_healthy
+
+    assert forecast_verdict(8.9, 10.0).status == "good"
+    assert forecast_verdict(9.5, 10.0).status == "warn"
+    assert forecast_verdict(12.0, 10.0).status == "bad"
+    assert forecast_verdict(None, 10.0).status == "info"
+    # A failed fit overrides an apparently good error.
+    failed = forecast_verdict(5.0, 10.0, failed_fits=1, total_fits=3)
+    assert failed.status == "bad" and "1 of 3" in failed.explanation
+
+    healthy = {"rhat_max": 1.005, "divergences": 0, "ess_bulk_min": 250.0, "chains": 2}
+    assert sampler_healthy(healthy)
+    assert not sampler_healthy({**healthy, "rhat_max": 1.02})
+    assert not sampler_healthy({**healthy, "divergences": 3})
+    assert not sampler_healthy({**healthy, "ess_bulk_min": 150.0})  # under 100 per chain
+    assert not sampler_healthy({**healthy, "rhat_max": None})
+
+
+def test_icr_verdict_reports_direction_and_setting():
+    from bayesian_t1dm.report_page import icr_verdict
+
+    consistent = icr_verdict("morning", 6.7, 6.1, 7.3, 7.0, "consistent_with_programmed")
+    assert consistent.status == "good"
+    assert "6.7 g per unit (90% range 6.1 to 7.3)" in consistent.headline and "set to 7.0" in consistent.headline
+    assert "harder" in consistent.explanation
+    harder = icr_verdict("morning", 5.5, 5.0, 6.0, 7.0, "carbs_hit_harder_than_programmed")
+    assert harder.status == "warn" and harder.label == "Carbs raise glucose more than the setting assumes"

@@ -142,7 +142,7 @@ class BayesianGlucoseModel:
         *,
         draws: int = 1000,
         tune: int = 1000,
-        chains: int = 2,
+        chains: int = 4,
         target_quantiles: tuple[float, float] = (0.1, 0.9),
         target_accept: float = 0.95,
         max_treedepth: int = 12,
@@ -182,29 +182,26 @@ class BayesianGlucoseModel:
         X = standardized.to_numpy(dtype=float)
         y_values = y_std.to_numpy(dtype=float)
 
+        # Direct regression of glucose `horizon` minutes ahead on the current features (current and lagged
+        # glucose, insulin, carbs, basal, time of day). Current glucose is a feature, so "glucose stays the
+        # same" is a special case of the model. There is no per-row latent state: rows are not contiguous
+        # in time (CGM gaps are dropped), and a latent state per row would make the posterior 100k+ dimensional.
         with pm.Model() as model:
+            # Data containers keep the design matrix out of the compiled graph; as literal constants a
+            # 150k x 80 matrix makes the compiled sampler large enough to crash the worker processes.
+            X_data = pm.Data("X", X)
+            y_data = pm.Data("y", y_values)
             intercept = pm.Normal("intercept", mu=0.0, sigma=1.0)
-            beta = pm.Normal("beta", mu=0.0, sigma=0.5, shape=X.shape[1])
-            rho = pm.Beta("rho", alpha=2.0, beta=2.0)
-            sigma_state = pm.Exponential("sigma_state", 1.0)
+            beta = pm.Normal("beta", mu=0.0, sigma=1.0, shape=X.shape[1])
             sigma_obs = pm.Exponential("sigma_obs", 1.0)
-            latent = pm.AR(
-                "latent",
-                rho=rho,
-                sigma=sigma_state,
-                constant=False,
-                ar_order=1,
-                shape=len(y_values),
-                init_dist=pm.Normal.dist(0.0, 1.0),
-            )
-            mu = intercept + pm.math.dot(X, beta) + latent
-            pm.StudentT("obs", nu=5.0, mu=mu, sigma=sigma_obs, observed=y_values)
+            mu = intercept + pm.math.dot(X_data, beta)
+            pm.StudentT("obs", nu=5.0, mu=mu, sigma=sigma_obs, observed=y_data)
             sample_started = time.perf_counter()
             posterior = pm.sample(
                 draws=self.draws,
                 tune=self.tune,
                 chains=self.chains,
-                cores=1,
+                cores=min(self.chains, os.cpu_count() or 1),
                 target_accept=self.target_accept,
                 random_seed=self.random_seed,
                 progressbar=False,
@@ -247,37 +244,25 @@ class BayesianGlucoseModel:
         return variable.transpose(*dims).values
 
     def _simulate_mean_draws(self, fit: ModelFit, frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.random.Generator]:
-        """Return (mean_draws, sigma_obs, rng): the latent-mean trajectory for every posterior draw.
+        """Return (mean_draws, sigma_obs, rng): the predicted mean for every posterior draw.
 
         ``mean_draws`` has shape (n_posterior_samples, n_rows) in glucose units. The random
         generator is seeded from ``random_seed`` on every call, so two calls on scenario
-        variants of the same frame use identical AR innovations (common random numbers).
+        variants of the same frame use identical observation noise (common random numbers).
         """
         posterior = fit.posterior
         X = self._prepare_matrix(fit, frame)
         intercept = self._stack_draws(posterior, "intercept")
         beta = self._stack_draws(posterior, "beta")
-        latent = self._stack_draws(posterior, "latent")
-        rho = self._stack_draws(posterior, "rho")
-        sigma_state = self._stack_draws(posterior, "sigma_state")
-
         if beta.ndim != 2:
             beta = np.reshape(beta, (beta.shape[0], -1))
         if X.shape[1] != beta.shape[1]:
             raise ValueError(
                 f"Prediction matrix has {X.shape[1]} features but posterior beta expects {beta.shape[1]}"
             )
-
         sigma_obs = self._stack_draws(posterior, "sigma_obs")  # shape (n_samples,)
         rng = np.random.default_rng(self.random_seed)
-        n_samples = intercept.shape[0]
-        n_obs = X.shape[0]
-        mean = np.zeros((n_samples, n_obs), dtype=float)
-        state = latent[:, -1].copy()
-        for t in range(n_obs):
-            linear = intercept + (X[t] @ beta.T)
-            state = rho * state + rng.normal(0.0, sigma_state, size=n_samples)
-            mean[:, t] = (linear + state) * fit.target_scale + fit.target_mean
+        mean = (intercept[:, np.newaxis] + beta @ X.T) * fit.target_scale + fit.target_mean
         return mean, sigma_obs, rng
 
     def _summarize_draws(self, fit: ModelFit, mean: np.ndarray, sigma_obs: np.ndarray, rng: np.random.Generator, index) -> pd.DataFrame:

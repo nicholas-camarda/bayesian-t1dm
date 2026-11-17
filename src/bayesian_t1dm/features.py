@@ -222,6 +222,10 @@ def _aggregate_basal(data: IngestedData, grid: pd.DataFrame, *, freq: str) -> pd
     return out
 
 
+# Settings the pump's bolus calculator used for each logged meal; carried alongside carb_grams.
+CALCULATOR_SETTING_COLUMNS = ("carb_ratio_g_per_unit", "isf_mgdl_per_unit", "target_bg_mgdl")
+
+
 def _aggregate_carbs(data: IngestedData, grid: pd.DataFrame, *, freq: str, windows_minutes: Sequence[int]) -> pd.DataFrame:
     step_minutes = _freq_minutes(freq)
     out = grid.copy()
@@ -240,7 +244,12 @@ def _aggregate_carbs(data: IngestedData, grid: pd.DataFrame, *, freq: str, windo
     if carbs.empty:
         return out
 
-    carbs = carbs.groupby("timestamp", as_index=False).agg(carb_grams=("carb_grams", "sum"))
+    # Bolus-calculator settings in force for the meal travel with it (not model inputs).
+    setting_columns = [column for column in CALCULATOR_SETTING_COLUMNS if column in carbs.columns]
+    carbs = carbs.groupby("timestamp", as_index=False).agg(
+        carb_grams=("carb_grams", "sum"),
+        **{column: (column, "first") for column in setting_columns},
+    )
     out = out.merge(carbs, on="timestamp", how="left", suffixes=("", "_agg"))
     out["carb_grams"] = out["carb_grams_agg"].combine_first(out["carb_grams"])
     out = out.drop(columns=[column for column in ["carb_grams_agg"] if column in out.columns])

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -104,6 +106,15 @@ def _fake_status_research_result() -> TherapyResearchResult:
         meal_proxy_mode="strict",
         ic_policy="exploratory_only",
     )
+
+
+
+def _built_raw_tree(tmp_path: Path, workspace_root: Path, fixture_dir: Path) -> Path:
+    """Copy a fixture raw tree into the test cloud folder and build its merged dataset."""
+    raw_root = tmp_path / "cloud" / "data" / "raw"
+    shutil.copytree(fixture_dir, raw_root)
+    assert main(["--root", str(workspace_root), "build-dataset", "--raw", str(raw_root)]) == 0
+    return raw_root
 
 
 def test_validate_raw_command_writes_summary_report(tmp_path):
@@ -302,15 +313,8 @@ def test_ingest_command_defaults_report_to_runtime_output(tmp_path, tandem_fixtu
     monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(cloud_root))
     monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
 
-    exit_code = main(
-        [
-            "--root",
-            str(workspace_root),
-            "ingest",
-            "--raw",
-            str(tandem_fixture_dir),
-        ]
-    )
+    raw_root = _built_raw_tree(tmp_path, workspace_root, tandem_fixture_dir)
+    exit_code = main(["--root", str(workspace_root), "ingest", "--raw", str(raw_root)])
 
     assert exit_code == 0
     assert (runtime_root / "output" / "source" / "coverage.md").exists()
@@ -369,16 +373,8 @@ def test_run_skip_recommendations_writes_skipped_policy(tmp_path, tandem_fixture
         ),
     )
 
-    exit_code = main(
-        [
-            "--root",
-            str(workspace_root),
-            "run",
-            "--raw",
-            str(tandem_fixture_dir),
-            "--skip-recommendations",
-        ]
-    )
+    raw_root = _built_raw_tree(tmp_path, workspace_root, tandem_fixture_dir)
+    exit_code = main(["--root", str(workspace_root), "run", "--raw", str(raw_root), "--skip-recommendations"])
 
     assert exit_code == 0
     report_json = tmp_path / "runtime" / "cache" / "forecast" / "run_summary.json"
@@ -397,7 +393,7 @@ def test_run_skip_recommendations_writes_skipped_policy(tmp_path, tandem_fixture
     assert any(event["event"] == "command.complete" and event["status"] == "success" for event in events)
 
 
-def test_prepare_model_data_without_apple_writes_tandem_only_dataset(tmp_path, monkeypatch):
+def test_build_dataset_without_apple_writes_tandem_only_dataset_and_skips_unchanged_inputs(tmp_path, monkeypatch):
     workspace_root = tmp_path / "repo"
     workspace_root.mkdir()
     cloud_root = tmp_path / "cloud"
@@ -405,86 +401,37 @@ def test_prepare_model_data_without_apple_writes_tandem_only_dataset(tmp_path, m
     raw_root = cloud_root / "data" / "raw"
     raw_root.mkdir(parents=True, exist_ok=True)
     _write_tandem_cgm_export(raw_root)
-
     monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(cloud_root))
     monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
 
-    output = tmp_path / "prepared_model_data_5min.csv"
-    report = tmp_path / "model_data_preparation.md"
-    exit_code = main(
-        [
-            "--root",
-            str(workspace_root),
-            "prepare-model-data",
-            "--raw",
-            str(raw_root),
-            "--output",
-            str(output),
-            "--report",
-            str(report),
-            "--skip-backfill",
-        ]
-    )
+    assert main(["--root", str(workspace_root), "build-dataset", "--raw", str(raw_root)]) == 0
 
-    assert exit_code == 0
-    assert output.exists()
-    assert report.exists()
-
-    prepared = pd.read_csv(output)
+    merged = cloud_root / "data" / "merged"
+    prepared = pd.read_parquet(merged / "prepared_model_data_5min.parquet")
     assert "health_activity_value" not in prepared.columns
-    text = report.read_text(encoding="utf-8")
+    text = (runtime_root / "output" / "prepare" / "model_data_preparation.md").read_text(encoding="utf-8")
     assert "- mode: tandem_only" in text
     assert "- apple_available: False" in text
-    assert "- health_features_included: False" in text
-    assert "below the requested minimum" in text
-    run_dir = _latest_log_dir(runtime_root, "prepare-model-data")
+    manifest = json.loads((merged / "dataset.json").read_text(encoding="utf-8"))
+    built_at = manifest["built_at"]
+    run_dir = _latest_log_dir(runtime_root, "build-dataset")
     events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert any(event["event"] == "prepare_model_data.apple_import.reused_existing" for event in events)
-    assert any(event["event"] == "prepare_model_data.apple_health.not_detected" for event in events)
-    assert any(event["event"] == "command.stage.start" and event["stage"] == "prepare_model_data.load_inputs" for event in events)
-    assert any(event["event"] == "command.stage.start" and event["stage"] == "prepare_model_data.build_dataset" for event in events)
-    assert any(event["event"] == "prepare_model_data.dataset_summary" for event in events)
+    assert any(event["event"] == "command.stage.start" and event["stage"] == "dataset.build" for event in events)
 
+    # Unchanged inputs: nothing is rebuilt.
+    assert main(["--root", str(workspace_root), "build-dataset", "--raw", str(raw_root)]) == 0
+    assert json.loads((merged / "dataset.json").read_text(encoding="utf-8"))["built_at"] == built_at
 
-def test_prepare_model_data_backfills_tandem_when_needed_without_apple(tmp_path, monkeypatch):
-    workspace_root = tmp_path / "repo"
-    workspace_root.mkdir()
-    cloud_root = tmp_path / "cloud"
-    runtime_root = tmp_path / "runtime"
-    raw_root = cloud_root / "data" / "raw"
-    raw_root.mkdir(parents=True, exist_ok=True)
-    _write_tandem_cgm_export(raw_root)
+    # A new raw file makes analyses refuse the old dataset until it is rebuilt.
+    (raw_root / "carbs.csv").write_text("timestamp,carb_grams\n2025-05-24 08:00:00,30\n", encoding="utf-8")
+    from bayesian_t1dm.dataset import StaleDatasetError, load_merged_dataset
 
-    monkeypatch.setenv("TANDEM_SOURCE_EMAIL", "me@example.com")
-    monkeypatch.setenv("TANDEM_SOURCE_PASSWORD", "secret")
-    monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(cloud_root))
-    monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
-    monkeypatch.setattr(cli, "TConnectSyncSourceClient", lambda paths, **kwargs: _FakeApiClient(paths, **kwargs))
-
-    report = tmp_path / "model_data_preparation.md"
-    exit_code = main(
-        [
-            "--root",
-            str(workspace_root),
-            "prepare-model-data",
-            "--raw",
-            str(raw_root),
-            "--report",
-            str(report),
-            "--history-days",
-            "30",
-        ]
-    )
-
-    assert exit_code == 0
-    client = _FakeApiClient.last_instance
-    assert client is not None
-    assert any(call[0] == "export" for call in client.calls)
-    text = report.read_text(encoding="utf-8")
-    assert "- backfill_status: completed" in text
-    assert "- requested_tandem_start: 2025-04-25 00:00:00" in text
-    assert "- requested_tandem_end: 2025-05-24 00:00:00" in text
-
+    try:
+        load_merged_dataset(raw_root)
+    except StaleDatasetError as exc:
+        assert "1 added" in str(exc)
+    else:
+        raise AssertionError("expected a stale-dataset error after adding a raw file")
 
 def test_validate_therapy_infra_command_writes_artifacts(tmp_path):
     workspace_root = tmp_path / "repo"
@@ -555,7 +502,7 @@ def test_review_therapy_evidence_command_writes_report_and_supporting_artifacts(
         final_dataset_end=pd.Timestamp("2025-01-07 23:55:00"),
         final_row_count=len(dataset.frame),
     )
-    monkeypatch.setattr(cli, "_prepare_model_data", lambda args, paths, session=None: preparation)
+    monkeypatch.setattr(cli, "_load_dataset", lambda args, session=None: SimpleNamespace(preparation=preparation))
 
     report = tmp_path / "therapy_evidence_review.html"
     exit_code = main(
@@ -598,7 +545,7 @@ def test_research_latent_meal_icr_command_writes_artifacts_and_review(tmp_path, 
         final_dataset_end=pd.Timestamp("2025-01-07 23:55:00"),
         final_row_count=len(dataset.frame),
     )
-    monkeypatch.setattr(cli, "_prepare_model_data", lambda args, paths, session=None: preparation)
+    monkeypatch.setattr(cli, "_load_dataset", lambda args, session=None: SimpleNamespace(preparation=preparation))
 
     report_dir = tmp_path / "latent_meal"
     review_html = report_dir / "latent_meal_review.html"
@@ -681,7 +628,7 @@ def test_research_latent_meal_icr_full_scope_writes_outputs(tmp_path, monkeypatc
         final_dataset_end=pd.Timestamp("2025-01-07 23:55:00"),
         final_row_count=len(dataset.frame),
     )
-    monkeypatch.setattr(cli, "_prepare_model_data", lambda args, paths, session=None: preparation)
+    monkeypatch.setattr(cli, "_load_dataset", lambda args, session=None: SimpleNamespace(preparation=preparation))
 
     exit_code = main(
         [
@@ -778,7 +725,7 @@ def test_status_command_writes_curated_latest_outputs_and_cache_artifacts(tmp_pa
         final_dataset_end=pd.Timestamp("2025-01-07 23:55:00"),
         final_row_count=len(dataset.frame),
     )
-    monkeypatch.setattr(cli, "_prepare_model_data", lambda args, paths, session=None: preparation)
+    monkeypatch.setattr(cli, "_load_dataset", lambda args, session=None: SimpleNamespace(preparation=preparation))
     monkeypatch.setattr(cli, "run_therapy_research", lambda *args, **kwargs: _fake_status_research_result())
     monkeypatch.setattr(
         cli,
@@ -828,7 +775,6 @@ def test_status_command_writes_curated_latest_outputs_and_cache_artifacts(tmp_pa
     assert (output_root / "therapy" / "therapy_review.html").exists()
     assert (output_root / "forecast" / "forecast_review.html").exists()
     assert (output_root / "therapy" / "model_data_preparation.md").exists()
-    assert (runtime_root / "cache" / "prepared" / "prepared_model_data_5min.csv").exists()
     assert (runtime_root / "cache" / "forecast" / "run_summary.json").exists()
     assert _latest_log_dir(runtime_root, "status").joinpath("events.jsonl").exists()
 
@@ -839,7 +785,7 @@ def test_ingest_failure_is_logged(tmp_path, tandem_fixture_dir, monkeypatch):
     runtime_root = tmp_path / "runtime"
     monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(tmp_path / "cloud"))
     monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
-    monkeypatch.setattr(cli, "load_tandem_exports", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(cli, "load_merged_dataset", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
 
     try:
         main(

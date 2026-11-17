@@ -6,3 +6,8 @@ dependencies:
   - pip
   - pip:
       - -e .[dev]
+variables:
+  # PyTensor's C backend passes a linker flag (-ld64) that current Xcode rejects; the Numba backend avoids the C compiler.
+  PYTENSOR_FLAGS: mode=NUMBA,cxx=
+  # Apple Accelerate's multithreaded BLAS crashes inside parallel PyMC chains; the chains are the parallelism.
+  VECLIB_MAXIMUM_THREADS: "1"
