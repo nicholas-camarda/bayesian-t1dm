@@ -996,6 +996,76 @@ def _latent_meal_posterior_html(result: LatentMealResearchResult) -> str:
     )
 
 
+def _latent_meal_estimator_html(result: LatentMealResearchResult) -> str:
+    estimates = result.latent_carb_estimates
+    if estimates is None or estimates.empty or "estimator" not in estimates.columns:
+        return ""
+    estimator = estimates["estimator"].astype(str)
+    trajectory_rows = int(estimator.eq("trajectory").sum())
+    fallback_rows = int(len(estimates) - trajectory_rows)
+    contraction = pd.to_numeric(estimates.get("prior_contraction"), errors="coerce").dropna()
+    fit_rmse = pd.to_numeric(estimates.get("trajectory_fit_rmse_mgdl"), errors="coerce").dropna()
+    poor_fit = int(estimates["flags"].astype(str).str.contains("trajectory_poor_fit", regex=False).sum()) if "flags" in estimates.columns else 0
+    return "\n".join(
+        [
+            "<div class='section'>",
+            "<h2>How These Estimates Were Made</h2>",
+            "<table>",
+            "<thead><tr><th>check</th><th>value</th><th>how to read it</th></tr></thead>",
+            "<tbody>",
+            f"<tr><td>meals fitted on the full glucose trace</td><td>{trajectory_rows}</td><td>The validated estimator.</td></tr>",
+            f"<tr><td>meals using the fallback</td><td>{fallback_rows}</td><td>Peak/AUC heuristic; biased high in simulation. Treat with suspicion.</td></tr>",
+            f"<tr><td>median prior contraction</td><td>{'NA' if contraction.empty else f'{float(contraction.median()):.2f}'}</td>"
+            "<td>0 = the trace added nothing beyond bolus &times; I:C; 1 = the trace decided.</td></tr>",
+            f"<tr><td>median fit RMSE (mg/dL)</td><td>{'NA' if fit_rmse.empty else f'{float(fit_rmse.median()):.1f}'}</td>"
+            "<td>Well above about 10 means real meals do not look like the model and the simulation evidence does not transfer.</td></tr>",
+            f"<tr><td>meals flagged as poor fit</td><td>{poor_fit}</td><td>Trace shape the model could not reproduce.</td></tr>",
+            "</tbody></table>",
+            "<p>Estimates are carb-equivalents under the programmed I:C and correction factor. "
+            "Run <code>bayesian-t1dm validate-latent-meal</code> for the simulation evidence behind them.</p>",
+            "</div>",
+        ]
+    )
+
+
+def _latent_meal_effective_icr_html(result: LatentMealResearchResult) -> str:
+    evidence = getattr(result, "effective_icr_evidence", None)
+    header = "<div class='section'><h2>Effective I:C From Logged Meals</h2>"
+    if evidence is None or evidence.empty or int(pd.to_numeric(evidence["logged_meal_windows"], errors="coerce").fillna(0).sum()) == 0:
+        return (
+            header
+            + "<div class='empty-state'>No accepted window has a logged carb count, so the I:C setting itself cannot be assessed: "
+            "an undercounted meal and a too-weak ratio produce the same glucose trace. "
+            "Log carbs for clean first meals in a <code>carbs.csv</code> (<code>timestamp,carb_grams</code>) under the raw data tree to unlock this.</div></div>"
+        )
+    rows = []
+    for row in evidence.itertuples(index=False):
+        has_estimate = pd.notna(row.effective_icr)
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(row.segment))}</td>"
+            f"<td>{int(row.logged_meal_windows)}</td>"
+            f"<td>{int(row.n_meals)}</td>"
+            f"<td>{float(row.programmed_icr):.1f}</td>"
+            f"<td>{f'{float(row.effective_icr):.1f}' if has_estimate else 'NA'}</td>"
+            f"<td>{f'[{float(row.effective_icr_lower_90):.1f}, {float(row.effective_icr_upper_90):.1f}]' if has_estimate else 'NA'}</td>"
+            f"<td>{html.escape(str(row.status))}</td>"
+            "</tr>"
+        )
+    return "\n".join(
+        [
+            header,
+            "<table>",
+            "<thead><tr><th>segment</th><th>logged windows</th><th>usable meals</th><th>programmed I:C</th><th>effective I:C</th><th>90% interval</th><th>status</th></tr></thead>",
+            "<tbody>",
+            *rows,
+            "</tbody></table>",
+            "<p>Assumes the programmed correction factor is right. Research evidence for a conversation with a clinician, not an instruction to change a pump setting.</p>",
+            "</div>",
+        ]
+    )
+
+
 def _latent_meal_artifact_index_html(
     artifact_root: Path,
     *,
@@ -1019,6 +1089,7 @@ def _latent_meal_artifact_index_html(
             "latent_meal_window_audit.csv",
             "latent_carb_estimator_report.md",
             "latent_carb_estimates.csv",
+            "effective_icr_evidence.csv",
             "latent_meal_fit_summary.md",
             "latent_meal_posterior_meals.csv",
             "latent_meal_confidence_report.md",
@@ -1075,10 +1146,13 @@ def write_latent_meal_review_html(
     else:
         sections = [
             _latent_meal_gate_html(result),
+            _latent_meal_estimator_html(result),
+            _latent_meal_effective_icr_html(result),
             _latent_meal_model_comparison_html(result),
             _latent_meal_posterior_html(result),
             _latent_meal_artifact_index_html(artifact_root_path, research_scope="full", artifact_href_prefix=artifact_href_prefix),
         ]
+        sections = [section for section in sections if section]
     html_text = _page_shell(
         title="Bayesian T1DM Latent Meal Review",
         banner_html=_latent_meal_banner(result),

@@ -23,6 +23,7 @@ from bayesian_t1dm.latent_meal_validation import (
     render_effective_icr_recovery_markdown,
     run_effective_icr_recovery,
 )
+from bayesian_t1dm.review import write_latent_meal_review_html
 from bayesian_t1dm.therapy_research import (
     LatentMealTherapySettings,
     parse_therapy_segments,
@@ -196,6 +197,11 @@ def test_pipeline_recovers_effective_icr_from_logged_breakfasts(tmp_path):
     assert "## Effective I:C From Logged Meals" in report
     assert "carbs_hit_harder_than_programmed" in report
 
+    review = write_latent_meal_review_html(result, tmp_path / "latent" / "latent_meal_review.html").read_text(encoding="utf-8")
+    assert "How These Estimates Were Made" in review
+    assert "Effective I:C From Logged Meals" in review
+    assert "carbs_hit_harder_than_programmed" in review
+
 
 def test_pipeline_says_icr_is_unassessable_without_logged_carbs(tmp_path):
     result = _run_full(_simulated_breakfast_data(days=8, true_icr=8.0, log_carbs=False))
@@ -213,3 +219,6 @@ def test_pipeline_says_icr_is_unassessable_without_logged_carbs(tmp_path):
     report = paths["latent_carb_estimator_report"].read_text(encoding="utf-8")
     assert "No accepted window has a logged carb count" in report
     assert "carbs.csv" in report
+
+    review = write_latent_meal_review_html(result, tmp_path / "latent" / "latent_meal_review.html").read_text(encoding="utf-8")
+    assert "No accepted window has a logged carb count" in review
