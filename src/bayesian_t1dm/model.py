@@ -166,7 +166,6 @@ class BayesianGlucoseModel:
 
     def fit(self, frame: FeatureFrame) -> ModelFit:
         try:
-            import arviz as az
             import pymc as pm
         except Exception as exc:  # pragma: no cover - dependency guard
             raise RuntimeError("PyMC and ArviZ are required to fit the Bayesian model") from exc

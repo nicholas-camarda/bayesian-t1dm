@@ -4,13 +4,12 @@ from dataclasses import dataclass, replace
 import json
 import math
 from pathlib import Path
-import re
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
 
-from .evaluate import CalibrationSummary, FoldResult, WalkForwardReport, walk_forward_splits
+from .evaluate import walk_forward_splits
 from .features import FeatureConfig, FeatureFrame, recompute_scenario_features
 from .health_auto_export import AnalysisReadyHealthDataset
 from .latent_meal_trajectory import MealWindowTrajectory, estimate_carbs_from_trajectory
@@ -2068,6 +2067,8 @@ def build_first_meal_clean_window_registry(
     ordered["timestamp"] = pd.to_datetime(ordered["timestamp"], errors="coerce")
     ordered = ordered.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
     ordered["date"] = ordered["timestamp"].dt.normalize()
+    step_seconds = ordered["timestamp"].diff().dt.total_seconds().dropna()
+    step_minutes = float(step_seconds[step_seconds > 0].median() / 60.0) if (step_seconds > 0).any() else 5.0
     morning_candidates = ordered.loc[
         ordered["therapy_segment"].astype(str).eq("morning")
         & pd.to_numeric(_column_or_default(ordered, "bolus_units"), errors="coerce").fillna(0.0).ge(1.5)
@@ -2116,8 +2117,15 @@ def build_first_meal_clean_window_registry(
         closed_loop_confounding_premeal = meaningful_basal_transition_premeal or stacked_bolus_premeal
         prior_bolus_4h = bool(pd.to_numeric(prior_bolus_window.get("bolus_units"), errors="coerce").fillna(0.0).ge(0.5).any())
         postmeal_additional_bolus_120m = bool(pd.to_numeric(post_bolus_window.get("bolus_units"), errors="coerce").fillna(0.0).ge(0.5).any())
-        cgm_coverage_fraction = float(1.0 - pd.to_numeric(evaluation_window.get("missing_cgm"), errors="coerce").fillna(1.0).mean()) if not evaluation_window.empty else 0.0
-        missing_cgm_first_90m = bool(pd.to_numeric(post_early.get("missing_cgm"), errors="coerce").fillna(0.0).gt(0).any())
+        # Coverage is measured against the rows a complete window would have, not the rows
+        # that happen to be present: the prepared frame drops rows whose forecast target is
+        # missing, so a CGM gap removes rows as well as flagging them.
+        expected_window_rows = int(round((premeal_minutes + postmeal_minutes) / step_minutes)) + 1
+        expected_early_rows = int(round(90.0 / step_minutes)) + 1
+        observed_window_rows = int(pd.to_numeric(evaluation_window.get("missing_cgm"), errors="coerce").fillna(1.0).eq(0).sum()) if not evaluation_window.empty else 0
+        observed_early_rows = int(pd.to_numeric(post_early.get("missing_cgm"), errors="coerce").fillna(1.0).eq(0).sum()) if not post_early.empty else 0
+        cgm_coverage_fraction = float(min(1.0, observed_window_rows / expected_window_rows))
+        missing_cgm_first_90m = bool(observed_early_rows < expected_early_rows)
         source_quality_grade = "good" if cgm_coverage_fraction >= 0.9 and not missing_cgm_first_90m else "degraded"
         exclusion_reasons: list[str] = []
         if prior_bolus_4h:

@@ -5,7 +5,6 @@ from contextlib import nullcontext
 from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
-import shutil
 import sys
 
 import pandas as pd
@@ -37,7 +36,7 @@ from .health_auto_export import (
     intersect_spans,
 )
 from .latent_meal_validation import run_latent_meal_truth_recovery, write_latent_meal_recovery_artifacts
-from .ingest import build_export_manifest, load_tandem_exports, summarize_coverage, summarize_tandem_raw_dir, write_export_manifest
+from .ingest import IngestedData, build_export_manifest, load_tandem_exports, summarize_coverage, summarize_tandem_raw_dir, write_export_manifest
 from .model import BayesianGlucoseModel
 from .observability import LoggingSession, setup_run_logging
 from .paths import ProjectPaths

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -743,3 +742,28 @@ def test_validate_therapy_infra_reports_scenarios():
     assert not result.scenario_results.empty
     assert {"basal_direction", "explicit_icr", "proxy_only_icr", "apple_helpful", "apple_null", "corrupted", "low_identifiability"}.issubset(set(result.scenario_results["scenario"]))
     assert "Therapy Infrastructure Validation" in result.report_markdown
+
+
+def test_first_meal_window_coverage_counts_rows_missing_from_the_frame():
+    from bayesian_t1dm.therapy_research import build_first_meal_clean_window_registry, build_therapy_research_frame
+
+    dataset = _build_clean_first_meal_dataset(apple=False, explicit_carbs=False)
+    complete = build_first_meal_clean_window_registry(build_therapy_research_frame(dataset, segments=parse_therapy_segments()))
+    assert not complete.empty
+    first = complete.sort_values("timestamp").iloc[0]
+    assert first["cgm_coverage_fraction"] == pytest.approx(1.0)
+
+    # Remove 40 minutes of rows right after the first meal, as the prepared frame does when
+    # a CGM gap leaves those rows without a forecast target. No remaining row is flagged
+    # missing_cgm, so only a row count can reveal the hole.
+    timestamps = pd.to_datetime(dataset.frame["timestamp"])
+    meal_time = pd.Timestamp(first["timestamp"])
+    hole = timestamps.gt(meal_time + pd.Timedelta(minutes=20)) & timestamps.le(meal_time + pd.Timedelta(minutes=60))
+    gappy = replace(dataset, frame=dataset.frame.loc[~hole].reset_index(drop=True))
+    windows = build_first_meal_clean_window_registry(build_therapy_research_frame(gappy, segments=parse_therapy_segments()))
+    affected = windows.loc[pd.to_datetime(windows["timestamp"]).eq(meal_time)].iloc[0]
+
+    assert affected["cgm_coverage_fraction"] < 0.9
+    assert int(affected["missing_cgm_first_90m"]) == 1
+    assert {"poor_cgm_coverage", "missing_cgm_first_90m"}.issubset(set(str(affected["exclusion_reasons"]).split("|")))
+    assert int(affected["included"]) == 0

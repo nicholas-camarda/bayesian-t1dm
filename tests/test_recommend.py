@@ -11,7 +11,7 @@ from bayesian_t1dm.features import FeatureConfig, build_feature_frame
 from bayesian_t1dm.ingest import load_tandem_exports
 from bayesian_t1dm.model import FitDiagnostics, ScenarioForecast
 from bayesian_t1dm.quality import DataQualitySummary
-from bayesian_t1dm.recommend import RecommendationPolicy, Scenario, build_recommendation_policy, recommend_setting_changes
+from bayesian_t1dm.recommend import Scenario, build_recommendation_policy, recommend_setting_changes
 
 
 class DummyModel:
