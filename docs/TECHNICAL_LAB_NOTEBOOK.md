@@ -44,7 +44,7 @@ This section records a code and method audit done without access to the personal
 ### Verified
 
 - The test suite passes (ingestion, Apple Health import, feature construction, model plumbing, report and status writers, CLI commands) and now runs in CI on Python 3.11 and 3.13.
-- The trajectory-based latent carb estimator recovers simulated carbohydrate. Against meals bolused for a mis-counted amount, bolus x I:C is off by about 17 g on average; the trajectory estimator is off by 2.5 to 9 g in six of seven scenarios with 90% intervals that cover truth at least 90% of the time, including a scenario where absorption shape, bolus timing, therapy settings and drift are all wrong together. Reproduce with `bayesian-t1dm validate-latent-meal`.
+- The trajectory-based latent carb estimator recovers simulated carbohydrate. Against meals bolused for a mis-counted amount, bolus x I:C is off by about 17 g on average; the trajectory estimator is off by 2.5 to 9 g in seven of eight scenarios with 90% intervals that cover truth at least 90% of the time, including a scenario where absorption shape, bolus timing, therapy settings and drift are all wrong together. Reproduce with `bayesian-t1dm validate-latent-meal`.
 
 ### Found broken and fixed
 
@@ -59,7 +59,7 @@ This section records a code and method audit done without access to the personal
 - **Carbs and I:C are not separately identifiable from glucose.** A post-meal trace identifies `carbs x CF / ICR`. Without carbohydrate truth, "the meal was undercounted" and "the I:C ratio is too weak" produce the same trace. The honest per-meal output is a carb-equivalent under the programmed settings, or equivalently a statement about whether the bolus was adequate for that meal. Phase D ("carb-entry error scoring") and "effective I:C" are the same number viewed two ways until some meals have trusted carb counts.
 - **What would break the tie:** a few weeks of deliberately weighed or packaged breakfasts logged with carbs (even 15 to 20 meals). With carb truth for a subset, the same trajectory model can estimate ICR directly, and the remaining meals inherit a calibrated prior.
 - **Late absorption is invisible.** Carbohydrate that lands after the 180-minute window biases the estimate low (about -18 g in the biphasic simulation). Fat- and protein-heavy meals should not be trusted.
-- **Closed-loop basal is unmodelled.** Control-IQ raises and lowers basal during the post-meal window; only bolus insulin enters the estimator. The drift term absorbs some of this but the size of the error on real data is unknown.
+- **Closed-loop basal is only approximately accounted for.** Control-IQ raises and lowers basal during the post-meal window. The estimator counts delivery above or below a schedule inferred from the median delivery at that time of day, which is right when modulation varies from day to day and wrong when the controller does the same thing most mornings. The size of the residual error on real data is unknown.
 
 ### Not verified, and what to do first
 
@@ -78,7 +78,7 @@ The fixed code has not been run against the real dataset. The first session back
 | Prepared 5-minute dataset | Tested; gap fill is now causal |
 | Forecast validation | Plumbing tested; earlier real-data metrics are suspect because of the leak |
 | Forecast-based recommendations | Always suppressed on real data (no carbs). The scenario math is a sensitivity analysis of a predictive regression, not a causal estimate. Lowest priority |
-| Therapy research (basal / I:C identifiability) | Tested on synthetic frames whose glucose does not respond physically to insulin or carbs, so its "truth recovery" is weaker evidence than the name suggests |
+| Therapy research (basal / I:C identifiability) | Tested on synthetic frames where the 30-minute target is a linear function of the features but the glucose series itself has no meal or insulin dynamics, so its "truth recovery" is weaker evidence than the name suggests |
 | Latent meal | Phase B (cohort) and Phase C (estimator) are implemented and validated in simulation. Real-data fit quality unknown |
 
 ## Current North Star

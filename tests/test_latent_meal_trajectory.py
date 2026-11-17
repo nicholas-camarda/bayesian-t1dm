@@ -203,3 +203,44 @@ def test_truth_recovery_is_deterministic_and_writes_artifacts(tmp_path):
 def test_truth_recovery_rejects_empty_runs():
     with pytest.raises(ValueError):
         run_latent_meal_truth_recovery(n_meals_per_scenario=0)
+
+
+def test_absorbed_units_from_deliveries_matches_bolus_curve_and_handles_negatives():
+    from bayesian_t1dm.latent_meal_trajectory import absorbed_units_from_deliveries
+
+    at = np.arange(0.0, 305.0, 5.0)
+    single = absorbed_units_from_deliveries(np.array([0.0]), np.array([2.0]), at)
+    np.testing.assert_allclose(single, 2.0 * _insulin_absorbed_fraction(at), atol=1e-9)
+    assert single[-1] == pytest.approx(2.0, abs=1e-6)
+
+    # Nothing is absorbed before it is delivered, and withheld insulin counts negative.
+    later = absorbed_units_from_deliveries(np.array([60.0]), np.array([-0.5]), at)
+    assert np.all(later[at <= 60.0] == 0.0)
+    assert later[-1] < 0.0
+
+    assert np.all(absorbed_units_from_deliveries(np.array([]), np.array([]), at) == 0.0)
+
+
+def test_closed_loop_meals_are_estimated_better_when_basal_deviation_is_counted():
+    scenario = next(item for item in DEFAULT_SCENARIOS if item.name == "closed_loop_basal")
+    rng = np.random.default_rng(4)
+    with_basal: list[float] = []
+    bolus_only: list[float] = []
+    modulated = 0
+    for _ in range(80):
+        meal = simulate_meal(rng, scenario)
+        extra = meal.trajectory.insulin_absorbed_units - meal.bolus_only_absorbed_units
+        if np.abs(extra).max() < 0.3:
+            continue
+        modulated += 1
+        kwargs = dict(bolus_units=meal.bolus_units)
+        with_basal.append(abs(_estimate(meal.trajectory, **kwargs).carb_median - meal.true_carbs))
+        ignoring = MealWindowTrajectory(
+            minutes=meal.trajectory.minutes,
+            glucose=meal.trajectory.glucose,
+            insulin_absorbed_units=meal.bolus_only_absorbed_units,
+        )
+        bolus_only.append(abs(_estimate(ignoring, **kwargs).carb_median - meal.true_carbs))
+
+    assert modulated >= 10
+    assert np.mean(with_basal) < np.mean(bolus_only)

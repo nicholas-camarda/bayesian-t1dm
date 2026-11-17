@@ -767,3 +767,79 @@ def test_first_meal_window_coverage_counts_rows_missing_from_the_frame():
     assert int(affected["missing_cgm_first_90m"]) == 1
     assert {"poor_cgm_coverage", "missing_cgm_first_90m"}.issubset(set(str(affected["exclusion_reasons"]).split("|")))
     assert int(affected["included"]) == 0
+
+
+def _basal_modulation_frame(days: int = 10) -> pd.DataFrame:
+    timestamps = pd.date_range("2025-03-01 00:00:00", periods=days * 288, freq="5min")
+    hour = timestamps.hour
+    scheduled_rate = np.where(hour < 6, 0.6, np.where(hour < 12, 0.9, 0.8))
+    frame = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "glucose": 110.0,
+            "missing_cgm": 0,
+            "bolus_units": 0.0,
+            "iob_units": 0.0,
+            "basal_units_delivered": scheduled_rate * 5.0 / 60.0,
+        }
+    )
+    return frame
+
+
+def test_scheduled_basal_is_recovered_despite_one_day_of_modulation():
+    from bayesian_t1dm.therapy_research import _scheduled_basal_units_per_row
+
+    frame = _basal_modulation_frame()
+    timestamps = frame["timestamp"]
+    truth = frame["basal_units_delivered"].copy()
+    modulated = timestamps.ge("2025-03-05 08:00") & timestamps.lt("2025-03-05 10:00")
+    frame.loc[modulated, "basal_units_delivered"] = 3.0 * 5.0 / 60.0
+
+    schedule = _scheduled_basal_units_per_row(frame)
+
+    np.testing.assert_allclose(schedule.to_numpy(), truth.to_numpy(), atol=1e-9)
+
+
+def test_scheduled_basal_is_nan_without_enough_comparable_days():
+    from bayesian_t1dm.therapy_research import _scheduled_basal_units_per_row
+
+    assert _scheduled_basal_units_per_row(_basal_modulation_frame(days=3)).isna().all()
+
+
+def test_window_trajectory_counts_bolus_decay_and_basal_above_schedule():
+    from bayesian_t1dm.insulin import expand_bolus_series_to_grid
+    from bayesian_t1dm.latent_meal_trajectory import absorbed_units_from_deliveries
+    from bayesian_t1dm.therapy_research import _first_meal_window_trajectories
+
+    frame = _basal_modulation_frame()
+    meal_time = pd.Timestamp("2025-03-05 08:00")
+    timestamps = frame["timestamp"]
+    frame.loc[timestamps.eq(meal_time), "bolus_units"] = 4.0
+    frame["iob_units"] = expand_bolus_series_to_grid(frame[["timestamp", "bolus_units"]])["iob_units"].to_numpy()
+    window_metrics = pd.DataFrame({"meal_id": ["m1"], "timestamp": [meal_time]})
+
+    bolus_only = _first_meal_window_trajectories(frame, window_metrics)["m1"]
+    assert bolus_only.insulin_absorbed_units[0] == pytest.approx(0.0, abs=1e-9)
+    assert 3.0 < bolus_only.insulin_absorbed_units[-1] < 4.0  # most, not all, of 4 U by 180 min
+
+    # The controller doubles basal for the first hour after the meal on this day only.
+    boosted = timestamps.ge(meal_time) & timestamps.lt(meal_time + pd.Timedelta(minutes=60))
+    frame.loc[boosted, "basal_units_delivered"] *= 2.0
+    with_basal = _first_meal_window_trajectories(frame, window_metrics)["m1"]
+
+    extra_units = np.full(12, 0.9 * 5.0 / 60.0)
+    expected_extra = absorbed_units_from_deliveries(np.arange(0.0, 60.0, 5.0), extra_units, with_basal.minutes)
+    np.testing.assert_allclose(with_basal.insulin_absorbed_units - bolus_only.insulin_absorbed_units, expected_extra, atol=1e-6)
+    assert expected_extra[-1] > 0.5
+
+
+def test_window_trajectory_is_skipped_when_iob_bookkeeping_is_inconsistent():
+    from bayesian_t1dm.therapy_research import _first_meal_window_trajectories
+
+    frame = _basal_modulation_frame()
+    meal_time = pd.Timestamp("2025-03-05 08:00")
+    frame.loc[frame["timestamp"].eq(meal_time), "bolus_units"] = 4.0
+    # IOB that rises with no bolus behind it: absorbed insulin would have to go negative.
+    frame.loc[frame["timestamp"].gt(meal_time), "iob_units"] = 2.0
+
+    assert _first_meal_window_trajectories(frame, pd.DataFrame({"meal_id": ["m1"], "timestamp": [meal_time]})) == {}

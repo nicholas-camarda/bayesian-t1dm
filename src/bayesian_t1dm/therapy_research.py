@@ -12,7 +12,7 @@ import pandas as pd
 from .evaluate import walk_forward_splits
 from .features import FeatureConfig, FeatureFrame, recompute_scenario_features
 from .health_auto_export import AnalysisReadyHealthDataset
-from .latent_meal_trajectory import MealWindowTrajectory, estimate_carbs_from_trajectory
+from .latent_meal_trajectory import MealWindowTrajectory, absorbed_units_from_deliveries, estimate_carbs_from_trajectory
 from .model import BayesianGlucoseModel, FitDiagnostics
 
 
@@ -2902,18 +2902,53 @@ def _accepted_first_meal_window_metrics(
     return pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
 
 
+def _scheduled_basal_units_per_row(
+    ordered: pd.DataFrame,
+    *,
+    slot_minutes: int = 30,
+    window_days: int = 43,
+    min_days: int = 5,
+) -> pd.Series:
+    """Estimate the scheduled (un-modulated) basal delivery for every row.
+
+    The frame only records what was delivered. The pump's schedule repeats daily while
+    closed-loop adjustments differ from day to day, so the median delivery at the same
+    time of day across nearby days is a robust estimate of the schedule. Rows without at
+    least ``min_days`` comparable days in the centred ``window_days`` window are NaN.
+    """
+    delivered = pd.to_numeric(ordered["basal_units_delivered"], errors="coerce")
+    timestamps = ordered["timestamp"]
+    slot = (timestamps.dt.hour * 60 + timestamps.dt.minute) // int(slot_minutes)
+    date = timestamps.dt.normalize()
+    per_day = delivered.groupby([date, slot]).median().unstack(level=1).sort_index()
+    if per_day.empty:
+        return pd.Series(np.nan, index=ordered.index, dtype=float)
+    per_day = per_day.reindex(pd.date_range(per_day.index.min(), per_day.index.max(), freq="D"))
+    schedule = per_day.rolling(window=int(window_days), center=True, min_periods=int(min_days)).median()
+    lookup = schedule.stack(future_stack=True)
+    keys = pd.MultiIndex.from_arrays([date, slot])
+    return pd.Series(lookup.reindex(keys).to_numpy(dtype=float), index=ordered.index, dtype=float)
+
+
 def _first_meal_window_trajectories(
     research_frame: pd.DataFrame,
     window_metrics: pd.DataFrame,
     *,
     postmeal_minutes: int = 180,
+    basal_reference_minutes: int = 180,
+    insulin_action_minutes: int = 300,
 ) -> dict[str, MealWindowTrajectory]:
     """Extract the observed post-meal CGM trace and absorbed insulin for each accepted window.
 
-    Insulin absorbed since the anchor is reconstructed from the frame's own IOB bookkeeping:
-    ``iob(anchor) + boluses delivered after the anchor - iob(t)``. Windows whose insulin
-    columns are missing or not physically consistent (absorbed insulin that goes down) are
-    left out, and the caller falls back to the summary-statistic estimator for them.
+    Bolus insulin absorbed since the anchor is reconstructed from the frame's own IOB
+    bookkeeping: ``iob(anchor) + boluses delivered after the anchor - iob(t)``. Windows
+    whose insulin columns are missing or not physically consistent (absorbed bolus insulin
+    that goes down) are left out, and the caller falls back to the summary-statistic
+    estimator for them.
+
+    Closed-loop basal modulation is added on top when ``basal_units_delivered`` is present:
+    delivery above or below the median rate of the ``basal_reference_minutes`` before the
+    meal is treated as extra (or withheld) insulin and pushed through the action curve.
     """
     trajectories: dict[str, MealWindowTrajectory] = {}
     required = {"timestamp", "glucose", "iob_units", "bolus_units"}
@@ -2922,6 +2957,7 @@ def _first_meal_window_trajectories(
     ordered = research_frame.copy()
     ordered["timestamp"] = pd.to_datetime(ordered["timestamp"], errors="coerce")
     ordered = ordered.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    scheduled_basal = _scheduled_basal_units_per_row(ordered) if "basal_units_delivered" in ordered.columns else None
     for row in window_metrics.itertuples(index=False):
         anchor_time = pd.Timestamp(row.timestamp)
         post = ordered.loc[
@@ -2938,6 +2974,29 @@ def _first_meal_window_trajectories(
         absorbed = float(iob.iloc[0]) + later_bolus - iob
         if (absorbed.diff().dropna() < -0.05).any() or absorbed.min() < -0.05:
             continue
+        if scheduled_basal is not None:
+            delivered = pd.to_numeric(post["basal_units_delivered"], errors="coerce")
+            reference = scheduled_basal.loc[post.index]
+            if reference.isna().any():
+                # Too few comparable days to infer the schedule: fall back to the pre-meal rate.
+                premeal = pd.to_numeric(
+                    ordered.loc[
+                        ordered["timestamp"].ge(anchor_time - pd.Timedelta(minutes=basal_reference_minutes))
+                        & ordered["timestamp"].lt(anchor_time),
+                        "basal_units_delivered",
+                    ],
+                    errors="coerce",
+                ).dropna()
+                reference = pd.Series(float(premeal.median()) if len(premeal) >= 12 else np.nan, index=post.index)
+            if delivered.notna().all() and reference.notna().all():
+                post_minutes = (post["timestamp"] - anchor_time).dt.total_seconds().div(60.0).to_numpy(dtype=float)
+                excess = delivered.to_numpy(dtype=float) - reference.to_numpy(dtype=float)
+                absorbed = absorbed + absorbed_units_from_deliveries(
+                    post_minutes,
+                    excess,
+                    post_minutes,
+                    insulin_action_minutes=insulin_action_minutes,
+                )
         glucose = pd.to_numeric(post["glucose"], errors="coerce")
         observed = glucose.notna()
         if "missing_cgm" in post.columns:
@@ -2948,7 +3007,7 @@ def _first_meal_window_trajectories(
         trajectory = MealWindowTrajectory(
             minutes=minutes.to_numpy(dtype=float),
             glucose=glucose.loc[observed].to_numpy(dtype=float),
-            insulin_absorbed_units=absorbed.loc[observed].clip(lower=0.0).to_numpy(dtype=float),
+            insulin_absorbed_units=absorbed.loc[observed].to_numpy(dtype=float),
         )
         if trajectory.is_usable():
             trajectories[str(row.meal_id)] = trajectory

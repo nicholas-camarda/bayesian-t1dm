@@ -42,7 +42,8 @@ class MealWindowTrajectory:
 
     ``minutes`` are minutes since the meal anchor for rows with a real CGM reading,
     ``glucose`` the readings, and ``insulin_absorbed_units`` the cumulative units of
-    bolus insulin absorbed since the anchor (including decay of insulin already on board).
+    insulin absorbed since the anchor: boluses, decay of insulin already on board, and
+    basal delivered above (positive) or below (negative) the pre-meal reference rate.
     """
 
     minutes: np.ndarray
@@ -165,6 +166,32 @@ def _absorption_basis(
     absorbed.setflags(write=False)
     t95.setflags(write=False)
     return absorbed, t95
+
+
+def absorbed_units_from_deliveries(
+    delivery_minutes: np.ndarray,
+    delivery_units: np.ndarray,
+    at_minutes: np.ndarray,
+    *,
+    insulin_action_minutes: int = 300,
+) -> np.ndarray:
+    """Cumulative insulin absorbed at ``at_minutes`` from a series of small deliveries.
+
+    ``delivery_units`` may be negative: basal delivered *below* the reference rate is
+    insulin the body expected and did not get. Uses the same action curve as bolus IOB.
+    """
+    from .insulin import insulin_action_curve
+
+    delivery_minutes = np.asarray(delivery_minutes, dtype=float)
+    delivery_units = np.asarray(delivery_units, dtype=float)
+    at_minutes = np.asarray(at_minutes, dtype=float)
+    if delivery_minutes.size == 0:
+        return np.zeros(at_minutes.shape, dtype=float)
+    curve = insulin_action_curve(1.0, duration_minutes=insulin_action_minutes)
+    elapsed = at_minutes[:, None] - delivery_minutes[None, :]
+    remaining = np.interp(np.clip(elapsed, 0.0, insulin_action_minutes), curve["minutes"].to_numpy(dtype=float), curve["iob_fraction"].to_numpy(dtype=float))
+    absorbed_fraction_matrix = np.where(elapsed < 0.0, 0.0, 1.0 - remaining)
+    return absorbed_fraction_matrix @ delivery_units
 
 
 def _marginal_quantile(values: np.ndarray, weights: np.ndarray, quantile: float) -> float:

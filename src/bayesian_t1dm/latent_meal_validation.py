@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 from .insulin import insulin_action_curve
-from .latent_meal_trajectory import MealWindowTrajectory, absorbed_fraction
+from .latent_meal_trajectory import MealWindowTrajectory, absorbed_fraction, absorbed_units_from_deliveries
 
 
 @dataclass(frozen=True)
@@ -43,6 +43,9 @@ class MealSimulationScenario:
     drift_sd_mgdl_per_hour: float = 0.0
     noise_sd_mgdl: float = 4.0
     carb_count_error_log_sd: float = 0.35
+    # Simulate an automated insulin delivery controller that raises basal when glucose
+    # runs high and suspends it when glucose runs low.
+    closed_loop_basal: bool = False
 
 
 DEFAULT_SCENARIOS: tuple[MealSimulationScenario, ...] = (
@@ -52,6 +55,11 @@ DEFAULT_SCENARIOS: tuple[MealSimulationScenario, ...] = (
     MealSimulationScenario("prebolus_timing", "Meal starts 0-20 minutes after the bolus.", prebolus_max_minutes=20.0),
     MealSimulationScenario("wrong_settings", "True I:C and correction factor each differ from programmed by ~15%.", settings_error_log_sd=0.15),
     MealSimulationScenario("baseline_drift", "Unmodelled linear drift, SD 10 mg/dL per hour.", drift_sd_mgdl_per_hour=10.0),
+    MealSimulationScenario(
+        "closed_loop_basal",
+        "A controller raises basal above 160 mg/dL and suspends it below 90 mg/dL; the estimator is given the basal deviation.",
+        closed_loop_basal=True,
+    ),
     MealSimulationScenario(
         "everything_at_once",
         "Long-tail absorption, pre-bolus, wrong settings, drift and noisier CGM together.",
@@ -93,6 +101,8 @@ class SimulatedMeal:
     programmed_icr: float
     programmed_correction_factor: float
     premeal_glucose: float
+    # Insulin absorbed from the meal bolus alone, ignoring any basal modulation.
+    bolus_only_absorbed_units: np.ndarray | None = None
 
     @property
     def bolus_implied_carbs(self) -> float:
@@ -124,20 +134,35 @@ def simulate_meal(
         noise[index] = 0.7 * noise[index - 1] + rng.normal(0.0, innovation_sd)
 
     insulin_fraction = _insulin_absorbed_fraction(minutes)
-    glucose = (
-        premeal_glucose
-        + (true_cf / true_icr) * true_carbs * _true_absorbed_fraction(minutes - delay, kind=scenario.absorption, duration=duration)
-        - true_cf * bolus_units * insulin_fraction
-        + drift * minutes / 60.0
-        + noise
-    )
+    bolus_absorbed = bolus_units * insulin_fraction
+    carb_effect = (true_cf / true_icr) * true_carbs * _true_absorbed_fraction(minutes - delay, kind=scenario.absorption, duration=duration)
+    passive = premeal_glucose + carb_effect - true_cf * bolus_absorbed + drift * minutes / 60.0 + noise
+    basal_absorbed = np.zeros(minutes.size)
+    if scenario.closed_loop_basal:
+        scheduled_units_per_hour = 0.8
+        excess_units = np.zeros(minutes.size)
+        glucose = passive.copy()
+        for index in range(1, minutes.size):
+            previous = glucose[index - 1]
+            if previous > 160.0:
+                rate = min(0.03 * (previous - 160.0), 3.0)
+            elif previous < 90.0:
+                rate = -scheduled_units_per_hour
+            else:
+                rate = 0.0
+            excess_units[index - 1] = rate * 5.0 / 60.0
+            basal_absorbed[index] = absorbed_units_from_deliveries(minutes[:index], excess_units[:index], minutes[index : index + 1])[0]
+            glucose[index] = passive[index] - true_cf * basal_absorbed[index]
+    else:
+        glucose = passive
     return SimulatedMeal(
-        trajectory=MealWindowTrajectory(minutes=minutes, glucose=glucose, insulin_absorbed_units=bolus_units * insulin_fraction),
+        trajectory=MealWindowTrajectory(minutes=minutes, glucose=glucose, insulin_absorbed_units=bolus_absorbed + basal_absorbed),
         true_carbs=true_carbs,
         bolus_units=bolus_units,
         programmed_icr=programmed_icr,
         programmed_correction_factor=programmed_correction_factor,
         premeal_glucose=premeal_glucose,
+        bolus_only_absorbed_units=bolus_absorbed,
     )
 
 
@@ -310,8 +335,8 @@ def render_latent_meal_recovery_markdown(
         [
             "## Reading this",
             "",
-            "- This is evidence about the estimator under a simulator, not about real meals. The simulator has no",
-            "  closed-loop basal modulation, no exercise, and no sensor lag.",
+            "- This is evidence about the estimator under a simulator, not about real meals. The simulator is linear,",
+            "  has no exercise and no sensor lag, and its closed-loop controller is a threshold rule, not Control-IQ.",
             "- Glucose identifies `carbs x CF / ICR`, not carbs. The `wrong_settings` scenario shows the cost: the",
             "  estimate is a carb-equivalent under the programmed settings.",
             "- Carbohydrate absorbed after the 180-minute window is invisible; `biphasic_absorption` shows the",

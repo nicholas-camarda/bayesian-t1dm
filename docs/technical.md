@@ -316,7 +316,7 @@ $$
 
 - $C$ = meal carbohydrate (grams), the quantity of interest
 - $A$ = fraction of the meal absorbed, a gamma CDF with shape $a \in \{1.5, 2.5, 4, 7\}$ and mean absorption time $m$ (35 to 170 min); $\delta \in \{0, 10, 20\}$ min is the delay between bolus and carbohydrate appearance
-- $U(t)$ = units of bolus insulin absorbed since the anchor, reconstructed from the frame as $\text{IOB}(0) + \text{boluses after } 0 - \text{IOB}(t)$, so later boluses and insulin already on board are included
+- $U(t)$ = units of insulin absorbed since the anchor. The bolus part is reconstructed from the frame as $\text{IOB}(0) + \text{boluses after } 0 - \text{IOB}(t)$, so later boluses and insulin already on board are included. Closed-loop basal is added on top: delivery above or below the scheduled rate is pushed through the same action curve (negative when basal was suspended). The schedule is not in the frame, so it is estimated as the median delivery at the same time of day over the surrounding 43 days
 - CF, ICR = programmed correction factor and I:C ratio for the segment
 - $b_0, b_1, d$ = baseline offset (SD 5 mg/dL), linear drift (SD 8 mg/dL/h) and relative correction-factor error (SD 0.15). They have zero-mean Gaussian priors and are integrated out in closed form
 - $\varepsilon$ = AR(1) noise, SD 8 mg/dL, correlation 0.7 per 5 minutes
@@ -329,7 +329,7 @@ What it cannot do:
 
 - Glucose identifies $C \cdot \text{CF}/\text{ICR}$, not $C$. The estimate is a carb-equivalent under the programmed settings. Carb-counting error and a wrong I:C ratio are not separable from a single meal without carb truth.
 - Carbohydrate absorbed after the 180-minute window is invisible, so slow high-fat meals are biased low.
-- Basal modulation by Control-IQ during the window is not modelled; only bolus insulin enters $U(t)$.
+- Basal modulation is counted relative to an inferred schedule. If the controller modulates basal at the same time on most days, the inferred schedule absorbs it and the modulation goes uncounted.
 
 The older estimator (peak and AUC summaries with fixed response constants) is retained as a fallback for windows whose trace or insulin columns are unusable, and is flagged `summary_heuristic_estimator`.
 
@@ -345,9 +345,10 @@ The older estimator (peak and AUC summaries with fixed response constants) is re
 | pre-bolus timing | 16.0 | 11.7 / 0.72 | 4.4 / 1.00 |
 | wrong settings (15%) | 17.2 | 15.5 / 0.57 | 7.9 / 0.91 |
 | baseline drift | 19.5 | 14.9 / 0.62 | 6.2 / 0.98 |
+| closed-loop basal | 17.2 | 13.5 / 0.66 | 4.2 / 1.00 |
 | everything at once | 16.8 | 15.5 / 0.55 | 9.1 / 0.91 |
 
-The simulator is linear, has no closed-loop basal response, no exercise and no sensor lag. These numbers say the estimator is internally sound and robust to the listed misspecifications; they do not say it is accurate on real meals.
+The simulator is linear and has no exercise and no sensor lag; its closed-loop controller is a simple threshold rule, not Control-IQ. These numbers say the estimator is internally sound and robust to the listed misspecifications; they do not say it is accurate on real meals.
 
 ## Output Contract
 
