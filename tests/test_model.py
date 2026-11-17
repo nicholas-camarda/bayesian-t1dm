@@ -149,3 +149,55 @@ def test_extract_fit_diagnostics_reads_sampler_health():
     assert diagnostics.divergences == 1
     assert diagnostics.max_tree_depth_observed == 10
     assert diagnostics.max_tree_depth_hits == 1
+
+
+def _slope_uncertain_fit() -> ModelFit:
+    # Four posterior draws that disagree about the sign of the effect of "x":
+    # three say raising x lowers glucose, one says it raises glucose.
+    betas = np.array([[[-1.0], [-1.0], [-1.0], [1.0]]])
+    n = betas.shape[1]
+    posterior = SimpleNamespace(
+        posterior=xr.Dataset(
+            {
+                "intercept": (("chain", "draw"), np.full((1, n), 2.0)),
+                "beta": (("chain", "draw", "beta_dim_0"), betas),
+                "latent": (("chain", "draw", "latent_dim_0"), np.zeros((1, n, 1))),
+                "rho": (("chain", "draw"), np.zeros((1, n))),
+                "sigma_state": (("chain", "draw"), np.zeros((1, n))),
+                "sigma_obs": (("chain", "draw"), np.zeros((1, n))),
+            }
+        )
+    )
+    return ModelFit(
+        posterior=posterior,
+        feature_columns=["x"],
+        feature_means=pd.Series({"x": 0.0}),
+        feature_scales=pd.Series({"x": 1.0}),
+        target_mean=100.0,
+        target_scale=10.0,
+        horizon_minutes=30,
+        model=None,
+    )
+
+
+def test_scenario_forecasts_expose_paired_target_loss_draws():
+    model = BayesianGlucoseModel(draws=10, tune=10, chains=1, random_seed=3)
+    fit = _slope_uncertain_fit()
+    baseline = pd.DataFrame({"x": np.zeros(6), "target_glucose": np.full(6, 110.0)})
+    raised = baseline.assign(x=1.0)
+
+    current, candidate = model.scenario_forecasts(fit, [("current", baseline), ("raised", raised)], target_bg=110.0)
+
+    # Baseline predicts 120 in every draw: 10 mg/dL from target.
+    assert current.target_loss_draws == pytest.approx([10.0] * 4)
+    # Raising x gives 110 in three draws (on target) and 130 in one (worse).
+    assert candidate.target_loss_draws == pytest.approx([0.0, 0.0, 0.0, 20.0])
+
+
+def test_scenario_forecasts_omit_draw_losses_without_target():
+    model = BayesianGlucoseModel(draws=10, tune=10, chains=1)
+    frame = pd.DataFrame({"x": np.zeros(3), "target_glucose": np.full(3, 110.0)})
+
+    (forecast,) = model.scenario_forecasts(_slope_uncertain_fit(), [("current", frame)])
+
+    assert forecast.target_loss_draws is None

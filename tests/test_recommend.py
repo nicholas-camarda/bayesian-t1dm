@@ -381,3 +381,69 @@ def test_low_posterior_probability_cannot_surface_recommendation():
 
     assert policy.status == "generated"
     assert recommendations == []
+
+
+def test_posterior_probability_is_computed_across_draws_not_timepoints():
+    # The candidate's posterior-mean forecast is closer to target at every single
+    # timepoint, so the old timepoint-fraction statistic would report 1.0. Across paired
+    # posterior draws, though, it only wins 60% of the time, which must not clear the bar.
+    class DrawModel:
+        def scenario_forecasts(self, fit, scenarios, *, target_bg=None):
+            assert target_bg == 110.0
+            outputs = []
+            for name, _frame in scenarios:
+                current = name == "current"
+                mean = np.array([140.0, 140.0]) if current else np.array([120.0, 120.0])
+                draws = np.full(10, 30.0) if current else np.array([5.0] * 6 + [60.0] * 4)
+                outputs.append(
+                    ScenarioForecast(
+                        scenario_name=name,
+                        mean=mean,
+                        lower=mean - 5.0,
+                        upper=mean + 5.0,
+                        expected_loss=1.0,
+                        target_loss_draws=draws,
+                    )
+                )
+            return outputs
+
+    feature_frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2023-06-01 00:00:00", "2023-06-01 00:05:00"]),
+            "target_glucose": [110.0, 110.0],
+            "bolus_units": [1.0, 0.0],
+        }
+    )
+    kwargs = dict(
+        scenarios=[Scenario("bolus_plus_10", bolus_multiplier=1.1)],
+        walk_forward=_healthy_walk_forward(),
+        data_quality=_good_data_quality(),
+        carbs_present=True,
+        activity_present=True,
+        min_expected_gain_mgdl=1.0,
+    )
+    fit = SimpleNamespace(diagnostics=_healthy_fit_diagnostics())
+
+    recommendations, _, policy = recommend_setting_changes(DrawModel(), fit, feature_frame, **kwargs)
+
+    assert policy.status == "generated"
+    assert recommendations == []
+
+
+def test_recommendations_without_draws_are_flagged_as_timepoint_fraction(tandem_fixture_dir):
+    data = load_tandem_exports(tandem_fixture_dir)
+    feature_frame = build_feature_frame(data, FeatureConfig(horizon_minutes=30))
+    fit = SimpleNamespace(diagnostics=_healthy_fit_diagnostics())
+
+    recommendations, _, _ = recommend_setting_changes(
+        DummyModel(),
+        fit,
+        feature_frame.frame,
+        walk_forward=_healthy_walk_forward(),
+        data_quality=_good_data_quality(),
+        min_expected_gain_mgdl=5.0,
+    )
+
+    assert recommendations
+    assert all(rec.probability_basis == "timepoint_fraction" for rec in recommendations)
+    assert all("probability_from_timepoint_fraction" in rec.flags for rec in recommendations)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import inspect
 from typing import Iterable
 
 import numpy as np
@@ -31,6 +32,12 @@ class Recommendation:
     scenario_name: str
     confidence: str = "moderate"
     flags: list[str] = field(default_factory=list)
+    # "posterior_draws": share of paired posterior draws in which the scenario's mean
+    # deviation from target is smaller than the current settings' deviation.
+    # "timepoint_fraction": the model did not expose draws, so this is only the share of
+    # forecast rows where the posterior-mean prediction is closer to target. That is a
+    # coverage statistic, not a probability, and is flagged as such.
+    probability_basis: str = "posterior_draws"
 
 
 @dataclass(frozen=True)
@@ -201,6 +208,30 @@ def _recommendation_confidence(
     return "low"
 
 
+def _scenario_forecasts_with_target(model, fit, forecast_inputs, target_bg: float) -> list[ScenarioForecast]:
+    try:
+        accepts_target = "target_bg" in inspect.signature(model.scenario_forecasts).parameters
+    except (TypeError, ValueError):
+        accepts_target = False
+    if accepts_target:
+        return model.scenario_forecasts(fit, forecast_inputs, target_bg=target_bg)
+    return model.scenario_forecasts(fit, forecast_inputs)
+
+
+def _probability_scenario_better(
+    baseline: ScenarioForecast,
+    candidate: ScenarioForecast,
+    target_bg: float,
+) -> tuple[float, str]:
+    baseline_draws = getattr(baseline, "target_loss_draws", None)
+    candidate_draws = getattr(candidate, "target_loss_draws", None)
+    if baseline_draws is not None and candidate_draws is not None and len(baseline_draws) == len(candidate_draws) and len(baseline_draws) > 0:
+        return float(np.mean(np.asarray(candidate_draws) < np.asarray(baseline_draws))), "posterior_draws"
+    current_loss = np.abs(baseline.mean - target_bg)
+    candidate_loss = np.abs(candidate.mean - target_bg)
+    return float(np.mean(candidate_loss < current_loss)), "timepoint_fraction"
+
+
 def recommend_setting_changes(
     model: BayesianGlucoseModel,
     fit: ModelFit,
@@ -236,7 +267,7 @@ def recommend_setting_changes(
     baseline_scenario = Scenario("current")
     forecast_inputs = [(baseline_scenario.name, _apply_scenario(feature_frame, baseline_scenario))]
     forecast_inputs.extend((scenario.name, _apply_scenario(feature_frame, scenario)) for scenario in scenarios)
-    forecasts = model.scenario_forecasts(fit, forecast_inputs)
+    forecasts = _scenario_forecasts_with_target(model, fit, forecast_inputs, target_bg)
     recommendations: list[Recommendation] = []
     baseline_forecast = forecasts[0] if forecasts else None
     for scenario, forecast in zip(scenarios, forecasts[1:]):
@@ -257,10 +288,12 @@ def recommend_setting_changes(
         else:
             setting = "I/C ratio"
             change_percent = round(abs(scenario.icr_multiplier - 1.0) * 100.0, 6)
-        posterior_probability_better = float(np.mean(candidate_loss < current_loss))
+        posterior_probability_better, probability_basis = _probability_scenario_better(baseline_forecast, forecast, target_bg)
         if posterior_probability_better < 0.75:
             continue
         flags = _recommendation_flags(carbs_present=carbs_present, activity_present=activity_present)
+        if probability_basis != "posterior_draws":
+            flags.append("probability_from_timepoint_fraction")
         recommendations.append(
             Recommendation(
                 setting=setting,
@@ -276,6 +309,7 @@ def recommend_setting_changes(
                     activity_present=activity_present,
                 ),
                 flags=flags,
+                probability_basis=probability_basis,
             )
         )
     recommendations.sort(key=lambda rec: rec.expected_gain_mgdl, reverse=True)

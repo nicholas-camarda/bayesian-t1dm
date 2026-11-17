@@ -35,6 +35,10 @@ class ScenarioForecast:
     lower: np.ndarray
     upper: np.ndarray
     expected_loss: float
+    # Per-posterior-draw mean absolute deviation from the glucose target, when the caller
+    # supplied one. Draws are paired across scenarios (same parameters, same innovations),
+    # so comparing two scenarios draw-by-draw gives a genuine posterior probability.
+    target_loss_draws: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -243,7 +247,13 @@ class BayesianGlucoseModel:
         dims = ["sample"] + [dim for dim in variable.dims if dim != "sample"]
         return variable.transpose(*dims).values
 
-    def predict(self, fit: ModelFit, frame: pd.DataFrame) -> pd.DataFrame:
+    def _simulate_mean_draws(self, fit: ModelFit, frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.random.Generator]:
+        """Return (mean_draws, sigma_obs, rng): the latent-mean trajectory for every posterior draw.
+
+        ``mean_draws`` has shape (n_posterior_samples, n_rows) in glucose units. The random
+        generator is seeded from ``random_seed`` on every call, so two calls on scenario
+        variants of the same frame use identical AR innovations (common random numbers).
+        """
         posterior = fit.posterior
         X = self._prepare_matrix(fit, frame)
         intercept = self._stack_draws(posterior, "intercept")
@@ -264,50 +274,57 @@ class BayesianGlucoseModel:
         n_samples = intercept.shape[0]
         n_obs = X.shape[0]
         mean = np.zeros((n_samples, n_obs), dtype=float)
-        last_latent = latent[:, -1]
-        state = last_latent.copy()
+        state = latent[:, -1].copy()
         for t in range(n_obs):
             linear = intercept + (X[t] @ beta.T)
             state = rho * state + rng.normal(0.0, sigma_state, size=n_samples)
             mean[:, t] = (linear + state) * fit.target_scale + fit.target_mean
+        return mean, sigma_obs, rng
+
+    def _summarize_draws(self, fit: ModelFit, mean: np.ndarray, sigma_obs: np.ndarray, rng: np.random.Generator, index) -> pd.DataFrame:
+        central = np.mean(mean, axis=0)
         # Add observation noise to each posterior draw before computing quantiles,
         # so that predictive intervals reflect full posterior predictive uncertainty.
-        noise = rng.normal(0.0, sigma_obs[:, np.newaxis] * fit.target_scale, size=mean.shape)
-        predictive = mean + noise
+        predictive = rng.normal(0.0, sigma_obs[:, np.newaxis] * fit.target_scale, size=mean.shape)
+        predictive += mean
         lower_q, upper_q = self.target_quantiles
-        lower = np.quantile(predictive, lower_q, axis=0)
-        upper = np.quantile(predictive, upper_q, axis=0)
-        central = np.mean(mean, axis=0)
-        return pd.DataFrame({
-            "mean": central,
-            "lower": lower,
-            "upper": upper,
-        }, index=frame.index)
+        lower, upper = np.quantile(predictive, [lower_q, upper_q], axis=0)
+        return pd.DataFrame({"mean": central, "lower": lower, "upper": upper}, index=index)
+
+    def predict(self, fit: ModelFit, frame: pd.DataFrame) -> pd.DataFrame:
+        mean, sigma_obs, rng = self._simulate_mean_draws(fit, frame)
+        return self._summarize_draws(fit, mean, sigma_obs, rng, frame.index)
 
     def scenario_forecasts(
         self,
         fit: ModelFit,
         scenarios: Iterable[tuple[str, pd.DataFrame]],
+        *,
+        target_bg: float | None = None,
     ) -> list[ScenarioForecast]:
         results: list[ScenarioForecast] = []
         for name, scenario_frame in scenarios:
-            prediction = self.predict(fit, scenario_frame)
-            mean = prediction["mean"].to_numpy()
-            lower = prediction["lower"].to_numpy()
-            upper = prediction["upper"].to_numpy()
             if "target_glucose" not in scenario_frame.columns:
                 raise ValueError(
                     f"Scenario '{name}' frame is missing 'target_glucose' column. "
                     "Pass the full feature frame (including target) to scenario_forecasts."
                 )
+            mean_draws, sigma_obs, rng = self._simulate_mean_draws(fit, scenario_frame)
+            target_loss_draws = None
+            if target_bg is not None:
+                target_loss_draws = np.mean(np.abs(mean_draws - float(target_bg)), axis=1)
+            prediction = self._summarize_draws(fit, mean_draws, sigma_obs, rng, scenario_frame.index)
+            del mean_draws
+            mean = prediction["mean"].to_numpy()
             expected_loss = float(np.mean(np.abs(mean - scenario_frame["target_glucose"].to_numpy())))
             results.append(
                 ScenarioForecast(
                     scenario_name=name,
                     mean=mean,
-                    lower=lower,
-                    upper=upper,
+                    lower=prediction["lower"].to_numpy(),
+                    upper=prediction["upper"].to_numpy(),
                     expected_loss=expected_loss,
+                    target_loss_draws=target_loss_draws,
                 )
             )
         return results
