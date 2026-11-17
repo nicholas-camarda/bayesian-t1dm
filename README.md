@@ -45,6 +45,12 @@ What is currently in place:
 - technical documentation with equations and definitions
 - overwrite-in-place runtime output with human-facing `output/`, machine `cache/`, and separate `logs/`
 
+What has and has not been verified (November 2026 audit, details in the lab notebook):
+
+- verified by tests and simulation: ingestion, feature construction, the forecasting model's plumbing, and the latent carb estimator's ability to recover known carbohydrate from simulated meals
+- not verified: anything about real meals. No carbohydrate truth exists in the Tandem archive, and the checked-in code has not been re-run against the personal dataset since the audit's fixes
+- known dead end for now: the forecast-based recommendation lane suppresses every recommendation on real data because carbohydrate records are absent
+
 What still needs refinement:
 
 - stronger validation on long real-world exports
@@ -85,7 +91,7 @@ If the foundation gate is healthy, move to the strict Phase C fit:
 bayesian-t1dm research-latent-meal-icr --research-scope full
 ```
 
-This runs the proxy-only latent carb estimator on accepted windows only and writes research-only posterior carb-equivalent estimates with credible intervals. The workflow extracts the active Tandem pump profile from `raw/pump_event_metadata.json` and records the exact I:C ratios, correction factors, target glucose, insulin action duration, absorption prior, and maximum plausible meal size used for the run.
+This runs the proxy-only latent carb estimator on accepted windows only and writes research-only posterior carb-equivalent estimates with credible intervals. Each estimate comes from fitting the whole post-meal CGM trace against absorbed insulin; see "Latent Carb Estimator" in [`docs/technical.md`](./docs/technical.md) for the model and for what it cannot identify. The workflow extracts the active Tandem pump profile from `raw/pump_event_metadata.json` and records the exact I:C ratios, correction factors, target glucose, insulin action duration, absorption prior, and maximum plausible meal size used for the run.
 
 Use `--therapy-settings path/to/therapy_settings.json` only when you want to override the extracted Tandem profile. Minimal override JSON:
 
@@ -218,10 +224,11 @@ For faster real-data validation without the final recommendation fit:
 bayesian-t1dm run --skip-recommendations
 ```
 
-6. Run tests:
+6. Run tests and the lint check (both also run in GitHub Actions on every push and pull request):
 
 ```bash
 pytest
+ruff check src tests
 ```
 
 ## Configuration
@@ -282,6 +289,9 @@ bayesian-t1dm research-latent-meal-icr --research-scope full
 bayesian-t1dm build-latent-meal-fixture
 
 bayesian-t1dm validate-therapy-infra
+
+# check the latent carb estimators against simulated meals with known carbs
+bayesian-t1dm validate-latent-meal
 ```
 
 ## Data Flow
@@ -354,7 +364,8 @@ What each step does:
 5. `run` performs the forecasting lane and suppresses decision-support recommendations unless raw source quality, normalized bolus/IOB plausibility, CGM validity, timezone provenance, explicit meal truth, walk-forward performance, interval coverage, and sampler diagnostics all pass.
 6. `research-therapy-settings` runs a separate research-grade workflow for basal schedule, I/C ratio, and later sensitivity factor analysis. It starts with a methodological gate, builds strict meal-bolus proxy features when explicit carbs are absent, writes Tandem and Apple source report cards, compares candidate models, and writes human-reviewable segment-level evidence rather than auto-changing settings.
 7. `validate-therapy-infra` runs synthetic truth-recovery scenarios against the same therapy research stack so the infrastructure has to recover known therapy directions and suppress itself in corrupted or weak-identifiability cases.
-8. `review-therapy-evidence` orchestrates the current therapy-facing workflow and writes an interactive HTML review page focused on overnight basal identifiability, evidence quality, exclusion reasons, supporting artifacts, and code-path traceability.
+8. `validate-latent-meal` simulates meals with known carbohydrate and scores the latent carb estimators against that truth. It needs no personal data, runs in about 15 seconds, and exits non-zero if the trajectory estimator stops beating the bolus-implied baseline.
+9. `review-therapy-evidence` orchestrates the current therapy-facing workflow and writes an interactive HTML review page focused on overnight basal identifiability, evidence quality, exclusion reasons, supporting artifacts, and code-path traceability.
 
 Recommended recipes:
 

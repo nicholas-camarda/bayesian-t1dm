@@ -1,6 +1,6 @@
 # Technical Lab Notebook: Bayesian T1DM
 
-**Updated**: April 3, 2026  
+**Updated**: November 17, 2026  
 **Branch**: `main`  
 **Project**: Bayesian T1DM (`bayesian-t1dm`)  
 **Purpose**: Technical status notebook for the checked-in `main` branch
@@ -36,6 +36,50 @@ The current best scientific path is:
 2. treat meal response as a partially observed latent-signal problem
 3. start with **strict, low-confounding first-meal windows**
 4. estimate **latent meal exposure** and **carb-entry error** before trying to make broad therapy claims
+
+## November 2026 Audit: What Actually Works
+
+This section records a code and method audit done without access to the personal dataset. Everything below was established by reading the code, running the test suite, and simulating data with known truth. Nothing here is a finding about real glucose data.
+
+### Verified
+
+- The test suite passes (ingestion, Apple Health import, feature construction, model plumbing, report and status writers, CLI commands) and now runs in CI on Python 3.11 and 3.13.
+- The trajectory-based latent carb estimator recovers simulated carbohydrate. Against meals bolused for a mis-counted amount, bolus x I:C is off by about 17 g on average; the trajectory estimator is off by 2.5 to 9 g in six of seven scenarios with 90% intervals that cover truth at least 90% of the time, including a scenario where absorption shape, bolus timing, therapy settings and drift are all wrong together. Reproduce with `bayesian-t1dm validate-latent-meal`.
+
+### Found broken and fixed
+
+1. **Look-ahead leak in the forecast features.** CGM gaps were filled by linear interpolation, so a row inside a gap was given a glucose value computed from the reading at the far end of the gap, frequently the very value it was asked to forecast. Both the model and the persistence baseline benefited. The fill is now last-observation-carried-forward. Any walk-forward MAE or coverage number produced before this fix was optimistic by an unknown amount and should be regenerated.
+2. **The original latent carb estimator was miscalibrated.** The peak/AUC grid posterior was biased about +12 g in simulation and its 90% intervals covered truth 55 to 72% of the time. It is now only a fallback.
+3. **"Posterior probability better" was not a probability.** It was the share of forecast timepoints at which the mean prediction was closer to target, which reads 1.0 for any uniform shift. It is now the share of paired posterior draws in which the scenario wins.
+4. **Meal-window CGM coverage was overstated.** Coverage was computed over the rows present, but a CGM gap removes rows from the prepared frame. Windows with holes could pass the 90% gate. Coverage is now measured against the rows a complete window should have.
+5. **`max_treedepth` was not reaching the sampler** on PyMC 5 (and the spelling used is deprecated on PyMC 6).
+
+### Structural limits that no code change removes
+
+- **Carbs and I:C are not separately identifiable from glucose.** A post-meal trace identifies `carbs x CF / ICR`. Without carbohydrate truth, "the meal was undercounted" and "the I:C ratio is too weak" produce the same trace. The honest per-meal output is a carb-equivalent under the programmed settings, or equivalently a statement about whether the bolus was adequate for that meal. Phase D ("carb-entry error scoring") and "effective I:C" are the same number viewed two ways until some meals have trusted carb counts.
+- **What would break the tie:** a few weeks of deliberately weighed or packaged breakfasts logged with carbs (even 15 to 20 meals). With carb truth for a subset, the same trajectory model can estimate ICR directly, and the remaining meals inherit a calibrated prior.
+- **Late absorption is invisible.** Carbohydrate that lands after the 180-minute window biases the estimate low (about -18 g in the biphasic simulation). Fat- and protein-heavy meals should not be trusted.
+- **Closed-loop basal is unmodelled.** Control-IQ raises and lowers basal during the post-meal window; only bolus insulin enters the estimator. The drift term absorbs some of this but the size of the error on real data is unknown.
+
+### Not verified, and what to do first
+
+The fixed code has not been run against the real dataset. The first session back should:
+
+1. `bayesian-t1dm prepare-model-data`, then `bayesian-t1dm research-latent-meal-icr --research-scope full`.
+2. Open `latent_carb_estimator_report.md` and read the new Estimator section: how many rows used `trajectory` versus the fallback, the median `prior_contraction`, and the median fit RMSE. A fit RMSE far above 8 to 10 mg/dL means the forward model does not describe real meals and the simulation results do not transfer.
+3. Expect fewer accepted windows than before, because of the coverage fix.
+4. Re-run `bayesian-t1dm run --skip-recommendations` and compare model MAE with persistence MAE. If the model no longer beats persistence after the leak fix, the forecasting lane was never working.
+
+### Lane status
+
+| lane | status |
+| --- | --- |
+| Acquisition, normalization, Apple Health import | Tested; not re-run on real data in this audit |
+| Prepared 5-minute dataset | Tested; gap fill is now causal |
+| Forecast validation | Plumbing tested; earlier real-data metrics are suspect because of the leak |
+| Forecast-based recommendations | Always suppressed on real data (no carbs). The scenario math is a sensitivity analysis of a predictive regression, not a causal estimate. Lowest priority |
+| Therapy research (basal / I:C identifiability) | Tested on synthetic frames whose glucose does not respond physically to insulin or carbs, so its "truth recovery" is weaker evidence than the name suggests |
+| Latent meal | Phase B (cohort) and Phase C (estimator) are implemented and validated in simulation. Real-data fit quality unknown |
 
 ## Current North Star
 
@@ -283,6 +327,8 @@ Definition of done:
 
 - meal-level outputs are interpretable as research estimates rather than ad hoc heuristics
 
+Status (November 2026): implemented as the trajectory estimator and validated against simulated truth. Done in simulation, open on real data; the acceptance check is the fit RMSE and prior contraction reported by a real run.
+
 ### Phase D: Carb-entry error scoring
 
 Goals:
@@ -293,6 +339,8 @@ Goals:
 Definition of done:
 
 - the repo can say something more useful than “carbs are missing” for at least a subset of meal windows
+
+Status (November 2026): blocked on identifiability, not on code. See "Structural limits" above: without some meals carrying trusted carb counts, a carb-entry error score and an I:C error are the same quantity.
 
 ### Phase E: Expansion to less clean windows
 

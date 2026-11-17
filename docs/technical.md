@@ -156,6 +156,7 @@ Key features:
 - basal rate carried forward across the current bin
 - activity summary variables
 - CGM missingness and gap indicators
+- across a CGM gap the model-facing `glucose` column carries the last reading forward (`FeatureConfig.cgm_fill_method = "locf"`). Linear interpolation (`"linear"`) is available for retrospective plots but must not be used for forecasting: a gap row would be filled using the reading at the far end of the gap, which is often its own target. `glucose_observed` is never filled.
 - carb and meal-derived features when carbohydrate records are available
 - calendar features: sine/cosine hour-of-day, sine/cosine day-of-week, weekend indicator
 
@@ -216,29 +217,27 @@ These are intentionally conservative because the personal dataset can be sparse 
 
 ## Recommendation Scoring
 
-For each candidate scenario $s$, the pipeline re-scales the exposure features for basal, bolus, and I/C ratio changes, then computes the posterior predictive loss.
+For each candidate scenario $s$, the pipeline re-scales the exposure features for basal, bolus, and I/C ratio changes, recomputes the derived insulin features, and predicts with every posterior draw $k$.
 
-One simple loss form is:
-
-$$
-L(s) = w_1 \, \mathbb{E}\left[| \hat{y}_t(s) - y^\star |\right]
-      + w_2 \, \Pr(\hat{y}_t(s) < 70)
-      + w_3 \, \Pr(\hat{y}_t(s) > 180)
-$$
-
-where $y^\star$ is the target glucose, typically 110 mg/dL.
-
-The recommendation score is:
+The implemented loss is the mean absolute deviation of the predicted mean trajectory from the glucose target $y^\star$ (110 mg/dL by default):
 
 $$
-\Delta(s) = L(\text{current}) - L(s)
+L_k(s) = \frac{1}{T} \sum_{t=1}^{T} \left| \mu_{t,k}(s) - y^\star \right|
 $$
 
-A candidate is surfaced only if:
+Hypo- and hyperglycaemia terms are not part of the loss; a scenario that trades a little mean deviation for more lows is not penalised for it.
 
-- it improves expected loss by at least the configured threshold
-- the improvement is directionally consistent across posterior draws
-- the result is presented as human-reviewable decision support
+Two numbers are reported per scenario:
+
+- expected gain: $\frac{1}{T}\sum_t |\bar\mu_t(\text{current}) - y^\star| - \frac{1}{T}\sum_t |\bar\mu_t(s) - y^\star|$ using posterior-mean predictions
+- posterior probability better: $\Pr_k\left[L_k(s) < L_k(\text{current})\right]$, the share of posterior draws in which the scenario beats current settings. Draws are paired: both scenarios use the same parameter draw and the same latent-state innovations.
+
+A candidate is surfaced only if the expected gain clears the configured threshold, the posterior probability is at least 0.75, and the recommendation policy (validation, sampler diagnostics, data quality, carb and activity signal) passes.
+
+Two caveats that matter more than the arithmetic:
+
+- The model is a predictive regression on observational, closed-loop data. Its coefficients are not causal effects of insulin, so a scenario is a sensitivity analysis of the fitted model, not a prediction of what would happen if the setting were changed.
+- With the current Tandem archive carbohydrate records are absent, so the policy suppresses every recommendation. This lane has never produced a recommendation on real data.
 
 ## Validation
 
@@ -298,11 +297,57 @@ Workflow crosswalk:
 | `prepare-model-data` | What data spans are available and aligned? | `output/prepare/model_data_preparation.md`, `cache/prepared/prepared_model_data_5min.csv` | `src/bayesian_t1dm/cli.py::_prepare_model_data`, `src/bayesian_t1dm/health_auto_export.py::build_prepared_model_dataset` | Establishes the final Tandem-aligned modeling grid and overlap logic. |
 | `research-latent-meal-icr --research-scope foundation` | Is the first-meal cohort ready for Phase C? | `output/latent_meal/latent_meal_research_gate.md`, `output/latent_meal/first_meal_clean_window_audit.md` | `src/bayesian_t1dm/therapy_research.py::run_latent_meal_icr_research` | Main scientific checkpoint for latent-meal readiness. |
 | `research-latent-meal-icr --research-scope full` | Does the accepted first-meal cohort support useful latent meal fitting yet? | `output/latent_meal/latent_meal_fit_summary.md`, `output/latent_meal/latent_meal_posterior_meals.csv`, `output/latent_meal/latent_meal_model_comparison.md` | `src/bayesian_t1dm/therapy_research.py::run_latent_meal_icr_research` | Research-only constrained latent-response fit on accepted windows. |
+| `validate-latent-meal` | Does the latent carb estimator recover known truth in simulation? | `output/latent_meal/validation/latent_meal_truth_recovery.md` | `src/bayesian_t1dm/latent_meal_validation.py::run_latent_meal_truth_recovery` | Simulated meals with known carbs; scores bolus-implied, the old peak/AUC heuristic, and the trajectory estimator. Exits non-zero if the trajectory estimator stops beating bolus x I:C. |
 | `status` | What is the combined current state across lanes? | `current_status.html`, `therapy_review.html`, `forecast_review.html` | `src/bayesian_t1dm/status.py::derive_current_status` | Combined overview, not the primary science loop. |
 | `run --skip-recommendations` | Does walk-forward forecasting still behave sensibly? | `forecast_review.html`, `cache/forecast/run_summary.json` | `src/bayesian_t1dm/report.py::build_run_summary`, `src/bayesian_t1dm/review.py::write_run_review_html` | Secondary forecast diagnostic. |
 | `research-therapy-settings` | What therapy contexts and identifiability gates are available? | `therapy_research_gate.md`, `therapy_feature_audit.md`, `therapy_model_comparison.md` | `src/bayesian_t1dm/therapy_research.py::build_therapy_research_frame`, `src/bayesian_t1dm/therapy_research.py::run_therapy_research` | Shows whether basal / I:C / ISF are directly observed, proxy-supported, weakly identified, or blocked. |
 | `validate-therapy-infra` | Does the therapy workflow recover known truth and suppress itself correctly? | `therapy_infra_validation.md`, `therapy_synthetic_results.csv` | `src/bayesian_t1dm/therapy_research.py::validate_therapy_infra` | Tests truth-recovery and false-positive suppression, not just predictive fit. |
 | `review-therapy-evidence` | What is actually happening with overnight basal evidence in the current data? | `output/therapy/therapy_review.html` | `src/bayesian_t1dm/review.py::write_therapy_evidence_review_html` | Secondary therapy-facing explanation surface. |
+
+## Latent Carb Estimator
+
+Code: `src/bayesian_t1dm/latent_meal_trajectory.py`, called from `therapy_research.py::_latent_carb_posterior_for_window`.
+
+For an accepted first-meal window, with $t$ in minutes after the bolus, the forward model is
+
+$$
+G(t) = G_0 + b_0 + b_1 t + \frac{\text{CF}}{\text{ICR}}\, C \, A(t - \delta;\, a, m) - \text{CF}\,(1 + d)\, U(t) + \varepsilon(t)
+$$
+
+- $C$ = meal carbohydrate (grams), the quantity of interest
+- $A$ = fraction of the meal absorbed, a gamma CDF with shape $a \in \{1.5, 2.5, 4, 7\}$ and mean absorption time $m$ (35 to 170 min); $\delta \in \{0, 10, 20\}$ min is the delay between bolus and carbohydrate appearance
+- $U(t)$ = units of bolus insulin absorbed since the anchor, reconstructed from the frame as $\text{IOB}(0) + \text{boluses after } 0 - \text{IOB}(t)$, so later boluses and insulin already on board are included
+- CF, ICR = programmed correction factor and I:C ratio for the segment
+- $b_0, b_1, d$ = baseline offset (SD 5 mg/dL), linear drift (SD 8 mg/dL/h) and relative correction-factor error (SD 0.15). They have zero-mean Gaussian priors and are integrated out in closed form
+- $\varepsilon$ = AR(1) noise, SD 8 mg/dL, correlation 0.7 per 5 minutes
+
+The prior on $C$ is centred on bolus x ICR with SD $\max(20, 0.5 \times \text{mean})$ grams (tighter when a carb entry was logged). The posterior over $(C, a, m, \delta)$ is evaluated on a grid. Analysis tiers scale every noise and nuisance SD by the tier's uncertainty multiplier.
+
+Per-meal outputs include `estimator` (`trajectory` or `summary_heuristic`), `prior_contraction` ($1 - \text{posterior var}/\text{prior var}$: how much the trace told us beyond the bolus) and `trajectory_fit_rmse_mgdl`.
+
+What it cannot do:
+
+- Glucose identifies $C \cdot \text{CF}/\text{ICR}$, not $C$. The estimate is a carb-equivalent under the programmed settings. Carb-counting error and a wrong I:C ratio are not separable from a single meal without carb truth.
+- Carbohydrate absorbed after the 180-minute window is invisible, so slow high-fat meals are biased low.
+- Basal modulation by Control-IQ during the window is not modelled; only bolus insulin enters $U(t)$.
+
+The older estimator (peak and AUC summaries with fixed response constants) is retained as a fallback for windows whose trace or insulin columns are unusable, and is flagged `summary_heuristic_estimator`.
+
+### Synthetic truth recovery
+
+`bayesian-t1dm validate-latent-meal` simulates meals with known carbohydrate, each bolused for a mis-counted amount, and scores each estimator's posterior median against truth. With 200 meals per scenario and the default seed:
+
+| scenario | bolus x ICR MAE (g) | heuristic MAE / 90% coverage | trajectory MAE / 90% coverage |
+| --- | ---: | ---: | ---: |
+| matched assumptions | 17.2 | 13.8 / 0.66 | 3.9 / 0.99 |
+| long-tail absorption | 17.2 | 17.7 / 0.55 | 2.5 / 1.00 |
+| biphasic absorption | 17.2 | 17.5 / 0.55 | 17.8 / 0.71 |
+| pre-bolus timing | 16.0 | 11.7 / 0.72 | 4.4 / 1.00 |
+| wrong settings (15%) | 17.2 | 15.5 / 0.57 | 7.9 / 0.91 |
+| baseline drift | 19.5 | 14.9 / 0.62 | 6.2 / 0.98 |
+| everything at once | 16.8 | 15.5 / 0.55 | 9.1 / 0.91 |
+
+The simulator is linear, has no closed-loop basal response, no exercise and no sensor lag. These numbers say the estimator is internally sound and robust to the listed misspecifications; they do not say it is accurate on real meals.
 
 ## Output Contract
 
