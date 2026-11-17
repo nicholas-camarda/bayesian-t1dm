@@ -45,6 +45,13 @@ What is currently in place:
 - technical documentation with equations and definitions
 - overwrite-in-place runtime output with human-facing `output/`, machine `cache/`, and separate `logs/`
 
+If you collected Tandem data before November 2026, rebuild it once. The collector used to discard the carbs you enter in the pump's bolus calculator; they are still in the archived raw events and `normalize-raw --force` recovers them (details in the lab notebook, "Recovering carbs already in the archive"):
+
+```bash
+python -m pip install -e '.[dev]'    # tconnectsync must be 2.x; 3.x removed APIs this repo uses
+bayesian-t1dm normalize-raw --force
+```
+
 What has and has not been verified (November 2026 audit, details in the lab notebook):
 
 - verified by tests and simulation: ingestion, feature construction, the forecasting model's plumbing, and the latent carb estimator's ability to recover known carbohydrate from simulated meals

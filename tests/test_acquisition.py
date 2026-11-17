@@ -507,3 +507,122 @@ def test_backfill_skips_completed_windows(tmp_path):
     export_calls_after_second = [call for call in client.calls if call[0] == "fetch"]
     assert len(records_second) == 2
     assert len(export_calls_after_second) == 2
+
+
+# ---------------------------------------------------------------------------
+# Carbs entered in the pump's bolus calculator (LID_BOLUS_REQUESTED_MSG1)
+# ---------------------------------------------------------------------------
+
+
+def _encode_pump_event(event_id: int, seconds_since_tandem_epoch: int, seq_num: int, fields: dict[int, tuple[str, int | float]]) -> bytes:
+    """Build one 26-byte Tandem history-log event (big endian), as Tandem Source returns them."""
+    import struct
+
+    raw = bytearray(26)
+    struct.pack_into(">H", raw, 0, event_id & 0x0FFF)
+    struct.pack_into(">I", raw, 2, seconds_since_tandem_epoch)
+    struct.pack_into(">I", raw, 6, seq_num)
+    for offset, (fmt, value) in fields.items():
+        struct.pack_into(fmt, raw, offset, value)
+    return bytes(raw)
+
+
+def _bolus_request(seconds: int, seq: int, *, bolus_id: int, carbs: int) -> bytes:
+    return _encode_pump_event(64, seconds, seq, {11: (">B", 1), 12: (">H", bolus_id), 14: (">H", 110), 16: (">H", carbs), 18: (">f", 0.0), 22: (">I", 10000)})
+
+
+def _bolus_delivery(seconds: int, seq: int, *, bolus_id: int, milliunits: int) -> bytes:
+    return _encode_pump_event(280, seconds, seq, {12: (">H", bolus_id), 14: (">H", milliunits), 22: (">H", milliunits)})
+
+
+def test_event_payloads_keep_carbs_only_for_delivered_boluses():
+    from bayesian_t1dm.acquisition import _tconnectsync_event_payloads
+
+    events = [
+        _FakeTandemSourceEvent({"id": 64, "name": "LID_BOLUS_REQUESTED_MSG1", "eventTimestamp": "2025-07-10T07:58:00-04:00", "bolusid": 11, "carbamount": 45}),
+        _FakeTandemSourceEvent({"id": 280, "name": "LID_BOLUS_DELIVERY", "eventTimestamp": "2025-07-10T08:00:00-04:00", "bolusid": 11, "deliveredTotal": 4500}),
+        # Requested with carbs but cancelled before anything was delivered: not a meal record.
+        _FakeTandemSourceEvent({"id": 64, "name": "LID_BOLUS_REQUESTED_MSG1", "eventTimestamp": "2025-07-10T12:00:00-04:00", "bolusid": 12, "carbamount": 60}),
+        _FakeTandemSourceEvent({"id": 280, "name": "LID_BOLUS_DELIVERY", "eventTimestamp": "2025-07-10T12:01:00-04:00", "bolusid": 12, "deliveredTotal": 0}),
+        # Correction-only bolus: delivered, no carbs.
+        _FakeTandemSourceEvent({"id": 64, "name": "LID_BOLUS_REQUESTED_MSG1", "eventTimestamp": "2025-07-10T15:00:00-04:00", "bolusid": 13, "carbamount": 0}),
+        _FakeTandemSourceEvent({"id": 280, "name": "LID_BOLUS_DELIVERY", "eventTimestamp": "2025-07-10T15:01:00-04:00", "bolusid": 13, "deliveredTotal": 1000}),
+        # tconnectsync 3.x spells the fields in camelCase.
+        _FakeTandemSourceEvent({"id": 64, "name": "LID_BOLUS_REQUESTED_MSG1", "eventTimestamp": "2025-07-10T18:00:00-04:00", "bolusId": 14, "carbAmount": 70}),
+        _FakeTandemSourceEvent({"id": 280, "name": "LID_BOLUS_DELIVERY", "eventTimestamp": "2025-07-10T18:02:00-04:00", "bolusId": 14, "deliveredTotal": 7000}),
+    ]
+
+    payloads = _tconnectsync_event_payloads(events, pump_serial="90723647", tconnect_device_id="723357")
+
+    carbs = sorted(payloads["carbs"], key=lambda record: record["eventDateTime"])
+    assert [record["carbs"] for record in carbs] == [45.0, 70.0]
+    assert [str(record["bolus_id"]) for record in carbs] == ["11", "14"]
+    assert carbs[0]["eventDateTime"] == "2025-07-10T07:58:00-04:00"
+    assert carbs[0]["pump_serial"] == "90723647"
+    assert len(payloads["bolus"]) == 4
+
+
+def test_normalized_window_turns_pump_carbs_into_carb_truth(tmp_path):
+    from bayesian_t1dm.acquisition import ExportWindow, _tconnectsync_event_payloads, normalize_tconnectsync_payloads
+
+    events = [
+        _FakeTandemSourceEvent({"id": 64, "name": "LID_BOLUS_REQUESTED_MSG1", "eventTimestamp": "2025-07-10T07:58:00", "bolusid": 21, "carbamount": 52}),
+        _FakeTandemSourceEvent({"id": 280, "name": "LID_BOLUS_DELIVERY", "eventTimestamp": "2025-07-10T08:00:00", "bolusid": 21, "deliveredTotal": 5200}),
+    ]
+    payloads = _tconnectsync_event_payloads(events)
+    window = ExportWindow(start_date=pd.Timestamp("2025-07-10").date(), end_date=pd.Timestamp("2025-07-11").date())
+
+    ingested, _ = normalize_tconnectsync_payloads(payloads, window=window, endpoint_family="tconnectsync")
+
+    assert ingested.carbs["carb_grams"].tolist() == [52.0]
+    # Floored to the 5-minute analysis grid, like every other normalized event.
+    assert ingested.carbs["timestamp"].iloc[0] == pd.Timestamp("2025-07-10 07:55:00")
+    assert ingested.bolus["bolus_units"].tolist() == [5.2]
+
+
+def test_archived_raw_pump_events_yield_carbs_on_normalize(tmp_path):
+    import base64
+
+    from bayesian_t1dm.acquisition import _decode_archived_pump_event_carbs, _load_archived_window_payloads
+
+    pytest.importorskip("tconnectsync.eventparser.generic")
+    raw_dir = tmp_path / "2025-07-10__2025-07-11" / "raw"
+    raw_dir.mkdir(parents=True)
+    # Seconds since 2008-01-01 for 2025-07-10 07:58 and 08:00 pump-local time.
+    request_time = int((pd.Timestamp("2025-07-10 07:58:00") - pd.Timestamp("2008-01-01")).total_seconds())
+    stream = b"".join(
+        [
+            _bolus_request(request_time, 100, bolus_id=31, carbs=48),
+            _bolus_delivery(request_time + 120, 101, bolus_id=31, milliunits=4800),
+            _bolus_request(request_time + 3600, 102, bolus_id=32, carbs=30),  # never delivered
+        ]
+    )
+    (raw_dir / "pump_events_raw_90723647_723357.txt").write_text(base64.b64encode(stream).decode() + "\n", encoding="utf-8")
+    (raw_dir / "pump_events_raw_1453346_1032256.txt").write_text("not base64 at all !!\n", encoding="utf-8")
+    (raw_dir / "bolus.json").write_text("[]\n", encoding="utf-8")
+
+    carbs = _decode_archived_pump_event_carbs(raw_dir)
+    assert [record["carbs"] for record in carbs] == [48.0]
+    assert carbs[0]["pump_serial"] == "90723647"
+    assert carbs[0]["tconnect_device_id"] == "723357"
+    assert str(carbs[0]["eventDateTime"]).startswith("2025-07-10T07:58:00")
+
+    payloads = _load_archived_window_payloads(raw_dir.parent)
+    assert [record["carbs"] for record in payloads["carbs"]] == [48.0]
+
+
+def test_archived_carbs_are_not_decoded_when_window_already_has_a_carb_family(tmp_path):
+    import base64
+
+    from bayesian_t1dm.acquisition import _load_archived_window_payloads
+
+    raw_dir = tmp_path / "w" / "raw"
+    raw_dir.mkdir(parents=True)
+    request_time = int((pd.Timestamp("2025-07-10 07:58:00") - pd.Timestamp("2008-01-01")).total_seconds())
+    stream = _bolus_request(request_time, 1, bolus_id=1, carbs=40) + _bolus_delivery(request_time + 60, 2, bolus_id=1, milliunits=4000)
+    (raw_dir / "pump_events_raw_1_2.txt").write_text(base64.b64encode(stream).decode(), encoding="utf-8")
+    (raw_dir / "carbs.json").write_text('[{"eventDateTime": "2025-07-10T07:58:00", "carbs": 40}]\n', encoding="utf-8")
+
+    payloads = _load_archived_window_payloads(raw_dir.parent)
+
+    assert payloads["carbs"] == [{"eventDateTime": "2025-07-10T07:58:00", "carbs": 40}]

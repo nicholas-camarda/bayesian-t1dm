@@ -17,7 +17,8 @@ dependencies = [
   "pyarrow>=15",
   "arviz>=0.16",
   "pymc>=5.0",
-  "tconnectsync",
+  # 3.x removed pump_event_metadata() and pump_events_raw(), which collection relies on.
+  "tconnectsync>=2.2,<3",
 ]
 
 [project.optional-dependencies]

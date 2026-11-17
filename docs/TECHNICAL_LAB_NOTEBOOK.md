@@ -25,6 +25,7 @@ The repository is best understood as a **personal diabetes research workbench**,
 The strongest current conclusion is not a therapy setting recommendation. It is a data-truth conclusion:
 
 - the current `tconnectsync` Tandem raw archive does **not** appear to contain explicit carbohydrate records
+- **November 2026 correction: this was at least partly a pipeline artifact.** Carbs typed into the bolus calculator are recorded on the pump's `LID_BOLUS_REQUESTED_MSG1` event, which the collection code fetched and archived (inside `raw/pump_events_raw_*.txt`) but never extracted. That is fixed; whether your archive actually holds carb entries depends on whether you enter carbs when you bolus, and has not been checked against the real files. See "Recovering carbs already in the archive" below.
 - the canonical Tandem feature table therefore has `carb_grams == 0` and `meal_event == 0` everywhere unless meal information is supplied from some other source
 - this makes direct recovery of basal, I/C, and sensitivity from observed glucose much harder than the repo originally hoped
 
@@ -57,9 +58,25 @@ This section records a code and method audit done without access to the personal
 5. **`max_treedepth` was not reaching the sampler** on PyMC 5 (and the spelling used is deprecated on PyMC 6).
 6. **A hand-kept carb log was silently ignored** unless it sat in a directory named `normalized`. `carbs.csv` or `carb_log.csv` with `timestamp,carb_grams` is now read from anywhere in the raw tree, and a logged entry no longer has to fall in the same 5-minute bin as the bolus.
 
+7. **Pump-entered carbs were thrown away.** Only `LID_BOLUS_DELIVERY` events were kept; the carb amount lives on `LID_BOLUS_REQUESTED_MSG1`, linked by bolus id. Collection now emits a `carbs` payload family (carbs kept only when that bolus was actually delivered), and `normalize-raw` decodes the already-archived `pump_events_raw_*.txt` files for windows collected before the fix.
+8. **Collection would not run on a fresh install.** `tconnectsync` was unpinned; 3.0 removed `pump_event_metadata()` and `pump_events_raw()`, which collection calls. It is now pinned to `>=2.2,<3`, and the test suite passes on 2.3.4.
+
+### Recovering carbs already in the archive
+
+This is the highest-value next step, because pump carb entries would give the latent-meal lane carb truth for free.
+
+```bash
+python -m pip install -e '.[dev]'           # moves tconnectsync back to 2.x
+bayesian-t1dm normalize-raw --force          # rebuilds every window, decoding archived pump events
+bayesian-t1dm prepare-model-data --skip-backfill
+bayesian-t1dm research-latent-meal-icr --research-scope full
+```
+
+Then check `output/latent_meal/latent_meal_research_gate.md` for `explicit_carb_source_available: True`, and the "Effective I:C From Logged Meals" section of `latent_carb_estimator_report.md`. If carbs are still absent, either you rarely enter carbs on the pump, or the archived event text is in a format the decoder does not recognise; `normalize-raw` skips unreadable files rather than failing, so a zero count is the symptom.
+
 ### Structural limits that no code change removes
 
-- **Carbs and I:C are not separately identifiable from glucose.** A post-meal trace identifies `carbs x CF / ICR`. Without carbohydrate truth, "the meal was undercounted" and "the I:C ratio is too weak" produce the same trace. The honest per-meal output is a carb-equivalent under the programmed settings, or equivalently a statement about whether the bolus was adequate for that meal. Phase D ("carb-entry error scoring") and "effective I:C" are the same number viewed two ways until some meals have trusted carb counts.
+- **Carbs and I:C are not separately identifiable from glucose.** A post-meal trace identifies `carbs x CF / ICR`. Without carbohydrate truth (pump-entered carbs, if they turn out to exist, are exactly that truth), "the meal was undercounted" and "the I:C ratio is too weak" produce the same trace. The honest per-meal output is a carb-equivalent under the programmed settings, or equivalently a statement about whether the bolus was adequate for that meal. Phase D ("carb-entry error scoring") and "effective I:C" are the same number viewed two ways until some meals have trusted carb counts.
 - **What breaks the tie:** a few weeks of deliberately weighed or packaged breakfasts logged with carbs. This path is now implemented: put a `carbs.csv` (`timestamp,carb_grams`) in the raw data tree and the full latent-meal run reports an effective I:C per segment with a 90% interval once at least 5 clean logged meals exist. In simulation, 20 logged meals recover a true ratio of 8 or 12.5 against a programmed 10 to within about 3%, and flag the difference every time. This is the shortest route from this repo to an actual statement about a therapy setting.
 - **Late absorption is invisible.** Carbohydrate that lands after the 180-minute window biases the estimate low (about -18 g in the biphasic simulation). Fat- and protein-heavy meals should not be trusted.
 - **Closed-loop basal is only approximately accounted for.** Control-IQ raises and lowers basal during the post-meal window. The estimator counts delivery above or below a schedule inferred from the median delivery at that time of day, which is right when modulation varies from day to day and wrong when the controller does the same thing most mornings. The size of the residual error on real data is unknown.

@@ -1368,8 +1368,13 @@ def _tconnectsync_event_payloads(
     pump_serial: str | None = None,
     tconnect_device_id: str | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
-    payloads: dict[str, list[dict[str, Any]]] = {'cgm': [], 'bolus': [], 'basal': [], 'activity': []}
+    payloads: dict[str, list[dict[str, Any]]] = {'cgm': [], 'bolus': [], 'basal': [], 'activity': [], 'carbs': []}
     device_fields = _device_fields_for_record(pump_serial=pump_serial, tconnect_device_id=tconnect_device_id)
+    # Carbs typed into the pump's bolus calculator live on LID_BOLUS_REQUESTED_MSG1, not on
+    # the delivery event. They are collected by bolus id and kept only for boluses that were
+    # actually delivered, so a cancelled request that is re-entered is not counted twice.
+    carb_requests: dict[str, dict[str, Any]] = {}
+    delivered_bolus_ids: set[str] = set()
     for event in events:
         record = event.todict() if hasattr(event, 'todict') else {}
         name = str(record.get('name') or type(event).__name__).upper()
@@ -1399,8 +1404,27 @@ def _tconnectsync_event_payloads(
                     **device_fields,
                 }
             )
+        elif name == 'LID_BOLUS_REQUESTED_MSG1':
+            bolus_id = record.get('bolusid') if record.get('bolusid') is not None else record.get('bolusId')
+            carb_amount = pd.to_numeric(
+                pd.Series([record.get('carbamount') if record.get('carbamount') is not None else record.get('carbAmount')]),
+                errors='coerce',
+            ).iloc[0]
+            if bolus_id is not None and not pd.isna(carb_amount) and float(carb_amount) > 0:
+                carb_requests[str(bolus_id)] = {
+                    'eventDateTime': event_timestamp,
+                    'carbs': float(carb_amount),
+                    'bolus_id': bolus_id,
+                    'source_event_id': record.get('id'),
+                    'source_event_name': name,
+                    'source_seq_num': record.get('seqNum'),
+                    **device_fields,
+                }
         elif name == 'LID_BOLUS_DELIVERY':
             delivered_total = pd.to_numeric(pd.Series([record.get('deliveredTotal')]), errors='coerce').iloc[0]
+            delivered_bolus_id = record.get('bolusid') if record.get('bolusid') is not None else record.get('bolusId')
+            if delivered_bolus_id is not None and not pd.isna(delivered_total) and float(delivered_total) > 0:
+                delivered_bolus_ids.add(str(delivered_bolus_id))
             payloads['bolus'].append(
                 {
                     'completionDateTime': event_timestamp,
@@ -1427,7 +1451,50 @@ def _tconnectsync_event_payloads(
                 }
             )
     payloads['activity'] = []
+    payloads['carbs'] = [request for bolus_id, request in carb_requests.items() if bolus_id in delivered_bolus_ids]
     return payloads
+
+
+def _decode_archived_pump_event_carbs(raw_dir: Path) -> list[dict[str, Any]]:
+    """Recover bolus-calculator carb entries from archived ``pump_events_raw_*.txt`` files.
+
+    Windows collected before carb extraction existed still hold every pump event as base64
+    text, so the carbs can be rebuilt without contacting Tandem. Returns an empty list when
+    there are no such files or tconnectsync's event parser is unavailable.
+    """
+    raw_files = sorted(raw_dir.glob('pump_events_raw_*.txt'))
+    if not raw_files:
+        return []
+    _ensure_pkg_resources_module()
+    try:
+        from tconnectsync.eventparser.generic import Events, decode_raw_events  # type: ignore
+        from tconnectsync.eventparser.raw_event import EVENT_LEN  # type: ignore
+    except Exception:  # pragma: no cover - optional dependency guard
+        return []
+    records: list[dict[str, Any]] = []
+    for path in raw_files:
+        text = path.read_text(encoding='utf-8').strip()
+        if not text:
+            continue
+        device_key = path.stem.replace('pump_events_raw_', '', 1)
+        pump_serial, _, device_id = device_key.rpartition('_')
+        try:
+            if text.startswith('"'):
+                # Some archives store the API's JSON string literal rather than the bare text.
+                text = json.loads(text)
+            decoded = decode_raw_events(text)
+            usable = len(decoded) - (len(decoded) % EVENT_LEN)
+            events = list(Events(decoded[:usable]))
+        except Exception:
+            # An unreadable archive file costs that file's carbs, not the whole window.
+            continue
+        payloads = _tconnectsync_event_payloads(
+            events,
+            pump_serial=None if pump_serial in {'', 'unknown'} else pump_serial,
+            tconnect_device_id=device_id or None,
+        )
+        records.extend(payloads['carbs'])
+    return records
 
 
 def _canonical_export_name(window: ExportWindow, source_path: Path) -> str:
@@ -1914,6 +1981,10 @@ def _load_archived_window_payloads(window_dir: Path) -> dict[str, Any]:
         payloads[path.stem] = json.loads(path.read_text(encoding="utf-8"))
     if not payloads:
         raise AcquisitionError(f"No archived JSON payloads found under {raw_dir}")
+    if not any('carb' in str(family).lower() for family in payloads):
+        archived_carbs = _decode_archived_pump_event_carbs(raw_dir)
+        if archived_carbs:
+            payloads['carbs'] = archived_carbs
     return payloads
 
 
