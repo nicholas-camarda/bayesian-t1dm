@@ -2712,7 +2712,11 @@ def extract_latent_meal_therapy_settings_from_tandem_raw(
             sort_time = requested_end if pd.notna(requested_end) else last_uploaded if pd.notna(last_uploaded) else pd.Timestamp.min
             candidates.append((pd.Timestamp(sort_time), path, settings_payload, active_profile))
     if not candidates:
-        raise FileNotFoundError(f"No Tandem pump profile settings found under {root}")
+        raise FileNotFoundError(
+        f"No Tandem pump profile settings found under {root}. The full latent-meal scope needs the programmed I:C ratio "
+        "and correction factor: either archive a Tandem window that includes raw/pump_event_metadata.json, or pass "
+        "--therapy-settings path/to/therapy_settings.json (format in the README)."
+    )
     _, _, settings_payload, active_profile = sorted(candidates, key=lambda item: (item[0], str(item[1])))[-1]
     profile_segments = _valid_tandem_profile_segments(active_profile)
     if not profile_segments:

@@ -222,3 +222,74 @@ def test_pipeline_says_icr_is_unassessable_without_logged_carbs(tmp_path):
 
     review = write_latent_meal_review_html(result, tmp_path / "latent" / "latent_meal_review.html").read_text(encoding="utf-8")
     assert "No accepted window has a logged carb count" in review
+
+
+def test_cli_workflow_from_raw_tree_with_hand_kept_carb_log(tmp_path, monkeypatch):
+    """prepare-model-data -> research-latent-meal-icr on a raw tree laid out like the real archive."""
+    import json
+
+    from bayesian_t1dm.cli import main
+
+    cloud = tmp_path / "cloud"
+    runtime = tmp_path / "runtime"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    normalized = cloud / "data" / "raw" / "tconnectsync" / "2025-03-01__2025-03-14" / "normalized"
+    normalized.mkdir(parents=True)
+    data = _simulated_breakfast_data(days=14, true_icr=12.5, log_carbs=True, seed=2)
+    data.cgm[["timestamp", "glucose"]].to_csv(normalized / "cgm.csv", index=False)
+    data.bolus[["timestamp", "bolus_units"]].to_csv(normalized / "bolus.csv", index=False)
+    data.basal[["start_timestamp", "end_timestamp", "basal_units_per_hour"]].to_csv(normalized / "basal.csv", index=False)
+    # The hand-kept log sits at the top of the raw tree, not inside a normalized window.
+    data.carbs[["timestamp", "carb_grams"]].to_csv(cloud / "data" / "raw" / "carbs.csv", index=False)
+    settings_path = tmp_path / "therapy_settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "icr_grams_per_unit": {segment: PROGRAMMED_ICR for segment in ["overnight", "morning", "afternoon", "evening"]},
+                "correction_factor_mgdl_per_unit": {segment: CORRECTION_FACTOR for segment in ["overnight", "morning", "afternoon", "evening"]},
+                "target_glucose_mgdl": 110.0,
+                "insulin_action_minutes": 300,
+                "carb_absorption_minutes_prior": 180,
+                "max_plausible_meal_carbs": 180,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(cloud))
+    monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        assert main(["--root", str(repo), "prepare-model-data", "--skip-backfill"]) == 0
+        assert (
+            main(
+                [
+                    "--root",
+                    str(repo),
+                    "research-latent-meal-icr",
+                    "--research-scope",
+                    "full",
+                    "--skip-backfill",
+                    "--therapy-settings",
+                    str(settings_path),
+                ]
+            )
+            == 0
+        )
+
+    output = runtime / "output" / "latent_meal"
+    evidence = pd.read_csv(output / "effective_icr_evidence.csv").set_index("segment").loc["morning"]
+    assert int(evidence["n_meals"]) >= 8
+    assert evidence["status"] == "carbs_hit_softer_than_programmed"
+    assert evidence["effective_icr"] == pytest.approx(12.5, rel=0.08)
+    assert (output / "latent_meal_review.html").exists()
+    estimates = pd.read_csv(output / "latent_carb_estimates.csv")
+    assert estimates["estimator"].eq("trajectory").all()
+
+
+def test_full_scope_without_pump_profile_explains_how_to_supply_settings(tmp_path):
+    from bayesian_t1dm.therapy_research import extract_latent_meal_therapy_settings_from_tandem_raw
+
+    with pytest.raises(FileNotFoundError, match="--therapy-settings"):
+        extract_latent_meal_therapy_settings_from_tandem_raw(tmp_path)

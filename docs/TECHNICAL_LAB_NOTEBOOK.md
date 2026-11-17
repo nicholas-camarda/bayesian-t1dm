@@ -46,6 +46,8 @@ This section records a code and method audit done without access to the personal
 - The test suite passes (ingestion, Apple Health import, feature construction, model plumbing, report and status writers, CLI commands) and now runs in CI on Python 3.11 and 3.13.
 - The trajectory-based latent carb estimator recovers simulated carbohydrate. Against meals bolused for a mis-counted amount, bolus x I:C is off by about 17 g on average; the trajectory estimator is off by 2.5 to 9 g in seven of eight scenarios with 90% intervals that cover truth at least 90% of the time, including a scenario where absorption shape, bolus timing, therapy settings and drift are all wrong together. Reproduce with `bayesian-t1dm validate-latent-meal`.
 
+- The real commands run end to end on a raw tree laid out like the Tandem archive but filled with simulated days: `prepare-model-data`, `research-latent-meal-icr --research-scope full` (which picked up a hand-kept `carbs.csv` and reported an effective I:C of 7.8 [7.4, 8.2] against a simulated truth of 8.0), and `run --skip-recommendations` (model MAE 2.8 against persistence 5.9 mg/dL, 80% interval coverage 0.75). The first two are now an automated test.
+
 ### Found broken and fixed
 
 1. **Look-ahead leak in the forecast features.** CGM gaps were filled by linear interpolation, so a row inside a gap was given a glucose value computed from the reading at the far end of the gap, frequently the very value it was asked to forecast. Both the model and the persistence baseline benefited. The fill is now last-observation-carried-forward. Any walk-forward MAE or coverage number produced before this fix was optimistic by an unknown amount and should be regenerated.
@@ -53,6 +55,7 @@ This section records a code and method audit done without access to the personal
 3. **"Posterior probability better" was not a probability.** It was the share of forecast timepoints at which the mean prediction was closer to target, which reads 1.0 for any uniform shift. It is now the share of paired posterior draws in which the scenario wins.
 4. **Meal-window CGM coverage was overstated.** Coverage was computed over the rows present, but a CGM gap removes rows from the prepared frame. Windows with holes could pass the 90% gate. Coverage is now measured against the rows a complete window should have.
 5. **`max_treedepth` was not reaching the sampler** on PyMC 5 (and the spelling used is deprecated on PyMC 6).
+6. **A hand-kept carb log was silently ignored** unless it sat in a directory named `normalized`. `carbs.csv` or `carb_log.csv` with `timestamp,carb_grams` is now read from anywhere in the raw tree, and a logged entry no longer has to fall in the same 5-minute bin as the bolus.
 
 ### Structural limits that no code change removes
 
@@ -67,7 +70,7 @@ The fixed code has not been run against the real dataset. The first session back
 
 1. `bayesian-t1dm prepare-model-data`, then `bayesian-t1dm research-latent-meal-icr --research-scope full`.
 2. Open `latent_carb_estimator_report.md` and read the new Estimator section: how many rows used `trajectory` versus the fallback, the median `prior_contraction`, and the median fit RMSE. A fit RMSE far above 8 to 10 mg/dL means the forward model does not describe real meals and the simulation results do not transfer.
-3. Expect fewer accepted windows than before, because of the coverage fix.
+3. Expect fewer accepted windows than before, because of the coverage fix. If the full scope stops with "No Tandem pump profile settings found", pass `--therapy-settings` as the message says.
 4. Re-run `bayesian-t1dm run --skip-recommendations` and compare model MAE with persistence MAE. If the model no longer beats persistence after the leak fix, the forecasting lane was never working.
 
 ### Lane status
