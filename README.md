@@ -1,121 +1,79 @@
 # Bayesian T1DM
 
-Bayesian forecasting and recommendation pipeline for personal Type 1 diabetes data.
+A personal research workbench that turns Tandem insulin-pump data and Apple Health data into evidence about pump settings. For example: given every breakfast logged on the pump, does glucose respond as if the morning insulin-to-carb (I:C) ratio were right?
 
-## Mission
+It is research and decision support, not a medical device; nothing here changes a pump setting.
 
-This repository exists to turn your personal Tandem and Apple Health data into traceable therapy-setting evidence.
+## Questions it answers
 
-The near-term mission is not just to forecast glucose. It is to answer:
+| Question | Command | Answer page |
+| --- | --- | --- |
+| Is my morning I:C ratio right? | `research-latent-meal-icr --research-scope full` | `output/latent_meal/latent_meal_review.html` |
+| Is there enough clean overnight data to judge basal? | `review-therapy-evidence` | `output/therapy/therapy_review.html` |
+| Can glucose be forecast 30 minutes ahead better than "it stays the same"? | `run --skip-recommendations` | `output/forecast/forecast_review.html` |
+| Is the Tandem data complete? | `ingest` | `output/source/coverage_review.html` |
+| Where does everything stand? | `status` | `output/current_status.html` |
 
-- do the available data identify anything useful about your current settings?
-- starting with overnight / fasting basal, what appears identifiable versus blocked?
-- what evidence supports a likely direction of change?
-- where do the blockers live when the answer is still unclear?
+Every page opens with the question, a one-sentence answer, how much to trust it and what to do next; figures, tables and the files behind it fold out below. Methods are in [`docs/technical.md`](docs/technical.md); current scientific status is in [`docs/TECHNICAL_LAB_NOTEBOOK.md`](docs/TECHNICAL_LAB_NOTEBOOK.md).
 
-Forecasting, feature engineering, and synthetic validation support that mission, but they are not the headline goal.
+## Requirements
 
-This is a research project and decision-support workbench, not a medical device or automated pump controller.
+- macOS or Linux with Conda
+- A Tandem Source account (pump data is pulled with [`tconnectsync`](https://github.com/jwoglom/tconnectsync) 3.x)
+- Optional: Apple Health exports from the Health Auto Export app (JSON)
 
-## Current Status
-
-The active implementation is Python. Legacy R work is archived in [`archive/r/`](./archive/r/), and exploratory notebooks live in [`notebooks/`](./notebooks/).
-
-For project orientation at two different levels:
-
-- implementation and data-flow details: [`docs/technical.md`](./docs/technical.md)
-- current scientific direction and branch truth: [`docs/TECHNICAL_LAB_NOTEBOOK.md`](./docs/TECHNICAL_LAB_NOTEBOOK.md)
-
-What is currently in place:
-
-- Tandem Source acquisition through `tconnectsync`
-- raw API payload archival as the source of truth
-- normalization of CGM, bolus, basal, and activity tables
-- multi-export Apple Health import with canonical overlap resolution
-- Tandem-aligned 5-minute analysis-ready dataset materialization
-- Apple Health feature screening against Tandem targets
-- manifest generation and coverage checks
-- 5-minute feature-table construction
-- insulin activity and IOB expansion from bolus events
-- Bayesian forecasting model scaffolding in PyMC
-- recommendation scoring for candidate pump-setting changes
-- sampler diagnostics in run outputs
-- recommendation suppression policy tied to validation quality and signal availability
-- test fixtures and validation checks
-- technical documentation with equations and definitions
-- overwrite-in-place runtime output with human-facing `output/`, machine `cache/`, and separate `logs/`
-
-If you collected Tandem data before November 2026, rebuild it once. The collector used to discard the carbs you enter in the pump's bolus calculator; they are still in the archived raw events and `normalize-raw --force` recovers them (details in the lab notebook, "Recovering carbs already in the archive"):
+## Install
 
 ```bash
-python -m pip install -e '.[dev]'    # tconnectsync must be 2.x; 3.x removed APIs this repo uses
-bayesian-t1dm normalize-raw --force
+conda env create -f environment.yml
 ```
-
-What has and has not been verified (November 2026 audit, details in the lab notebook):
-
-- verified by tests and simulation: ingestion, feature construction, the forecasting model's plumbing, and the latent carb estimator's ability to recover known carbohydrate from simulated meals
-- not verified: anything about real meals. No carbohydrate truth exists in the Tandem archive, and the checked-in code has not been re-run against the personal dataset since the audit's fixes
-- known dead end for now: the forecast-based recommendation lane suppresses every recommendation on real data because carbohydrate records are absent
-
-What still needs refinement:
-
-- stronger validation on long real-world exports
-- prior and threshold calibration against your own data
-- richer basal schedule handling
-- broader backtesting against simpler baselines
-- potential simplification or reparameterization of the latent residual model after more real-data diagnostics
-
-Supported collection path:
-
-- API-first acquisition through `tconnectsync`
-- browser or Playwright acquisition is not part of the active workflow
-- manual CSV exports can still be staged locally and ingested, but repo-local `data/raw/` is not the canonical long-term home
-
-## Start Here
-
-If you are doing science work, use this loop:
-
-1. Refresh the prepared dataset.
 
 ```bash
-bayesian-t1dm prepare-model-data
+conda activate bt1dm
 ```
 
-This writes the preparation report under `~/Workspaces/bayesian-t1dm/runtime/output/prepare/` and the prepared dataset under `~/Workspaces/bayesian-t1dm/runtime/cache/prepared/`.
-
-2. Inspect the latent-meal foundation.
+Put Tandem credentials in a `.env` file in the repository root (never committed):
 
 ```bash
-bayesian-t1dm research-latent-meal-icr --research-scope foundation
+TANDEM_SOURCE_EMAIL=you@example.com
+TANDEM_SOURCE_PASSWORD=...
+TIMEZONE_NAME=America/New_York
 ```
 
-This is the primary scientific lane. It audits meal-truth semantics, assembles first-meal candidates, and tells you whether the accepted cohort is ready for Phase C fitting.
-
-If the foundation gate is healthy, move to the strict Phase C fit:
+## First run
 
 ```bash
-bayesian-t1dm research-latent-meal-icr --research-scope full
+bayesian-t1dm backfill --start-date 2024-01-01 --end-date 2026-11-17
 ```
 
-This runs the proxy-only latent carb estimator on accepted windows only and writes research-only posterior carb-equivalent estimates with credible intervals. Each estimate comes from fitting the whole post-meal CGM trace against absorbed insulin; see "Latent Carb Estimator" in [`docs/technical.md`](./docs/technical.md) for the model and for what it cannot identify. The workflow extracts the active Tandem pump profile from `raw/pump_event_metadata.json` and records the exact I:C ratios, correction factors, target glucose, insulin action duration, absorption prior, and maximum plausible meal size used for the run.
+```bash
+bayesian-t1dm build-dataset
+```
 
-Use `--therapy-settings path/to/therapy_settings.json` only when you want to override the extracted Tandem profile. Minimal override JSON:
+```bash
+bayesian-t1dm status
+```
+
+`backfill` saves Tandem Source responses untouched under `data/raw/tconnectsync/<window>/raw/` and cleaned tables next to them. `build-dataset` merges all Tandem and Apple Health data into one deduplicated, validated dataset; it does work only when a raw file changed, and every analysis refuses to run on a dataset older than its raw files.
+
+## Data
+
+Everything lives in the project folder set by `BAYESIAN_T1DM_CLOUD_ROOT` (the Project Vault by default); generated reports go to `~/Workspaces/bayesian-t1dm/runtime/output/`.
+
+| Path under the project folder | What goes there |
+| --- | --- |
+| `data/raw/tconnectsync/` | Tandem downloads, one folder per 30-day window (written by `collect` / `backfill`) |
+| `data/raw/health_auto_export/` | Apple Health exports: drop `HealthAutoExport-*.json` files anywhere here |
+| `data/raw/carbs.csv` | Optional hand-kept carb log, `timestamp,carb_grams` in local pump time |
+| `data/raw/context_events.csv` | Days to leave out of meal and basal analyses, `start_date,end_date,reason` (for example a steroid injection) |
+| `data/merged/` | The merged dataset, `validation_report.md` and input fingerprints (written by `build-dataset`) |
+
+Carbs entered in the pump's bolus calculator are read from the pump events, together with the I:C ratio and correction factor the calculator used, so each meal is judged against the setting in force that day. The latent-meal analysis reads your programmed profile from the newest Tandem window; `--therapy-settings file.json` overrides it with this format:
 
 ```json
 {
-  "icr_grams_per_unit": {
-    "overnight": 12.0,
-    "morning": 10.0,
-    "afternoon": 11.0,
-    "evening": 9.0
-  },
-  "correction_factor_mgdl_per_unit": {
-    "overnight": 45.0,
-    "morning": 40.0,
-    "afternoon": 45.0,
-    "evening": 40.0
-  },
+  "icr_grams_per_unit": {"overnight": 12.0, "morning": 10.0, "afternoon": 11.0, "evening": 9.0},
+  "correction_factor_mgdl_per_unit": {"overnight": 45.0, "morning": 40.0, "afternoon": 45.0, "evening": 40.0},
   "target_glucose_mgdl": 110.0,
   "insulin_action_minutes": 300,
   "carb_absorption_minutes_prior": 180,
@@ -123,383 +81,22 @@ Use `--therapy-settings path/to/therapy_settings.json` only when you want to ove
 }
 ```
 
-The first artifact to inspect is `~/Workspaces/bayesian-t1dm/runtime/output/latent_meal/latent_meal_review.html`. The downstream analysis table is `~/Workspaces/bayesian-t1dm/runtime/cache/latent_meal/latent_carb_estimates.csv`. The exact priors used for a run are recorded in `~/Workspaces/bayesian-t1dm/runtime/cache/latent_meal/therapy_settings_used.json`.
+## Limits
 
-To get evidence about the I:C setting itself rather than a carb-equivalent, log carbs for clean first meals. Without carb truth, an undercounted meal and a too-weak ratio look identical in the glucose trace. Create a `carbs.csv` anywhere under the raw data tree:
+Tandem Source is undocumented and has changed without notice; when collection fails, check for a newer `tconnectsync`. Carbs and I:C cannot be separated from glucose alone, so I:C evidence needs logged carbs. Retrospective personal data support associations, not causal claims; results are for a conversation with a clinician.
 
-```csv
-timestamp,carb_grams
-2026-11-18 07:42:00,45
-2026-11-19 07:55:00,38
-```
-
-Use local pump time, and log within about 20 minutes before to 30 minutes after the meal bolus. Weighed or packaged foods are worth far more than estimates. Re-run `prepare-model-data` and the full-scope command; once at least 5 accepted first-meal windows have a logged count (20 is a better target), `latent_carb_estimator_report.md` gains an effective I:C per segment with a 90% interval, and `effective_icr_evidence.csv` holds the numbers. This is research evidence to discuss with a clinician, not an instruction to change a pump setting.
-
-3. Refresh the combined snapshot when you want the whole repo summarized in one place.
+## Development
 
 ```bash
-bayesian-t1dm status
+pytest -q
 ```
 
-This publishes `~/Workspaces/bayesian-t1dm/runtime/output/current_status.html` plus the latest `therapy_review.html` and `forecast_review.html`. It is the combined overview, not the scientific starting point.
-
-4. Use the forecast diagnostic only when you want a secondary validation readout.
-
 ```bash
-bayesian-t1dm run --skip-recommendations
-```
-
-This is the secondary forecast/validation lane. It is useful for checking walk-forward behavior, but it is not the main science loop.
-
-5. Use the therapy drill-down only when you need identifiability context.
-
-```bash
-bayesian-t1dm review-therapy-evidence
-```
-
-This is a secondary diagnostics surface for basal and meal-linked identifiability.
-
-6. Use the fixture builder when you want a fast representative latent-meal subset.
-
-```bash
-bayesian-t1dm build-latent-meal-fixture
-```
-
-This keeps all first-meal candidates and a small number of background days while shrinking the prepared data for debugging.
-
-The runtime layout is intentionally boring now:
-
-- top-level human-facing entrypoints live in `~/Workspaces/bayesian-t1dm/runtime/output/`
-- machine-oriented summaries live in `~/Workspaces/bayesian-t1dm/runtime/cache/`
-- logs live in `~/Workspaces/bayesian-t1dm/runtime/logs/`
-- legacy clutter is archived once under `~/Workspaces/bayesian-t1dm/runtime/archive/legacy_output`
-
-## Quickstart
-
-1. Create and activate the Conda environment:
-
-```bash
-conda env create -f environment.yml
-conda activate bt1dm
-```
-
-This environment file installs the package in editable dev mode. If you prefer to create it manually instead of using [`environment.yml`](./environment.yml):
-
-```bash
-conda create -n bt1dm python=3.11
-conda activate bt1dm
-python -m pip install --upgrade pip
-python -m pip install -e '.[dev]'
-```
-
-2. Confirm the CLI is available:
-
-```bash
-bayesian-t1dm --help
-```
-
-3. Inspect or validate raw Tandem exports:
-
-```bash
-bayesian-t1dm normalize-raw
-bayesian-t1dm validate-raw
-bayesian-t1dm ingest
-```
-
-4. Prepare model-ready data:
-
-```bash
-bayesian-t1dm prepare-model-data
-```
-
-`prepare-model-data` is the default data-prep workflow. It reads already-imported Apple Health tables from the canonical cloud raw tree when they are present, measures Apple/Tandem overlap, backfills Tandem data when credentials are available, and writes an aligned 5-minute model dataset. If Apple Health is absent, it falls back to a Tandem-only dataset and targets roughly one year of Tandem history by default.
-
-If you have new Health Auto Export bundles that have not been imported yet, run the import step first:
-
-```bash
-bayesian-t1dm import-health-auto-export --input \
-  "$HOME/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm/data/raw/apple_health_data"
-```
-
-Then rerun:
-
-```bash
-bayesian-t1dm prepare-model-data
-```
-
-Use `--apple-input` with `prepare-model-data` only when you intentionally want it to import fresh Apple Health bundles before preparing the dataset.
-
-5. Run the full pipeline:
-
-```bash
-bayesian-t1dm run
-```
-
-For faster real-data validation without the final recommendation fit:
-
-```bash
-bayesian-t1dm run --skip-recommendations
-```
-
-6. Run tests and the lint check (both also run in GitHub Actions on every push and pull request):
-
-```bash
-pytest
 ruff check src tests
 ```
 
-## Configuration
+Both run in GitHub Actions on pushes to `main` and on pull requests. Tests use synthetic data only. `bayesian-t1dm validate-latent-meal` checks the carb estimator against simulated meals with known carbohydrate.
 
-Credentials and acquisition settings belong in a root-level `.env` file that is never committed.
+## License and contact
 
-Required or commonly used variables:
-
-- `TANDEM_SOURCE_EMAIL` or `TCONNECT_EMAIL`
-- `TANDEM_SOURCE_PASSWORD` or `TCONNECT_PASSWORD`
-- `TANDEM_SOURCE_REGION` or `TCONNECT_REGION`
-- `TIMEZONE_NAME`
-- `TANDEM_SOURCE_PUMP_SERIAL`, `TANDEM_PUMP_SERIAL`, or `PUMP_SERIAL_NUMBER` if required for your account
-
-The active acquisition flow assumes Tandem Source is the authoritative cloud source for your Mobi data and that `tconnectsync` can query it directly.
-
-## Core Commands
-
-If you are actively working in the repo, these are the commands that matter most:
-
-```bash
-# run the main end-to-end status workflow
-bayesian-t1dm status
-
-# refresh the prepared dataset
-bayesian-t1dm prepare-model-data
-
-# rebuild the therapy drill-down dashboard
-bayesian-t1dm review-therapy-evidence
-
-# rebuild the forecasting / validation drill-down dashboard
-bayesian-t1dm run --skip-recommendations
-
-# run the full forecasting + recommendation pipeline
-bayesian-t1dm run
-```
-
-Use these less often, when needed:
-
-```bash
-# import new Apple Health bundles
-bayesian-t1dm import-health-auto-export --input \
-  "$HOME/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm/data/raw/apple_health_data"
-
-# repair or inspect Tandem raw data
-bayesian-t1dm normalize-raw
-bayesian-t1dm ingest
-bayesian-t1dm validate-raw
-
-# generate supporting therapy research artifacts
-bayesian-t1dm research-therapy-settings
-
-# generate experimental latent meal artifacts
-bayesian-t1dm research-latent-meal-icr --research-scope foundation
-bayesian-t1dm research-latent-meal-icr --research-scope full
-
-# build a fast representative latent meal debugging fixture
-bayesian-t1dm build-latent-meal-fixture
-
-bayesian-t1dm validate-therapy-infra
-
-# check the latent carb estimators against simulated meals with known carbs
-bayesian-t1dm validate-latent-meal
-```
-
-## Data Flow
-
-The active pipeline is:
-
-1. Tandem Mobi syncs to Tandem Source through the mobile app
-2. `tconnectsync` logs in and requests Tandem Source API windows
-3. raw API responses are archived under the cloud raw tree
-4. normalized CGM, bolus, basal, and activity tables are written beside the raw responses
-5. optional Apple Health year-chunk bundles are imported under `data/raw/health_auto_export/<export_id>/...`
-6. imported Apple Health tables are unified with deterministic latest-export-wins dedupe
-7. `prepare-model-data` inspects Apple and Tandem spans from the canonical raw tree, requests missing Tandem history when needed, and writes an alignment/preparation report
-8. a per-window Tandem manifest records coverage, hashes, timestamps, and pump identity
-9. a Tandem 5-minute feature grid is built
-10. Apple Health context is merged onto those Tandem timestamps when available to create the final prepared dataset
-11. insulin exposure and IOB are derived from bolus events
-12. lagged, rolling, and calendar features are created
-13. optional therapy research builds segment-level contexts, audits feature engineering, and compares candidate models
-14. therapy research now writes a methodological gate, meal-proxy audit, and standardized Tandem/Apple source report cards before model comparison
-15. the Bayesian forecasting model is fit
-16. scenario comparison and recommendation ranking are generated
-
-## Review Flow
-
-Canonical repair/review workflow:
-
-1. `bayesian-t1dm normalize-raw`
-2. `bayesian-t1dm ingest`
-3. `bayesian-t1dm run --skip-recommendations`
-
-Canonical current-status workflow:
-
-1. `bayesian-t1dm status`
-2. open `~/Workspaces/bayesian-t1dm/runtime/output/current_status.html`
-3. drill into `therapy_review.html` or `forecast_review.html` only when you need the supporting detail
-
-This keeps raw-window repair, coverage review, and predictive validation separate from recommendation generation.
-
-Canonical Tandem + Apple Health workflow:
-
-1. `bayesian-t1dm normalize-raw`
-2. `bayesian-t1dm import-health-auto-export --input "$HOME/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm/data/raw/apple_health_data"` when new bundles need to be imported
-3. `bayesian-t1dm prepare-model-data`
-4. `bayesian-t1dm screen-health-features`
-5. `bayesian-t1dm run --skip-recommendations`
-6. `bayesian-t1dm run`
-
-Canonical Tandem-only fallback workflow:
-
-1. `bayesian-t1dm normalize-raw`
-2. `bayesian-t1dm prepare-model-data`
-3. `bayesian-t1dm run --skip-recommendations`
-4. `bayesian-t1dm run`
-
-Canonical therapy evidence workflow:
-
-1. `bayesian-t1dm normalize-raw`
-2. `bayesian-t1dm import-health-auto-export --input "$HOME/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm/data/raw/apple_health_data"` when new bundles need to be imported
-3. `bayesian-t1dm prepare-model-data`
-4. `bayesian-t1dm review-therapy-evidence`
-5. review `therapy_review.html` first, then inspect the linked supporting artifacts if you need to go deeper
-
-What each step does:
-
-1. `normalize-raw` rebuilds normalized Tandem tables from archived raw API payloads.
-2. `prepare-model-data` reuses already-imported Apple Health tables from the canonical raw tree by default, computes Apple/Tandem overlap, backfills Tandem data when needed, and writes the prepared 5-minute model dataset plus a preparation report. Use `import-health-auto-export` first when you have new bundles to ingest.
-3. `screen-health-features` evaluates Apple context features against Tandem glucose targets using the unified prepared dataset and skips cleanly when Apple Health is absent.
-4. `run --skip-recommendations` is a forecast diagnostic. It checks walk-forward forecasting, raw source quality, normalized plausibility, and sampler/report wiring; it is not proof that the real-data pipeline is valid for therapy recommendations.
-5. `run` performs the forecasting lane and suppresses decision-support recommendations unless raw source quality, normalized bolus/IOB plausibility, CGM validity, timezone provenance, explicit meal truth, walk-forward performance, interval coverage, and sampler diagnostics all pass.
-6. `research-therapy-settings` runs a separate research-grade workflow for basal schedule, I/C ratio, and later sensitivity factor analysis. It starts with a methodological gate, builds strict meal-bolus proxy features when explicit carbs are absent, writes Tandem and Apple source report cards, compares candidate models, and writes human-reviewable segment-level evidence rather than auto-changing settings.
-7. `validate-therapy-infra` runs synthetic truth-recovery scenarios against the same therapy research stack so the infrastructure has to recover known therapy directions and suppress itself in corrupted or weak-identifiability cases.
-8. `validate-latent-meal` simulates meals with known carbohydrate and scores the latent carb estimators against that truth. It needs no personal data, runs in about 15 seconds, and exits non-zero if the trajectory estimator stops beating the bolus-implied baseline.
-9. `review-therapy-evidence` orchestrates the current therapy-facing workflow and writes an interactive HTML review page focused on overnight basal identifiability, evidence quality, exclusion reasons, supporting artifacts, and code-path traceability.
-
-Recommended recipes:
-
-- latest real window review:
-
-```bash
-bayesian-t1dm normalize-raw --window-id YYYY-MM-DD__YYYY-MM-DD
-bayesian-t1dm ingest
-bayesian-t1dm run --skip-recommendations
-```
-
-- latest 14-day review:
-
-```bash
-bayesian-t1dm run --skip-recommendations --eval-folds 2 --draws 200 --tune 200 --chains 2
-```
-
-## Storage Layout
-
-Canonical project organization:
-
-- code: `~/Workspaces/bayesian-t1dm/source`
-- runtime outputs, scratch space, and intermediate artifacts: `~/Workspaces/bayesian-t1dm/runtime`
-- cloud project home: `~/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm`
-
-Within the cloud project home:
-
-- scraped/raw acquisition data lives under `data/raw/`
-- final published outputs belong under `output/`
-- routine working summaries default to `~/Workspaces/bayesian-t1dm/runtime/output/`
-- cloud `output/` should be used for intentional published/final artifacts rather than default working reports
-
-Within the cloud raw tree, the acquisition flow writes:
-
-- raw API payload archives under `data/raw/tconnectsync/<window_id>/raw/`
-- normalized CSVs under `data/raw/tconnectsync/<window_id>/normalized/`
-- per-window manifests under `data/raw/tconnectsync/<window_id>/window_manifest.csv`
-- collection manifest at `data/raw/tandem_export_manifest.csv`
-- imported Apple Health bundles under `data/raw/health_auto_export/<export_id>/raw/` and `.../normalized/`
-
-Discovery rules:
-
-- active Tandem ingest walks the cloud raw tree but excludes deprecated `archive data/` content
-- canonical Apple Health loading reads only `data/raw/health_auto_export/...`
-- repo-local `data/raw/` remains a manual staging area, not the canonical long-term source tree
-
-Repo-local `data/raw/` is a convenience/manual staging location, not the canonical scraped-data home.
-
-## Repository Layout
-
-- `src/bayesian_t1dm/` - importable Python package for ingest, acquisition, features, modeling, recommendation, evaluation, and reporting
-- `notebooks/` - exploratory notebooks and experiments
-- `archive/r/` - archived R prototypes and scratch code
-- `docs/` - technical documentation
-- `tests/` - fixtures and regression tests
-
-## Outputs
-
-The pipeline produces:
-
-- coverage summaries showing how much history is available
-- self-contained HTML review pages for coverage and run inspection
-- processed tables with normalized timestamps and derived insulin exposure
-- posterior forecasts with uncertainty intervals
-- walk-forward metrics against a persistence baseline
-- sampler diagnostics for every walk-forward fit and the final fit
-- explicit data-quality summaries showing whether source windows are good, degraded, or broken
-- recommendation policy metadata showing whether recommendations were generated, suppressed, or skipped
-- recommendation summaries for human review only when raw source quality, normalized plausibility, validation, explicit meal truth, and sampler gates pass, including per-recommendation confidence and warning flags
-- runtime reports under `~/Workspaces/bayesian-t1dm/runtime/output/` by default
-- quality fields separate raw source completeness, normalized feature plausibility, cohort/window coverage, forecast validation, and recommendation eligibility; do not treat one green field as substituting for the others
-
-Default runtime review artifacts:
-
-- top-level human-facing entrypoints:
-  - `current_status.html`
-  - `therapy_review.html`
-  - `forecast_review.html`
-- workflow directories:
-  - `output/source/`
-  - `output/prepare/`
-  - `output/therapy/`
-  - `output/forecast/`
-  - `output/latent_meal/`
-  - `output/fixture/`
-- cache directories:
-  - `cache/prepared/`
-  - `cache/analysis_ready/`
-  - `cache/latent_meal/`
-  - `cache/forecast/`
-  - `cache/status/`
-  - `cache/prepare/`
-- logs:
-  - `logs/<command>/`
-
-## Limitations
-
-- Tandem Source availability and `tconnectsync` behavior still affect acquisition.
-- Tandem Source is undocumented, so API drift remains a risk.
-- Recommendations are advisory and must be reviewed by you.
-- The default insulin action curve is an approximation, not physiology ground truth.
-- The Bayesian model is intentionally conservative because personal data can be sparse and irregular.
-- A modest MAE win over persistence does not justify recommendations if interval coverage is poor or sampler diagnostics fail.
-
-## Interpretation
-
-Treat predictive discrimination, interval calibration, and recommendation confidence as separate questions.
-
-- `run` may perform multiple expensive fits because walk-forward evaluation is time-aware.
-- `--skip-recommendations` is the preferred fast path for real-data validation.
-- incomplete source windows remain reviewable, but they suppress recommendations by policy.
-- `cache/forecast/run_summary.json` includes fit diagnostics and recommendation-policy status.
-- `therapy_review.html` is the primary therapy-facing visual review artifact.
-- `coverage_review.html` and `forecast_review.html` remain the primary operational review artifacts for raw coverage and forecasting behavior.
-- recommendation records include `confidence` and `flags` so low-signal cases are explicit in machine-readable output.
-- An empty recommendation list can mean no scenario cleared the gain threshold, or that recommendations were intentionally suppressed or skipped.
-
-## Technical Notes
-
-For model equations, variable definitions, and recommendation math, see [`docs/technical.md`](./docs/technical.md).
+Personal research code; no license is granted. Contact the repository owner through GitHub.

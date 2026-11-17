@@ -10,7 +10,7 @@ The active pipeline is:
 4. normalized CGM, bolus, basal, and activity tables are written beside the raw responses
 5. optional Health Auto Export bundles are archived under `data/raw/health_auto_export/<export_id>/...`
 6. imported Apple Health tables are unified with deterministic latest-export-wins overlap resolution
-7. `prepare-model-data` inspects Apple and Tandem coverage, requests missing Tandem history when needed, and writes a preparation/alignment report
+7. `build-dataset` fingerprints every raw input (SHA-256), and only when one changed: normalizes new Tandem windows, reads Tandem once, adds every Apple Health export JSON (byte-identical copies once, newest export wins where they overlap), builds the 5-minute dataset and writes it with `validation_report.md` to `data/merged/`. Analyses load that dataset and refuse to run if a raw file changed since the build.
 8. a per-window Tandem manifest records coverage, hashes, timestamps, and pump identity
 9. a Tandem 5-minute feature frame is built
 10. canonical Apple Health context is merged onto Tandem feature-frame timestamps when available to create the final prepared dataset
@@ -54,7 +54,7 @@ Raw discovery rules:
 
 - active Tandem ingest excludes deprecated `archive data/` content from generic raw discovery
 - canonical Apple Health loading reads only `data/raw/health_auto_export/...`
-- `data/raw/apple_health_data/` is a source pool for `import-health-auto-export`, not a direct modeling input
+- `data/raw/health_auto_export/` holds Apple Health exports as dropped (`HealthAutoExport-*.json`); the raw JSON is read directly, nothing is copied
 
 The acquisition manifest captures:
 
@@ -259,7 +259,7 @@ Operational notes:
 Canonical research loop:
 
 1. `bayesian-t1dm normalize-raw` when raw Tandem payloads have changed or need repair.
-2. `bayesian-t1dm prepare-model-data` to refresh the prepared dataset and the machine artifacts under `cache/`.
+2. `bayesian-t1dm build-dataset` to merge any new raw data into `data/merged/` (a no-op when nothing changed).
 3. `bayesian-t1dm research-latent-meal-icr --research-scope foundation` to inspect honest meal-truth semantics and first-meal clean-window readiness.
 4. `bayesian-t1dm research-latent-meal-icr --research-scope full` only after the foundation cohort is actually ready for latent fitting.
 5. `bayesian-t1dm status` when you want the combined snapshot across therapy, forecast, and latent-meal lanes.
@@ -278,7 +278,7 @@ If the latent-meal foundation cohort is blocked or empty, debug cohort quality, 
 Step-by-step behavior:
 
 1. `normalize-raw` rebuilds normalized Tandem tables from archived `tconnectsync` raw payloads.
-2. `prepare-model-data` imports Apple Health bundles when provided, computes Apple/Tandem overlap, backfills Tandem history when needed, and writes a prepared 5-minute model dataset. If Apple Health is absent, it falls back cleanly to Tandem-only preparation and targets roughly one year of Tandem history by default.
+2. `build-dataset` merges Tandem and Apple Health into one deduplicated 5-minute dataset when raw inputs change, and writes `validation_report.md` (inputs, spans, row counts, completeness and plausibility checks).
 3. `research-latent-meal-icr --research-scope foundation` audits meal-truth semantics, builds the first-meal clean-window cohort, and tells you whether the accepted cohort is ready for Phase C. This is the main scientific checkpoint.
 4. `research-latent-meal-icr --research-scope full` runs the constrained first-meal latent-response approximation on accepted windows only and writes research-only posterior, confidence, and model-comparison artifacts.
 5. `status` refreshes the combined snapshot and publishes the latest top-level HTML entrypoints, but it is still a combined overview rather than the primary scientific loop.
@@ -294,7 +294,7 @@ Workflow crosswalk:
 | Step | Question | Main artifact(s) | Main code path(s) | Interpretation |
 | --- | --- | --- | --- | --- |
 | `normalize-raw` | Did we correctly rebuild normalized Tandem windows? | `normalize_raw_summary.md` | `src/bayesian_t1dm/acquisition.py::normalize_tconnectsync_archive` | Confirms raw-to-normalized reconstruction before modeling. |
-| `prepare-model-data` | What data spans are available and aligned? | `output/prepare/model_data_preparation.md`, `cache/prepared/prepared_model_data_5min.csv` | `src/bayesian_t1dm/cli.py::_prepare_model_data`, `src/bayesian_t1dm/health_auto_export.py::build_prepared_model_dataset` | Establishes the final Tandem-aligned modeling grid and overlap logic. |
+| `build-dataset` | What data went in, and is the merged dataset valid? | `data/merged/validation_report.md`, `data/merged/dataset.json`, `output/prepare/model_data_preparation.md` | `src/bayesian_t1dm/dataset.py::build_merged_dataset` |
 | `research-latent-meal-icr --research-scope foundation` | Is the first-meal cohort ready for Phase C? | `output/latent_meal/latent_meal_research_gate.md`, `output/latent_meal/first_meal_clean_window_audit.md` | `src/bayesian_t1dm/therapy_research.py::run_latent_meal_icr_research` | Main scientific checkpoint for latent-meal readiness. |
 | `research-latent-meal-icr --research-scope full` | Does the accepted first-meal cohort support useful latent meal fitting yet? | `output/latent_meal/latent_meal_fit_summary.md`, `output/latent_meal/latent_meal_posterior_meals.csv`, `output/latent_meal/latent_meal_model_comparison.md` | `src/bayesian_t1dm/therapy_research.py::run_latent_meal_icr_research` | Research-only constrained latent-response fit on accepted windows. |
 | `validate-latent-meal` | Does the latent carb estimator recover known truth in simulation? | `output/latent_meal/validation/latent_meal_truth_recovery.md` | `src/bayesian_t1dm/latent_meal_validation.py::run_latent_meal_truth_recovery` | Simulated meals with known carbs; scores bolus-implied, the old peak/AUC heuristic, and the trajectory estimator. Exits non-zero if the trajectory estimator stops beating bolus x I:C. |
@@ -413,9 +413,9 @@ These are the primary visual inspection surfaces for active-pipeline review. The
 
 Apple Health-specific working artifacts:
 
-- `import-health-auto-export` writes per-bundle manifests under `data/raw/health_auto_export/<export_id>/health_auto_export_manifest.csv`
-- `prepare-model-data` writes `model_data_preparation.md` under `output/prepare/` and `prepared_model_data_5min.csv` under `cache/prepared/`
-- `build-health-analysis-ready` writes a wide Tandem-aligned 5-minute table under `cache/analysis_ready/analysis_ready_health_5min.csv` and a short summary under `output/prepare/`
+- `build-dataset` writes the merged tables, `prepared_model_data_5min.parquet`, `dataset.json` (input fingerprints, spans, row counts) and `validation_report.md` under `data/merged/`
+- `build-dataset` also writes `model_data_preparation.md` under `output/prepare/` when it rebuilds
+- `context_events.csv` in the raw folder lists date ranges (`start_date,end_date,reason`) left out of the meal and overnight-basal analyses
 - `screen-health-features` writes `health_feature_screening.md` under `output/prepare/` and `health_feature_scores.csv` under `cache/prepare/`
 - `research-latent-meal-icr` writes foundation or full-scope latent-meal artifacts under `output/latent_meal/`
 - `build-latent-meal-fixture` writes the fixture audit bundle under `output/fixture/` and the reduced prepared dataset under `cache/latent_meal/`

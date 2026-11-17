@@ -24,8 +24,7 @@ The repository is best understood as a **personal diabetes research workbench**,
 
 The strongest current conclusion is not a therapy setting recommendation. It is a data-truth conclusion:
 
-- the current `tconnectsync` Tandem raw archive does **not** appear to contain explicit carbohydrate records
-- **November 2026 correction: this was at least partly a pipeline artifact.** Carbs typed into the bolus calculator are recorded on the pump's `LID_BOLUS_REQUESTED_MSG1` event, which the collection code fetched and archived (inside `raw/pump_events_raw_*.txt`) but never extracted. That is fixed; whether your archive actually holds carb entries depends on whether you enter carbs when you bolus, and has not been checked against the real files. See "Recovering carbs already in the archive" below.
+- the Tandem archive **does** contain carbohydrate records: carbs typed into the bolus calculator are on the pump's `LID_BOLUS_REQUESTED_MSG1` event, together with the carb ratio in force; `LID_BOLUS_REQUESTED_MSG2` holds the correction factor and target in force. Counts are in `data/merged/validation_report.md`
 - the canonical Tandem feature table therefore has `carb_grams == 0` and `meal_event == 0` everywhere unless meal information is supplied from some other source
 - this makes direct recovery of basal, I/C, and sensitivity from observed glucose much harder than the repo originally hoped
 
@@ -47,7 +46,7 @@ This section records a code and method audit done without access to the personal
 - The test suite passes (ingestion, Apple Health import, feature construction, model plumbing, report and status writers, CLI commands) and now runs in CI on Python 3.11 and 3.13.
 - The trajectory-based latent carb estimator recovers simulated carbohydrate. Against meals bolused for a mis-counted amount, bolus x I:C is off by about 17 g on average; the trajectory estimator is off by 2.5 to 9 g in seven of eight scenarios with 90% intervals that cover truth at least 90% of the time, including a scenario where absorption shape, bolus timing, therapy settings and drift are all wrong together. Reproduce with `bayesian-t1dm validate-latent-meal`.
 
-- The real commands run end to end on a raw tree laid out like the Tandem archive but filled with simulated days: `prepare-model-data`, `research-latent-meal-icr --research-scope full` (which picked up a hand-kept `carbs.csv` and reported an effective I:C of 7.8 [7.4, 8.2] against a simulated truth of 8.0), and `run --skip-recommendations` (model MAE 2.8 against persistence 5.9 mg/dL, 80% interval coverage 0.75). The first two are now an automated test.
+- The real commands run end to end on a raw tree laid out like the Tandem archive but filled with simulated days: `build-dataset`, `research-latent-meal-icr --research-scope full` (which picked up a hand-kept `carbs.csv` and reported an effective I:C of 7.8 [7.4, 8.2] against a simulated truth of 8.0), and `run --skip-recommendations` (model MAE 2.8 against persistence 5.9 mg/dL, 80% interval coverage 0.75). The first two are now an automated test.
 
 ### Found broken and fixed
 
@@ -61,18 +60,18 @@ This section records a code and method audit done without access to the personal
 7. **Pump-entered carbs were thrown away.** Only `LID_BOLUS_DELIVERY` events were kept; the carb amount lives on `LID_BOLUS_REQUESTED_MSG1`, linked by bolus id. Collection now emits a `carbs` payload family (carbs kept only when that bolus was actually delivered), and `normalize-raw` decodes the already-archived `pump_events_raw_*.txt` files for windows collected before the fix.
 8. **Collection would not run on a fresh install.** `tconnectsync` was unpinned; 3.0 removed `pump_event_metadata()` and `pump_events_raw()`, which collection calls. It is now pinned to `>=2.2,<3`, and the test suite passes on 2.3.4.
 
-### Recovering carbs already in the archive
-
-This is the highest-value next step, because pump carb entries would give the latent-meal lane carb truth for free.
+### Data pipeline
 
 ```bash
-python -m pip install -e '.[dev]'           # moves tconnectsync back to 2.x
-bayesian-t1dm normalize-raw --force          # rebuilds every window, decoding archived pump events
-bayesian-t1dm prepare-model-data --skip-backfill
+bayesian-t1dm backfill --start-date YYYY-MM-DD --end-date YYYY-MM-DD   # Tandem Source via tconnectsync 3.x
+bayesian-t1dm build-dataset                                             # merge, deduplicate, validate (only when raw changed)
 bayesian-t1dm research-latent-meal-icr --research-scope full
 ```
 
-Then check `output/latent_meal/latent_meal_research_gate.md` for `explicit_carb_source_available: True`, and the "Effective I:C From Logged Meals" section of `latent_carb_estimator_report.md`. If carbs are still absent, either you rarely enter carbs on the pump, or the archived event text is in a format the decoder does not recognise; `normalize-raw` skips unreadable files rather than failing, so a zero count is the symptom.
+- Tandem Source retired the endpoints tconnectsync 2.x used in mid-2026 (they now return HTTP 403); collection uses 3.x (`get_pumper`, `get_pump_logs`). Windows collected with 2.x keep their base64 event files, which 3.x still decodes.
+- Carbs are always rebuilt from a window's raw pump events, with the I:C ratio and correction factor the bolus calculator used. Each breakfast is compared with the setting in force for it, and the effective I:C is reported per settings period; the current period is the headline.
+- `data/raw/context_events.csv` lists date ranges left out of the meal and overnight-basal analyses (for example the 14 days after a steroid injection). Excluded first meals are a hard exclusion in every analysis tier.
+- An unreadable archived event file is an error, not a silent skip.
 
 ### Structural limits that no code change removes
 
@@ -81,14 +80,14 @@ Then check `output/latent_meal/latent_meal_research_gate.md` for `explicit_carb_
 - **Late absorption is invisible.** Carbohydrate that lands after the 180-minute window biases the estimate low (about -18 g in the biphasic simulation). Fat- and protein-heavy meals should not be trusted.
 - **Closed-loop basal is only approximately accounted for.** Control-IQ raises and lowers basal during the post-meal window. The estimator counts delivery above or below a schedule inferred from the median delivery at that time of day, which is right when modulation varies from day to day and wrong when the controller does the same thing most mornings. The size of the residual error on real data is unknown.
 
-### Not verified, and what to do first
+### Status of the real-data runs
 
-The fixed code has not been run against the real dataset. The first session back should:
+Real-data results come from generated reports that trace to a run, not from this notebook: `data/merged/validation_report.md` (what went into the dataset), `output/latent_meal/latent_meal_review.html` (breakfast I:C), `output/forecast/forecast_review.html` (forecast against the "glucose stays the same" baseline).
 
-1. `bayesian-t1dm prepare-model-data`, then `bayesian-t1dm research-latent-meal-icr --research-scope full`.
-2. Open `latent_carb_estimator_report.md` and read the new Estimator section: how many rows used `trajectory` versus the fallback, the median `prior_contraction`, and the median fit RMSE. A fit RMSE far above 8 to 10 mg/dL means the forward model does not describe real meals and the simulation results do not transfer.
-3. Expect fewer accepted windows than before, because of the coverage fix. If the full scope stops with "No Tandem pump profile settings found", pass `--therapy-settings` as the message says.
-4. Re-run `bayesian-t1dm run --skip-recommendations` and compare model MAE with persistence MAE. If the model no longer beats persistence after the leak fix, the forecasting lane was never working.
+Open items:
+
+1. All Tandem windows are flagged for duplicate rows and internal gaps by the source-completeness check. A flag on every window points at the check (or the deliberate overlap between adjacent windows) rather than the data; it matters because incomplete windows suppress recommendations.
+2. The forecast model is a regression of glucose 30 minutes ahead on current and lagged glucose, insulin, carbs, basal and time of day. Its value over the baseline on real data has to be read from the forecast page of a current run.
 
 ### Lane status
 
