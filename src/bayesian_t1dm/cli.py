@@ -36,6 +36,7 @@ from .health_auto_export import (
     ModelDataPreparationResult,
     intersect_spans,
 )
+from .latent_meal_validation import run_latent_meal_truth_recovery, write_latent_meal_recovery_artifacts
 from .ingest import build_export_manifest, load_tandem_exports, summarize_coverage, summarize_tandem_raw_dir, write_export_manifest
 from .model import BayesianGlucoseModel
 from .observability import LoggingSession, setup_run_logging
@@ -158,6 +159,11 @@ def build_parser() -> argparse.ArgumentParser:
     validate_therapy.add_argument("--include-models", default=None, help="Comma-separated model families such as ridge,segmented_ridge,tree_boost,ensemble")
     validate_therapy.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
     validate_therapy.add_argument("--ic-policy", choices=["exploratory_only", "conservative", "off"], default="exploratory_only")
+
+    validate_latent = add_command("validate-latent-meal", "Run synthetic truth-recovery validation for the latent carb estimators")
+    validate_latent.add_argument("--report-dir", default=None)
+    validate_latent.add_argument("--meals", type=int, default=200, help="Simulated meals per scenario")
+    validate_latent.add_argument("--seed", type=int, default=20260403)
 
     review_therapy = add_command("review-therapy-evidence", "Build a therapy evidence report focused on identifiability and overnight basal evidence")
     review_therapy.add_argument("--raw", default=None)
@@ -829,6 +835,8 @@ def _apply_command_defaults(args: argparse.Namespace, paths: ProjectPaths) -> No
         args.review_html = args.review_html or str(Path(args.output_dir) / "latent_meal_review.html")
     if args.command == "validate-therapy-infra":
         args.report_dir = args.report_dir or str(paths.output_therapy / "validation")
+    if args.command == "validate-latent-meal":
+        args.report_dir = args.report_dir or str(paths.output_latent_meal / "validation")
     if args.command == "normalize-raw":
         args.raw = args.raw or str(paths.cloud_raw / "tconnectsync")
         args.report = args.report or str(paths.output_source / "normalize_raw_summary.md")
@@ -948,6 +956,13 @@ def _dispatch_command(
             )
             write_therapy_infra_validation_artifacts(result, args.report_dir)
         return 0
+
+    if args.command == "validate-latent-meal":
+        with session.stage("latent_meal.validate_estimators", report_dir=args.report_dir, meals=args.meals, seed=args.seed):
+            recovery = run_latent_meal_truth_recovery(n_meals_per_scenario=args.meals, seed=args.seed)
+            recovery_paths = write_latent_meal_recovery_artifacts(recovery, args.report_dir)
+        print(f"Latent meal truth recovery: {'pass' if recovery.passed() else 'FAIL'} -> {recovery_paths['report']}")
+        return 0 if recovery.passed() else 1
 
     if args.command == "review-therapy-evidence":
         report_path = Path(args.report)

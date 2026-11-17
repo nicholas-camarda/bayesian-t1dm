@@ -13,6 +13,7 @@ import pandas as pd
 from .evaluate import CalibrationSummary, FoldResult, WalkForwardReport, walk_forward_splits
 from .features import FeatureConfig, FeatureFrame, recompute_scenario_features
 from .health_auto_export import AnalysisReadyHealthDataset
+from .latent_meal_trajectory import MealWindowTrajectory, estimate_carbs_from_trajectory
 from .model import BayesianGlucoseModel, FitDiagnostics
 
 
@@ -2893,6 +2894,59 @@ def _accepted_first_meal_window_metrics(
     return pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
 
 
+def _first_meal_window_trajectories(
+    research_frame: pd.DataFrame,
+    window_metrics: pd.DataFrame,
+    *,
+    postmeal_minutes: int = 180,
+) -> dict[str, MealWindowTrajectory]:
+    """Extract the observed post-meal CGM trace and absorbed insulin for each accepted window.
+
+    Insulin absorbed since the anchor is reconstructed from the frame's own IOB bookkeeping:
+    ``iob(anchor) + boluses delivered after the anchor - iob(t)``. Windows whose insulin
+    columns are missing or not physically consistent (absorbed insulin that goes down) are
+    left out, and the caller falls back to the summary-statistic estimator for them.
+    """
+    trajectories: dict[str, MealWindowTrajectory] = {}
+    required = {"timestamp", "glucose", "iob_units", "bolus_units"}
+    if research_frame.empty or window_metrics.empty or not required.issubset(research_frame.columns):
+        return trajectories
+    ordered = research_frame.copy()
+    ordered["timestamp"] = pd.to_datetime(ordered["timestamp"], errors="coerce")
+    ordered = ordered.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    for row in window_metrics.itertuples(index=False):
+        anchor_time = pd.Timestamp(row.timestamp)
+        post = ordered.loc[
+            ordered["timestamp"].ge(anchor_time)
+            & ordered["timestamp"].le(anchor_time + pd.Timedelta(minutes=postmeal_minutes))
+        ]
+        if post.empty:
+            continue
+        iob = pd.to_numeric(post["iob_units"], errors="coerce")
+        bolus = pd.to_numeric(post["bolus_units"], errors="coerce").fillna(0.0)
+        if iob.isna().any():
+            continue
+        later_bolus = bolus.cumsum() - float(bolus.iloc[0])
+        absorbed = float(iob.iloc[0]) + later_bolus - iob
+        if (absorbed.diff().dropna() < -0.05).any() or absorbed.min() < -0.05:
+            continue
+        glucose = pd.to_numeric(post["glucose"], errors="coerce")
+        observed = glucose.notna()
+        if "missing_cgm" in post.columns:
+            observed &= pd.to_numeric(post["missing_cgm"], errors="coerce").fillna(1.0).eq(0)
+        if not observed.any():
+            continue
+        minutes = (post.loc[observed, "timestamp"] - anchor_time).dt.total_seconds().div(60.0)
+        trajectory = MealWindowTrajectory(
+            minutes=minutes.to_numpy(dtype=float),
+            glucose=glucose.loc[observed].to_numpy(dtype=float),
+            insulin_absorbed_units=absorbed.loc[observed].clip(lower=0.0).to_numpy(dtype=float),
+        )
+        if trajectory.is_usable():
+            trajectories[str(row.meal_id)] = trajectory
+    return trajectories
+
+
 def _latent_meal_reference_parameters(
     window_metrics: pd.DataFrame,
     *,
@@ -3048,6 +3102,7 @@ def _latent_carb_posterior_for_window(
     *,
     settings: LatentMealTherapySettings,
     params: dict[str, float],
+    trajectory: MealWindowTrajectory | None = None,
 ) -> tuple[dict[str, float | str | bool], pd.DataFrame]:
     segment = str(row.get("segment") or "default")
     icr = settings.icr_for_segment(segment)
@@ -3130,6 +3185,45 @@ def _latent_carb_posterior_for_window(
     absorption_lower_90 = _weighted_quantile(flat_absorption, flat_weights, 0.05)
     absorption_upper_90 = _weighted_quantile(flat_absorption, flat_weights, 0.95)
 
+    # Preferred path: fit the whole post-meal trace. The summary-statistic posterior above
+    # is kept only as a fallback for windows whose trace or insulin bookkeeping is unusable.
+    estimator = "summary_heuristic"
+    prior_contraction = float("nan")
+    trajectory_fit_rmse = float("nan")
+    trajectory_poor_fit = False
+    if trajectory is not None and trajectory.is_usable():
+        premeal_glucose = float(pd.to_numeric(pd.Series([row.get("premeal_glucose")]), errors="coerce").fillna(np.nan).iloc[0])
+        trajectory_posterior = estimate_carbs_from_trajectory(
+            trajectory,
+            icr_grams_per_unit=icr,
+            correction_factor_mgdl_per_unit=correction_factor,
+            bolus_implied_carbs=bolus_implied,
+            baseline_glucose=premeal_glucose,
+            max_carbs=max_carbs,
+            # The settings carry an absorption *duration*; a gamma meal has absorbed ~95% of
+            # its carbohydrate at roughly 2.2x its mean absorption time.
+            absorption_mean_minutes_prior=absorption_prior / 2.2,
+            carb_prior_mean=carb_prior_mean,
+            carb_prior_sd=None if not explicit_available else carb_prior_sd,
+            uncertainty_multiplier=tier_uncertainty_multiplier,
+        )
+        estimator = "trajectory"
+        carb_mean = trajectory_posterior.carb_mean
+        carb_median = trajectory_posterior.carb_median
+        carb_lower_50 = trajectory_posterior.carb_lower_50
+        carb_upper_50 = trajectory_posterior.carb_upper_50
+        carb_lower_90 = trajectory_posterior.carb_lower_90
+        carb_upper_90 = trajectory_posterior.carb_upper_90
+        absorption_mean = trajectory_posterior.absorption_minutes_mean
+        absorption_lower_90 = trajectory_posterior.absorption_minutes_lower_90
+        absorption_upper_90 = trajectory_posterior.absorption_minutes_upper_90
+        flat_carbs = trajectory_posterior.grid_carbs
+        flat_absorption = trajectory_posterior.grid_absorption_minutes
+        flat_weights = trajectory_posterior.grid_weights
+        prior_contraction = trajectory_posterior.prior_contraction
+        trajectory_fit_rmse = trajectory_posterior.fit_rmse_mgdl
+        trajectory_poor_fit = trajectory_posterior.poor_fit
+
     prior_gap = abs(carb_median - bolus_implied)
     interval_width_90 = carb_upper_90 - carb_lower_90
     interval_penalty = min(1.0, interval_width_90 / max(carb_median, 1.0))
@@ -3192,6 +3286,10 @@ def _latent_carb_posterior_for_window(
         flags.append("insulin_context")
     if peak_target < 20.0:
         flags.append("weak_postmeal_signal")
+    if estimator != "trajectory":
+        flags.append("summary_heuristic_estimator")
+    if trajectory_poor_fit:
+        flags.append("trajectory_poor_fit")
 
     sample_quantiles = np.linspace(0.005, 0.995, 100)
     cumulative = np.cumsum(flat_weights)
@@ -3236,6 +3334,9 @@ def _latent_carb_posterior_for_window(
         "analysis_tier_rank": analysis_tier_rank,
         "relaxed_exclusion_reasons": relaxed_exclusion_reasons,
         "flags": "|".join(flags),
+        "estimator": estimator,
+        "prior_contraction": prior_contraction,
+        "trajectory_fit_rmse_mgdl": trajectory_fit_rmse,
     }
     return summary, pd.DataFrame(sample_rows)
 
@@ -3246,6 +3347,7 @@ def _build_latent_meal_posterior_meals(
     model_name: str,
     params: dict[str, float],
     therapy_settings: LatentMealTherapySettings | None = None,
+    trajectories: Mapping[str, MealWindowTrajectory] | None = None,
 ) -> pd.DataFrame:
     columns = [
         "meal_id",
@@ -3297,6 +3399,9 @@ def _build_latent_meal_posterior_meals(
         "observed_peak_delta",
         "observed_auc_above_baseline",
         "selected_model",
+        "estimator",
+        "prior_contraction",
+        "trajectory_fit_rmse_mgdl",
     ]
     if window_metrics.empty:
         return pd.DataFrame(columns=columns)
@@ -3313,7 +3418,12 @@ def _build_latent_meal_posterior_meals(
 
     posterior_summaries: list[dict[str, Any]] = []
     for _, metric_row in window_metrics.iterrows():
-        posterior_summary, _ = _latent_carb_posterior_for_window(metric_row, settings=settings, params=params)
+        posterior_summary, _ = _latent_carb_posterior_for_window(
+            metric_row,
+            settings=settings,
+            params=params,
+            trajectory=(trajectories or {}).get(str(metric_row.get("meal_id"))),
+        )
         posterior_summaries.append(posterior_summary)
     posterior_summary_frame = pd.DataFrame(posterior_summaries, index=window_metrics.index)
     latent_mean = pd.to_numeric(posterior_summary_frame["latent_carb_mean"], errors="coerce")
@@ -3421,6 +3531,9 @@ def _build_latent_meal_posterior_meals(
             "observed_peak_delta": peak_delta,
             "observed_auc_above_baseline": pd.to_numeric(window_metrics.get("observed_auc_above_baseline"), errors="coerce"),
             "selected_model": model_name,
+            "estimator": posterior_summary_frame["estimator"],
+            "prior_contraction": posterior_summary_frame["prior_contraction"],
+            "trajectory_fit_rmse_mgdl": posterior_summary_frame["trajectory_fit_rmse_mgdl"],
         }
     ).sort_values("timestamp").reset_index(drop=True)
     return posterior
@@ -3455,6 +3568,9 @@ LATENT_CARB_ESTIMATE_COLUMNS = [
     "analysis_tier",
     "analysis_tier_rank",
     "relaxed_exclusion_reasons",
+    "estimator",
+    "prior_contraction",
+    "trajectory_fit_rmse_mgdl",
     "flags",
     "exclusion_reasons",
 ]
@@ -3477,13 +3593,19 @@ def _build_latent_carb_posterior_samples(
     *,
     settings: LatentMealTherapySettings,
     params: dict[str, float],
+    trajectories: Mapping[str, MealWindowTrajectory] | None = None,
 ) -> pd.DataFrame:
     columns = ["meal_id", "sample_index", "analysis_tier", "latent_carb_grams", "absorption_minutes", "posterior_weight"]
     if window_metrics.empty:
         return pd.DataFrame(columns=columns)
     frames: list[pd.DataFrame] = []
     for _, metric_row in window_metrics.iterrows():
-        _, samples = _latent_carb_posterior_for_window(metric_row, settings=settings, params=params)
+        _, samples = _latent_carb_posterior_for_window(
+            metric_row,
+            settings=settings,
+            params=params,
+            trajectory=(trajectories or {}).get(str(metric_row.get("meal_id"))),
+        )
         frames.append(samples)
     if not frames:
         return pd.DataFrame(columns=columns)
@@ -3647,8 +3769,25 @@ def _render_latent_carb_estimator_report(
         latent_carb_estimates.get("health_activity_roll_sum_60m", pd.Series(np.nan, index=latent_carb_estimates.index)),
         errors="coerce",
     )
+    estimator_series = latent_carb_estimates.get("estimator", pd.Series("summary_heuristic", index=latent_carb_estimates.index)).astype(str)
+    estimator_counts = estimator_series.value_counts().to_dict()
+    contraction = pd.to_numeric(latent_carb_estimates.get("prior_contraction", pd.Series(np.nan, index=latent_carb_estimates.index)), errors="coerce")
+    fit_rmse = pd.to_numeric(latent_carb_estimates.get("trajectory_fit_rmse_mgdl", pd.Series(np.nan, index=latent_carb_estimates.index)), errors="coerce")
+    poor_fit_count = int(latent_carb_estimates["flags"].astype(str).str.contains("trajectory_poor_fit", regex=False).sum())
     lines.extend(
         [
+            "## Estimator",
+            "",
+            "- `trajectory` rows fit the whole post-meal CGM trace against absorbed insulin (see `latent_meal_trajectory.py`).",
+            "- `summary_heuristic` rows fall back to the older peak/AUC posterior because the trace or insulin bookkeeping was unusable.",
+            "  In synthetic truth recovery (`bayesian-t1dm validate-latent-meal`) that fallback is biased high with under-covering intervals.",
+            f"- trajectory_rows: {int(estimator_counts.get('trajectory', 0))}",
+            f"- summary_heuristic_rows: {int(estimator_counts.get('summary_heuristic', 0))}",
+            f"- median_prior_contraction: {'NA' if contraction.dropna().empty else f'{float(contraction.median()):.2f}'}"
+            " (0 = the trace added nothing beyond bolus x I:C, 1 = the trace dominates)",
+            f"- median_trajectory_fit_rmse_mgdl: {'NA' if fit_rmse.dropna().empty else f'{float(fit_rmse.median()):.1f}'}",
+            f"- trajectory_poor_fit_rows: {poor_fit_count}",
+            "",
             "## Cohort Summary",
             "",
             f"- post_meal_control_success_rows: {success_count}",
@@ -3829,9 +3968,16 @@ def run_latent_meal_icr_research(
     window_metrics = _accepted_first_meal_window_metrics(research_frame, meal_event_registry, meal_windows)
     settings = _settings_for_estimation(therapy_settings)
     model_comparison, selected_model, params = _latent_meal_model_comparison(window_metrics, therapy_settings=settings)
-    posterior_meals = _build_latent_meal_posterior_meals(window_metrics, model_name=selected_model, params=params, therapy_settings=settings)
+    trajectories = _first_meal_window_trajectories(research_frame, window_metrics)
+    posterior_meals = _build_latent_meal_posterior_meals(
+        window_metrics,
+        model_name=selected_model,
+        params=params,
+        therapy_settings=settings,
+        trajectories=trajectories,
+    )
     latent_carb_estimates = _build_latent_carb_estimates(posterior_meals)
-    posterior_samples = _build_latent_carb_posterior_samples(window_metrics, settings=settings, params=params)
+    posterior_samples = _build_latent_carb_posterior_samples(window_metrics, settings=settings, params=params, trajectories=trajectories)
     gate, gate_markdown = _render_full_latent_meal_gate(dataset, meal_windows, posterior_meals, research_scope=research_scope)
     return LatentMealResearchResult(
         prepared_dataset=dataset,

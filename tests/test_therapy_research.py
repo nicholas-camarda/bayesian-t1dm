@@ -515,20 +515,32 @@ def test_extract_latent_meal_therapy_settings_from_tandem_pump_metadata(tmp_path
     assert settings.correction_factor_mgdl_per_unit["evening"] == pytest.approx((60.0 * 48 + 58.0 * 36) / 84)
 
 
+def _with_physical_iob(dataset: AnalysisReadyHealthDataset) -> AnalysisReadyHealthDataset:
+    """Recompute IOB from the bolus column so insulin bookkeeping is self-consistent."""
+    from bayesian_t1dm.insulin import expand_bolus_series_to_grid
+
+    frame = dataset.frame.copy()
+    exposure = expand_bolus_series_to_grid(frame[["timestamp", "bolus_units"]])
+    frame["iob_units"] = exposure["iob_units"].to_numpy()
+    frame["insulin_activity_units"] = exposure["insulin_activity_units"].to_numpy()
+    return replace(dataset, frame=frame)
+
+
 def test_latent_carb_estimator_directionality_with_insulin_and_glucose_response():
-    base = _build_clean_first_meal_dataset(apple=False, explicit_carbs=False)
+    base = _with_physical_iob(_build_clean_first_meal_dataset(apple=False, explicit_carbs=False))
     base_median = _first_latent_carb_median(base)
 
     more_insulin_frame = base.frame.copy()
     bolus_mask = pd.to_numeric(more_insulin_frame["bolus_units"], errors="coerce").fillna(0.0).gt(0)
     more_insulin_frame.loc[bolus_mask, "bolus_units"] *= 1.5
-    more_insulin_median = _first_latent_carb_median(replace(base, frame=more_insulin_frame))
+    more_insulin_median = _first_latent_carb_median(_with_physical_iob(replace(base, frame=more_insulin_frame)))
 
     larger_response_frame = base.frame.copy()
     timestamps = pd.to_datetime(larger_response_frame["timestamp"], errors="coerce")
     for meal_time in timestamps.loc[bolus_mask]:
-        response_mask = timestamps.ge(meal_time) & timestamps.le(meal_time + pd.Timedelta(minutes=180))
-        larger_response_frame.loc[response_mask, "glucose"] += 25.0
+        response_mask = timestamps.gt(meal_time) & timestamps.le(meal_time + pd.Timedelta(minutes=180))
+        minutes_after = (timestamps.loc[response_mask] - meal_time).dt.total_seconds() / 60.0
+        larger_response_frame.loc[response_mask, "glucose"] += 40.0 * np.clip(minutes_after / 90.0, 0.0, 1.0)
     larger_response_median = _first_latent_carb_median(replace(base, frame=larger_response_frame))
 
     assert more_insulin_median > base_median

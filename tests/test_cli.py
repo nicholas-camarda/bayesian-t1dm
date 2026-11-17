@@ -510,6 +510,31 @@ def test_validate_therapy_infra_command_writes_artifacts(tmp_path):
     assert (report_dir / "therapy_synthetic_recommendation_audit.md").exists()
 
 
+def test_validate_latent_meal_command_writes_artifacts(tmp_path, capsys):
+    workspace_root = tmp_path / "repo"
+    workspace_root.mkdir()
+    report_dir = tmp_path / "latent_validation"
+
+    exit_code = main(
+        [
+            "--root",
+            str(workspace_root),
+            "validate-latent-meal",
+            "--report-dir",
+            str(report_dir),
+            "--meals",
+            "25",
+        ]
+    )
+
+    assert exit_code == 0
+    assert "pass" in capsys.readouterr().out
+    report = (report_dir / "latent_meal_truth_recovery.md").read_text(encoding="utf-8")
+    assert "everything_at_once" in report
+    assert (report_dir / "latent_meal_truth_recovery_summary.csv").exists()
+    assert (report_dir / "latent_meal_truth_recovery_meals.csv").exists()
+
+
 def test_review_therapy_evidence_command_writes_report_and_supporting_artifacts(tmp_path, monkeypatch):
     workspace_root = tmp_path / "repo"
     workspace_root.mkdir()
