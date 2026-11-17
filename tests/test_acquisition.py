@@ -85,11 +85,16 @@ def _pump_log_event(code: int, when: str, seq: int, device: str, **properties) -
     }
 
 
-def _cgm_event(when: str, seq: int, device: str, glucose: int) -> dict:
+def _tandem_seconds(when: str) -> int:
+    return int((pd.Timestamp(when) - pd.Timestamp("2008-01-01")).total_seconds())
+
+
+def _cgm_event(when: str, seq: int, device: str, glucose: int, measured: str | None = None) -> dict:
+    """A G7 reading received at ``when`` and measured by the sensor at ``measured`` (default: same time)."""
     return _pump_log_event(
         399, when, seq, device,
         algorithmState=0, cgmDataType=0, currentGlucoseDisplayValue=glucose, egvInfoBitmask=0,
-        egvTimeStamp=0, glucoseValueStatus=0, interval=5, rate=0, reservedD15=0, rssi=0,
+        egvTimeStamp=_tandem_seconds(measured or when), glucoseValueStatus=0, interval=5, rate=0, reservedD15=0, rssi=0,
     )
 
 
@@ -406,8 +411,11 @@ def test_normalize_tconnectsync_preserves_dst_fallback_offsets_for_review():
 
     ingested, _ = normalize_tconnectsync_payloads(payloads, window=window, endpoint_family="tconnectsync", timezone="America/New_York")
 
+    # Both readings of the repeated 01:30 hour are kept; they share a local timestamp but are not
+    # duplicate records (different glucose), so the window is not flagged for duplicates.
     assert len(ingested.cgm) == 2
-    assert ingested.manifest.loc[ingested.manifest["kind"].eq("cgm"), "has_duplicates"].iloc[0]
+    assert ingested.cgm["glucose"].tolist() == [110, 111]
+    assert not ingested.manifest.loc[ingested.manifest["kind"].eq("cgm"), "has_duplicates"].iloc[0]
 
 
 def test_load_tandem_exports_reads_normalized_paths_from_manifest(tmp_path):
@@ -570,7 +578,7 @@ def test_normalized_window_turns_pump_carbs_into_carb_truth(tmp_path):
 def test_archived_raw_pump_events_yield_carbs_on_normalize(tmp_path):
     import base64
 
-    from bayesian_t1dm.acquisition import _decode_archived_pump_event_carbs, _load_archived_window_payloads
+    from bayesian_t1dm.acquisition import _decode_archived_pump_events, _load_archived_window_payloads
 
     pytest.importorskip("tconnectsync.eventparser.generic")
     raw_dir = tmp_path / "2025-07-10__2025-07-11" / "raw"
@@ -587,7 +595,7 @@ def test_archived_raw_pump_events_yield_carbs_on_normalize(tmp_path):
     (raw_dir / "pump_events_raw_90723647_723357.txt").write_text(base64.b64encode(stream).decode() + "\n", encoding="utf-8")
     (raw_dir / "bolus.json").write_text("[]\n", encoding="utf-8")
 
-    carbs = _decode_archived_pump_event_carbs(raw_dir)
+    carbs = _decode_archived_pump_events(raw_dir)["carbs"]
     assert [record["carbs"] for record in carbs] == [48.0]
     assert carbs[0]["pump_serial"] == "90723647"
     assert carbs[0]["tconnect_device_id"] == "723357"
@@ -598,13 +606,13 @@ def test_archived_raw_pump_events_yield_carbs_on_normalize(tmp_path):
 
 
 def test_unreadable_archived_pump_events_are_an_error_not_a_silent_skip(tmp_path):
-    from bayesian_t1dm.acquisition import AcquisitionError, _decode_archived_pump_event_carbs
+    from bayesian_t1dm.acquisition import AcquisitionError, _decode_archived_pump_events
 
     raw_dir = tmp_path / "w" / "raw"
     raw_dir.mkdir(parents=True)
     (raw_dir / "pump_events_raw_1453346_1032256.txt").write_text("not base64 at all !!\n", encoding="utf-8")
     with pytest.raises(AcquisitionError, match="not valid base64"):
-        _decode_archived_pump_event_carbs(raw_dir)
+        _decode_archived_pump_events(raw_dir)
 
 
 def test_raw_pump_events_replace_a_stored_carb_payload(tmp_path):
@@ -674,3 +682,29 @@ def test_carb_entries_carry_the_bolus_calculator_settings_in_force(tmp_path):
     ingested, _ = normalize_tconnectsync_payloads({"carbs": carbs}, window=window, endpoint_family="tconnectsync")
     row = ingested.carbs.iloc[0]
     assert (row["carb_ratio_g_per_unit"], row["isf_mgdl_per_unit"], row["target_bg_mgdl"]) == (6.5, 65.0, 110.0)
+
+
+def test_cgm_uses_sensor_time_and_ignores_alerts(tmp_path):
+    """Backfilled readings arrive together but belong at the time the sensor measured them."""
+    from tconnectsync.eventparser.generic import Events
+
+    from bayesian_t1dm.acquisition import _tconnectsync_event_payloads
+
+    events = [
+        _cgm_event("2026-10-04T08:03:30", 1, "uuid", 150),
+        # Signal dropout: two readings measured at 08:08:30 and 08:13:30 arrive at 08:20:05.
+        _cgm_event("2026-10-04T08:20:05", 2, "uuid", 155, measured="2026-10-04T08:08:30"),
+        _cgm_event("2026-10-04T08:20:05", 3, "uuid", 161, measured="2026-10-04T08:13:30"),
+        _cgm_event("2026-10-04T08:23:30", 4, "uuid", 166),
+        # A CGM alert is not a reading.
+        _pump_log_event(256 + 999, "2026-10-04T08:25:00", 5, "uuid"),
+    ]
+    cgm = _tconnectsync_event_payloads(list(Events(events)))["cgm"]
+    times = [pd.Timestamp(row["eventDateTime"]).strftime("%H:%M:%S") for row in cgm]
+    assert times == ["08:03:30", "08:08:30", "08:13:30", "08:23:30"]
+    assert [row["egv_estimatedGlucoseValue"] for row in cgm] == [150, 155, 161, 166]
+
+    window = ExportWindow(date(2026, 10, 4), date(2026, 10, 4))
+    ingested, _ = normalize_tconnectsync_payloads({"cgm": cgm}, window=window, endpoint_family="tconnectsync", timezone="America/New_York")
+    slots = pd.to_datetime(ingested.cgm["timestamp"]).dt.strftime("%H:%M").tolist()
+    assert slots == ["08:00", "08:05", "08:10", "08:20"]  # one reading per slot; none piled into 08:20

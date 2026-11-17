@@ -227,6 +227,10 @@ def _coerce_glucose_columns(columns: Iterable[str], *, allow_generic_value: bool
     return selected
 
 
+# A CGM gap this long is reported per window as a data-quality note.
+CGM_LONG_GAP_MINUTES = 120.0
+
+
 def _build_manifest_row(kind: str, frame: pd.DataFrame, source_order: int, source_file: str, source_sheet: str | None = None) -> dict[str, object]:
     timestamps = _infer_timestamp_series(kind, frame).dropna().sort_values()
     unique_timestamps = timestamps.drop_duplicates()
@@ -235,12 +239,16 @@ def _build_manifest_row(kind: str, frame: pd.DataFrame, source_order: int, sourc
     deltas = unique_timestamps.diff().dropna().dt.total_seconds().div(60.0) if len(unique_timestamps) > 1 else pd.Series(dtype=float)
     median_step_minutes = float(deltas.median()) if not deltas.empty else np.nan
     max_step_minutes = float(deltas.max()) if not deltas.empty else np.nan
-    has_duplicates = bool(len(timestamps) != len(unique_timestamps))
-    if kind == "cgm":
-        has_internal_gap = bool(np.isfinite(max_step_minutes) and max_step_minutes > 7.5)
-    else:
-        has_internal_gap = False
-    is_complete_window = bool(pd.notna(first_timestamp) and pd.notna(last_timestamp) and not has_internal_gap)
+    # Identical records; two readings that share a 5-minute timestamp are not duplicates.
+    has_duplicates = bool(frame.duplicated().any())
+    cgm_slot_coverage = np.nan
+    cgm_gaps_ge_2h = 0
+    if kind == "cgm" and pd.notna(first_timestamp) and pd.notna(last_timestamp):
+        slots = int((last_timestamp - first_timestamp) / pd.Timedelta(minutes=5)) + 1
+        cgm_slot_coverage = float(unique_timestamps.dt.floor("5min").nunique() / slots)
+        cgm_gaps_ge_2h = int((deltas >= CGM_LONG_GAP_MINUTES).sum())
+    has_internal_gap = bool(cgm_gaps_ge_2h)
+    is_complete_window = bool(pd.notna(first_timestamp) and pd.notna(last_timestamp))
     return {
         "kind": kind,
         "source_order": int(source_order),
@@ -254,6 +262,8 @@ def _build_manifest_row(kind: str, frame: pd.DataFrame, source_order: int, sourc
         "max_step_minutes": max_step_minutes,
         "has_internal_gap": has_internal_gap,
         "has_duplicates": has_duplicates,
+        "cgm_slot_coverage": cgm_slot_coverage,
+        "cgm_gaps_ge_2h": cgm_gaps_ge_2h,
         "is_complete_window": is_complete_window,
     }
 
@@ -331,6 +341,8 @@ def build_export_manifest(data: IngestedData) -> pd.DataFrame:
                 "max_step_minutes",
                 "has_internal_gap",
                 "has_duplicates",
+                "cgm_slot_coverage",
+                "cgm_gaps_ge_2h",
                 "is_complete_window",
             ]
         )

@@ -98,10 +98,15 @@ def write_coverage_review_html(summary: dict[str, Any], quality_rows: pd.DataFra
             for reason in _reason_list(raw):
                 if reason not in reasons:
                     reasons.append(reason)
+        cgm = group.loc[group["kind"].astype(str).eq("cgm")] if "kind" in group else group.iloc[0:0]
+        slot_coverage = pd.to_numeric(cgm["cgm_slot_coverage"], errors="coerce").dropna() if "cgm_slot_coverage" in cgm else pd.Series(dtype=float)
+        long_gaps = pd.to_numeric(cgm["cgm_gaps_ge_2h"], errors="coerce").dropna() if "cgm_gaps_ge_2h" in cgm else pd.Series(dtype=float)
         window_rows.append(
             (
                 rp.esc(window_id),
                 rp.fmt(coverage.min() * 100 if not coverage.dropna().empty else float("nan"), 0, suffix="%"),
+                rp.fmt(slot_coverage.iloc[0] * 100 if not slot_coverage.empty else float("nan"), 1, suffix="%"),
+                rp.fmt(long_gaps.iloc[0] if not long_gaps.empty else float("nan"), 0),
                 rp.esc("; ".join(rp.plain(r) for r in reasons) or "complete"),
             )
         )
@@ -129,8 +134,11 @@ def write_coverage_review_html(summary: dict[str, Any], quality_rows: pd.DataFra
         ),
         rp.details(
             "Details: every window",
-            rp.table(["window", "lowest coverage", "problems"], window_rows, numeric=[1])
-            + rp.caption("Coverage is the share of the requested period with data, for the data type with the least coverage in that window."),
+            rp.table(["window", "days covered", "CGM readings (% of 5-min slots)", "CGM gaps of 2 h or more", "download problems"], window_rows, numeric=[1, 2, 3])
+            + rp.caption(
+                "Days covered is the share of the requested dates the download spans, for the data type with the least. "
+                "CGM readings is the share of 5-minute slots with a sensor reading. A window counts as incomplete only for download problems."
+            ),
         ),
         rp.details("Details: rows by data type", rp.bar_list(kind_rows) if kind_rows else "<p>No rows.</p>"),
         rp.glossary(

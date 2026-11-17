@@ -86,7 +86,7 @@ Real-data results come from generated reports that trace to a run, not from this
 
 Open items:
 
-1. All Tandem windows are flagged for duplicate rows and internal gaps by the source-completeness check. A flag on every window points at the check (or the deliberate overlap between adjacent windows) rather than the data; it matters because incomplete windows suppress recommendations.
+1. CGM readings are placed at the sensor's measurement time (`egvTimeStamp`), not the pump's receipt time. Readings backfilled after a signal dropout used to arrive together and pile into one 5-minute slot, leaving the slots before them empty; that was why every window showed repeated timestamps and short gaps. A window now counts as incomplete only when its download misses requested days or a required data type; CGM coverage and gaps of 2 hours or more are reported per window as data quality.
 2. The forecast model is a regression of glucose 30 minutes ahead on current and lagged glucose, insulin, carbs, basal and time of day. Its value over the baseline on real data has to be read from the forecast page of a current run.
 
 ### Lane status

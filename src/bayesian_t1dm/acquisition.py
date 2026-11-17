@@ -1188,6 +1188,8 @@ def _write_tconnectsync_window_artifacts(
                 'activity_present': bool(summary['activity_present']),
                 'timezone': summary['timezone'],
                 'rejected_row_count': int(summary.get('rejected_counts', {}).get(kind, 0)),
+                'cgm_slot_coverage': manifest_row.get('cgm_slot_coverage'),
+                'cgm_gaps_ge_2h': manifest_row.get('cgm_gaps_ge_2h'),
             },
         )
         manifest_rows.append(quality_row)
@@ -1309,6 +1311,22 @@ def _device_fields_for_record(*, pump_serial: str | None, tconnect_device_id: st
     return fields
 
 
+# Tandem pump clocks count seconds from 2008-01-01 in pump-local time.
+_TANDEM_EPOCH = pd.Timestamp('2008-01-01')
+
+
+def _cgm_sensor_time(event_timestamp: Any, egv_seconds: Any) -> str | None:
+    """Sensor measurement time of a CGM reading, in the same local offset as the pump event time."""
+    seconds = pd.to_numeric(pd.Series([egv_seconds]), errors='coerce').iloc[0]
+    received = pd.to_datetime(event_timestamp, errors='coerce')
+    if pd.isna(seconds) or float(seconds) <= 0 or pd.isna(received):
+        return None
+    measured = _TANDEM_EPOCH + pd.Timedelta(seconds=float(seconds))
+    if received.tzinfo is not None:
+        measured = measured.tz_localize(received.tzinfo)
+    return measured.isoformat()
+
+
 def _tconnectsync_event_payloads(
     events: Sequence[Any],
     *,
@@ -1329,12 +1347,19 @@ def _tconnectsync_event_payloads(
         record = event.todict() if hasattr(event, 'todict') else {}
         name = str(record.get('name') or type(event).__name__).upper()
         event_timestamp = record.get('eventTimestamp') or getattr(event, 'eventTimestamp', None)
-        if 'CGM' in name:
+        if name.startswith('LID_CGM_DATA'):
+            # Only sensor readings (not alerts or session events), placed at the time the sensor measured
+            # them. The event time is when the pump received the reading; after a signal dropout the pump
+            # receives a burst of backfilled readings at once, which would pile them into one 5-minute slot.
             glucose_value = record.get('currentGlucoseDisplayValue')
+            sensor_time = _cgm_sensor_time(event_timestamp, record.get('egvTimeStamp'))
+            if glucose_value is None or sensor_time is None:
+                continue
             payloads['cgm'].append(
                 {
-                    'eventDateTime': event_timestamp,
+                    'eventDateTime': sensor_time,
                     'egv_estimatedGlucoseValue': glucose_value,
+                    'pump_received_time': event_timestamp,
                     'source_event_id': record.get('id'),
                     'source_event_name': name,
                     **device_fields,
@@ -1419,37 +1444,44 @@ def _tconnectsync_event_payloads(
     return payloads
 
 
+EVENT_DERIVED_FAMILIES = ('cgm', 'bolus', 'basal', 'carbs')
+
+
 def _archived_pump_event_files(raw_dir: Path) -> list[Path]:
-    return sorted([*raw_dir.glob('pump_events_raw_*.txt'), *raw_dir.glob('pump_logs_*.json')])
+    logs = [path for path in raw_dir.glob('pump_logs_*.json') if not path.name.endswith('.meta.json')]
+    return sorted([*raw_dir.glob('pump_events_raw_*.txt'), *logs])
 
 
-def _decode_archived_pump_event_carbs(raw_dir: Path) -> list[dict[str, Any]]:
-    """Rebuild bolus-calculator carb entries, with the settings in force, from a window's raw pump events.
+def _decode_archived_pump_events(raw_dir: Path) -> dict[str, list[dict[str, Any]]]:
+    """Rebuild CGM, bolus, basal and carb payloads from a window's raw pump events.
 
     ``pump_logs_*.json`` holds the tconnectsync 3.x pump-logs responses; ``pump_events_raw_*.txt`` holds
     the base64 events of windows collected with 2.x (3.x still decodes them). An unreadable file is an
-    error: silently skipping it would drop that window's carbs.
+    error: silently skipping it would drop that window's data.
     """
     from tconnectsync.eventparser.generic import Events, decode_raw_events  # type: ignore
     from tconnectsync.eventparser.raw_event import EVENT_LEN  # type: ignore
 
-    records: list[dict[str, Any]] = []
-    for path in sorted(raw_dir.glob('pump_logs_*.json')):
-        payload = json.loads(path.read_text(encoding='utf-8'))
-        seen: set[tuple[Any, Any]] = set()
-        events = []
-        for chunk in payload.get('chunks') or []:
-            for event in chunk['response'].get('events') or []:
-                key = (event.get('sequenceGroup'), event.get('sequenceNumber'))
-                if key not in seen:
-                    seen.add(key)
-                    events.append(event)
-        records.extend(
-            _tconnectsync_event_payloads(
-                list(Events(events)), pump_serial=payload.get('pump_serial') or None, tconnect_device_id=payload.get('pump_device_id') or None
-            )['carbs']
-        )
-    for path in sorted(raw_dir.glob('pump_events_raw_*.txt')):
+    merged: dict[str, list[dict[str, Any]]] = {family: [] for family in EVENT_DERIVED_FAMILIES}
+
+    def add(events: list[Any], pump_serial: str | None, device_id: str | None) -> None:
+        payloads = _tconnectsync_event_payloads(events, pump_serial=pump_serial, tconnect_device_id=device_id)
+        for family in EVENT_DERIVED_FAMILIES:
+            merged[family].extend(payloads.get(family, []))
+
+    for path in _archived_pump_event_files(raw_dir):
+        if path.suffix == '.json':
+            payload = json.loads(path.read_text(encoding='utf-8'))
+            seen: set[tuple[Any, Any]] = set()
+            events = []
+            for chunk in payload['chunks']:
+                for event in chunk['response'].get('events') or []:
+                    key = (event.get('sequenceGroup'), event.get('sequenceNumber'))
+                    if key not in seen:
+                        seen.add(key)
+                        events.append(event)
+            add(list(Events(events)), payload.get('pump_serial') or None, payload.get('pump_device_id') or None)
+            continue
         text = path.read_text(encoding='utf-8').strip()
         if not text:
             continue
@@ -1463,13 +1495,8 @@ def _decode_archived_pump_event_carbs(raw_dir: Path) -> list[dict[str, Any]]:
         except (ValueError, binascii.Error) as exc:
             raise AcquisitionError(f'Archived pump events in {path} are not valid base64') from exc
         usable = len(decoded) - (len(decoded) % EVENT_LEN)
-        payloads = _tconnectsync_event_payloads(
-            list(Events(decoded[:usable])),
-            pump_serial=None if pump_serial in {'', 'unknown'} else pump_serial,
-            tconnect_device_id=device_id or None,
-        )
-        records.extend(payloads['carbs'])
-    return records
+        add(list(Events(decoded[:usable])), None if pump_serial in {'', 'unknown'} else pump_serial, device_id or None)
+    return merged
 
 
 def _canonical_export_name(window: ExportWindow, source_path: Path) -> str:
@@ -1957,11 +1984,11 @@ def _load_archived_window_payloads(window_dir: Path) -> dict[str, Any]:
     if not payloads:
         raise AcquisitionError(f"No archived JSON payloads found under {raw_dir}")
     if _archived_pump_event_files(raw_dir):
-        # The raw pump events are the source of truth for carbs (and the settings in force); any carb
-        # payload extracted at collection time is replaced by what the events say.
-        for family in [family for family in payloads if 'carb' in str(family).lower()]:
+        # The raw pump events are the source of truth for every event-derived table; payloads extracted
+        # at collection time (possibly by older code) are replaced by what the events say.
+        for family in [family for family in payloads if str(family).lower() in EVENT_DERIVED_FAMILIES or 'carb' in str(family).lower()]:
             del payloads[family]
-        payloads['carbs'] = _decode_archived_pump_event_carbs(raw_dir)
+        payloads.update(_decode_archived_pump_events(raw_dir))
     return payloads
 
 

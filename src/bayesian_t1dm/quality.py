@@ -12,13 +12,13 @@ import pandas as pd
 
 REQUIRED_WINDOW_KINDS: tuple[str, ...] = ("cgm", "bolus", "basal")
 OPTIONAL_WINDOW_KINDS: tuple[str, ...] = ("activity", "carbs")
+# A window is incomplete only when its download misses requested days or a required data type.
+# CGM gaps, repeated timestamps, overlap with neighbouring windows and rows outside the requested
+# dates are data properties, recorded per window (cgm_slot_coverage, cgm_gaps_ge_2h) but not failures.
 QUALITY_REASON_ORDER: tuple[str, ...] = (
     "missing_kind",
     "starts_late",
     "ends_early",
-    "internal_gap",
-    "duplicates",
-    "overlap",
 )
 
 
@@ -73,9 +73,6 @@ def ordered_completeness_reasons(
     observed_last_timestamp: Any,
     row_count: int,
     required: bool,
-    has_internal_gap: bool = False,
-    has_duplicates: bool = False,
-    has_overlap: bool = False,
 ) -> list[str]:
     reasons: list[str] = []
     requested_start_date = pd.Timestamp(requested_start).date() if requested_start else None
@@ -89,12 +86,6 @@ def ordered_completeness_reasons(
         reasons.append("starts_late")
     if requested_end_date is not None and not pd.isna(observed_last) and observed_last.date() < requested_end_date:
         reasons.append("ends_early")
-    if has_internal_gap:
-        reasons.append("internal_gap")
-    if has_duplicates:
-        reasons.append("duplicates")
-    if has_overlap:
-        reasons.append("overlap")
 
     ordered: list[str] = []
     seen: set[str] = set()
@@ -150,9 +141,6 @@ def build_window_quality_row(
         observed_last_timestamp=observed_last_timestamp,
         row_count=row_count,
         required=required,
-        has_internal_gap=has_internal_gap,
-        has_duplicates=has_duplicates,
-        has_overlap=has_overlap,
     )
 
     row = {
@@ -250,7 +238,7 @@ def _read_window_quality_rows(raw_dir: str | Path) -> pd.DataFrame:
                         "provenance_manifest": "window",
                         **{
                             key: row.get(key)
-                            for key in ["timezone", "rejected_row_count"]
+                            for key in ["timezone", "rejected_row_count", "cgm_slot_coverage", "cgm_gaps_ge_2h"]
                             if key in row and not pd.isna(row.get(key))
                         },
                     },
@@ -268,14 +256,7 @@ def _fallback_quality_rows_from_export_manifest(
     rows: list[dict[str, Any]] = []
     for row in export_manifest.to_dict(orient="records"):
         source_file = str(row.get("source_file") or "raw")
-        reasons: list[str] = []
-        if _coerce_bool(row.get("has_internal_gap")):
-            reasons.append("internal_gap")
-        if _coerce_bool(row.get("has_duplicates")):
-            reasons.append("duplicates")
-        if not _coerce_bool(row.get("is_complete_window", True)):
-            if not reasons:
-                reasons.append("ends_early")
+        reasons: list[str] = [] if _coerce_bool(row.get("is_complete_window", True)) else ["ends_early"]
         quality_row = {
             "window_id": source_file,
             "requested_start": _iso_or_none(row.get("first_timestamp")),
@@ -339,10 +320,6 @@ def assess_data_quality(
         requires_timezone = "provenance_manifest" in window_rows.columns and window_rows["provenance_manifest"].astype(str).eq("window").any()
         if requires_timezone and ("timezone" not in window_rows.columns or window_rows["timezone"].isna().all()):
             window_reasons.add("missing_timezone_provenance")
-        if "rejected_row_count" in window_rows.columns:
-            rejected_rows = pd.to_numeric(window_rows["rejected_row_count"], errors="coerce").fillna(0).sum()
-            if rejected_rows > 0:
-                window_reasons.add("out_of_window_rows_rejected")
         if window_reasons:
             incomplete_windows.add(str(window_id))
             aggregated_reasons.update(window_reasons)

@@ -359,3 +359,19 @@ def test_icr_verdict_reports_direction_and_setting():
     assert "harder" in consistent.explanation
     harder = icr_verdict("morning", 5.5, 5.0, 6.0, 7.0, "carbs_hit_harder_than_programmed")
     assert harder.status == "warn" and harder.label == "Carbs raise glucose more than the setting assumes"
+
+
+def test_window_completeness_depends_on_download_coverage_not_cgm_gaps():
+    from bayesian_t1dm.quality import build_window_quality_row
+
+    full = build_window_quality_row(
+        window_id="w", kind="cgm", requested_start="2026-09-20", requested_end="2026-10-19",
+        row_count=8000, observed_first_timestamp="2026-09-20T00:00:00", observed_last_timestamp="2026-10-19T23:55:00",
+        has_internal_gap=True, has_duplicates=True, has_overlap=True,
+    )
+    assert full["is_complete_window"] and json.loads(full["completeness_reasons"]) == []
+    short = build_window_quality_row(
+        window_id="w", kind="cgm", requested_start="2026-09-20", requested_end="2026-10-19",
+        row_count=4000, observed_first_timestamp="2026-09-20T00:00:00", observed_last_timestamp="2026-10-04T23:55:00",
+    )
+    assert json.loads(short["completeness_reasons"]) == ["ends_early"]

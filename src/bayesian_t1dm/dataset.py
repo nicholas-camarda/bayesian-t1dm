@@ -35,7 +35,7 @@ from .quality import DataQualitySummary, assess_data_quality, assess_prepared_fe
 from .report_page import plain
 
 # Bump when merge, cleaning or feature code changes what the build produces; a version change forces a rebuild.
-DATASET_VERSION = 2
+DATASET_VERSION = 3
 HORIZON_MINUTES = 30
 CARB_LOG_NAMES = ("carbs.csv", "carb_log.csv")
 
@@ -281,6 +281,11 @@ def build_merged_dataset(paths: ProjectPaths, *, raw_root: str | Path | None = N
         },
         "row_counts": {name: int(len(getattr(merged, name))) for name in _TABLES} | {"tandem_cgm": int(len(tandem.cgm)), "prepared_rows": int(len(dataset.frame))},
         "coverage": asdict(coverage),
+        "cgm_slot_coverage_by_window": (
+            pd.to_numeric(quality_rows.loc[quality_rows["kind"].astype(str).eq("cgm"), "cgm_slot_coverage"], errors="coerce").dropna().astype(float).tolist()
+            if "cgm_slot_coverage" in quality_rows
+            else []
+        ),
         "data_quality": asdict(data_quality),
     }
     (out_dir / "dataset.json").write_text(json.dumps(_jsonable(manifest), indent=2), encoding="utf-8")
@@ -412,8 +417,14 @@ def _validation_report(manifest: dict[str, Any]) -> str:
         "",
         "| check | result |",
         "| --- | --- |",
-        f"| Tandem download windows complete | {plain(quality['status'])}; {quality['incomplete_window_count']} windows with gaps or other problems |",
+        f"| Tandem downloads complete | {plain(quality['status'])}; {quality['incomplete_window_count']} windows missing requested days or a data type |",
     ]
+    cgm_coverage = pd.Series(manifest.get("cgm_slot_coverage_by_window") or [], dtype=float).dropna()
+    if not cgm_coverage.empty:
+        lines.append(
+            f"| CGM readings per window | median {cgm_coverage.median() * 100:.1f}% of 5-minute slots (lowest {cgm_coverage.min() * 100:.1f}%); "
+            f"{int((cgm_coverage < 0.9).sum())} windows under 90% |"
+        )
     for reason, count in sorted((quality.get("reason_counts") or {}).items(), key=lambda kv: -kv[1]):
         lines.append(f"| windows where {plain(reason)} | {count} |")
     lines.append(f"| 5-minute data plausible | {plain(quality.get('normalized_plausibility_status'))} |")
