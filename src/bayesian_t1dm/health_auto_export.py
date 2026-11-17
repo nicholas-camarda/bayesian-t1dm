@@ -25,6 +25,8 @@ SUPPORTED_POINT_METRICS = {
 SUPPORTED_INTERVAL_METRICS = {"sleep_analysis"}
 SUPPORTED_METRICS = SUPPORTED_POINT_METRICS | SUPPORTED_INTERVAL_METRICS | {"heart_rate"}
 SUPPORTED_GLUCOSE_METRICS = {"blood_glucose"}
+# Logged food entries (for example from Bevel): one row per entry time with these nutrients in grams.
+NUTRITION_METRICS = {"carbohydrates": "carb_grams", "protein": "protein_grams", "total_fat": "fat_grams"}
 EXPORT_JSON_PATTERN = re.compile(r"HealthAutoExport-(\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2})\.json$")
 
 
@@ -281,6 +283,7 @@ def _empty_health_tables() -> dict[str, pd.DataFrame]:
     return {
         "cgm": pd.DataFrame(columns=["timestamp", "glucose", "source_file", "source_label", "glucose_source", "source_device", *metadata_columns]),
         "health_activity": pd.DataFrame(columns=["timestamp", "activity_value", "source_file", "source_device", *metadata_columns]),
+        "nutrition": pd.DataFrame(columns=["timestamp", *NUTRITION_METRICS.values(), "source_file", "source_device", *metadata_columns]),
         "health_measurements": pd.DataFrame(
             columns=["timestamp", "metric", "stat", "value", "unit", "source_file", "source_device", *metadata_columns]
         ),
@@ -352,6 +355,7 @@ def _normalize_health_payload(payload: dict[str, Any], *, source_file: str) -> t
     cgm_frames: list[pd.DataFrame] = []
     measurement_frames: list[pd.DataFrame] = []
     sleep_frames: list[pd.DataFrame] = []
+    nutrition_rows: list[dict[str, Any]] = []
     ignored_metrics: list[str] = []
     glucose_present = False
 
@@ -368,6 +372,13 @@ def _normalize_health_payload(payload: dict[str, Any], *, source_file: str) -> t
             glucose_present = True
             cgm_frames.append(_normalize_glucose_metric(rows, source_file=source_file))
             continue
+        if metric_name in NUTRITION_METRICS:
+            nutrition_rows.extend(
+                {"timestamp": row.get("date"), "nutrient": NUTRITION_METRICS[metric_name], "grams": row.get("qty"), "source_device": str(row.get("source") or "")}
+                for row in rows
+                if isinstance(row, dict)
+            )
+            continue
         if metric_name in SUPPORTED_POINT_METRICS:
             measurement_frames.append(_normalize_point_metric(metric_name, units, rows, source_file=source_file))
         elif metric_name == "heart_rate":
@@ -383,6 +394,21 @@ def _normalize_health_payload(payload: dict[str, Any], *, source_file: str) -> t
         cgm["glucose"] = pd.to_numeric(cgm["glucose"], errors="coerce")
         cgm = cgm.dropna(subset=["timestamp", "glucose"]).reset_index(drop=True)
         tables["cgm"] = cgm
+
+    if nutrition_rows:
+        long = pd.DataFrame(nutrition_rows)
+        long["timestamp"] = _parse_series(long["timestamp"])
+        long["grams"] = pd.to_numeric(long["grams"], errors="coerce")
+        long = long.dropna(subset=["timestamp", "grams"])
+        if not long.empty:
+            wide = long.pivot_table(index="timestamp", columns="nutrient", values="grams", aggfunc="sum").reset_index()
+            for column in NUTRITION_METRICS.values():
+                if column not in wide.columns:
+                    wide[column] = np.nan
+            sources = long.groupby("timestamp")["source_device"].first()
+            wide["source_device"] = wide["timestamp"].map(sources)
+            wide["source_file"] = source_file
+            tables["nutrition"] = wide[["timestamp", *NUTRITION_METRICS.values(), "source_file", "source_device"]]
 
     if measurement_frames:
         measurements = pd.concat(measurement_frames, ignore_index=True, sort=False)
@@ -469,6 +495,8 @@ def _dedupe_canonical_health_table(kind: str, frame: pd.DataFrame) -> pd.DataFra
     if kind == "health_activity":
         subset = ["timestamp", "source_device"]
         return out.drop_duplicates(subset=subset, keep="last").reset_index(drop=True)
+    if kind == "nutrition":
+        return out.drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
     if kind == "sleep":
         subset = ["date", "source_device"]
         return out.drop_duplicates(subset=subset, keep="last").reset_index(drop=True)

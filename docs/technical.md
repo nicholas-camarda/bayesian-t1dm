@@ -417,6 +417,7 @@ Apple Health-specific working artifacts:
 - `build-dataset` also writes `model_data_preparation.md` under `output/prepare/` when it rebuilds
 - CGM rows come only from sensor-reading events (`LID_CGM_DATA_*`), timed by the sensor's measurement time (`egvTimeStamp`); the pump's receipt time lags it for readings backfilled after a signal dropout
 - window completeness covers the download only (`missing_kind`, `starts_late`, `ends_early`); `cgm_slot_coverage` and `cgm_gaps_ge_2h` are reported per window as data quality
+- logged food from Apple Health (`carbohydrates`, `protein`, `total_fat`, one row per entry time) is matched to each breakfast within 30 minutes. It never replaces the pump-entered carbs: the effective I:C is rerun (a) without breakfasts with at least 20 g fat or 25 g protein and (b) with each meal's carbs as the geometric mean of the pump entry and the logged-food carbs divided by their median ratio over all meals that have both
 - `context_events.csv` in the raw folder lists date ranges (`start_date,end_date,reason`) left out of the meal and overnight-basal analyses
 - `screen-health-features` writes `health_feature_screening.md` under `output/prepare/` and `health_feature_scores.csv` under `cache/prepare/`
 - `research-latent-meal-icr` writes foundation or full-scope latent-meal artifacts under `output/latent_meal/`

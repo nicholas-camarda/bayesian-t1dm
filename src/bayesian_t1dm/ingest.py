@@ -59,6 +59,8 @@ class IngestedData:
     health_measurements: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
     sleep: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
     workouts: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
+    # Logged food entries from Apple Health (carbs, protein, fat); supplementary, not pump carb truth.
+    nutrition: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
     manifest: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
     source_files: list[Path] = field(default_factory=list)
 
@@ -1056,6 +1058,7 @@ def attach_health_auto_export(tandem: IngestedData, raw_dir: str | Path) -> Inge
     merged.health_measurements = health_tables["health_measurements"]
     merged.sleep = health_tables["sleep"]
     merged.workouts = health_tables["workouts"]
+    merged.nutrition = health_tables["nutrition"]
     merged.manifest = build_export_manifest(merged)
     return merged
 

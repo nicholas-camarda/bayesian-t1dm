@@ -340,7 +340,8 @@ def _run_latent_meal_analysis(
             args.raw,
             segments=parse_therapy_segments(args.segments),
         )
-    preparation = _load_dataset(args, session).preparation
+    merged = _load_dataset(args, session)
+    preparation = merged.preparation
     with _session_stage(session, "latent_meal.research"):
         result = run_latent_meal_icr_research(
             preparation.dataset,
@@ -349,6 +350,7 @@ def _run_latent_meal_analysis(
             research_scope=args.research_scope,
             therapy_settings=therapy_settings,
             excluded_periods=load_excluded_periods(args.raw),
+            nutrition=merged.data.nutrition,
         )
     return preparation, result
 

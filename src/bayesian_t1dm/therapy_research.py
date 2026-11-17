@@ -3153,6 +3153,9 @@ def _first_meal_window_trajectories(
 
 
 EFFECTIVE_ICR_EVIDENCE_COLUMNS = [
+    "analysis",
+    "logged_food_scale",
+    "logged_food_pairs",
     "segment",
     "programmed_icr",
     "settings_source",
@@ -3170,6 +3173,64 @@ EFFECTIVE_ICR_EVIDENCE_COLUMNS = [
     "between_meal_log_sd",
     "status",
 ]
+
+
+# Logged food entries (for example Bevel) are a second, noisy estimate of a meal's carbs. They are
+# never treated as truth: the headline I:C stays anchored to the pump entries the insulin was dosed on.
+LOGGED_FOOD_MATCH_MINUTES = 30
+HIGH_FAT_GRAMS = 20.0
+HIGH_PROTEIN_GRAMS = 25.0
+LOGGED_FOOD_COLUMNS = ("logged_food_carb_grams", "logged_food_protein_grams", "logged_food_fat_grams", "high_fat_protein")
+
+
+def _logged_food_near(nutrition: pd.DataFrame, when: pd.Timestamp) -> pd.DataFrame:
+    stamps = pd.to_datetime(nutrition["timestamp"], errors="coerce")
+    window = pd.Timedelta(minutes=LOGGED_FOOD_MATCH_MINUTES)
+    return nutrition.loc[stamps.between(when - window, when + window)]
+
+
+def _attach_logged_food(window_metrics: pd.DataFrame, nutrition: pd.DataFrame | None) -> pd.DataFrame:
+    """Add the logged food (carbs, protein, fat) within 30 minutes of each meal, and the high fat/protein flag."""
+    out = window_metrics.copy()
+    for column in LOGGED_FOOD_COLUMNS:
+        out[column] = np.nan if column != "high_fat_protein" else False
+    if nutrition is None or nutrition.empty or out.empty:
+        return out
+    for index, row in out.iterrows():
+        nearby = _logged_food_near(nutrition, pd.Timestamp(row["timestamp"]))
+        if nearby.empty:
+            continue
+        carbs, protein, fat = (float(pd.to_numeric(nearby[column], errors="coerce").sum()) for column in ("carb_grams", "protein_grams", "fat_grams"))
+        out.at[index, "logged_food_carb_grams"] = carbs if carbs > 0 else np.nan
+        out.at[index, "logged_food_protein_grams"] = protein
+        out.at[index, "logged_food_fat_grams"] = fat
+        out.at[index, "high_fat_protein"] = bool(fat >= HIGH_FAT_GRAMS or protein >= HIGH_PROTEIN_GRAMS)
+    return out
+
+
+def _logged_food_scale(research_frame: pd.DataFrame, nutrition: pd.DataFrame | None) -> tuple[float, int]:
+    """Median ratio of logged-food carbs to pump-entered carbs over every meal that has both (any time of day).
+
+    Dividing logged-food carbs by this puts them on the pump-entry scale, so combining the two can reduce
+    noise without shifting the overall level.
+    """
+    if nutrition is None or nutrition.empty or "explicit_carb_grams" not in research_frame:
+        return float("nan"), 0
+    pump = research_frame.loc[pd.to_numeric(research_frame["explicit_carb_grams"], errors="coerce").gt(0), ["timestamp", "explicit_carb_grams"]].copy()
+    pump["timestamp"] = pd.to_datetime(pump["timestamp"], errors="coerce")
+    ratios = []
+    for row in nutrition.itertuples(index=False):
+        food = float(pd.to_numeric(pd.Series([row.carb_grams]), errors="coerce").iloc[0])
+        if not np.isfinite(food) or food <= 0:
+            continue
+        when = pd.Timestamp(row.timestamp)
+        near = pump.loc[pump["timestamp"].between(when - pd.Timedelta(minutes=LOGGED_FOOD_MATCH_MINUTES), when + pd.Timedelta(minutes=LOGGED_FOOD_MATCH_MINUTES))]
+        entered = float(pd.to_numeric(near["explicit_carb_grams"], errors="coerce").sum())
+        if entered > 0:
+            ratios.append(food / entered)
+    if len(ratios) < MIN_LOGGED_MEALS_FOR_ICR:
+        return float("nan"), len(ratios)
+    return float(np.exp(np.median(np.log(ratios)))), len(ratios)
 
 
 def _settings_in_force(metric_row: Any, segment: str, settings: LatentMealTherapySettings) -> tuple[float, float, str]:
@@ -3190,69 +3251,95 @@ def _effective_icr_evidence(
     trajectories: Mapping[str, MealWindowTrajectory],
     *,
     settings: LatentMealTherapySettings,
+    bevel_scale: float = float("nan"),
+    bevel_pairs: int = 0,
 ) -> pd.DataFrame:
     """Effective I:C from accepted windows with a logged carb count, per segment and settings period.
 
     Each meal is compared with the I:C and correction factor in force for that meal, so a change of
     pump settings does not bias the comparison. Meals are then pooled within each settings period (a
     run of meals with the same programmed I:C); the most recent period is the current setting.
+
+    The primary analysis uses the pump-entered carbs. Two sensitivity analyses rerun it: without
+    breakfasts that logged food marks as high in fat or protein (late absorption the estimator cannot
+    see), and with each meal's carbs replaced by the geometric mean of the pump entry and the logged-food
+    estimate put on the pump scale (``bevel_scale``).
     """
     if window_metrics.empty:
         return pd.DataFrame(columns=EFFECTIVE_ICR_EVIDENCE_COLUMNS)
+
+    def pump_carbs(row: Any) -> float:
+        return float(pd.to_numeric(pd.Series([row.stated_carbs]), errors="coerce").fillna(np.nan).iloc[0])
+
+    def combined_carbs(row: Any) -> float:
+        entered = pump_carbs(row)
+        food = float(pd.to_numeric(pd.Series([getattr(row, "logged_food_carb_grams", np.nan)]), errors="coerce").iloc[0])
+        if not np.isfinite(entered) or entered <= 0 or not np.isfinite(food) or food <= 0:
+            return entered
+        return float(np.sqrt(entered * food / bevel_scale))
+
+    analyses: list[tuple[str, Any, Any]] = [("primary", lambda row: True, pump_carbs)]
+    has_food = "high_fat_protein" in window_metrics and window_metrics["logged_food_carb_grams"].notna().any()
+    if has_food:
+        analyses.append(("without high fat or protein breakfasts", lambda row: not bool(getattr(row, "high_fat_protein", False)), pump_carbs))
+        if np.isfinite(bevel_scale):
+            analyses.append(("pump and logged-food carbs combined", lambda row: True, combined_carbs))
+
     rows: list[dict[str, Any]] = []
-    for segment, group in window_metrics.groupby(window_metrics["segment"].astype(str), sort=True):
-        meals: list[dict[str, Any]] = []
-        for metric_row in group.sort_values("timestamp").itertuples(index=False):
-            stated = float(pd.to_numeric(pd.Series([metric_row.stated_carbs]), errors="coerce").fillna(np.nan).iloc[0])
-            if not np.isfinite(stated) or stated <= 0:
-                continue
-            icr, cf, source = _settings_in_force(metric_row, segment, settings)
-            meals.append({"row": metric_row, "stated": stated, "icr": round(icr, 2), "cf": cf, "source": source, "timestamp": pd.Timestamp(metric_row.timestamp)})
-        if not meals:
-            rows.append({"segment": segment, "programmed_icr": float(settings.icr_for_segment(segment)), "settings_source": "pump profile",
-                         "period_start": None, "period_end": None, "is_current_setting": True, "logged_meal_windows": 0,
-                         **pool_effective_icr([], programmed_icr=float(settings.icr_for_segment(segment))).to_dict()})
-            continue
-        # Settings periods: consecutive meals with the same programmed I:C.
-        periods: list[list[dict[str, Any]]] = []
-        for meal in meals:
-            if periods and periods[-1][-1]["icr"] == meal["icr"]:
-                periods[-1].append(meal)
-            else:
-                periods.append([meal])
-        for index, period in enumerate(periods):
-            observations: list[CarbSensitivityObservation] = []
-            for meal in period:
-                trajectory = trajectories.get(str(meal["row"].meal_id))
-                if trajectory is None:
+    for analysis, include, carbs_for in analyses:
+        for segment, group in window_metrics.groupby(window_metrics["segment"].astype(str), sort=True):
+            meals: list[dict[str, Any]] = []
+            for metric_row in group.sort_values("timestamp").itertuples(index=False):
+                stated = carbs_for(metric_row)
+                if not np.isfinite(stated) or stated <= 0 or not include(metric_row):
                     continue
-                tier = next(
-                    (item for item in LATENT_MEAL_ANALYSIS_TIERS if str(item["analysis_tier"]) == str(getattr(meal["row"], "analysis_tier", "clean_reference"))),
-                    LATENT_MEAL_ANALYSIS_TIERS[-1],
+                icr, cf, source = _settings_in_force(metric_row, segment, settings)
+                meals.append({"row": metric_row, "stated": stated, "icr": round(icr, 2), "cf": cf, "source": source, "timestamp": pd.Timestamp(metric_row.timestamp)})
+            base = {"analysis": analysis, "logged_food_scale": bevel_scale, "logged_food_pairs": bevel_pairs}
+            if not meals:
+                rows.append({**base, "segment": segment, "programmed_icr": float(settings.icr_for_segment(segment)), "settings_source": "pump profile",
+                             "period_start": None, "period_end": None, "is_current_setting": True, "logged_meal_windows": 0,
+                             **pool_effective_icr([], programmed_icr=float(settings.icr_for_segment(segment))).to_dict()})
+                continue
+            periods: list[list[dict[str, Any]]] = []
+            for meal in meals:
+                if periods and periods[-1][-1]["icr"] == meal["icr"]:
+                    periods[-1].append(meal)
+                else:
+                    periods.append([meal])
+            for index, period in enumerate(periods):
+                observations: list[CarbSensitivityObservation] = []
+                for meal in period:
+                    trajectory = trajectories.get(str(meal["row"].meal_id))
+                    if trajectory is None:
+                        continue
+                    tier = next(
+                        (item for item in LATENT_MEAL_ANALYSIS_TIERS if str(item["analysis_tier"]) == str(getattr(meal["row"], "analysis_tier", "clean_reference"))),
+                        LATENT_MEAL_ANALYSIS_TIERS[-1],
+                    )
+                    observation = observe_carb_sensitivity(
+                        trajectory,
+                        stated_carbs=meal["stated"],
+                        icr_grams_per_unit=meal["icr"],
+                        correction_factor_mgdl_per_unit=meal["cf"],
+                        baseline_glucose=float(meal["row"].premeal_glucose),
+                        uncertainty_multiplier=float(tier["uncertainty_multiplier"]),
+                    )
+                    if observation is not None:
+                        observations.append(observation)
+                estimate = pool_effective_icr(observations, programmed_icr=period[0]["icr"])
+                rows.append(
+                    {
+                        **base,
+                        "segment": segment,
+                        "settings_source": " and ".join(sorted({meal["source"] for meal in period})),
+                        "period_start": period[0]["timestamp"],
+                        "period_end": period[-1]["timestamp"],
+                        "is_current_setting": index == len(periods) - 1,
+                        "logged_meal_windows": len(period),
+                        **estimate.to_dict(),
+                    }
                 )
-                observation = observe_carb_sensitivity(
-                    trajectory,
-                    stated_carbs=meal["stated"],
-                    icr_grams_per_unit=meal["icr"],
-                    correction_factor_mgdl_per_unit=meal["cf"],
-                    baseline_glucose=float(meal["row"].premeal_glucose),
-                    uncertainty_multiplier=float(tier["uncertainty_multiplier"]),
-                )
-                if observation is not None:
-                    observations.append(observation)
-            sources = sorted({meal["source"] for meal in period})
-            estimate = pool_effective_icr(observations, programmed_icr=period[0]["icr"])
-            rows.append(
-                {
-                    "segment": segment,
-                    "settings_source": " and ".join(sources),
-                    "period_start": period[0]["timestamp"],
-                    "period_end": period[-1]["timestamp"],
-                    "is_current_setting": index == len(periods) - 1,
-                    "logged_meal_windows": len(period),
-                    **estimate.to_dict(),
-                }
-            )
     return pd.DataFrame(rows, columns=EFFECTIVE_ICR_EVIDENCE_COLUMNS)
 
 
@@ -3284,6 +3371,8 @@ def _render_effective_icr_section(evidence: pd.DataFrame | None) -> list[str]:
             ]
         )
         return lines
+    sensitivity = evidence.loc[evidence["analysis"].ne("primary")]
+    evidence = evidence.loc[evidence["analysis"].eq("primary")]
     for segment, group in evidence.groupby("segment", sort=True):
         current = group.loc[group["is_current_setting"].astype(bool)]
         row = current.iloc[0] if not current.empty else group.iloc[-1]
@@ -3312,6 +3401,30 @@ def _render_effective_icr_section(evidence: pd.DataFrame | None) -> list[str]:
             + (f"{float(row.effective_icr):.1f} | {float(row.effective_icr_lower_90):.1f} to {float(row.effective_icr_upper_90):.1f}" if estimated else "NA | NA")
             + f" | {plain(row.status)} |"
         )
+    if not sensitivity.empty:
+        scale = float(sensitivity["logged_food_scale"].iloc[0])
+        pairs = int(sensitivity["logged_food_pairs"].iloc[0])
+        lines.extend(
+            [
+                "",
+                "### Sensitivity analyses with logged food (for example Bevel)",
+                "",
+                (f"Logged-food carbs ran {scale:.2f} times the pump entry for the same meal (median over {pairs} meals with both). " if np.isfinite(scale) else "")
+                + f"High fat or protein means at least {HIGH_FAT_GRAMS:.0f} g fat or {HIGH_PROTEIN_GRAMS:.0f} g protein logged within {LOGGED_FOOD_MATCH_MINUTES} minutes; "
+                "breakfasts without logged food are kept. The combined count is the geometric mean of the pump entry and the logged-food "
+                "carbs divided by that ratio, so it can reduce noise but not shift the overall level.",
+                "",
+                "| analysis | time of day | settings period | pump I:C (g/U) | used | effective I:C (g/U) | 90% range | result |",
+                "| --- | --- | --- | ---: | ---: | ---: | --- | --- |",
+            ]
+        )
+        for row in sensitivity.loc[sensitivity["is_current_setting"].astype(bool)].itertuples(index=False):
+            estimated = np.isfinite(row.effective_icr)
+            lines.append(
+                f"| {row.analysis} | {row.segment} | {_period_text(row.period_start, row.period_end)} | {float(row.programmed_icr):.1f} | {int(row.n_meals)} | "
+                + (f"{float(row.effective_icr):.1f} | {float(row.effective_icr_lower_90):.1f} to {float(row.effective_icr_upper_90):.1f}" if estimated else "NA | NA")
+                + f" | {plain(row.status)} |"
+            )
     lines.extend(
         [
             "",
@@ -4305,6 +4418,7 @@ def run_latent_meal_icr_research(
     research_scope: str = "foundation",
     therapy_settings: LatentMealTherapySettings | None = None,
     excluded_periods: tuple[ExcludedPeriod, ...] = (),
+    nutrition: pd.DataFrame | None = None,
 ) -> LatentMealResearchResult:
     if research_scope not in {"foundation", "full"}:
         raise ValueError(f"Unsupported research_scope: {research_scope}")
@@ -4357,7 +4471,9 @@ def run_latent_meal_icr_research(
     )
     latent_carb_estimates = _build_latent_carb_estimates(posterior_meals)
     posterior_samples = _build_latent_carb_posterior_samples(window_metrics, settings=settings, params=params, trajectories=trajectories)
-    effective_icr_evidence = _effective_icr_evidence(window_metrics, trajectories, settings=settings)
+    window_metrics = _attach_logged_food(window_metrics, nutrition)
+    bevel_scale, bevel_pairs = _logged_food_scale(research_frame, nutrition)
+    effective_icr_evidence = _effective_icr_evidence(window_metrics, trajectories, settings=settings, bevel_scale=bevel_scale, bevel_pairs=bevel_pairs)
     gate, gate_markdown = _render_full_latent_meal_gate(dataset, meal_windows, posterior_meals, research_scope=research_scope)
     return LatentMealResearchResult(
         prepared_dataset=dataset,

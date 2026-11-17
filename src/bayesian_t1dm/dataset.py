@@ -35,7 +35,7 @@ from .quality import DataQualitySummary, assess_data_quality, assess_prepared_fe
 from .report_page import plain
 
 # Bump when merge, cleaning or feature code changes what the build produces; a version change forces a rebuild.
-DATASET_VERSION = 4
+DATASET_VERSION = 5
 HORIZON_MINUTES = 30
 CARB_LOG_NAMES = ("carbs.csv", "carb_log.csv")
 
@@ -134,7 +134,7 @@ def _changed_tandem_windows(diff: dict[str, list[str]]) -> list[str]:
 # Storage
 # ---------------------------------------------------------------------------
 
-_TABLES = ("cgm", "bolus", "carbs", "basal", "activity", "health_activity", "health_measurements", "sleep", "workouts")
+_TABLES = ("cgm", "bolus", "carbs", "basal", "activity", "health_activity", "health_measurements", "sleep", "workouts", "nutrition")
 
 
 def _to_parquet(frame: pd.DataFrame, path: Path) -> None:
@@ -353,7 +353,7 @@ def load_merged_dataset(raw_root: str | Path, *, inputs: list[InputFile] | None 
     )
     data = _read_tables(out_dir / "tables")
     tandem = IngestedData(**{**{name: getattr(data, name) for name in _TABLES}, "cgm": pd.read_parquet(out_dir / "tables" / "tandem_cgm.parquet")})
-    tandem.health_activity = tandem.health_measurements = tandem.sleep = tandem.workouts = pd.DataFrame()
+    tandem.health_activity = tandem.health_measurements = tandem.sleep = tandem.workouts = tandem.nutrition = pd.DataFrame()
     coverage_fields = {**manifest["coverage"]}
     for key in ("first_timestamp", "last_timestamp"):
         coverage_fields[key] = _timestamp_or_none(coverage_fields.get(key))
@@ -411,7 +411,7 @@ def _validation_report(manifest: dict[str, Any]) -> str:
         "(the same reading from both sources is kept once).",
         f"- Boluses {counts['bolus']:,}; carb entries {counts['carbs']:,}; basal segments {counts['basal']:,}.",
         f"- Apple Health: {counts['health_activity']:,} activity rows, {counts['health_measurements']:,} measurements, "
-        f"{counts['sleep']:,} nights of sleep, {counts['workouts']:,} workouts.",
+        f"{counts['sleep']:,} nights of sleep, {counts['workouts']:,} workouts, {counts['nutrition']:,} logged food entries.",
         "",
         "## Checks",
         "",

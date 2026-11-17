@@ -704,7 +704,7 @@ def test_latent_meal_tiered_window_registry_preserves_clean_gate_and_marks_relax
 def test_research_therapy_settings_cli_writes_artifacts(tmp_path, monkeypatch):
     dataset = _build_prepared_dataset(apple=True)
     preparation = SimpleNamespace(dataset=dataset)
-    monkeypatch.setattr(cli, "_load_dataset", lambda args, session=None: SimpleNamespace(preparation=preparation))
+    monkeypatch.setattr(cli, "_load_dataset", lambda args, session=None: SimpleNamespace(preparation=preparation, data=SimpleNamespace(nutrition=pd.DataFrame())))
 
     report_dir = tmp_path / "reports"
     exit_code = main(

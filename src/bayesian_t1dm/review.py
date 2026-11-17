@@ -632,7 +632,9 @@ def write_latent_meal_review_html(
     logged_carbs = pd.to_numeric(windows.loc[pd.to_numeric(windows.get("included"), errors="coerce").fillna(0).astype(bool), "stated_carbs"], errors="coerce").dropna() if not windows.empty and "stated_carbs" in windows else pd.Series(dtype=float)
     logged_carbs = logged_carbs[logged_carbs > 0]
 
-    evidence = result.effective_icr_evidence if result.effective_icr_evidence is not None else pd.DataFrame()
+    all_evidence = result.effective_icr_evidence if result.effective_icr_evidence is not None else pd.DataFrame()
+    evidence = all_evidence.loc[all_evidence["analysis"].eq("primary")] if "analysis" in all_evidence else all_evidence
+    sensitivity = all_evidence.loc[all_evidence["analysis"].ne("primary") & all_evidence["is_current_setting"].astype(bool)] if "analysis" in all_evidence else all_evidence.iloc[0:0]
     estimated = evidence.loc[pd.to_numeric(evidence.get("effective_icr"), errors="coerce").notna()] if not evidence.empty else evidence
     current_rows = evidence.loc[evidence["is_current_setting"].astype(bool)] if not evidence.empty and "is_current_setting" in evidence else evidence.iloc[0:0]
     current = current_rows.iloc[0] if not current_rows.empty else None
@@ -764,6 +766,31 @@ def write_latent_meal_review_html(
             ),
         )
         if period_rows
+        else "",
+        rp.details(
+            "Details: sensitivity analyses with logged food",
+            rp.table(
+                ["analysis", "breakfasts used", "effective I:C (90% range)", "result"],
+                [
+                    (
+                        rp.esc(row["analysis"]),
+                        rp.fmt(row["n_meals"], 0),
+                        f"{rp.fmt(row['effective_icr'])} ({rp.fmt(row['effective_icr_lower_90'])} to {rp.fmt(row['effective_icr_upper_90'])})" if math.isfinite(float(row["effective_icr"])) else "&ndash;",
+                        rp.esc(rp.plain(row["status"])),
+                    )
+                    for _, row in sensitivity.iterrows()
+                ],
+                numeric=[1],
+            )
+            + rp.caption(
+                (f"Logged food (for example Bevel) ran {float(sensitivity['logged_food_scale'].iloc[0]):.2f} times your pump entry for the same meal "
+                 f"(median over {int(sensitivity['logged_food_pairs'].iloc[0])} meals). " if math.isfinite(float(sensitivity["logged_food_scale"].iloc[0])) else "")
+                + "Both analyses use your current setting. High fat or protein means at least 20 g fat or 25 g protein logged within 30 minutes; breakfasts "
+                "without logged food are kept. The combined count averages your entry with the logged-food carbs rescaled to your entries, so it can reduce "
+                "noise but not move the overall level. The headline above stays on your pump entries."
+            ),
+        )
+        if not sensitivity.empty
         else "",
         rp.details(
             "Details: which breakfasts were used",

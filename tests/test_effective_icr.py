@@ -349,3 +349,36 @@ def test_malformed_context_events_file_is_an_error(tmp_path):
     (tmp_path / "context_events.csv").write_text("start_date,end_date,reason\n2025-03-06,2025-03-03,backwards\n", encoding="utf-8")
     with pytest.raises(ValueError, match="invalid row"):
         load_excluded_periods(tmp_path)
+
+
+def test_logged_food_sensitivity_analyses_leave_the_primary_result_alone():
+    data = _simulated_breakfast_data(days=20, true_icr=8.0, log_carbs=True, seed=6)
+    rng = np.random.default_rng(1)
+    carbs = data.carbs.copy()
+    food = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(carbs["timestamp"]) + pd.Timedelta(minutes=2),
+            "carb_grams": carbs["carb_grams"] * 1.22 * np.exp(rng.normal(0.0, 0.15, len(carbs))),
+            "protein_grams": 10.0,
+            "fat_grams": [30.0 if index % 5 == 0 else 8.0 for index in range(len(carbs))],  # every fifth breakfast is high fat
+        }
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        dataset = build_analysis_ready_health_dataset(tandem_data=data, health_data=IngestedData(), config=FeatureConfig(horizon_minutes=30))
+        settings = LatentMealTherapySettings(
+            icr_grams_per_unit={"morning": PROGRAMMED_ICR}, correction_factor_mgdl_per_unit={"morning": CORRECTION_FACTOR},
+            target_glucose_mgdl=110.0, insulin_action_minutes=300, carb_absorption_minutes_prior=180, max_plausible_meal_carbs=180.0,
+        )
+        common = dict(segments=parse_therapy_segments(), research_scope="full", therapy_settings=settings)
+        without = run_latent_meal_icr_research(dataset, **common).effective_icr_evidence
+        with_food = run_latent_meal_icr_research(dataset, nutrition=food, **common).effective_icr_evidence
+
+    primary = with_food.loc[with_food["analysis"].eq("primary")].reset_index(drop=True)
+    pd.testing.assert_frame_equal(primary.drop(columns=["logged_food_scale", "logged_food_pairs"]), without.drop(columns=["logged_food_scale", "logged_food_pairs"]))
+    assert set(with_food["analysis"]) == {"primary", "without high fat or protein breakfasts", "pump and logged-food carbs combined"}
+    assert with_food["logged_food_scale"].iloc[0] == pytest.approx(1.22, rel=0.1)
+    by_analysis = with_food.set_index("analysis")
+    assert by_analysis.loc["without high fat or protein breakfasts", "n_meals"] < by_analysis.loc["primary", "n_meals"]
+    # Rescaled to the pump entries, the combined count stays at the primary level.
+    assert by_analysis.loc["pump and logged-food carbs combined", "effective_icr"] == pytest.approx(by_analysis.loc["primary", "effective_icr"], rel=0.08)
