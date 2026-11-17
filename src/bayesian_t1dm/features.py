@@ -17,6 +17,12 @@ class FeatureConfig:
     iob_duration_minutes: int = 300
     horizon_minutes: int = 30
     fill_cgm_interior_only: bool = True
+    # How the model-facing ``glucose`` column is filled across CGM gaps.
+    # "locf" carries the last observation forward and is causal: a row never sees a
+    # reading taken after its own timestamp. "linear" interpolates between the readings
+    # on either side of a gap, which is smoother for retrospective analysis but leaks
+    # future glucose into gap rows and must not be used to train or score forecasts.
+    cgm_fill_method: str = "locf"
     drop_imputed_targets: bool = True
     gap_flag_thresholds_minutes: tuple[int, ...] = (10, 20, 30)
     carb_windows_minutes: tuple[int, ...] = (30, 60, 120)
@@ -85,7 +91,10 @@ def _aggregate_cgm(
     freq: str,
     fill_interior_only: bool,
     gap_flag_thresholds_minutes: Sequence[int],
+    fill_method: str = "locf",
 ) -> pd.DataFrame:
+    if fill_method not in {"locf", "linear"}:
+        raise ValueError(f"Unknown cgm_fill_method: {fill_method!r} (expected 'locf' or 'linear')")
     out = grid.copy()
     out["glucose_observed"] = np.nan
     out["glucose"] = np.nan
@@ -111,7 +120,16 @@ def _aggregate_cgm(
     out["cgm_invalid"] = pd.to_numeric(out.get("cgm_invalid_agg", out["cgm_invalid"]), errors="coerce").fillna(0).astype(int)
     out = out.drop(columns=[column for column in ["cgm_invalid_agg"] if column in out.columns])
     out["glucose"] = out["glucose_observed"]
-    if fill_interior_only:
+    if fill_method == "locf":
+        has_later_reading = out["glucose_observed"].bfill().notna()
+        filled = out["glucose"].ffill()
+        if fill_interior_only:
+            # Match the linear path: only fill gaps that sit between two readings.
+            filled = filled.where(has_later_reading)
+        else:
+            filled = filled.bfill()
+        out["glucose"] = filled
+    elif fill_interior_only:
         out["glucose"] = out["glucose"].interpolate(method="linear", limit_area="inside")
     else:
         out["glucose"] = out["glucose"].interpolate(method="linear", limit_direction="both")
@@ -324,6 +342,7 @@ def build_feature_frame(data: IngestedData, config: FeatureConfig | None = None)
         freq=config.freq,
         fill_interior_only=config.fill_cgm_interior_only,
         gap_flag_thresholds_minutes=config.gap_flag_thresholds_minutes,
+        fill_method=config.cgm_fill_method,
     )
     frame = _aggregate_activity(data, frame, freq=config.freq)
     frame = _aggregate_basal(data, frame, freq=config.freq)

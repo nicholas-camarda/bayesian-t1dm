@@ -206,7 +206,7 @@ class BayesianGlucoseModel:
                 random_seed=self.random_seed,
                 progressbar=False,
                 return_inferencedata=True,
-                nuts_sampler_kwargs={"max_treedepth": self.max_treedepth},
+                nuts={"max_treedepth": self.max_treedepth},
             )
             wall_time_seconds = time.perf_counter() - sample_started
 

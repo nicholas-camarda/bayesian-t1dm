@@ -1,2 +1,0 @@
-[console_scripts]
-bayesian-t1dm = bayesian_t1dm.cli:main

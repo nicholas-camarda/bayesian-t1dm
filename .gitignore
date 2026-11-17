@@ -1,6 +1,7 @@
 .*
 !.gitignore
 !.env.example
+!.github/
 
 data/
 output/
@@ -16,6 +17,9 @@ old
 *.Rproj.user/
 __pycache__/
 *.pyc
+*.egg-info/
+build/
+dist/
 bayesian-t1dm/
 
 AGENTS.md
