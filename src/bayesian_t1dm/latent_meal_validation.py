@@ -28,7 +28,13 @@ import numpy as np
 import pandas as pd
 
 from .insulin import insulin_action_curve
-from .latent_meal_trajectory import MealWindowTrajectory, absorbed_fraction, absorbed_units_from_deliveries
+from .latent_meal_trajectory import (
+    MealWindowTrajectory,
+    absorbed_fraction,
+    absorbed_units_from_deliveries,
+    observe_carb_sensitivity,
+    pool_effective_icr,
+)
 
 
 @dataclass(frozen=True)
@@ -117,9 +123,10 @@ def simulate_meal(
     programmed_correction_factor: float = 40.0,
     window_minutes: int = 180,
     premeal_glucose: float = 110.0,
+    true_icr_multiplier: float = 1.0,
 ) -> SimulatedMeal:
     minutes = np.arange(0.0, window_minutes + 5.0, 5.0)
-    true_icr = programmed_icr * float(np.exp(rng.normal(0.0, scenario.settings_error_log_sd)))
+    true_icr = programmed_icr * float(true_icr_multiplier) * float(np.exp(rng.normal(0.0, scenario.settings_error_log_sd)))
     true_cf = programmed_correction_factor * float(np.exp(rng.normal(0.0, scenario.settings_error_log_sd)))
     true_carbs = float(rng.uniform(15.0, 100.0))
     # The person boluses for what they *think* they are eating.
@@ -291,6 +298,115 @@ def run_latent_meal_truth_recovery(
     )
 
 
+LOGGED_MEAL_SCENARIO = MealSimulationScenario(
+    "logged_meals",
+    "Meals with logged carbs (10% logging error), long-tail absorption, pre-bolus, drift and noisy CGM. Correction factor exact.",
+    absorption="gamma",
+    prebolus_max_minutes=20.0,
+    drift_sd_mgdl_per_hour=10.0,
+    noise_sd_mgdl=6.0,
+    carb_count_error_log_sd=0.10,
+)
+
+
+def run_effective_icr_recovery(
+    *,
+    n_cohorts: int = 40,
+    meals_per_cohort: int = 20,
+    true_icr_multipliers: tuple[float, ...] = (0.8, 1.0, 1.25),
+    programmed_icr: float = 10.0,
+    programmed_correction_factor: float = 40.0,
+    seed: int = 20260403,
+    scenario: MealSimulationScenario = LOGGED_MEAL_SCENARIO,
+) -> pd.DataFrame:
+    """Can a cohort of logged meals recover an I:C ratio that differs from the programmed one?
+
+    Each cohort is ``meals_per_cohort`` simulated meals whose carbs were logged (and bolused
+    for with the programmed ratio) while the body's true ratio is
+    ``programmed_icr * multiplier``. Reports how close the pooled estimate lands, how often
+    its 90% interval contains the truth, and how often it calls a difference.
+    """
+    if n_cohorts <= 0 or meals_per_cohort <= 0:
+        raise ValueError("n_cohorts and meals_per_cohort must be positive")
+    rows: list[dict[str, object]] = []
+    for multiplier in true_icr_multipliers:
+        rng = np.random.default_rng(seed)
+        true_icr = programmed_icr * float(multiplier)
+        estimates: list[float] = []
+        covered = 0
+        flagged = 0
+        usable_meals = 0
+        for _ in range(n_cohorts):
+            observations = []
+            for _ in range(meals_per_cohort):
+                meal = simulate_meal(
+                    rng,
+                    scenario,
+                    programmed_icr=programmed_icr,
+                    programmed_correction_factor=programmed_correction_factor,
+                    true_icr_multiplier=float(multiplier),
+                )
+                observation = observe_carb_sensitivity(
+                    meal.trajectory,
+                    # What was entered into the pump: the bolus calculator divided it by the programmed ratio.
+                    stated_carbs=meal.bolus_implied_carbs,
+                    icr_grams_per_unit=programmed_icr,
+                    correction_factor_mgdl_per_unit=programmed_correction_factor,
+                    baseline_glucose=meal.premeal_glucose,
+                )
+                if observation is not None:
+                    observations.append(observation)
+            usable_meals += len(observations)
+            estimate = pool_effective_icr(observations, programmed_icr=programmed_icr)
+            if not np.isfinite(estimate.effective_icr):
+                continue
+            estimates.append(estimate.effective_icr)
+            covered += int(estimate.effective_icr_lower_90 <= true_icr <= estimate.effective_icr_upper_90)
+            flagged += int(estimate.status != "consistent_with_programmed")
+        completed = len(estimates)
+        rows.append(
+            {
+                "true_icr": true_icr,
+                "programmed_icr": programmed_icr,
+                "n_cohorts": completed,
+                "meals_per_cohort": meals_per_cohort,
+                "mean_usable_meals": usable_meals / n_cohorts,
+                "mean_estimated_icr": float(np.mean(estimates)) if estimates else float("nan"),
+                "sd_estimated_icr": float(np.std(estimates)) if estimates else float("nan"),
+                "coverage_90": covered / completed if completed else float("nan"),
+                "flagged_as_different": flagged / completed if completed else float("nan"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def render_effective_icr_recovery_markdown(recovery: pd.DataFrame) -> str:
+    lines = [
+        "# Effective I:C From Logged Meals: Synthetic Recovery",
+        "",
+        "Each cohort is a set of simulated meals whose carbs were logged and bolused for with the programmed I:C,",
+        "while the simulated body responds with a different true I:C. The pooled estimate should land on the truth.",
+        "",
+        "| true I:C | programmed | cohorts | meals / cohort | mean estimate | SD | 90% coverage | flagged as different |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for row in recovery.itertuples(index=False):
+        lines.append(
+            f"| {row.true_icr:.1f} | {row.programmed_icr:.1f} | {int(row.n_cohorts)} | {int(row.meals_per_cohort)} | "
+            f"{row.mean_estimated_icr:.2f} | {row.sd_estimated_icr:.2f} | {row.coverage_90:.2f} | {row.flagged_as_different:.2f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "- `flagged as different` in the row where true equals programmed is the false-alarm rate (nominal 0.10).",
+            "- The estimate assumes the programmed correction factor is right. If it is off by x%, the I:C estimate is off by about x%.",
+            "- Simulation only: see the caveats in the latent carb recovery report.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def render_latent_meal_recovery_markdown(
     result: LatentMealRecoveryResult,
     scenarios: tuple[MealSimulationScenario, ...] = DEFAULT_SCENARIOS,
@@ -347,7 +463,12 @@ def render_latent_meal_recovery_markdown(
     return "\n".join(lines)
 
 
-def write_latent_meal_recovery_artifacts(result: LatentMealRecoveryResult, report_dir: str | Path) -> dict[str, Path]:
+def write_latent_meal_recovery_artifacts(
+    result: LatentMealRecoveryResult,
+    report_dir: str | Path,
+    *,
+    icr_recovery: pd.DataFrame | None = None,
+) -> dict[str, Path]:
     root = Path(report_dir)
     root.mkdir(parents=True, exist_ok=True)
     paths = {
@@ -358,4 +479,9 @@ def write_latent_meal_recovery_artifacts(result: LatentMealRecoveryResult, repor
     paths["report"].write_text(render_latent_meal_recovery_markdown(result), encoding="utf-8")
     result.summary.to_csv(paths["summary"], index=False)
     result.meals.to_csv(paths["meals"], index=False)
+    if icr_recovery is not None:
+        paths["icr_report"] = root / "effective_icr_recovery.md"
+        paths["icr_summary"] = root / "effective_icr_recovery.csv"
+        paths["icr_report"].write_text(render_effective_icr_recovery_markdown(icr_recovery), encoding="utf-8")
+        icr_recovery.to_csv(paths["icr_summary"], index=False)
     return paths

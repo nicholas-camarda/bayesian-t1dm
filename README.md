@@ -118,6 +118,16 @@ Use `--therapy-settings path/to/therapy_settings.json` only when you want to ove
 
 The first artifact to inspect is `~/Workspaces/bayesian-t1dm/runtime/output/latent_meal/latent_meal_review.html`. The downstream analysis table is `~/Workspaces/bayesian-t1dm/runtime/cache/latent_meal/latent_carb_estimates.csv`. The exact priors used for a run are recorded in `~/Workspaces/bayesian-t1dm/runtime/cache/latent_meal/therapy_settings_used.json`.
 
+To get evidence about the I:C setting itself rather than a carb-equivalent, log carbs for clean first meals. Without carb truth, an undercounted meal and a too-weak ratio look identical in the glucose trace. Create a `carbs.csv` anywhere under the raw data tree:
+
+```csv
+timestamp,carb_grams
+2026-11-18 07:42:00,45
+2026-11-19 07:55:00,38
+```
+
+Use local pump time, and log within about 20 minutes before to 30 minutes after the meal bolus. Weighed or packaged foods are worth far more than estimates. Re-run `prepare-model-data` and the full-scope command; once at least 5 accepted first-meal windows have a logged count (20 is a better target), `latent_carb_estimator_report.md` gains an effective I:C per segment with a 90% interval, and `effective_icr_evidence.csv` holds the numbers. This is research evidence to discuss with a clinician, not an instruction to change a pump setting.
+
 3. Refresh the combined snapshot when you want the whole repo summarized in one place.
 
 ```bash

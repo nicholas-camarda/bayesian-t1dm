@@ -109,6 +109,7 @@ class TrajectoryCarbPosterior:
     absorption_minutes_mean: float
     absorption_minutes_lower_90: float
     absorption_minutes_upper_90: float
+    carb_sd: float
     carb_prior_mean: float
     carb_prior_sd: float
     # 1 - posterior_var / prior_var for carbs: 0 means the trace taught us nothing beyond
@@ -320,6 +321,7 @@ def estimate_carbs_from_trajectory(
         absorption_minutes_mean=float(np.sum(t95_sorted * t95_weights)),
         absorption_minutes_lower_90=_marginal_quantile(t95_sorted, t95_weights, 0.05),
         absorption_minutes_upper_90=_marginal_quantile(t95_sorted, t95_weights, 0.95),
+        carb_sd=float(np.sqrt(carb_var)),
         carb_prior_mean=prior_mean,
         carb_prior_sd=prior_sd,
         prior_contraction=float(np.clip(1.0 - carb_var / prior_sd**2, 0.0, 1.0)),
@@ -329,4 +331,140 @@ def estimate_carbs_from_trajectory(
         grid_carbs=flat_carbs[flat_order],
         grid_absorption_minutes=flat_absorption[flat_order],
         grid_weights=flat_weights[flat_order],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Effective I:C ratio from meals with trusted carbohydrate counts
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CarbSensitivityObservation:
+    """One meal's evidence about carb sensitivity relative to the programmed settings.
+
+    ``log_ratio`` is log(carb-equivalent explaining the trace / carbs actually logged).
+    Zero means glucose rose exactly as much as CF / ICR predicts for the logged carbs.
+    """
+
+    log_ratio: float
+    log_ratio_sd: float
+    carb_equivalent: float
+    stated_carbs: float
+    fit_rmse_mgdl: float
+
+
+def observe_carb_sensitivity(
+    trajectory: MealWindowTrajectory,
+    *,
+    stated_carbs: float,
+    icr_grams_per_unit: float,
+    correction_factor_mgdl_per_unit: float,
+    baseline_glucose: float | None = None,
+    uncertainty_multiplier: float = 1.0,
+    config: TrajectoryEstimatorConfig | None = None,
+) -> CarbSensitivityObservation | None:
+    """Estimate the carb-equivalent of a logged meal *without* leaning on the logged amount.
+
+    The carb prior is made deliberately vague (SD of at least 60 g) so the result reflects
+    the glucose trace. Returns None when the trace cannot support a ratio.
+    """
+    if not np.isfinite(stated_carbs) or stated_carbs <= 0:
+        return None
+    posterior = estimate_carbs_from_trajectory(
+        trajectory,
+        icr_grams_per_unit=icr_grams_per_unit,
+        correction_factor_mgdl_per_unit=correction_factor_mgdl_per_unit,
+        bolus_implied_carbs=float(stated_carbs),
+        baseline_glucose=baseline_glucose,
+        max_carbs=max(180.0, 3.0 * float(stated_carbs)),
+        carb_prior_mean=float(stated_carbs),
+        carb_prior_sd=max(60.0, 1.5 * float(stated_carbs)),
+        uncertainty_multiplier=uncertainty_multiplier,
+        config=config,
+    )
+    if posterior.carb_mean <= 1.0 or posterior.poor_fit:
+        return None
+    return CarbSensitivityObservation(
+        log_ratio=float(np.log(posterior.carb_mean / float(stated_carbs))),
+        # Delta method: sd(log C) ~= sd(C) / mean(C).
+        log_ratio_sd=float(max(posterior.carb_sd / posterior.carb_mean, 1e-3)),
+        carb_equivalent=posterior.carb_mean,
+        stated_carbs=float(stated_carbs),
+        fit_rmse_mgdl=posterior.fit_rmse_mgdl,
+    )
+
+
+@dataclass(frozen=True)
+class EffectiveIcrEstimate:
+    n_meals: int
+    programmed_icr: float
+    sensitivity_ratio: float
+    sensitivity_ratio_lower_90: float
+    sensitivity_ratio_upper_90: float
+    effective_icr: float
+    effective_icr_lower_90: float
+    effective_icr_upper_90: float
+    between_meal_log_sd: float
+    status: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self.__dict__)
+
+
+MIN_LOGGED_MEALS_FOR_ICR = 5
+
+
+def pool_effective_icr(
+    observations: list[CarbSensitivityObservation],
+    *,
+    programmed_icr: float,
+    min_meals: int = MIN_LOGGED_MEALS_FOR_ICR,
+) -> EffectiveIcrEstimate:
+    """Random-effects pooling of per-meal carb sensitivity into an effective I:C ratio.
+
+    If carbs raise glucose ``ratio`` times as much as the programmed CF / ICR implies, and
+    the correction factor is right, the I:C ratio that would have covered those meals is
+    ``programmed_icr / ratio``. The interval uses a t distribution on the meal count and a
+    DerSimonian-Laird between-meal variance, so real meal-to-meal variability widens it.
+    """
+    from scipy.stats import t as _student_t
+
+    n = len(observations)
+    nan = float("nan")
+    if n < min_meals:
+        return EffectiveIcrEstimate(n, float(programmed_icr), nan, nan, nan, nan, nan, nan, nan, "insufficient_logged_meals")
+    values = np.array([item.log_ratio for item in observations], dtype=float)
+    variances = np.array([item.log_ratio_sd**2 for item in observations], dtype=float)
+    fixed_weights = 1.0 / variances
+    fixed_mean = float(np.sum(fixed_weights * values) / np.sum(fixed_weights))
+    heterogeneity = float(np.sum(fixed_weights * (values - fixed_mean) ** 2))
+    scaling = float(np.sum(fixed_weights) - np.sum(fixed_weights**2) / np.sum(fixed_weights))
+    tau_squared = max(0.0, (heterogeneity - (n - 1)) / scaling) if scaling > 0 else 0.0
+    weights = 1.0 / (variances + tau_squared)
+    pooled = float(np.sum(weights * values) / np.sum(weights))
+    # Hartung-Knapp standard error: robust when the per-meal variances are themselves uncertain.
+    standard_error = float(np.sqrt(np.sum(weights * (values - pooled) ** 2) / ((n - 1) * np.sum(weights))))
+    standard_error = max(standard_error, float(np.sqrt(1.0 / np.sum(weights))))
+    half_width = float(_student_t.ppf(0.95, df=n - 1)) * standard_error
+    ratio = float(np.exp(pooled))
+    ratio_lower = float(np.exp(pooled - half_width))
+    ratio_upper = float(np.exp(pooled + half_width))
+    if ratio_lower > 1.0:
+        status = "carbs_hit_harder_than_programmed"
+    elif ratio_upper < 1.0:
+        status = "carbs_hit_softer_than_programmed"
+    else:
+        status = "consistent_with_programmed"
+    return EffectiveIcrEstimate(
+        n_meals=n,
+        programmed_icr=float(programmed_icr),
+        sensitivity_ratio=ratio,
+        sensitivity_ratio_lower_90=ratio_lower,
+        sensitivity_ratio_upper_90=ratio_upper,
+        effective_icr=float(programmed_icr / ratio),
+        effective_icr_lower_90=float(programmed_icr / ratio_upper),
+        effective_icr_upper_90=float(programmed_icr / ratio_lower),
+        between_meal_log_sd=float(np.sqrt(tau_squared)),
+        status=status,
     )

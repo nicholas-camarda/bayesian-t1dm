@@ -350,6 +350,34 @@ The older estimator (peak and AUC summaries with fixed response constants) is re
 
 The simulator is linear and has no exercise and no sensor lag; its closed-loop controller is a simple threshold rule, not Control-IQ. These numbers say the estimator is internally sound and robust to the listed misspecifications; they do not say it is accurate on real meals.
 
+### Effective I:C from logged meals
+
+Code: `latent_meal_trajectory.py::observe_carb_sensitivity`, `pool_effective_icr`; wired in `therapy_research.py::_effective_icr_evidence`.
+
+When an accepted window carries a logged carb count $S_i$, the ambiguity above disappears for that meal. The trajectory estimator is re-run with a deliberately vague carb prior (SD at least 60 g) to get the carb-equivalent $\hat{C}_i$ the trace supports, and the meal contributes
+
+$$
+\log r_i = \log\left(\hat{C}_i / S_i\right), \qquad \text{sd}(\log r_i) \approx \text{sd}(\hat{C}_i)/\hat{C}_i
+$$
+
+$r_i > 1$ means glucose rose more per logged gram than CF / ICR predicts. Meals in a segment are pooled with a DerSimonian-Laird random-effects model (between-meal variance $\tau^2$) and a Hartung-Knapp $t$ interval, so genuine meal-to-meal variability widens the result. The effective ratio is
+
+$$
+\text{ICR}_{\text{effective}} = \text{ICR}_{\text{programmed}} / r
+$$
+
+At least 5 usable logged meals are required; below that the status is `insufficient_logged_meals`. The estimate assumes the programmed correction factor is right: a correction factor that is off by x% moves the I:C estimate by about x%.
+
+Carb logs enter the pipeline as a `carbs.csv` (or `carb_log.csv`) with `timestamp,carb_grams` columns anywhere in the raw data tree; this hand-kept file is the one table accepted outside a `normalized/` directory. Entries from 20 minutes before to 30 minutes after the first-meal bolus are summed as that meal's logged carbs.
+
+Synthetic recovery (`validate-latent-meal`, 40 cohorts of 20 logged meals, programmed I:C 10, with long-tail absorption, pre-bolus timing, drift, noisy CGM and 10% logging error):
+
+| true I:C | mean estimate | SD across cohorts | 90% coverage | flagged as different |
+| ---: | ---: | ---: | ---: | ---: |
+| 8.0 | 7.99 | 0.25 | 0.90 | 1.00 |
+| 10.0 | 9.87 | 0.34 | 0.95 | 0.05 |
+| 12.5 | 12.16 | 0.49 | 0.95 | 1.00 |
+
 ## Output Contract
 
 `cache/forecast/run_summary.json` includes:

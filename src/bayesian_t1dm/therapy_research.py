@@ -12,7 +12,15 @@ import pandas as pd
 from .evaluate import walk_forward_splits
 from .features import FeatureConfig, FeatureFrame, recompute_scenario_features
 from .health_auto_export import AnalysisReadyHealthDataset
-from .latent_meal_trajectory import MealWindowTrajectory, absorbed_units_from_deliveries, estimate_carbs_from_trajectory
+from .latent_meal_trajectory import (
+    MIN_LOGGED_MEALS_FOR_ICR,
+    CarbSensitivityObservation,
+    MealWindowTrajectory,
+    absorbed_units_from_deliveries,
+    estimate_carbs_from_trajectory,
+    observe_carb_sensitivity,
+    pool_effective_icr,
+)
 from .model import BayesianGlucoseModel, FitDiagnostics
 
 
@@ -190,6 +198,7 @@ class LatentMealResearchResult:
     latent_carb_estimator_report_markdown: str = ""
     tier_summary: pd.DataFrame | None = None
     tier_summary_markdown: str = ""
+    effective_icr_evidence: pd.DataFrame | None = None
 
 
 @dataclass(frozen=True)
@@ -2147,7 +2156,21 @@ def build_first_meal_clean_window_registry(
         if missing_cgm_first_90m:
             exclusion_reasons.append("missing_cgm_first_90m")
 
-        stated_carbs = pd.to_numeric(pd.Series([getattr(candidate, "explicit_carb_grams", np.nan)]), errors="coerce").iloc[0]
+        # A carb entry rarely lands in the same 5-minute bin as the bolus, so take every
+        # explicit entry from 20 minutes before to 30 minutes after the bolus.
+        stated_carbs = float("nan")
+        if "explicit_carb_grams" in ordered.columns:
+            nearby_carbs = pd.to_numeric(
+                ordered.loc[
+                    ordered["timestamp"].ge(timestamp - pd.Timedelta(minutes=20))
+                    & ordered["timestamp"].le(timestamp + pd.Timedelta(minutes=30)),
+                    "explicit_carb_grams",
+                ],
+                errors="coerce",
+            )
+            nearby_carbs = nearby_carbs.loc[nearby_carbs.gt(0)]
+            if not nearby_carbs.empty:
+                stated_carbs = float(nearby_carbs.sum())
         rows.append(
             {
                 "candidate_id": f"first_meal_{candidate_index:04d}",
@@ -3014,6 +3037,116 @@ def _first_meal_window_trajectories(
     return trajectories
 
 
+EFFECTIVE_ICR_EVIDENCE_COLUMNS = [
+    "segment",
+    "logged_meal_windows",
+    "n_meals",
+    "programmed_icr",
+    "sensitivity_ratio",
+    "sensitivity_ratio_lower_90",
+    "sensitivity_ratio_upper_90",
+    "effective_icr",
+    "effective_icr_lower_90",
+    "effective_icr_upper_90",
+    "between_meal_log_sd",
+    "status",
+]
+
+
+def _effective_icr_evidence(
+    window_metrics: pd.DataFrame,
+    trajectories: Mapping[str, MealWindowTrajectory],
+    *,
+    settings: LatentMealTherapySettings,
+) -> pd.DataFrame:
+    """Pool accepted windows that carry a logged carb count into an effective I:C per segment.
+
+    This is the only output of the latent-meal lane that speaks to the I:C setting itself
+    rather than to a carb-equivalent: with carbs known, the trace says how hard a gram of
+    carbohydrate actually hits compared with what CF / ICR predicts.
+    """
+    if window_metrics.empty:
+        return pd.DataFrame(columns=EFFECTIVE_ICR_EVIDENCE_COLUMNS)
+    rows: list[dict[str, Any]] = []
+    for segment, group in window_metrics.groupby(window_metrics["segment"].astype(str), sort=True):
+        programmed_icr = settings.icr_for_segment(segment)
+        correction_factor = settings.correction_factor_for_segment(segment)
+        observations: list[CarbSensitivityObservation] = []
+        logged = 0
+        for metric_row in group.itertuples(index=False):
+            stated = float(pd.to_numeric(pd.Series([metric_row.stated_carbs]), errors="coerce").fillna(np.nan).iloc[0])
+            if not np.isfinite(stated) or stated <= 0:
+                continue
+            logged += 1
+            trajectory = trajectories.get(str(metric_row.meal_id))
+            if trajectory is None:
+                continue
+            tier = next(
+                (item for item in LATENT_MEAL_ANALYSIS_TIERS if str(item["analysis_tier"]) == str(getattr(metric_row, "analysis_tier", "clean_reference"))),
+                LATENT_MEAL_ANALYSIS_TIERS[-1],
+            )
+            observation = observe_carb_sensitivity(
+                trajectory,
+                stated_carbs=stated,
+                icr_grams_per_unit=programmed_icr,
+                correction_factor_mgdl_per_unit=correction_factor,
+                baseline_glucose=float(metric_row.premeal_glucose),
+                uncertainty_multiplier=float(tier["uncertainty_multiplier"]),
+            )
+            if observation is not None:
+                observations.append(observation)
+        estimate = pool_effective_icr(observations, programmed_icr=programmed_icr)
+        rows.append({"segment": segment, "logged_meal_windows": logged, **estimate.to_dict()})
+    return pd.DataFrame(rows, columns=EFFECTIVE_ICR_EVIDENCE_COLUMNS)
+
+
+def _render_effective_icr_section(evidence: pd.DataFrame | None) -> list[str]:
+    lines = [
+        "## Effective I:C From Logged Meals",
+        "",
+        "Uses only accepted windows that carry a logged carb count. Assumes the programmed correction factor is right.",
+        "",
+    ]
+    if evidence is None or evidence.empty or int(pd.to_numeric(evidence["logged_meal_windows"], errors="coerce").fillna(0).sum()) == 0:
+        lines.extend(
+            [
+                "No accepted window has a logged carb count, so the I:C setting itself cannot be assessed: without carb truth,",
+                "an undercounted meal and a too-weak ratio produce the same glucose trace.",
+                "",
+                f"To unlock this, log carbs for at least {MIN_LOGGED_MEALS_FOR_ICR} clean first meals (20 is better) in a `carbs.csv` with",
+                "`timestamp,carb_grams` columns placed in the raw data tree, then re-run `prepare-model-data`.",
+                "",
+            ]
+        )
+        return lines
+    lines.extend(
+        [
+            "| segment | logged windows | usable meals | programmed I:C | effective I:C | 90% interval | status |",
+            "| --- | ---: | ---: | ---: | ---: | --- | --- |",
+        ]
+    )
+    for row in evidence.itertuples(index=False):
+        if np.isfinite(row.effective_icr):
+            lines.append(
+                f"| {row.segment} | {int(row.logged_meal_windows)} | {int(row.n_meals)} | {float(row.programmed_icr):.1f} | {float(row.effective_icr):.1f} | "
+                f"[{float(row.effective_icr_lower_90):.1f}, {float(row.effective_icr_upper_90):.1f}] | {row.status} |"
+            )
+        else:
+            lines.append(
+                f"| {row.segment} | {int(row.logged_meal_windows)} | {int(row.n_meals)} | {float(row.programmed_icr):.1f} | NA | NA | {row.status} |"
+            )
+    lines.extend(
+        [
+            "",
+            "- `carbs_hit_harder_than_programmed`: glucose rose more per logged gram than CF / ICR predicts; the effective ratio is lower (more insulin per gram).",
+            "- `carbs_hit_softer_than_programmed`: the opposite.",
+            "- This is research evidence for a conversation with a clinician, not an instruction to change a pump setting.",
+            "",
+        ]
+    )
+    return lines
+
+
 def _latent_meal_reference_parameters(
     window_metrics: pd.DataFrame,
     *,
@@ -3788,6 +3921,7 @@ def _render_latent_carb_estimator_report(
     settings: LatentMealTherapySettings,
     selected_model: str,
     params: dict[str, float],
+    effective_icr_evidence: pd.DataFrame | None = None,
 ) -> str:
     lines = [
         "# Latent Carb Estimator Report",
@@ -3810,6 +3944,7 @@ def _render_latent_carb_estimator_report(
         "- Credible intervals are conditional on the configured therapy settings, response model, CGM quality, and accepted-window gates.",
         "",
     ]
+    lines.extend(_render_effective_icr_section(effective_icr_evidence))
     if latent_carb_estimates.empty:
         lines.extend(["No latent carb estimates were generated.", ""])
         return "\n".join(lines)
@@ -4045,6 +4180,7 @@ def run_latent_meal_icr_research(
     )
     latent_carb_estimates = _build_latent_carb_estimates(posterior_meals)
     posterior_samples = _build_latent_carb_posterior_samples(window_metrics, settings=settings, params=params, trajectories=trajectories)
+    effective_icr_evidence = _effective_icr_evidence(window_metrics, trajectories, settings=settings)
     gate, gate_markdown = _render_full_latent_meal_gate(dataset, meal_windows, posterior_meals, research_scope=research_scope)
     return LatentMealResearchResult(
         prepared_dataset=dataset,
@@ -4080,7 +4216,9 @@ def run_latent_meal_icr_research(
             settings=settings,
             selected_model=selected_model,
             params=params,
+            effective_icr_evidence=effective_icr_evidence,
         ),
+        effective_icr_evidence=effective_icr_evidence,
     )
 
 
@@ -4146,6 +4284,9 @@ def write_latent_meal_research_artifacts(
     settings = result.therapy_settings if result.therapy_settings is not None else LatentMealTherapySettings.default()
     paths["therapy_settings_used"].write_text(json.dumps(settings.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
     posterior_samples.to_parquet(paths["posterior_samples"], index=False)
+    paths["effective_icr_evidence"] = root / "effective_icr_evidence.csv"
+    effective_icr = result.effective_icr_evidence if result.effective_icr_evidence is not None else pd.DataFrame(columns=EFFECTIVE_ICR_EVIDENCE_COLUMNS)
+    effective_icr.to_csv(paths["effective_icr_evidence"], index=False)
     return paths
 
 

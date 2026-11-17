@@ -304,3 +304,33 @@ def test_manifest_source_order_uses_tconnectsync_window_dates():
 
     orders = dict(zip(manifest["source_file"], manifest["source_order"]))
     assert orders["tconnectsync::2024-05-01__2024-05-01::tconnectsync"] < orders["tconnectsync::2024-06-01__2024-06-01::tconnectsync"]
+
+
+def _write_minimal_normalized_window(root):
+    normalized = root / "tconnectsync" / "2026-11-01__2026-11-14" / "normalized"
+    normalized.mkdir(parents=True)
+    (normalized / "cgm.csv").write_text("timestamp,glucose\n2026-11-18 07:40:00,110\n2026-11-18 07:45:00,112\n", encoding="utf-8")
+    (normalized / "bolus.csv").write_text("timestamp,bolus_units\n2026-11-18 07:45:00,4.5\n", encoding="utf-8")
+
+
+def test_hand_kept_carb_log_is_ingested_from_any_directory(tmp_path):
+    _write_minimal_normalized_window(tmp_path)
+    log_dir = tmp_path / "meal_log"
+    log_dir.mkdir()
+    (log_dir / "carbs.csv").write_text("Timestamp, carb_grams\n2026-11-18 07:42:00,45\n2026-11-19 07:55:00,38\n", encoding="utf-8")
+    (tmp_path / "carb_log.csv").write_text("timestamp,carb_grams\n2026-11-20 08:01:00,52\n", encoding="utf-8")
+
+    data = load_tandem_exports(tmp_path)
+
+    assert data.carbs["carb_grams"].tolist() == [45, 38, 52]
+    assert data.carbs["timestamp"].tolist() == list(pd.to_datetime(["2026-11-18 07:42:00", "2026-11-19 07:55:00", "2026-11-20 08:01:00"]))
+    assert len(data.bolus) == 1
+
+
+def test_carb_log_without_required_columns_is_not_treated_as_canonical(tmp_path):
+    _write_minimal_normalized_window(tmp_path)
+    (tmp_path / "carbs.csv").write_text("when,grams\n2026-11-18 07:42:00,45\n", encoding="utf-8")
+
+    data = load_tandem_exports(tmp_path)
+
+    assert data.carbs.empty

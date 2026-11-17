@@ -57,7 +57,7 @@ This section records a code and method audit done without access to the personal
 ### Structural limits that no code change removes
 
 - **Carbs and I:C are not separately identifiable from glucose.** A post-meal trace identifies `carbs x CF / ICR`. Without carbohydrate truth, "the meal was undercounted" and "the I:C ratio is too weak" produce the same trace. The honest per-meal output is a carb-equivalent under the programmed settings, or equivalently a statement about whether the bolus was adequate for that meal. Phase D ("carb-entry error scoring") and "effective I:C" are the same number viewed two ways until some meals have trusted carb counts.
-- **What would break the tie:** a few weeks of deliberately weighed or packaged breakfasts logged with carbs (even 15 to 20 meals). With carb truth for a subset, the same trajectory model can estimate ICR directly, and the remaining meals inherit a calibrated prior.
+- **What breaks the tie:** a few weeks of deliberately weighed or packaged breakfasts logged with carbs. This path is now implemented: put a `carbs.csv` (`timestamp,carb_grams`) in the raw data tree and the full latent-meal run reports an effective I:C per segment with a 90% interval once at least 5 clean logged meals exist. In simulation, 20 logged meals recover a true ratio of 8 or 12.5 against a programmed 10 to within about 3%, and flag the difference every time. This is the shortest route from this repo to an actual statement about a therapy setting.
 - **Late absorption is invisible.** Carbohydrate that lands after the 180-minute window biases the estimate low (about -18 g in the biphasic simulation). Fat- and protein-heavy meals should not be trusted.
 - **Closed-loop basal is only approximately accounted for.** Control-IQ raises and lowers basal during the post-meal window. The estimator counts delivery above or below a schedule inferred from the median delivery at that time of day, which is right when modulation varies from day to day and wrong when the controller does the same thing most mornings. The size of the residual error on real data is unknown.
 
@@ -79,7 +79,7 @@ The fixed code has not been run against the real dataset. The first session back
 | Forecast validation | Plumbing tested; earlier real-data metrics are suspect because of the leak |
 | Forecast-based recommendations | Always suppressed on real data (no carbs). The scenario math is a sensitivity analysis of a predictive regression, not a causal estimate. Lowest priority |
 | Therapy research (basal / I:C identifiability) | Tested on synthetic frames where the 30-minute target is a linear function of the features but the glucose series itself has no meal or insulin dynamics, so its "truth recovery" is weaker evidence than the name suggests |
-| Latent meal | Phase B (cohort) and Phase C (estimator) are implemented and validated in simulation. Real-data fit quality unknown |
+| Latent meal | Phase B (cohort) and Phase C (estimator) are implemented and validated in simulation. Effective I:C from logged meals is implemented and validated in simulation. Real-data fit quality unknown; no carb log exists yet |
 
 ## Current North Star
 
@@ -340,7 +340,7 @@ Definition of done:
 
 - the repo can say something more useful than “carbs are missing” for at least a subset of meal windows
 
-Status (November 2026): blocked on identifiability, not on code. See "Structural limits" above: without some meals carrying trusted carb counts, a carb-entry error score and an I:C error are the same quantity.
+Status (November 2026): blocked on data, not on code. See "Structural limits" above: without some meals carrying trusted carb counts, a carb-entry error score and an I:C error are the same quantity. The effective I:C estimator for logged meals is implemented and waiting for a carb log.
 
 ### Phase E: Expansion to less clean windows
 

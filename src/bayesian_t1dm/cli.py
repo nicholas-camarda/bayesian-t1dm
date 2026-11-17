@@ -35,7 +35,7 @@ from .health_auto_export import (
     ModelDataPreparationResult,
     intersect_spans,
 )
-from .latent_meal_validation import run_latent_meal_truth_recovery, write_latent_meal_recovery_artifacts
+from .latent_meal_validation import run_effective_icr_recovery, run_latent_meal_truth_recovery, write_latent_meal_recovery_artifacts
 from .ingest import IngestedData, build_export_manifest, load_tandem_exports, summarize_coverage, summarize_tandem_raw_dir, write_export_manifest
 from .model import BayesianGlucoseModel
 from .observability import LoggingSession, setup_run_logging
@@ -163,6 +163,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate_latent.add_argument("--report-dir", default=None)
     validate_latent.add_argument("--meals", type=int, default=200, help="Simulated meals per scenario")
     validate_latent.add_argument("--seed", type=int, default=20260403)
+    validate_latent.add_argument("--icr-cohorts", type=int, default=40, help="Simulated 20-meal cohorts per true I:C for the logged-meal recovery check; 0 skips it")
 
     review_therapy = add_command("review-therapy-evidence", "Build a therapy evidence report focused on identifiability and overnight basal evidence")
     review_therapy.add_argument("--raw", default=None)
@@ -959,7 +960,8 @@ def _dispatch_command(
     if args.command == "validate-latent-meal":
         with session.stage("latent_meal.validate_estimators", report_dir=args.report_dir, meals=args.meals, seed=args.seed):
             recovery = run_latent_meal_truth_recovery(n_meals_per_scenario=args.meals, seed=args.seed)
-            recovery_paths = write_latent_meal_recovery_artifacts(recovery, args.report_dir)
+            icr_recovery = run_effective_icr_recovery(n_cohorts=args.icr_cohorts, seed=args.seed) if args.icr_cohorts > 0 else None
+            recovery_paths = write_latent_meal_recovery_artifacts(recovery, args.report_dir, icr_recovery=icr_recovery)
         print(f"Latent meal truth recovery: {'pass' if recovery.passed() else 'FAIL'} -> {recovery_paths['report']}")
         return 0 if recovery.passed() else 1
 

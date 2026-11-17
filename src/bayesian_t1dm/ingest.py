@@ -742,13 +742,25 @@ def _load_frames(path: Path) -> list[tuple[pd.DataFrame, str | None]]:
     return []
 
 
+MANUAL_CARB_LOG_STEMS = frozenset({"carbs", "carb_log"})
+
+
 def _load_canonical_normalized_table(path: Path) -> tuple[str, pd.DataFrame] | None:
-    if path.parent.name != "normalized":
-        return None
     stem = path.stem.lower()
+    # Pipeline-written tables live in a ``normalized`` directory. A hand-kept carb log
+    # (``carbs.csv`` or ``carb_log.csv`` with timestamp,carb_grams) is accepted from any
+    # directory so that logging meals does not require knowing the archive layout.
+    is_manual_carb_log = stem in MANUAL_CARB_LOG_STEMS
+    if path.parent.name != "normalized" and not is_manual_carb_log:
+        return None
     frame = read_table(path)
     if frame.empty:
         return None
+    if is_manual_carb_log:
+        frame = frame.rename(columns={column: str(column).strip().lower() for column in frame.columns})
+        if not {"timestamp", "carb_grams"} <= set(frame.columns):
+            return None
+        stem = "carbs"
 
     if stem == "cgm" and {"timestamp", "glucose"} <= set(frame.columns):
         out = frame.copy()
