@@ -10,6 +10,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from .paths import analysis_timezone
 from .io import coalesce_columns, read_table
 
 
@@ -104,7 +105,6 @@ def discover_source_files(raw_dir: str | Path) -> list[Path]:
 
 
 def _parse_datetime(series: pd.Series) -> pd.Series:
-    import os
     import re
     import warnings
     from zoneinfo import ZoneInfo
@@ -137,17 +137,8 @@ def _parse_datetime(series: pd.Series) -> pd.Series:
             has_tz_hint = True
         parsed_values.append(stamp)
 
-    timezone_name = os.getenv("TIMEZONE_NAME") or "UTC"
-    try:
-        target_tz = ZoneInfo(timezone_name)
-    except Exception:  # pragma: no cover - defensive guard
-        warnings.warn(
-            f"Invalid TIMEZONE_NAME='{timezone_name}'. Falling back to UTC.",
-            UserWarning,
-            stacklevel=2,
-        )
-        target_tz = ZoneInfo("UTC")
-        timezone_name = "UTC"
+    timezone_name = analysis_timezone()
+    target_tz = ZoneInfo(timezone_name)
 
     if has_tz_hint:
         if has_naive_hint:

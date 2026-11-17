@@ -705,6 +705,26 @@ def test_cgm_uses_sensor_time_and_ignores_alerts(tmp_path):
     assert [row["egv_estimatedGlucoseValue"] for row in cgm] == [150, 155, 161, 166]
 
     window = ExportWindow(date(2026, 10, 4), date(2026, 10, 4))
-    ingested, _ = normalize_tconnectsync_payloads({"cgm": cgm}, window=window, endpoint_family="tconnectsync", timezone="America/New_York")
+    ingested, _ = normalize_tconnectsync_payloads({"cgm": cgm}, window=window, endpoint_family="tconnectsync")
     slots = pd.to_datetime(ingested.cgm["timestamp"]).dt.strftime("%H:%M").tolist()
     assert slots == ["08:00", "08:05", "08:10", "08:20"]  # one reading per slot; none piled into 08:20
+
+
+def test_pump_times_are_stored_in_local_time_not_utc(monkeypatch):
+    """An 08:00 Eastern bolus must be stored as 08:00, the same clock Apple Health uses."""
+    monkeypatch.setenv("TIMEZONE_NAME", "America/New_York")
+    window = ExportWindow(date(2026, 9, 20), date(2026, 9, 20))
+    payloads = {"bolus": [{"completionDateTime": "2026-09-20T08:00:15-04:00", "actualTotalBolusRequested": 3.0}], "cgm": [], "basal": [], "activity": []}
+    ingested, _ = normalize_tconnectsync_payloads(payloads, window=window, endpoint_family="tconnectsync")
+    assert pd.Timestamp(ingested.bolus["timestamp"].iloc[0]) == pd.Timestamp("2026-09-20 08:00:00")
+
+
+def test_missing_timezone_is_an_error_not_utc(monkeypatch):
+    from bayesian_t1dm.paths import analysis_timezone
+
+    monkeypatch.delenv("TIMEZONE_NAME", raising=False)
+    with pytest.raises(ValueError, match="Set TIMEZONE_NAME"):
+        analysis_timezone()
+    monkeypatch.setenv("TIMEZONE_NAME", "Eastern")
+    with pytest.raises(ValueError, match="not a valid IANA timezone"):
+        analysis_timezone()

@@ -22,6 +22,8 @@ os.environ["XDG_CACHE_HOME"] = str(_test_cache)
 os.environ["MPLCONFIGDIR"] = str(_test_mpl)
 os.environ["BAYESIAN_T1DM_RUNTIME_ROOT"] = str(_test_runtime)
 os.environ["BAYESIAN_T1DM_CLOUD_ROOT"] = str(_test_cloud)
+# Timestamps are stored in TIMEZONE_NAME local time and there is no default; fixtures are written in UTC.
+os.environ["TIMEZONE_NAME"] = "UTC"
 # Keep any backend flags from the environment (for example mode=NUMBA) and only
 # redirect the compile cache into the test home.
 os.environ["PYTENSOR_FLAGS"] = ",".join(

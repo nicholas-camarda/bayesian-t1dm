@@ -84,6 +84,8 @@ bayesian-t1dm research-latent-meal-icr --research-scope full
 
 Real-data results come from generated reports that trace to a run, not from this notebook: `data/merged/validation_report.md` (what went into the dataset), `output/latent_meal/latent_meal_review.html` (breakfast I:C), `output/forecast/forecast_review.html` (forecast against the "glucose stays the same" baseline).
 
+Timestamps: all data are stored in local wall-clock time from `TIMEZONE_NAME`, which is required (no default). Until November 17, 2026 the Tandem windows were stored in UTC because the setting was absent and the code fell back to UTC silently, while Apple Health was local. Every real-data result produced before that fix used Tandem times shifted by four to five hours: time-of-day segments ("morning", "overnight") covered the wrong hours, Apple glucose filled CGM gaps at the wrong times, and pump settings were looked up at the wrong hour. Those results are void.
+
 Open items:
 
 1. CGM readings are placed at the sensor's measurement time (`egvTimeStamp`), not the pump's receipt time. Readings backfilled after a signal dropout used to arrive together and pile into one 5-minute slot, leaving the slots before them empty; that was why every window showed repeated timestamps and short gaps. A window now counts as incomplete only when its download misses requested days or a required data type; CGM coverage and gaps of 2 hours or more are reported per window as data quality.

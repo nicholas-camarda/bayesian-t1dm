@@ -15,7 +15,7 @@ import pandas as pd
 from .io import read_table
 from .ingest import IngestedData, build_export_manifest, load_tandem_exports, summarize_export_manifest
 from .observability import sanitize_fields
-from .paths import ProjectPaths
+from .paths import ProjectPaths, analysis_timezone
 from .quality import REQUIRED_WINDOW_KINDS, build_window_quality_row
 
 
@@ -206,7 +206,7 @@ def load_tandem_credentials(repo_root: str | Path | None = None, env_file: str |
             f'Set TANDEM_SOURCE_EMAIL/TCONNECT_EMAIL and TANDEM_SOURCE_PASSWORD/TCONNECT_PASSWORD in {env_path} or your shell environment.',
         )
     region = os.getenv('TANDEM_SOURCE_REGION') or os.getenv('TCONNECT_REGION') or 'US'
-    timezone = os.getenv('TANDEM_SOURCE_TIMEZONE') or os.getenv('TIMEZONE_NAME') or os.getenv('TZ')
+    timezone = analysis_timezone()
     pump_serial = os.getenv('TANDEM_PUMP_SERIAL') or os.getenv('TANDEM_SOURCE_PUMP_SERIAL') or os.getenv('PUMP_SERIAL_NUMBER')
     return TandemCredentials(email=email, password=password, region=region, timezone=timezone, pump_serial=pump_serial)
 
@@ -344,7 +344,7 @@ def _ensure_datetime(value: Any, *, timezone: str | None = None) -> pd.Timestamp
 
 
 def _storage_timezone_name(timezone: str | None = None) -> str:
-    return timezone or os.getenv("TIMEZONE_NAME") or "UTC"
+    return timezone or analysis_timezone()
 
 
 def _canonicalize_timestamp_series_for_storage(
@@ -2006,7 +2006,7 @@ def normalize_tconnectsync_archive(
     root = Path(raw_root or (workspace.cloud_raw / "tconnectsync")).expanduser().resolve()
     if not root.exists():
         raise AcquisitionError(f"Raw archive root does not exist: {root}")
-    selected_timezone = timezone or os.getenv('TANDEM_SOURCE_TIMEZONE') or os.getenv('TIMEZONE_NAME') or os.getenv('TZ')
+    selected_timezone = timezone or analysis_timezone()
 
     if window_id is not None:
         window_dirs = [root / window_id]

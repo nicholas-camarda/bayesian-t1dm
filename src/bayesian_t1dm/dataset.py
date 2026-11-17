@@ -35,7 +35,7 @@ from .quality import DataQualitySummary, assess_data_quality, assess_prepared_fe
 from .report_page import plain
 
 # Bump when merge, cleaning or feature code changes what the build produces; a version change forces a rebuild.
-DATASET_VERSION = 3
+DATASET_VERSION = 4
 HORIZON_MINUTES = 30
 CARB_LOG_NAMES = ("carbs.csv", "carb_log.csv")
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from contextlib import nullcontext
 from datetime import date, timedelta
 from pathlib import Path
@@ -12,6 +13,7 @@ import warnings
 
 from .evaluate import run_walk_forward
 from .acquisition import (
+    load_local_env_file,
     ExportWindow,
     backfill_tandem_exports,
     collect_tandem_exports,
@@ -819,6 +821,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     paths = ProjectPaths.from_root(args.root).ensure()
+    # Settings such as TIMEZONE_NAME live in the repository's .env; the shell environment wins.
+    for key, value in load_local_env_file(paths.root / ".env").items():
+        os.environ.setdefault(key, value)
     _apply_command_defaults(args, paths)
 
     session = setup_run_logging(
