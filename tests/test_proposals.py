@@ -117,4 +117,4 @@ def test_segment_summary_keeps_segments_separate_and_leads_with_glucose():
     other = table[table["hours"].eq("09:00-00:00")].iloc[0]
     assert other["evidence_breakfasts"] == 0 and not other["had_breakfasts"]
     page = segment_markdown(table)
-    assert "05:00-09:00" in page and "30 breakfasts at 7.0 behaved like 6.5" in page and "no breakfasts in this segment" in page
+    assert "05:00-09:00" in page and "30 meals at 7.0 behaved like 6.5" in page and "no meals in this segment" in page

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import shutil
 import json
 import os
@@ -39,7 +40,7 @@ from .ingest import summarize_tandem_raw_dir
 from .model import BayesianGlucoseModel
 from .observability import LoggingSession, setup_run_logging
 from .outcomes_report import active_profile_now, current_day_parts, current_segment_settings, write_outcomes
-from .changes import SETTING_FIELDS, detect_setting_changes
+from .changes import EVALUATION_DAYS, SETTING_FIELDS, detect_setting_changes
 from .outcomes import day_part_table
 from .publish import current_commit, publish_run, working_tree_is_clean
 from .records import evaluate_open, load_records, register_proposal, save_records, sync_with_pump
@@ -113,6 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
     propose.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
     propose.add_argument("--research-scope", choices=["foundation", "full"], default="full")
     propose.add_argument("--therapy-settings", default=None)
+    propose.add_argument("--meal-segments", default="morning,afternoon,evening", help="Therapy segments whose first meal of the day counts as evidence (breakfast, lunch, dinner)")
     propose.add_argument("--record", action=argparse.BooleanOptionalAction, default=False, help="Update the durable change record in the Project Vault (proposals, entered changes, evaluations)")
 
     refresh = add_command("refresh", "Run the whole pipeline by hand: collect, build, outcomes, proposal, change record, then publish to the Vault")
@@ -142,6 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
     latent_meal.add_argument("--review-html", default=None)
     latent_meal.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
     latent_meal.add_argument("--research-scope", choices=["foundation", "full"], default="foundation")
+    latent_meal.add_argument("--meal-segments", default="morning", help="Therapy segments whose first meal of the day counts as evidence")
     latent_meal.add_argument("--therapy-settings", default=None, help="Optional JSON override for I:C, correction factor, target, insulin action, and carb absorption priors; full scope auto-extracts Tandem settings when omitted")
 
     latent_fixture = add_command("build-latent-meal-fixture", "Build a representative prepared-data fixture for latent meal foundation debugging")
@@ -381,6 +384,7 @@ def _run_latent_meal_analysis(
             therapy_settings=therapy_settings,
             excluded_periods=load_excluded_periods(args.raw),
             nutrition=merged.data.nutrition,
+            meal_segments=tuple(part.strip() for part in getattr(args, "meal_segments", "morning").split(",") if part.strip()),
         )
     return preparation, result
 
@@ -563,7 +567,6 @@ def _dispatch_command(
             )
             out = Path(args.report_dir)
             out.mkdir(parents=True, exist_ok=True)
-            pd.DataFrame([{"as_of": as_of.date(), **proposal.to_row()}]).to_csv(out / "breakfast_proposal.csv", index=False)
             cgm = merged.tandem_data.cgm
             now_settings = current_segment_settings(merged, args.raw)
             table = segment_summary(
@@ -573,8 +576,9 @@ def _dispatch_command(
             table.to_csv(out / "segment_summary.csv", index=False)
             change_log = ""
             if args.record:
-                change_log = _update_change_record(args, paths, merged, proposal, parts, as_of)
+                change_log, proposal = _update_change_record(args, paths, merged, proposal, parts, as_of)
                 (out / "change_log.md").write_text(change_log, encoding="utf-8")
+            pd.DataFrame([{"as_of": as_of.date(), **proposal.to_row()}]).to_csv(out / "breakfast_proposal.csv", index=False)
             (out / "breakfast_proposal.md").write_text(segment_markdown(table) + "\n" + proposal_markdown(proposal, as_of=as_of) + ("\n" + change_log if change_log else ""), encoding="utf-8")
         print((out / "breakfast_proposal.md").read_text(encoding="utf-8"))
         return 0
@@ -900,8 +904,9 @@ def _dispatch_command(
     return 2
 
 
-def _update_change_record(args, paths: ProjectPaths, merged: MergedDataset, proposal, parts, as_of: pd.Timestamp) -> str:
-    """Sync the durable record with the pump, register the proposal, run due evaluations, and return the change log."""
+def _update_change_record(args, paths: ProjectPaths, merged: MergedDataset, proposal, parts, as_of: pd.Timestamp):
+    """Sync the durable record with the pump, register the proposal, run due evaluations, and return the change log
+    with the proposal (held, with the reason, when earlier changes are still being evaluated)."""
     record_path = paths.cloud_root / "data" / "records" / "setting_proposals.csv"
     records = load_records(record_path)
     events = pd.read_parquet(merged_dir(args.raw) / "tables" / "pump_profile_events.parquet")
@@ -913,6 +918,13 @@ def _update_change_record(args, paths: ProjectPaths, merged: MergedDataset, prop
     # Changes are looked at from 30 days back so a new record also picks up edits made since the last refresh.
     records = sync_with_pump(records, changes, parts_by_start, since=as_of - pd.Timedelta(days=30))
     records, note = register_proposal(records, proposal, as_of=as_of)
+    if proposal.status == "proposed" and note.startswith("not recorded"):
+        first_due = (pd.to_datetime(records.loc[records["status"].isin(["entered"]), "entered_on"]).min().normalize() + pd.Timedelta(days=EVALUATION_DAYS + 1)).date()
+        proposal = dataclasses.replace(
+            proposal, status="held",
+            reason=f"waiting: earlier changes are still being evaluated (the first can be judged on {first_due}). The evidence would otherwise support {proposal.current_value:.1f} to {proposal.proposed_value:.1f} g/U "
+                   f"for the segment starting {int(proposal.segment_start_minutes) // 60:02d}:{int(proposal.segment_start_minutes) % 60:02d}",
+        )
     excluded = [day for period in load_excluded_periods(args.raw) for day in pd.date_range(period.start, period.end, freq="D")]
     records = evaluate_open(records, merged.tandem_data.cgm, parts_by_start, now=as_of, excluded_days=excluded)
     save_records(records, record_path)
@@ -925,7 +937,7 @@ def _update_change_record(args, paths: ProjectPaths, merged: MergedDataset, prop
             made = row.entered_on if pd.notna(row.entered_on) else f"proposed {row.proposed_on}"
             segment = f"{int(row.segment_start_minutes) // 60:02d}:{int(row.segment_start_minutes) % 60:02d}"
             lines.append(f"| {made} | {SETTING_FIELDS.get(row.setting, row.setting)} | {segment} | {row.old_value:g} -> {row.new_value:g} | {row.origin} | {int(row.concurrent_changes) if pd.notna(row.concurrent_changes) else 0} | {row.status} | {row.result if pd.notna(row.result) else ''} |")
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n", proposal
 
 
 def _run_refresh(args, paths: ProjectPaths, parser) -> int:
