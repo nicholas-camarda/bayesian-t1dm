@@ -426,3 +426,17 @@ def test_a_few_breakfasts_with_another_correction_factor_do_not_pull_the_rest():
     rows = [mobi(143, 55), mobi(198, 55, iob=0.96), mobi(131, 55)] + [mobi(g, 65) for g in (131, 136, 142, 150, 158, 165, 174, 202, 231)]
     cfs = [cf for _, cf, _ in _resolve_meal_settings(rows, "morning", settings=None)]
     assert cfs == [55.0] * 3 + [65.0] * 9
+
+
+def test_meals_are_pooled_by_the_pump_segment_that_covers_them_whichever_meal_of_the_day():
+    from bayesian_t1dm.therapy_research import _pool_label
+
+    metrics = pd.DataFrame(
+        {
+            "segment": ["morning", "morning", "afternoon", "evening", "afternoon"],
+            "profile_segment_start_minutes": [300.0, 540.0, 540.0, 1140.0, np.nan],
+        }
+    )
+    # A 10:00 breakfast and a 12:00 lunch share the 09:00 pump segment, so they share one evidence group; a meal with no
+    # pump segment on record keeps its therapy segment.
+    assert _pool_label(metrics).tolist() == ["05:00 segment", "09:00 segment", "09:00 segment", "19:00 segment", "afternoon"]

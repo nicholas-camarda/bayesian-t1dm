@@ -85,7 +85,7 @@ def affected_part(start_minutes: int, next_start_minutes: int) -> DayPart:
 
 
 def _held(reason: str, **fields: Any) -> Proposal:
-    return Proposal(setting="breakfast I:C", status="held", reason=reason, **fields)
+    return Proposal(setting="I:C", status="held", reason=reason, **fields)
 
 
 def propose_breakfast_icr(
@@ -96,32 +96,43 @@ def propose_breakfast_icr(
     as_of: pd.Timestamp,
     current_icr: dict[float, float] | None = None,
 ) -> Proposal:
-    """The breakfast I:C proposal, or a held proposal that says why not.
+    """The I:C proposal over all meals, or a held proposal that says why not.
 
     ``segment_ends`` maps a pump segment's start (minutes after midnight) to the start of the next, which bounds the
     affected hours. ``current_icr`` maps a segment's start to the I:C the pump holds now: when the person has
     already changed it since the last breakfast, evidence at the old setting is reported but nothing is proposed.
     """
     if evidence is None or evidence.empty:
-        return _held("no breakfast evidence")
+        return _held("no meal evidence")
     frame = evidence.copy()
     for column in ("period_start", "period_end"):
         frame[column] = pd.to_datetime(frame[column], errors="coerce")
     primary = frame[frame["analysis"].eq(PRIMARY) & frame["is_current_setting"].astype(bool)]
     recent = frame[frame["analysis"].eq(PRIMARY) & (frame["period_end"] >= as_of - pd.Timedelta(days=RECENT_DAYS))]
     if primary.empty or recent.empty:
-        return _held("no breakfast in the last 90 days")
-    # The segment covering most recent breakfasts, on the pump and profile now running.
+        return _held("no meal in the last 90 days")
+    # Every pump segment of the pump and profile now running is assessed on its own; the best-supported proposal wins.
     now = primary.sort_values("period_end").iloc[-1]
-    on_now = recent[recent["pump_serial"].eq(now["pump_serial"]) & recent["profile_id"].eq(now["profile_id"])]
-    if on_now.empty:
-        on_now = recent
-    counts = on_now.groupby("pump_segment_start_minutes")["n_meals"].sum()
-    segment = float(counts.idxmax())
-    candidates = primary[primary["pump_segment_start_minutes"].eq(segment) & primary["pump_serial"].eq(now["pump_serial"]) & primary["profile_id"].eq(now["profile_id"])]
-    if candidates.empty:
-        return _held(f"the segment starting {int(segment) // 60:02d}:{int(segment) % 60:02d} has no current-setting period", segment_start_minutes=segment)
-    row = candidates.sort_values("period_end").iloc[-1]
+    on_now = primary[primary["pump_serial"].eq(now["pump_serial"]) & primary["profile_id"].eq(now["profile_id"])]
+    assessed = []
+    for segment, group in on_now.groupby("pump_segment_start_minutes"):
+        row = group.sort_values("period_end").iloc[-1]
+        assessed.append((float(segment), row, _assess_segment(frame, row, float(segment), cgm, segment_ends, as_of, current_icr)))
+    proposed = [(segment, row, result) for segment, row, result in assessed if result.status == "proposed"]
+    if proposed:
+        # Strongest first: how far the current setting sits outside the evidence interval, relative to the setting.
+        def gap(item):
+            _, row, result = item
+            outside = max(row["effective_icr_lower_90"] - result.current_value, result.current_value - row["effective_icr_upper_90"])
+            return (outside / result.current_value, int(row["n_meals"]))
+        return max(proposed, key=gap)[2]
+    recent_counts = recent[recent["pump_serial"].eq(now["pump_serial"]) & recent["profile_id"].eq(now["profile_id"])].groupby("pump_segment_start_minutes")["n_meals"].sum()
+    busiest = float(recent_counts.idxmax()) if not recent_counts.empty else assessed[0][0]
+    return next(result for segment, _, result in assessed if segment == busiest)
+
+
+def _assess_segment(frame: pd.DataFrame, row: pd.Series, segment: float, cgm: pd.DataFrame, segment_ends: dict[float, float], as_of: pd.Timestamp, current_icr: dict[float, float] | None) -> Proposal:
+    """The rule applied to one pump segment's current-setting period."""
     identity = dict(
         pump_serial=str(row["pump_serial"]), profile_id=float(row["profile_id"]), segment_start_minutes=segment,
         current_value=float(row["programmed_icr"]), breakfasts=int(row["n_meals"]),
@@ -182,7 +193,7 @@ def propose_breakfast_icr(
     if proposed == round_step(current):
         return _held("the step rounds to no change", direction=direction, checks=checks, safety=safety, **identity)
     return Proposal(
-        setting="breakfast I:C", status="proposed",
+        setting="I:C", status="proposed",
         reason=f"carbs behaved like {estimate:.1f} g/U (90% range {row['effective_icr_lower_90']:.1f}-{row['effective_icr_upper_90']:.1f}) against the programmed {current:.1f}",
         direction=direction, proposed_value=proposed, checks=checks, safety=safety,
         affected_hours=part.name if part else "", **identity,
@@ -276,16 +287,16 @@ def segment_markdown(table: pd.DataFrame) -> str:
         "",
         "Each pump segment keeps its own I:C, correction factor and basal, so segments are not combined. Hours are the segment's own.",
         "",
-        "| hours | I:C (g/U) | CF (mg/dL/U) | basal (U/h) | in range 70-180 | below 70 | below 54 | above 180 | reading | breakfasts at this I:C | what breakfasts at an earlier I:C say |",
+        "| hours | I:C (g/U) | CF (mg/dL/U) | basal (U/h) | in range 70-180 | below 70 | below 54 | above 180 | reading | meals at this I:C | what the meals say about the I:C |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- |",
     ]
     for row in table.itertuples(index=False):
         evidence = (
-            f"{row.evidence_breakfasts} breakfasts at {row.evidence_setting:.1f} behaved like {row.evidence_icr:.1f} ({row.evidence_lower_90:.1f}-{row.evidence_upper_90:.1f})"
-            if np.isfinite(row.evidence_icr) else ("no breakfasts in this segment" if row.breakfasts_at_current_icr == 0 and row.evidence_breakfasts == 0 and not row.had_breakfasts else "fewer than 5 breakfasts at any setting")
+            f"{row.evidence_breakfasts} meals at {row.evidence_setting:.1f}{' (the current setting)' if abs(row.evidence_setting - row.icr_now) < 0.05 else ''} behaved like {row.evidence_icr:.1f} ({row.evidence_lower_90:.1f}-{row.evidence_upper_90:.1f})"
+            if np.isfinite(row.evidence_icr) else ("no meals in this segment" if row.breakfasts_at_current_icr == 0 and row.evidence_breakfasts == 0 and not row.had_breakfasts else "fewer than 5 meals at any setting")
         )
         lines.append(
             f"| {row.hours} | {row.icr_now:.1f} | {row.cf_now:.0f} | {row.basal_now:.2f} | {row.tir_90d:.1f}% ({row.tir_14d:.1f}%) | {row.below_70_90d:.2f}% ({row.below_70_14d:.2f}%) | "
-            f"{row.below_54_90d:.2f}% | {row.above_180_90d:.1f}% | {row.reading} | {row.breakfasts_at_current_icr} of {MIN_LOGGED_MEALS_FOR_ICR} | {evidence} |"
+            f"{row.below_54_90d:.2f}% | {row.above_180_90d:.1f}% | {row.reading} | {min(row.breakfasts_at_current_icr, 99)}{'+' if row.breakfasts_at_current_icr >= MIN_LOGGED_MEALS_FOR_ICR else f' of {MIN_LOGGED_MEALS_FOR_ICR}'} | {evidence} |"
         )
     return "\n".join(lines) + "\n"
