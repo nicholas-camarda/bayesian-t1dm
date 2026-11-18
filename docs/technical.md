@@ -11,8 +11,30 @@
 | E | Lunch and dinner I:C | E1 per segment evidence; E2 stricter eligibility; E3 proposals | planned |
 | F | Basal from the controller pattern | F1 commanded vs profile rate; F2 lows as a hard stop; F3 proposals | planned |
 | G | Correction factor | G1 correction-only boluses | planned |
+| H | What happened in each long high or low, and how to respond | H1 episode finder; H2 pattern and evidence; H3 repeats by pump segment; H4 playbook | Episodes tab |
 
 The goal throughout is more time in 70-180 mg/dL with time below 70 under 4% and below 54 under 1%. A proposal changes one setting by at most 10% and is held 14 days before the next. The system proposes and measures; the person enters the change on the pump.
+
+## Design overview
+
+How the pieces fit, and the method behind each. Every analysis follows the same shape: *describe what the record shows, estimate with its uncertainty, apply a written rule, and judge the result afterwards.* The person always enters changes on the pump; nothing here is a prescription.
+
+**Data layer.** Tandem Source (the pump's own event log, decoded; CGM, boluses, carbs, basal delivery, profile edits, controller modes, site changes), Apple Health (workouts, sleep, Bevel's food log), `context_events.csv` (illness, steroids, travel) and hand-kept carb logs. Every raw file is fingerprinted; `build-dataset` rebuilds only what changed. Times are pump local time. Glucose, insulin and carbs sit on a 5-minute grid; event times keep their exact moment where the lookup needs it (profile at the moment of a meal).
+
+| Goal | Question | Estimator | Uncertainty | Written rule | Checked by | Main weakness |
+| --- | --- | --- | --- | --- | --- | --- |
+| A | where do I stand | consensus CGM metrics, day-coverage rule, percentile profile by time of day | none needed (descriptive) | low limits 4% / 1%, time in range 70% | unit tests on known series | descriptive only |
+| B, E | does a meal behave like the pump's I:C | per-meal grid posterior over carbohydrate and absorption shape from the glucose trace, given insulin action and the controller's basal deviation, with a vague carb prior; sensitivity ratio = carb-equivalent / logged carbs; pooled per pump segment and setting by random effects (DerSimonian-Laird heterogeneity, Hartung-Knapp variance, t interval) | 90% interval | proposal only if the setting is outside the interval, every check agrees, low limits hold for added insulin, step at most 10% | simulation harness with known carbs (9 scenarios), five re-pools (tiers, clean, no correction, no high fat/protein, with Bevel) | assumes the correction factor is right; carb-counting bias is absorbed into the ratio; intervals are not probabilities of "too weak" |
+| C | did a change help | before versus after, 14 days each side, hours of the segment plus 4 | day-level bootstrap 90% interval | judged only when 14 after-days are in; one change open at a time | tests on synthetic series | before/after in one person is associational; several changes together are confounded |
+| D | can logged food sharpen the estimate | rule-based flags (Bevel food with no pump carbs, rises with no logged cause) | counts | flagged windows are excluded and counted | tests; real-data reread | rises from slow food at the meal look unlogged |
+| F | is basal too low or high | controller's commanded minus programmed rate over clean time, pooled by hours across days and compared with the current programmed rate | day-resampling interval and "chance the rule is met" | 25% or more for at least half the clean time, glucose above 120, lows within limits | tests; real-data reread | clean time is scarce (see below); sleep-mode target is higher than daytime |
+| H | what happened in each long high or low | ordered rules over insulin, carbs, corrections, site changes, workouts, unlogged food; repeats per pump segment | Wilson 90% intervals for rates | a repeating pattern points at that segment's I:C or basal | tests; real-data reread | rules, not a fitted model; sees only recorded insulin and carbs |
+
+**Methods behind them.** *Grid Bayesian posterior* for carbohydrate per meal (the only place Bayes' rule is used today). *Random-effects pooling* with Hartung-Knapp variance across meals, so real meal-to-meal variability widens the interval. *Day-level bootstrap* wherever days are the unit (basal, change evaluation). *Wilson intervals* for rates. *Theil-Sen plus least squares* to recover the correction factor from calculator records. *Profile replay* of the pump's own edit events. *Ordered rules* for classification. *Simulation* with known truth to test an estimator before it is trusted (carbs recovered, fat/protein absorption). The 30-minute forecast model is Bayesian (PyMC) but is not part of these goals and is judged against "glucose stays the same".
+
+**What is not yet probabilistic.** The I:C and basal answers are intervals and a bootstrap share, not posterior probabilities, and each segment is estimated on its own. The planned model reports "probability the current setting is too weak/too low" with its interval, shares information between neighbouring segments and meals (partial pooling), and uses the nuisance factors as predictors instead of throwing time away.
+
+**Why so little time is clean.** Over the last 90 days the basal analysis set aside 63% of all time: any carbohydrate entry of any size (365 of 3,680 entries are under 15 g), any bolus of 0.5 U or more (1,991 of the pump's boluses are 0.5 to 1.0 U, almost all Control-IQ's own automatic corrections, which are the controller behaviour being measured), each for a fixed 4 hours; and 15.5% of time falls on days in `context_events.csv`. Daytime segments were left with 67 clean hours (09:00-15:00) and 51 (15:00-19:00) out of 544 and 356. Counting only meals (15 g or more of carbohydrate, or 1 U or more) and scaling the window by size (2, 3 or 4 hours) would give 182 and 148 hours, and 63 and 55 usable days, from the same data.
 
 ## Breakfast I:C proposals (goal B)
 

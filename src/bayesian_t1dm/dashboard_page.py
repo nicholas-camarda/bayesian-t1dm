@@ -31,7 +31,7 @@ h2{font-size:17px;margin:26px 0 4px}h2:first-child{margin-top:0}.lead{color:var(
 .grid{display:grid;gap:12px}.g4{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}.g2{grid-template-columns:repeat(auto-fit,minmax(420px,1fr))}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
 .tile .k{color:var(--ink3);font-size:13px}.tile .v{font-size:28px;font-weight:650;line-height:1.15;font-variant-numeric:tabular-nums}.tile .n{color:var(--ink2);font-size:13px}
-.badge{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:650;border-radius:999px;padding:2px 9px}
+.badge{flex-shrink:0;white-space:nowrap;display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:650;border-radius:999px;padding:2px 9px}
 .b-act{background:var(--actbg);color:var(--act)}.b-watch{background:var(--warnbg);color:var(--warn)}.b-ok{background:var(--okbg);color:var(--ok)}
 .problem{display:flex;gap:12px;align-items:flex-start}.problem h3{margin:0 0 2px;font-size:15px}.problem p{margin:0;color:var(--ink2)}
 .btn{background:none;border:1px solid var(--line);color:var(--ink);border-radius:8px;padding:5px 10px;font:inherit;font-size:13px;cursor:pointer;margin-top:8px}.btn:hover{border-color:var(--blue)}
@@ -54,6 +54,7 @@ details{margin-top:8px}summary{cursor:pointer;color:var(--ink2);font-size:13px}
 <main class="wrap">
 <section class="tab" id="t-today"></section>
 <section class="tab" id="t-glucose"></section>
+<section class="tab" id="t-episodes"></section>
 <section class="tab" id="t-meals"></section>
 <section class="tab" id="t-basal"></section>
 <section class="tab" id="t-settings"></section>
@@ -95,7 +96,7 @@ function axes(svg, m, w, h, xs, ys, xticks, yticks, xfmt, yfmt, ylab){
 }
 
 /* ---- tabs ---- */
-const TABS = [['today','Today'],['glucose','Glucose'],['meals','Meals (I:C)'],['basal','Basal'],['settings','Changes'],['about','About']];
+const TABS = [['today','Today'],['glucose','Glucose'],['episodes','Episodes'],['meals','Meals (I:C)'],['basal','Basal'],['settings','Changes'],['about','About']];
 const nav = $('#nav');
 TABS.forEach(([id,label]) => { const b = document.createElement('button'); b.textContent = label; b.setAttribute('role','tab'); b.dataset.tab = id; b.onclick = () => go(id); nav.appendChild(b); });
 function go(id){ TABS.forEach(([t]) => $('#t-'+t).classList.toggle('on', t===id)); nav.querySelectorAll('button').forEach(b => b.setAttribute('aria-selected', b.dataset.tab===id)); (RENDER[id]||(()=>{}))(); window.scrollTo(0,0); try { history.replaceState(null,'','#'+id); } catch (e) { /* a page opened from a restricted origin cannot change its address */ } }
@@ -191,24 +192,73 @@ function episodeChart(host){
       const r=el('rect',{x,y:ys(v),width:Math.max(2,bwid),height:h-m.b-ys(v),rx:2,fill:css(c)},svg); r.onmousemove=ev=>showTip(ev,`<b>${String(k).padStart(2,'0')}:00-${String(k+1).padStart(2,'0')}:00</b><br>${v} ${name} started`); r.onmouseleave=hideTip; }); } });
 }
 
+
+/* ---- Episodes ---- */
+let openEpisode = 0;
+function renderEpisodes(){
+  const t = $('#t-episodes'), E = D.episode_detail;
+  if (!E) { t.innerHTML = '<h2>Episodes</h2><p class="lead">No episode data in this run.</p>'; return; }
+  const cnt = (kind, p) => (E.counts.find(c => c.kind===kind && c.pattern===p) || {n:0}).n;
+  const patterns = Object.keys(E.labels).filter(p => cnt('high',p) + cnt('low',p) > 0);
+  let h = `<h2>Long highs and lows, and what surrounded them</h2><p class="lead">A high is glucose above 250 mg/dL for 90 minutes or more; a low is below 70 for 15 minutes or more. Each is matched to the pattern the recorded data best support: insulin and carbs given before it, corrections during it, site changes, workouts and food you did not log. A pattern is not a diagnosis; where one repeats at the same time of day it points at the setting that governs those hours. Last ${E.days} days.</p>
+  <div class="grid g4">${tile('Long highs', E.highs, 'above 250 for 90 min or more')}${tile('Lows', E.lows, 'below 70 for 15 min or more')}${tile('Most common high', (()=>{const m=Object.keys(E.labels).map(p=>[p,cnt('high',p)]).sort((a,b)=>b[1]-a[1])[0]; return m&&m[1]?m[1]:0})(), (()=>{const m=Object.keys(E.labels).map(p=>[p,cnt('high',p)]).sort((a,b)=>b[1]-a[1])[0]; return m&&m[1]?E.labels[m[0]]:'none'})())}${tile('Most common low', (()=>{const m=Object.keys(E.labels).map(p=>[p,cnt('low',p)]).sort((a,b)=>b[1]-a[1])[0]; return m&&m[1]?m[1]:0})(), (()=>{const m=Object.keys(E.labels).map(p=>[p,cnt('low',p)]).sort((a,b)=>b[1]-a[1])[0]; return m&&m[1]?E.labels[m[0]]:'none'})())}</div>`;
+  h += `<h2>What repeats</h2>`;
+  h += E.repeats.length ? `<p class="lead">A pattern counts as repeating when at least 4 episodes of one kind fall in a pump segment and at least half of them fit it.</p><div class="grid">` + E.repeats.map(r => `<div class="card problem"><span class="badge b-watch">● ${esc(r.kind)}s</span><div><h3>${esc(r.label)} at ${esc(r.segment)}</h3><p>${r.n} of ${r.of} episodes in this segment. Points at: ${esc(r.points_at)}.</p><p style="margin-top:4px">${esc(r.advice)}</p></div></div>`).join('') + `</div>` : `<p class="lead">No pattern repeats in one segment yet.</p>`;
+  h += `<h2>What your data say about each pattern</h2><div class="grid g2">`;
+  patterns.forEach(p => { const pb = E.playbook[p] || {}; let extra = '';
+    if (p==='after_exercise' && E.exercise && E.exercise.after_workout_meals) { const x=E.exercise; extra = `<p class="note"><b>Your numbers:</b> after a workout (within 12 h) ${(x.after_workout_share*100).toFixed(1)}% of meal boluses were followed by a low within 4 hours (${x.after_workout_lows} of ${x.after_workout_meals}, ${x.from} to ${x.to}; 90% range ${(x.after_workout_interval[0]*100).toFixed(0)}-${(x.after_workout_interval[1]*100).toFixed(0)}%), against ${(x.other_share*100).toFixed(1)}% otherwise (${x.other_lows} of ${x.other_meals}; ${(x.other_interval[0]*100).toFixed(0)}-${(x.other_interval[1]*100).toFixed(0)}%). Workouts of 30 minutes or more. ${x.after_workout_interval[0]>x.other_interval[1]?'The ranges are apart: lows are more common after workouts.':'The ranges overlap: your data show no clear difference, so a workout alone does not explain these lows.'}</p>`; }
+    if (p==='site_or_insulin' && E.site && E.site.long_highs) { const x=E.site; extra = `<p class="note"><b>Your numbers:</b> ${x.linked} of ${x.long_highs} highs of 3 hours or more ended within an hour after a site change; chance alone would give about ${(x.chance_share*100).toFixed(0)}%. With so few, this is not evidence of a site problem pattern.</p>`; }
+    if (p==='meal_dosed_high' || p==='meal_underdosed') extra = `<p class="note">The <a href="#meals" data-go="meals">Meals (I:C)</a> tab shows whether the segment's I:C fits these meals.</p>`;
+    h += `<div class="card"><h3 style="margin:0 0 2px;font-size:15px">${esc(E.labels[p])}</h3><p style="margin:0;color:var(--ink2)"><b>${cnt('high',p)+cnt('low',p)}</b> episodes (${cnt('high',p)} high, ${cnt('low',p)} low). Points at ${esc(pb.points_at||'')}.</p><p style="margin:6px 0 0">${esc(pb.advice||'')}</p>${extra}</div>`; });
+  h += `</div><h2>Look at one</h2><p class="lead">The latest ${E.latest.length}. Pick one to see its glucose, the insulin and carbs around it, and why it got its pattern.</p><div class="card"><div class="scroll"><table id="eptable"></table></div></div><div class="card" style="margin-top:12px"><div id="epdetail"></div></div>`;
+  t.innerHTML = h; t.querySelectorAll('[data-go]').forEach(a => a.onclick = ev => { ev.preventDefault(); go(a.dataset.go); });
+  $('#eptable').innerHTML = `<tr><th class="l">Started</th><th class="l">Kind</th><th>Hours</th><th>Peak / low</th><th class="l">Segment</th><th class="l">Pattern</th></tr>` + E.latest.map((e,i) => `<tr data-i="${i}" style="cursor:pointer;${i===openEpisode?'background:var(--grid)':''}"><td class="l">${when(e.start)}</td><td class="l">${e.kind}</td><td>${e.hours.toFixed(1)}</td><td>${f0(e.extreme)}</td><td class="l">${esc(e.segment)}</td><td class="l">${esc(e.label)}</td></tr>`).join('');
+  $('#eptable').querySelectorAll('tr[data-i]').forEach(r => r.onclick = () => { openEpisode = +r.dataset.i; renderEpisodes(); });
+  if (E.latest.length) episodeDetail($('#epdetail'), E.latest[openEpisode]);
+}
+function episodeDetail(host, e){
+  const tr = e.trace; const hdr = document.createElement('div');
+  hdr.innerHTML = `<h3 style="margin:0 0 2px;font-size:15px">${esc(e.label)}</h3><p style="margin:0 0 8px;color:var(--ink2)">${esc(e.evidence)}.</p><div class="legend"><span><i style="background:var(--blue)"></i>glucose</span><span><i style="background:var(--orange);border-radius:50%"></i>insulin given (size = units)</span><span><i style="background:var(--ink)"></i>carbs logged</span><span><i style="background:var(--red)"></i>site change</span></div>`;
+  host.innerHTML = ''; host.appendChild(hdr); const box = document.createElement('div'); host.appendChild(box);
+  const m={l:40,r:10,t:10,b:58}; const g = tr.glucose; const n = g.length;
+  chart(box, 280, (svg,w,h) => {
+    const xs=scale(0,(n-1)*tr.step,m.l,w-m.r), lo=Math.min(40,...g.filter(v=>v!=null)), hi=Math.max(300,...g.filter(v=>v!=null))+10, ys=scale(lo,hi,h-m.b,m.t);
+    el('rect',{x:xs(tr.start_offset),y:m.t,width:Math.max(2,xs(tr.end_offset)-xs(tr.start_offset)),height:h-m.t-m.b,fill:css(e.kind==='high'?'--orange':'--red'),opacity:.12},svg);
+    [70,180,250].forEach(v => { el('line',{x1:m.l,x2:w-m.r,y1:ys(v),y2:ys(v),stroke:css('--grid')},svg); txt(svg,m.l-6,ys(v)+4,v,{'text-anchor':'end'}); });
+    const t0ms = new Date(tr.t0).getTime();
+    for (let k=0;k<=(n-1)*tr.step;k+=tr.step){ const d = new Date(t0ms + k*60000); if (d.getMinutes()===0 && d.getHours()%1===0 && (k%60===0 || true)) { txt(svg,xs(k),h-m.b+16,String(d.getHours()).padStart(2,'0')+':00',{'text-anchor':'middle'}); } }
+    el('path',{d:g.map((v,i)=>v==null?'':(i&&g[i-1]!=null?'L':'M')+xs(i*tr.step)+' '+ys(v)).join(''),fill:'none',stroke:css('--blue'),'stroke-width':2.2,'stroke-linejoin':'round'},svg);
+    tr.sites.forEach(o => { el('line',{x1:xs(o),x2:xs(o),y1:m.t,y2:h-m.b,stroke:css('--red'),'stroke-width':2,'stroke-dasharray':'4 3'},svg); });
+    tr.boluses.forEach(([o,u]) => { const c = el('circle',{cx:xs(o),cy:h-m.b+32,r:Math.max(3,Math.min(9,3+u*1.4)),fill:css('--orange'),stroke:css('--card'),'stroke-width':1.5},svg); c.onmousemove = ev => showTip(ev,`<b>${u.toFixed(2)} U</b>`); c.onmouseleave = hideTip; });
+    tr.carbs.forEach(([o,gr]) => { const c = el('rect',{x:xs(o)-4,y:h-m.b+44,width:8,height:8,fill:css('--ink'),rx:1.5},svg); c.onmousemove = ev => showTip(ev,`<b>${gr.toFixed(0)} g carbs</b>`); c.onmouseleave = hideTip; });
+    const hit = el('rect',{x:m.l,y:m.t,width:w-m.l-m.r,height:h-m.t-m.b,fill:'transparent'},svg);
+    hit.onmousemove = ev => { const r=svg.getBoundingClientRect(); const x=(ev.clientX-r.left)*(w/r.width); const i=Math.max(0,Math.min(n-1,Math.round((x-m.l)/(w-m.l-m.r)*(n-1)))); const d=new Date(new Date(tr.t0).getTime()+i*tr.step*60000); showTip(ev,`<b>${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}</b><br>${g[i]==null?'no reading':f0(g[i])+' mg/dL'}`); };
+    hit.onmouseleave = hideTip;
+  });
+}
+
 /* ---- Meals (I:C) ---- */
 let showAll = false;
 function renderMeals(){
   const t=$('#t-meals');
   t.innerHTML = `<h2>Do your meals behave like your pump setting?</h2><p class="lead">For each meal the glucose trace says how many grams of carbohydrate it behaved like, given the I:C your pump used. A dot is the I:C the meals behaved like, with its 90% range; the vertical mark is what the pump was set to. When the mark sits outside the range, the setting does not fit those meals. Meals are pooled by the pump segment they fall in (breakfast, lunch and dinner together).</p>
   <div class="seg"><button id="only" aria-pressed="${!showAll}">Current profile, latest period</button><button id="all" aria-pressed="${showAll}">All periods</button></div>
-  <div class="card"><div class="legend"><span><i style="background:var(--blue)"></i>I:C the meals behaved like (90% range)</span><span><i style="background:var(--ink)"></i>pump setting for those meals</span><span><i style="background:var(--orange);border-radius:50%"></i>setting the pump holds now, when changed since</span></div><div id="forest"></div><div class="scroll"><table id="evtable"></table></div>
+  <div class="card"><div class="legend"><span><i style="background:var(--blue)"></i>I:C the meals behaved like (90% range)</span><span>Number after the dates = meals. Faded rows have fewer than 10 meals, so their range is wide.</span><span><i style="background:var(--ink)"></i>pump setting for those meals</span><span><i style="background:var(--orange);border-radius:50%"></i>setting the pump holds now, when changed since</span></div><div id="forest"></div><div class="scroll"><table id="evtable"></table></div>
   <p class="note">Smaller g/U = more insulin per gram. "Behaves like 5.4 against a setting of 6.8" means those meals needed more insulin than the pump gave. The ratio found absorbs how you count carbs, so it is the ratio that works with how you eat. Segments with fewer than 5 meals at a setting are not shown.</p></div>`;
   $('#only').onclick=()=>{showAll=false;renderMeals();}; $('#all').onclick=()=>{showAll=true;renderMeals();};
   let rows = D.evidence.filter(r=>r.n>=5); if(!showAll){ const latest={}; rows.forEach(r=>{ if(!latest[r.segment]||r.end>latest[r.segment].end) latest[r.segment]=r; }); rows=Object.values(latest); }
   rows.sort((a,b)=>a.segment.localeCompare(b.segment)||a.start.localeCompare(b.start));
-  const m={l:158,r:16,t:8,b:44}, rh=28; const mon = d => new Date(d).toLocaleString('en',{month:'short',year:'2-digit'});
+  const mon = d => new Date(d).toLocaleString('en',{month:'short',year:'2-digit'});
+  const labelOf = r => `${r.segment} · ${mon(r.start)} to ${mon(r.end)} · ${r.n}`;
+  const labelW = Math.max(...rows.map(r => labelOf(r).length)) * 6.6 + 16;
+  const stacked = $('#forest').clientWidth < labelW + 260;
+  const m={l: stacked ? 14 : Math.ceil(labelW), r:16, t:8, b:44}, rh = stacked ? 50 : 28;
   chart($('#forest'), Math.max(80,rows.length*rh+m.t+m.b), (svg,w,h)=>{
     const lo=Math.min(4,...rows.map(r=>r.lower))-.3, hi=Math.max(9,...rows.map(r=>r.upper))+.3, xs=scale(lo,hi,m.l,w-m.r);
     for(let v=Math.ceil(lo);v<=hi;v++){ el('line',{x1:xs(v),x2:xs(v),y1:m.t,y2:h-m.b,stroke:css('--grid')},svg); txt(svg,xs(v),h-m.b+16,v,{'text-anchor':'middle'}); }
     txt(svg,(m.l+w-m.r)/2,h-3,'I:C, grams of carbohydrate per unit of insulin',{'text-anchor':'middle'});
-    rows.forEach((r,i)=>{ const y=m.t+i*rh+rh/2; txt(svg,m.l-8,y+4,`${r.segment} · ${mon(r.start)} to ${mon(r.end)}`,{'text-anchor':'end'});
-      const ln=el('line',{x1:xs(r.lower),x2:xs(r.upper),y1:y,y2:y,stroke:css('--blue'),'stroke-width':3,'stroke-linecap':'round'},svg); el('circle',{cx:xs(r.effective),cy:y,r:5,fill:css('--blue'),stroke:css('--card'),'stroke-width':2},svg);
+    rows.forEach((r,i)=>{ const y=m.t+i*rh+(stacked?rh*0.7:rh/2); if (stacked) txt(svg,m.l,y-14,labelOf(r),{'text-anchor':'start'}); else txt(svg,m.l-8,y+4,labelOf(r),{'text-anchor':'end'}); const thin = r.n < 10 ? .4 : 1;
+      const ln=el('line',{x1:xs(r.lower),x2:xs(r.upper),y1:y,y2:y,stroke:css('--blue'),'stroke-width':3,'stroke-linecap':'round',opacity:thin},svg); el('circle',{cx:xs(r.effective),cy:y,r:5,fill:css('--blue'),stroke:css('--card'),'stroke-width':2,opacity:thin},svg);
       el('rect',{x:xs(r.programmed)-1.5,y:y-9,width:3,height:18,fill:css('--ink'),rx:1},svg);
       if (r.now!=null && Math.abs(r.now-r.programmed)>=0.05 && r.latest) el('circle',{cx:xs(r.now),cy:y,r:8,fill:'none',stroke:css('--orange'),'stroke-width':2.5},svg);
       const hit=el('rect',{x:m.l,y:y-rh/2,width:w-m.l-m.r,height:rh,fill:'transparent'},svg); hit.onmousemove=ev=>showTip(ev,`<b>${r.segment} segment</b><br>${r.start} to ${r.end} · ${r.n} meals<br>behaved like ${f1(r.effective)} g/U (${f1(r.lower)}-${f1(r.upper)})<br>pump setting ${f1(r.programmed)}${r.current?'<br><i>current setting</i>':''}`); hit.onmouseleave=hideTip; });
@@ -221,10 +271,11 @@ function renderMeals(){
 function renderBasal(){
   const t=$('#t-basal'), s=D.controller.signals;
   t.innerHTML = `<h2>What Control-IQ does against your programmed basal</h2><p class="lead">Your pump records the rate it delivered and the rate your profile calls for. If it adds a lot of insulin on most nights and glucose is still high, the programmed basal is probably too low there. Time after meals, boluses, exercise and unlogged food is left out.</p>
-  <div class="card"><div class="scroll"><table id="sig"></table></div><p class="note">Rule: the controller runs 25% or more above the profile on at least half of the last 28 clean days, mean glucose is still above 120 mg/dL, and lows are within limits. Fewer than 14 clean days gives no signal. Daytime segments have few clean days because meals take most of the day.</p></div>
+  <div class="card"><div class="scroll"><table id="sig"></table></div><p class="note">Rule: over the last 28 days at the segment's current basal rate, the controller runs 25% or more above the profile for at least half of the clean time, mean glucose is still above 120 mg/dL, and lows are within limits. Each day counts in proportion to its clean hours, so daytime segments, where meals leave little clean time, can still be assessed. Ranges come from resampling days; \"chance the rule is met\" is the share of those resamples in which the controller ran 25% or more above the profile for at least half of the clean time. Under 10 days or 14 clean hours gives no signal.</p></div>
   <h2>Overnight, night by night</h2><p class="lead">Extra insulin delivered above the profile, as a share of the profile's insulin (${D.controller.nightly.length} clean nights). The dashed line is 25%.</p><div class="card"><div class="legend"><span><i style="background:var(--orange)"></i>25% or more above the profile</span><span><i style="background:var(--blue)"></i>under 25%</span></div><div id="nightly"></div></div>
   <h2>Overnight glucose, night by night</h2><p class="lead">Mean glucose over the same clean hours. The shaded band is the sleep-mode target, 112-120 mg/dL.</p><div class="card"><div id="nightglu"></div></div>`;
-  $('#sig').innerHTML = `<tr><th class="l">Segment</th><th>Clean days</th><th>Median extra</th><th>Days at 25%+</th><th>Mean glucose</th><th>Below 70</th><th class="l">Signal</th></tr>` + s.map(r=>`<tr><td class="l">${r.part}</td><td>${r.days}</td><td>${r.median_excess_fraction==null?'n/a':(r.median_excess_fraction*100>=0?'+':'')+(r.median_excess_fraction*100).toFixed(0)+'%'}</td><td>${r.share_over_x==null?'n/a':(r.share_over_x*100).toFixed(0)+'%'}</td><td>${f0(r.mean_glucose)}</td><td>${r.below_70_pct==null?'n/a':r.below_70_pct.toFixed(2)+'%'}</td><td class="l">${esc(r.signal)}</td></tr>`).join('');
+  const pc = v => v==null ? 'n/a' : (v*100).toFixed(0)+'%', sg = v => v==null ? 'n/a' : (v>=0?'+':'')+(v*100).toFixed(0)+'%';
+  $('#sig').innerHTML = `<tr><th class="l">Segment</th><th>Basal U/h</th><th>Days · clean hours (window)</th><th>Extra insulin (90% range)</th><th>Clean time at 25%+ (90% range)</th><th>Chance the rule is met</th><th>Mean glucose</th><th>Below 70</th><th class="l">Signal</th></tr>` + s.map(r=>`<tr><td class="l">${r.part}</td><td>${r.profile_rate==null?'n/a':r.profile_rate.toFixed(2)}</td><td>${r.days} · ${f0(r.clean_hours)} (${r.window_days} d)</td><td>${r.pooled_excess==null?'n/a':sg(r.pooled_excess)+' ('+sg(r.excess_lo)+' to '+sg(r.excess_hi)+')'}</td><td>${r.share_over_x==null?'n/a':pc(r.share_over_x)+' ('+pc(r.share_over_lo)+' to '+pc(r.share_over_hi)+')'}</td><td>${pc(r.prob_rule_met)}</td><td>${f0(r.mean_glucose)}</td><td>${r.below_70_pct==null?'n/a':r.below_70_pct.toFixed(2)+'%'}</td><td class="l">${esc(r.signal)}</td></tr>`).join('');
   nightChart($('#nightly'),'excess'); nightChart($('#nightglu'),'glucose');
 }
 function nightChart(host,kind){
@@ -261,10 +312,10 @@ function renderAbout(){
   <p><b>Meals (I:C)</b> compares each meal's glucose trace with what the pump's carb ratio predicts. It assumes the correction factor is right, and the ratio it finds includes any consistent miscounting of carbohydrate.</p>
   <p><b>Basal</b> reads the controller's own deliveries. Sleep mode aims for a higher glucose (112.5 to 120 mg/dL) than daytime, so some extra insulin at night is expected.</p>
   <p><b>Changes</b> are judged before versus after in one person: other things change in the same weeks, so a result is a pattern, not proof.</p></div>
-  <h2>Where the detail lives</h2><div class="card"><p>Tables behind each chart are in the folders next to this page: <code>A_outcomes/</code>, <code>B_icr/</code>, <code>C_changes/</code>, <code>F_basal/</code> and <code>00_General/</code>. Each has a <code>supporting/</code> folder for diagnostics.</p>
+  <h2>Where the detail lives</h2><div class="card"><p>Tables behind each chart are in the folders next to this page: <code>A_outcomes/</code>, <code>B_icr/</code>, <code>C_changes/</code>, <code>F_basal/</code>, <code>H_episodes/</code> and <code>00_General/</code>. Each has a <code>supporting/</code> folder for diagnostics.</p>
   <p class="note">Run ${esc(D.run.run_id||'')} · commit ${esc((D.run.commit||'').slice(0,8))} · built ${esc(D.run.built||'')}</p></div>`;
 }
-const RENDER={today:renderToday,glucose:renderGlucose,meals:renderMeals,basal:renderBasal,settings:renderSettings,about:renderAbout};
+const RENDER={today:renderToday,glucose:renderGlucose,episodes:renderEpisodes,meals:renderMeals,basal:renderBasal,settings:renderSettings,about:renderAbout};
 const startTab = (location.hash || '').slice(1); go(startTab in RENDER ? startTab : 'today');
 </script>
 </body>

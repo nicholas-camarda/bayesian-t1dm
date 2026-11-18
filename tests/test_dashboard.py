@@ -27,12 +27,12 @@ def _segments(**over):
 
 
 EMPTY_EPISODES = {"days": 90, "highs": [0] * 24, "lows": [0] * 24, "high_total": 0, "low_total": 0}
-NO_SIGNALS = pd.DataFrame(columns=["part", "days", "share_over_x", "median_excess_fraction", "mean_glucose", "signal"])
+NO_SIGNALS = pd.DataFrame(columns=["part", "window_days", "days", "clean_hours", "share_over_x", "share_over_lo", "share_over_hi", "pooled_excess", "mean_glucose", "signal"])
 
 
 def test_problems_list_lows_first_then_evidence_then_what_to_watch():
     evidence = [{"segment": "19:00", "programmed": 6.8, "effective": 5.0, "lower": 4.5, "upper": 5.5, "n": 48, "current": True, "now": 6.8, "latest": False}]
-    signals = pd.DataFrame([{"part": "00:00-05:00", "days": 28, "share_over_x": 0.68, "median_excess_fraction": 0.46, "mean_glucose": 148.0, "signal": "basal likely too low"}])
+    signals = pd.DataFrame([{"part": "00:00-05:00", "window_days": 28, "days": 28, "clean_hours": 120.0, "share_over_x": 0.68, "share_over_lo": 0.5, "share_over_hi": 0.8, "pooled_excess": 0.46, "mean_glucose": 148.0, "signal": "basal likely too low"}])
     segments = pd.concat([_segments(), _segments(hours="00:00-05:00", below_70_90d=5.0)], ignore_index=True)
     areas = dashboard.find_problem_areas(segments, evidence, signals, EMPTY_EPISODES, {})
     titles = [a["title"] for a in areas]

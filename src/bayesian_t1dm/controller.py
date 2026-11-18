@@ -100,8 +100,14 @@ def daily_controller_pattern(
     *,
     unlogged: pd.DataFrame | None = None,
     excluded_days=(),
+    min_clean_fraction: float | None = MIN_DAY_COVERAGE,
+    min_clean_hours: float = 0.0,
 ) -> pd.DataFrame:
-    """One row per day and pump segment: extra insulin as a share of the profile's, and mean glucose, over the clean time."""
+    """One row per day and pump segment: extra insulin as a share of the profile's, and mean glucose, over the clean time.
+
+    A day-segment counts when its clean time is at least ``min_clean_fraction`` of the segment's hours (None for no
+    fraction rule) and at least ``min_clean_hours``. ``clean_hours`` lets a later pooling weight each day by its clean time.
+    """
     intervals = delivery_intervals(rates)
     if intervals.empty:
         return pd.DataFrame()
@@ -131,13 +137,15 @@ def daily_controller_pattern(
         for date, group in inside.groupby("date"):
             hours = float(group["hours"].sum())
             profile_units = float(group["profile_units"].sum())
-            if hours < part.hours * MIN_DAY_COVERAGE or profile_units <= 0:
+            needed = max(part.hours * min_clean_fraction if min_clean_fraction is not None else 0.0, min_clean_hours)
+            if hours < needed or profile_units <= 0:
                 continue
             window = glucose[(glucose["timestamp"] >= group["timestamp"].min()) & (glucose["timestamp"] <= group["timestamp"].max() + pd.Timedelta(minutes=5))]
             clean = window[window["timestamp"].dt.floor("5min").isin(group["timestamp"].dt.floor("5min"))]["glucose"]
             rows.append(
                 {
                     "date": date, "part": part.name, "clean_hours": hours, "profile_units": profile_units,
+                    "profile_rate": round(float((group["profile_u_per_h"] * group["hours"]).sum() / hours), 3),
                     "excess_units": float(group["excess_units"].sum()), "excess_fraction": float(group["excess_units"].sum() / profile_units),
                     "mean_glucose": float(clean.mean()) if len(clean) else np.nan, "time_in_range_pct": float(100 * ((clean >= TARGET_LOW) & (clean <= TARGET_HIGH)).mean()) if len(clean) else np.nan,
                     "below_70_pct": float(100 * (clean < TARGET_LOW).mean()) if len(clean) else np.nan,
@@ -166,60 +174,93 @@ def controller_summary(daily: pd.DataFrame) -> pd.DataFrame:
 
 # The written rule for turning the pattern into a basal signal (chosen with the person, 2026-11-18).
 SIGNAL_EXTRA_FRACTION = 0.25  # X: the controller runs this far above (or below) the profile
-SIGNAL_SHARE_OF_DAYS = 0.50   # Y: on at least this share of the recent clean days
+SIGNAL_SHARE_OF_TIME = 0.50   # Y: for at least this share of the recent clean time
 SIGNAL_RECENT_DAYS = 28
-SIGNAL_MIN_DAYS = 14
+SIGNAL_WINDOWS = (28, 56, 90)  # a segment with too little clean time in 28 days widens to 56, then 90, and says so
+SIGNAL_MIN_DAYS = 10
+SIGNAL_MIN_HOURS = 14.0
+MIN_CLEAN_HOURS = 1.0         # a day-segment counts toward the pooled estimate with an hour of clean time
 HIGH_GLUCOSE_MGDL = 120.0     # the top of the sleep-mode target: glucose still above it despite the extra insulin
+BOOTSTRAP_DRAWS = 2000
+BOOTSTRAP_SEED = 20261118
 
 
-def basal_signal(daily: pd.DataFrame, *, recent_days: int = SIGNAL_RECENT_DAYS) -> pd.DataFrame:
-    """Per pump segment, over its most recent clean days: does the controller consistently work against the programmed basal?
+def basal_signal(daily: pd.DataFrame, *, windows: tuple[int, ...] = SIGNAL_WINDOWS, draws: int = BOOTSTRAP_DRAWS) -> pd.DataFrame:
+    """Per pump segment: does the controller consistently work against the programmed basal at its current rate?
 
-    "Basal likely too low": the controller delivers more than ``SIGNAL_EXTRA_FRACTION`` above the profile on at least
-    ``SIGNAL_SHARE_OF_DAYS`` of the days, mean glucose over those days is still above ``HIGH_GLUCOSE_MGDL``, and time
-    below 70 and below 54 stay within their limits. "Basal likely too high": it withholds more than that on at least
-    that share of days. Fewer than ``SIGNAL_MIN_DAYS`` clean days gives no signal.
+    Pooled by hours, over the last 28 calendar days (or the shortest of ``windows`` that holds enough clean time, reported
+    as ``window_days``), whatever basal rate the segment held then. What the
+    controller commanded is an absolute rate (U/h) that does not depend on which profile or basal edit was running, so
+    each day's commanded rate is compared with the segment's *current* programmed rate: a change of profile or an edit
+    does not throw away the earlier days. Each day is weighted by its clean hours, so a day with two clean hours counts in
+    proportion and daytime segments, where meals leave little clean time, can still be assessed. The share of clean time
+    with the controller commanding more than ``SIGNAL_EXTRA_FRACTION`` above (or below) the current rate, the pooled
+    extra insulin and its interval come from resampling days. ``prob_rule_met`` is the share of resamples in which the
+    controller ran that far above the current rate for at least ``SIGNAL_SHARE_OF_TIME`` of the clean time.
+
+    "Basal likely too low": that share is at least ``SIGNAL_SHARE_OF_TIME``, mean glucose over the clean time is above
+    ``HIGH_GLUCOSE_MGDL``, and time below 70 and below 54 are within their limits. "Basal likely too high": the mirror
+    case. Fewer than ``SIGNAL_MIN_DAYS`` days or ``SIGNAL_MIN_HOURS`` clean hours gives no signal.
     """
     from .outcomes import LOW_LIMIT_PERCENT, VERY_LOW_LIMIT_PERCENT
 
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
     rows = []
     for part, group in daily.groupby("part", sort=False):
-        recent = group.sort_values("date").tail(recent_days)
-        n = len(recent)
-        over = float((recent["excess_fraction"] > SIGNAL_EXTRA_FRACTION).mean()) if n else np.nan
-        under = float((recent["excess_fraction"] < -SIGNAL_EXTRA_FRACTION).mean()) if n else np.nan
-        glucose = float(recent["mean_glucose"].mean()) if n else np.nan
-        below_70, below_54 = (float(recent["below_70_pct"].mean()), float(recent["below_54_pct"].mean())) if n else (np.nan, np.nan)
+        group = group.sort_values("date")
+        rate = round(float(group["profile_rate"].iloc[-1]), 3)
+        for window in windows:
+            recent = group[group["date"] > group["date"].max() - pd.Timedelta(days=window)]
+            n, hours = len(recent), float(recent["clean_hours"].sum())
+            if n >= SIGNAL_MIN_DAYS and hours >= SIGNAL_MIN_HOURS:
+                break
+        row = {"part": part, "profile_rate": rate, "window_days": window, "days": n, "clean_hours": hours}
+        if n < SIGNAL_MIN_DAYS or hours < SIGNAL_MIN_HOURS:
+            row.update({"signal": f"not enough clean time ({n} days, {hours:.0f} h in the last {window} days; need {SIGNAL_MIN_DAYS} days and {SIGNAL_MIN_HOURS:.0f} h)"})
+            rows.append(row)
+            continue
+        w = recent["clean_hours"].to_numpy()
+        commanded = (recent["profile_units"] + recent["excess_units"]).to_numpy()
+        frac = commanded / (rate * w) - 1.0  # each day's commanded rate against the current programmed rate
+        over = float(w[frac > SIGNAL_EXTRA_FRACTION].sum() / w.sum())
+        under = float(w[frac < -SIGNAL_EXTRA_FRACTION].sum() / w.sum())
+        glucose = float(np.average(recent["mean_glucose"], weights=w))
+        below_70, below_54 = float(np.average(recent["below_70_pct"], weights=w)), float(np.average(recent["below_54_pct"], weights=w))
+        pick = rng.integers(0, n, size=(draws, n))
+        boot_over = np.array([w[i][frac[i] > SIGNAL_EXTRA_FRACTION].sum() / w[i].sum() for i in pick])
+        boot_excess = np.array([commanded[i].sum() / (rate * w[i].sum()) - 1.0 for i in pick])
         lows_ok = below_70 < LOW_LIMIT_PERCENT and below_54 < VERY_LOW_LIMIT_PERCENT
-        if n < SIGNAL_MIN_DAYS:
-            signal = f"not enough clean days ({n} of {SIGNAL_MIN_DAYS})"
-        elif over >= SIGNAL_SHARE_OF_DAYS and glucose > HIGH_GLUCOSE_MGDL and lows_ok:
+        if over >= SIGNAL_SHARE_OF_TIME and glucose > HIGH_GLUCOSE_MGDL and lows_ok:
             signal = "basal likely too low"
-        elif over >= SIGNAL_SHARE_OF_DAYS and not lows_ok:
+        elif over >= SIGNAL_SHARE_OF_TIME and not lows_ok:
             signal = "controller adds insulin but lows are over a limit: no added basal"
-        elif over >= SIGNAL_SHARE_OF_DAYS:
+        elif over >= SIGNAL_SHARE_OF_TIME:
             signal = "controller adds insulin and glucose is within the target: basal is being covered by the controller"
-        elif under >= SIGNAL_SHARE_OF_DAYS:
+        elif under >= SIGNAL_SHARE_OF_TIME:
             signal = "basal likely too high"
         else:
             signal = "no consistent pattern"
-        rows.append(
-            {"part": part, "days": n, "share_over_x": over, "share_under_minus_x": under, "mean_glucose": glucose, "below_70_pct": below_70,
-             "below_54_pct": below_54, "median_excess_fraction": float(recent["excess_fraction"].median()) if n else np.nan, "signal": signal}
+        row.update(
+            {"share_over_x": over, "share_over_lo": float(np.percentile(boot_over, 5)), "share_over_hi": float(np.percentile(boot_over, 95)), "share_under_minus_x": under,
+             "prob_rule_met": float((boot_over >= SIGNAL_SHARE_OF_TIME).mean()), "pooled_excess": float(commanded.sum() / (rate * w.sum()) - 1.0),
+             "excess_lo": float(np.percentile(boot_excess, 5)), "excess_hi": float(np.percentile(boot_excess, 95)), "mean_glucose": glucose,
+             "below_70_pct": below_70, "below_54_pct": below_54, "signal": signal}
         )
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
-def controller_inputs(merged, raw_root: str | Path, parts: list[DayPart], *, excluded_days=()) -> tuple[pd.DataFrame, pd.DataFrame]:
+def controller_inputs(merged, raw_root: str | Path, parts: list[DayPart], *, excluded_days=()) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """The daily controller pattern for a merged dataset, with its meal, unlogged-food and exercise exclusions.
 
-    Returns the daily table and the rate records it was built from (empty when the archive holds no rate records).
+    Returns the daily table, the rate records it was built from (empty when the archive holds no rate records) and the
+    unlogged-food intervals found along the way.
     """
     from . import meal_flags
 
     rates, modes = load_basal_delivery(Path(raw_root) / "tconnectsync")
     if rates.empty:
-        return pd.DataFrame(), rates
+        return pd.DataFrame(), rates, pd.DataFrame()
     cgm, bolus, carbs = merged.tandem_data.cgm, merged.tandem_data.bolus, merged.tandem_data.carbs
     meal_times = np.sort(
         np.concatenate(
@@ -230,4 +271,5 @@ def controller_inputs(merged, raw_root: str | Path, parts: list[DayPart], *, exc
     frame["explicit_carb_grams"] = frame["timestamp"].map(carbs.groupby(pd.to_datetime(carbs["timestamp"]))["carb_grams"].sum()).fillna(0.0)
     frame["bolus_units"] = frame["timestamp"].map(bolus.groupby(pd.to_datetime(bolus["timestamp"]))["bolus_units"].sum()).fillna(0.0)
     unlogged = meal_flags.unlogged_intervals(frame, merged.data.nutrition)
-    return daily_controller_pattern(rates, modes, cgm, meal_times, parts, unlogged=unlogged, excluded_days=excluded_days), rates
+    daily = daily_controller_pattern(rates, modes, cgm, meal_times, parts, unlogged=unlogged, excluded_days=excluded_days, min_clean_fraction=None, min_clean_hours=MIN_CLEAN_HOURS)
+    return daily, rates, unlogged
