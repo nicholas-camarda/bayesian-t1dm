@@ -218,3 +218,74 @@ def proposal_markdown(proposal: Proposal, *, as_of: pd.Timestamp) -> str:
         lines += ["", "## Low limits over the affected hours, last 90 days", ""] + [f"- {name}: {value:.2f}" for name, value in proposal.safety.items()]
     lines += ["", "## How it will be judged", "", proposal.evaluation, ""]
     return "\n".join(lines)
+
+
+def segment_summary(
+    parts: list[DayPart],
+    settings: dict[float, dict[str, float]],
+    outcomes_90: pd.DataFrame,
+    outcomes_14: pd.DataFrame,
+    evidence: pd.DataFrame,
+    *,
+    pump_serial: str,
+    profile_id: float,
+) -> pd.DataFrame:
+    """One row per pump segment (never merged): its settings now, how glucose did over its hours, and what the
+    breakfasts in it say about the I:C. Outcomes lead; the I:C evidence supports them.
+
+    ``outcomes_90`` and ``outcomes_14`` are ``day_part_table`` results for the same parts.
+    """
+    primary = evidence[evidence["analysis"].eq(PRIMARY) & evidence["pump_serial"].eq(pump_serial) & evidence["profile_id"].eq(profile_id)] if evidence is not None and not evidence.empty else pd.DataFrame()
+    rows = []
+    for part in parts:
+        start = float(part.start_minutes)
+        now = settings.get(start, {})
+        o90 = outcomes_90[outcomes_90["day_part"].eq(part.name)].iloc[0]
+        o14 = outcomes_14[outcomes_14["day_part"].eq(part.name)].iloc[0]
+        periods = primary[primary["pump_segment_start_minutes"].eq(start)].sort_values("period_end") if not primary.empty else primary
+        at_now = periods[periods["programmed_icr"].map(round_step).eq(round_step(now.get("icr", np.nan)))] if not periods.empty else periods
+        enough = periods[periods["n_meals"].ge(MIN_LOGGED_MEALS_FOR_ICR)] if not periods.empty else periods
+        latest_enough = enough.iloc[-1] if not enough.empty else None
+        collected = int(at_now["n_meals"].iloc[-1]) if not at_now.empty else 0
+        if passes_low_limits(o90) is False:
+            reading = "lows over a limit: no added insulin in these hours"
+        elif o90["time_in_range_pct"] >= 70:
+            reading = "meeting the time-in-range target"
+        else:
+            reading = "below the 70% time-in-range target with lows within limits"
+        if o14["time_in_range_pct"] < o90["time_in_range_pct"] - 10:
+            reading += f"; the last 14 days are {o90['time_in_range_pct'] - o14['time_in_range_pct']:.0f} points lower"
+        rows.append({
+            "hours": part.name, "icr_now": now.get("icr", np.nan), "cf_now": now.get("cf", np.nan), "basal_now": now.get("basal", np.nan),
+            "tir_90d": o90["time_in_range_pct"], "below_70_90d": o90["time_below_70_pct"], "below_54_90d": o90["time_below_54_pct"], "above_180_90d": o90["time_above_180_pct"],
+            "tir_14d": o14["time_in_range_pct"], "below_70_14d": o14["time_below_70_pct"],
+            "reading": reading, "breakfasts_at_current_icr": collected,
+            "evidence_icr": float(latest_enough["effective_icr"]) if latest_enough is not None else np.nan,
+            "evidence_lower_90": float(latest_enough["effective_icr_lower_90"]) if latest_enough is not None else np.nan,
+            "evidence_upper_90": float(latest_enough["effective_icr_upper_90"]) if latest_enough is not None else np.nan,
+            "evidence_setting": float(latest_enough["programmed_icr"]) if latest_enough is not None else np.nan,
+            "evidence_breakfasts": int(latest_enough["n_meals"]) if latest_enough is not None else 0,
+            "had_breakfasts": bool(not periods.empty),
+        })
+    return pd.DataFrame(rows)
+
+
+def segment_markdown(table: pd.DataFrame) -> str:
+    lines = [
+        "## Glucose by pump segment (last 90 days; last 14 days in brackets)",
+        "",
+        "Each pump segment keeps its own I:C, correction factor and basal, so segments are not combined. Hours are the segment's own.",
+        "",
+        "| hours | I:C (g/U) | CF (mg/dL/U) | basal (U/h) | in range 70-180 | below 70 | below 54 | above 180 | reading | breakfasts at this I:C | what breakfasts at an earlier I:C say |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- |",
+    ]
+    for row in table.itertuples(index=False):
+        evidence = (
+            f"{row.evidence_breakfasts} breakfasts at {row.evidence_setting:.1f} behaved like {row.evidence_icr:.1f} ({row.evidence_lower_90:.1f}-{row.evidence_upper_90:.1f})"
+            if np.isfinite(row.evidence_icr) else ("no breakfasts in this segment" if row.breakfasts_at_current_icr == 0 and row.evidence_breakfasts == 0 and not row.had_breakfasts else "fewer than 5 breakfasts at any setting")
+        )
+        lines.append(
+            f"| {row.hours} | {row.icr_now:.1f} | {row.cf_now:.0f} | {row.basal_now:.2f} | {row.tir_90d:.1f}% ({row.tir_14d:.1f}%) | {row.below_70_90d:.2f}% ({row.below_70_14d:.2f}%) | "
+            f"{row.below_54_90d:.2f}% | {row.above_180_90d:.1f}% | {row.reading} | {row.breakfasts_at_current_icr} of {MIN_LOGGED_MEALS_FOR_ICR} | {evidence} |"
+        )
+    return "\n".join(lines) + "\n"

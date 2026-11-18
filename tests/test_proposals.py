@@ -96,3 +96,25 @@ def test_a_change_already_entered_is_reported_not_proposed_again():
     assert result.current_value == 6.5
     same = propose_breakfast_icr(evidence, _cgm(), ENDS, as_of=AS_OF, current_icr={SEGMENT: 7.0})
     assert same.status == "proposed"
+
+
+def test_segment_summary_keeps_segments_separate_and_leads_with_glucose():
+    from bayesian_t1dm.outcomes import day_part_table, day_parts_from_starts
+    from bayesian_t1dm.proposals import segment_markdown, segment_summary
+
+    parts = day_parts_from_starts([0, 300, 540])
+    cgm = _cgm(days=30)
+    o90 = day_part_table(cgm, parts, as_of=AS_OF, days=30)
+    o14 = day_part_table(cgm, parts, as_of=AS_OF, days=14)
+    evidence = pd.DataFrame([_row(programmed=7.0, estimate=6.5, lower=6.0, upper=7.0, n=30)])
+    table = segment_summary(
+        parts, {0.0: {"icr": 7.0, "cf": 60.0, "basal": 0.7}, 300.0: {"icr": 6.5, "cf": 65.0, "basal": 0.71}, 540.0: {"icr": 6.5, "cf": 65.0, "basal": 0.71}},
+        o90, o14, evidence, pump_serial="1", profile_id=0.0,
+    )
+    assert list(table["hours"]) == ["00:00-05:00", "05:00-09:00", "09:00-00:00"]
+    five_to_nine = table[table["hours"].eq("05:00-09:00")].iloc[0]
+    assert five_to_nine["evidence_breakfasts"] == 30 and five_to_nine["breakfasts_at_current_icr"] == 0
+    other = table[table["hours"].eq("09:00-00:00")].iloc[0]
+    assert other["evidence_breakfasts"] == 0 and not other["had_breakfasts"]
+    page = segment_markdown(table)
+    assert "05:00-09:00" in page and "30 breakfasts at 7.0 behaved like 6.5" in page and "no breakfasts in this segment" in page

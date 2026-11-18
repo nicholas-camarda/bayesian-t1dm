@@ -65,7 +65,10 @@ def current_segment_settings(merged: MergedDataset, raw_root: str | Path) -> dic
     for minute in range(0, 24 * 60, 15):
         segment = history.segment_in_force(pump, profile_id, end_of_history, minute_of_day=minute)
         if segment is not None:
-            settings[float(segment["start_minutes"])] = {"icr": segment["carb_ratio_g_per_unit"], "cf": segment["isf_mgdl_per_unit"]}
+            settings[float(segment["start_minutes"])] = {
+                "icr": segment["carb_ratio_g_per_unit"], "cf": segment["isf_mgdl_per_unit"],
+                "basal": segment.get("basal_units_per_hour", float("nan")), "target": segment["target_bg_mgdl"],
+            }
     return settings
 
 

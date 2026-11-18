@@ -269,6 +269,7 @@ class ProfileHistory:
                     "carb_ratio_g_per_unit": float(row.carb_ratio_g_per_unit),
                     "isf_mgdl_per_unit": float(row.isf_mgdl_per_unit),
                     "target_bg_mgdl": float(row.target_bg_mgdl),
+                    "basal_units_per_hour": float(row.basal_units_per_hour),
                 }
                 complete = int(row.status) == SEGMENT_COMPLETE_STATUS
                 if int(row.modification) == SEGMENT_DELETE:
