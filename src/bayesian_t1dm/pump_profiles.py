@@ -330,6 +330,44 @@ class ProfileHistory:
             return None
         return table[covering]
 
+    def basal_rates(self, pumps: pd.Series, timestamps: pd.Series) -> np.ndarray:
+        """Vectorized exact-time replay, retaining unknown slots in incomplete profiles."""
+        stamps = pd.DatetimeIndex(timestamps)
+        times = stamps.to_numpy(dtype="datetime64[ns]")
+        minutes = np.asarray(stamps.hour * 60 + stamps.minute)
+        serials = pumps.map(pump_key).to_numpy()
+        rates = np.full(len(times), np.nan)
+        for pump, (activations, profiles) in self._active.items():
+            if pump not in self.visible:
+                continue
+            first, last = self.visible[pump]
+            selected = np.flatnonzero((serials == pump) & (times >= np.datetime64(first)) &
+                                      (times < np.datetime64(last + dt.timedelta(days=1))))
+            activation = np.searchsorted(np.asarray(activations, dtype="datetime64[ns]"), times[selected], side="right") - 1
+            selected = selected[activation >= 0]
+            active = np.asarray(profiles)[activation[activation >= 0]]
+            for profile in np.unique(active):
+                key = (pump, profile)
+                if key not in self._tables:
+                    continue
+                edits, snapshots = self._tables[key]
+                idx = selected[active == profile]
+                version = np.searchsorted(np.asarray(edits, dtype="datetime64[ns]"), times[idx], side="right") - 1
+                for k in np.unique(version[version >= 0]):
+                    positions = idx[version == k]
+                    table = snapshots[k]
+                    starts = sorted((seg["start_minutes"], i) for i, seg in enumerate(table) if seg is not None)
+                    if not starts:
+                        continue
+                    bounds, slots = zip(*starts)
+                    values = [table[i]["basal_units_per_hour"] if
+                              (i + 1 < len(table) and table[i + 1] is not None or
+                               i + 1 == len(table) and self._complete[key][k]) else np.nan for i in slots]
+                    covering = np.searchsorted(bounds, minutes[positions], side="right") - 1
+                    valid = covering >= 0
+                    rates[positions[valid]] = np.asarray(values)[covering[valid]]
+        return rates
+
     def settings_for(self, carbs: pd.DataFrame) -> pd.DataFrame:
         """``PROFILE_SETTING_COLUMNS`` for each carb entry (by ``pump_serial`` and ``timestamp``)."""
         out = pd.DataFrame(index=carbs.index, columns=list(PROFILE_SETTING_COLUMNS), dtype=float)
