@@ -178,6 +178,8 @@ def _aggregate_basal(data: IngestedData, grid: pd.DataFrame, *, freq: str) -> pd
         return out
 
     bin_start = out["timestamp"].to_numpy(dtype="datetime64[ns]")
+    if np.any(np.diff(bin_start) <= np.timedelta64(0, "ns")):
+        raise ValueError("The 5-minute grid must be sorted with unique timestamps to place basal intervals.")
     bin_end = bin_start + np.timedelta64(step_minutes, "m")
     overlap_minutes = np.zeros(len(out), dtype=float)
     delivered_units = np.zeros(len(out), dtype=float)
@@ -195,17 +197,20 @@ def _aggregate_basal(data: IngestedData, grid: pd.DataFrame, *, freq: str) -> pd
             continue
         start64 = np.datetime64(start.to_datetime64())
         end64 = np.datetime64(end.to_datetime64())
-        overlap_start = np.maximum(bin_start, start64)
-        overlap_end = np.minimum(bin_end, end64)
-        overlap = (overlap_end - overlap_start) / np.timedelta64(1, "m")
-        mask = overlap > 0
-        if not np.any(mask):
+        # Only bins that end after the interval starts and start before it ends can overlap it.
+        first = int(np.searchsorted(bin_end, start64, side="right"))
+        last = int(np.searchsorted(bin_start, end64, side="left"))
+        overlap = (np.minimum(bin_end[first:last], end64) - np.maximum(bin_start[first:last], start64)) / np.timedelta64(1, "m")
+        positive = overlap > 0
+        if not np.any(positive):
             previous_rate = rate
             continue
-        overlap_minutes[mask] += overlap[mask]
-        delivered_units[mask] += rate * overlap[mask] / 60.0
-        rate_weighted_minutes[mask] += rate * overlap[mask]
-        overlap_count[mask] += 1
+        bins = first + np.flatnonzero(positive)
+        overlap = overlap[positive]
+        overlap_minutes[bins] += overlap
+        delivered_units[bins] += rate * overlap / 60.0
+        rate_weighted_minutes[bins] += rate * overlap
+        overlap_count[bins] += 1
         if previous_rate is not None and not np.isclose(rate, previous_rate):
             change_idx = np.searchsorted(bin_start, start64, side="right") - 1
             if 0 <= change_idx < len(schedule_change):

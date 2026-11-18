@@ -128,17 +128,25 @@ def test_load_tandem_exports_raw_subtree_recovers_dense_cgm(tmp_path):
 
 
 def test_parse_datetime_mixed_tz_and_naive_normalizes_to_local(monkeypatch):
-    from bayesian_t1dm.ingest import _parse_datetime
+    from bayesian_t1dm.ingest import to_local_wall_clock
 
     monkeypatch.setenv("TIMEZONE_NAME", "America/New_York")
     series = pd.Series(["2024-05-01T00:00:00-04:00", "2024-05-01 00:05:00"])
-    with pytest.warns(UserWarning, match="Mixed timezone-aware"):
-        parsed = _parse_datetime(series)
+    parsed = to_local_wall_clock(series)
 
     assert str(parsed.dtype) == "datetime64[ns]"
     assert parsed.iloc[0].hour == 0
     assert parsed.iloc[1].hour == 0
     assert (parsed.iloc[1] - parsed.iloc[0]) == pd.Timedelta(minutes=5)
+
+
+def test_parse_datetime_rejects_unreadable_timestamps():
+    from bayesian_t1dm.ingest import to_local_wall_clock
+
+    parsed = to_local_wall_clock(pd.Series(["2024-05-01 00:05:00", None, ""]))
+    assert parsed.isna().tolist() == [False, True, True]
+    with pytest.raises(ValueError, match="not ISO 8601"):
+        to_local_wall_clock(pd.Series(["2024-05-01 00:05:00", "yesterday at noon"], name="timestamp"))
 
 
 def test_load_tandem_exports_discovers_parquet(tmp_path):

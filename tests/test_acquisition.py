@@ -710,6 +710,20 @@ def test_cgm_uses_sensor_time_and_ignores_alerts(tmp_path):
     assert slots == ["08:00", "08:05", "08:10", "08:20"]  # one reading per slot; none piled into 08:20
 
 
+def test_cgm_sensor_time_keeps_its_wall_clock_across_a_dst_change(monkeypatch):
+    """A reading measured at 01:58 EST and received at 03:01 EDT (clocks jumped forward) is stored at 01:58."""
+    from tconnectsync.eventparser.generic import Events
+
+    from bayesian_t1dm.acquisition import _tconnectsync_event_payloads
+
+    monkeypatch.setenv("TIMEZONE_NAME", "America/New_York")
+    events = [_cgm_event("2026-03-08T03:01:00", 1, "uuid", 150, measured="2026-03-08T01:58:00")]
+    cgm = _tconnectsync_event_payloads(list(Events(events)))["cgm"]
+    window = ExportWindow(date(2026, 3, 8), date(2026, 3, 8))
+    ingested, _ = normalize_tconnectsync_payloads({"cgm": cgm}, window=window, endpoint_family="tconnectsync")
+    assert pd.to_datetime(ingested.cgm["timestamp"]).dt.strftime("%H:%M").tolist() == ["01:55"]
+
+
 def test_pump_times_are_stored_in_local_time_not_utc(monkeypatch):
     """An 08:00 Eastern bolus must be stored as 08:00, the same clock Apple Health uses."""
     monkeypatch.setenv("TIMEZONE_NAME", "America/New_York")

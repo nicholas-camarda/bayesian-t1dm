@@ -17,6 +17,7 @@ from .acquisition import (
     load_tandem_credentials,
     login_tandem_source,
     normalize_tconnectsync_archive,
+    normalize_tconnectsync_window,
     normalize_tconnectsync_payloads,
 )
 from .evaluate import CalibrationSummary, FoldResult, WalkForwardReport, WalkForwardSplit, calibration_summary, run_walk_forward, walk_forward_splits
@@ -147,6 +148,7 @@ __all__ = [
     "LatentMealTherapySettings",
     "login_tandem_source",
     "normalize_tconnectsync_archive",
+    "normalize_tconnectsync_window",
     "normalize_tconnectsync_payloads",
     "parse_model_list",
     "parse_therapy_segments",

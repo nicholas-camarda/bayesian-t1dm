@@ -859,7 +859,7 @@ def test_settings_come_from_the_newest_window_including_tconnectsync_3_pumper_js
     ]
     pumper = {
         "requested_end": "2026-11-17",
-        "selected_pump_serials": ["1453346"],
+        "selected_pump_serials": ["1453346", "90723647"],
         "pumper": {
             "pumps": [
                 {
@@ -873,6 +873,14 @@ def test_settings_come_from_the_newest_window_including_tconnectsync_3_pumper_js
                             },
                             "globalMaxBolusSettings": {"maxBolus": 25000},
                         },
+                    },
+                },
+                # A second pump used in the same window, listed later but uploaded earlier: the newest upload wins.
+                {
+                    "serialNumber": "90723647",
+                    "settings": {
+                        "uploadedTimeStamp": "2025-08-27T16:04:01.73",
+                        "details": {"profiles": {"activeIdp": 0, "profile": [{"idp": 0, "timeDependentSegments": [{"startTime": 0, "carbRatio": 9000, "isf": 80, "targetBg": 110}]}]}},
                     },
                 },
                 # A pump not selected for this window is ignored even if it has settings.

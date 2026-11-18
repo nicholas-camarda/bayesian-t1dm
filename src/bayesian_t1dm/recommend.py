@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import inspect
 from typing import Iterable
 
 import numpy as np
@@ -208,16 +207,6 @@ def _recommendation_confidence(
     return "low"
 
 
-def _scenario_forecasts_with_target(model, fit, forecast_inputs, target_bg: float) -> list[ScenarioForecast]:
-    try:
-        accepts_target = "target_bg" in inspect.signature(model.scenario_forecasts).parameters
-    except (TypeError, ValueError):
-        accepts_target = False
-    if accepts_target:
-        return model.scenario_forecasts(fit, forecast_inputs, target_bg=target_bg)
-    return model.scenario_forecasts(fit, forecast_inputs)
-
-
 def _probability_scenario_better(
     baseline: ScenarioForecast,
     candidate: ScenarioForecast,
@@ -267,7 +256,7 @@ def recommend_setting_changes(
     baseline_scenario = Scenario("current")
     forecast_inputs = [(baseline_scenario.name, _apply_scenario(feature_frame, baseline_scenario))]
     forecast_inputs.extend((scenario.name, _apply_scenario(feature_frame, scenario)) for scenario in scenarios)
-    forecasts = _scenario_forecasts_with_target(model, fit, forecast_inputs, target_bg)
+    forecasts = model.scenario_forecasts(fit, forecast_inputs, target_bg=target_bg)
     recommendations: list[Recommendation] = []
     baseline_forecast = forecasts[0] if forecasts else None
     for scenario, forecast in zip(scenarios, forecasts[1:]):

@@ -106,66 +106,42 @@ def discover_source_files(raw_dir: str | Path) -> list[Path]:
     return sorted(discovered)
 
 
-def _parse_datetime(series: pd.Series) -> pd.Series:
-    import re
-    import warnings
+_TZ_OFFSET = re.compile(r"(?:Z|[+-]\d{2}:?\d{2})$", re.IGNORECASE)
+
+
+def to_local_wall_clock(series: pd.Series, *, timezone: str | None = None) -> pd.Series:
+    """Parse timestamps to naive wall-clock time in ``timezone`` (default ``TIMEZONE_NAME``).
+
+    Values that carry a UTC offset are converted to that timezone; values without one are already local time.
+    A value that is present but is not an ISO 8601 timestamp raises ``ValueError``.
+    """
     from zoneinfo import ZoneInfo
 
-    raw_values = series.tolist()
-    tz_offset_re = re.compile(r"(Z|[+-]\d{2}:?\d{2})$", re.IGNORECASE)
-    has_tz_hint = False
-    has_naive_hint = False
-    parsed_values: list[pd.Timestamp | pd.NaT] = []
-    for value in raw_values:
-        if value is None or (isinstance(value, float) and np.isnan(value)) or pd.isna(value):
-            parsed_values.append(pd.NaT)
-            continue
-        try:
-            ts = pd.to_datetime(value, errors="coerce", utc=False)
-        except Exception:
-            ts = pd.NaT
-        if pd.isna(ts):
-            parsed_values.append(pd.NaT)
-            continue
-        stamp = pd.Timestamp(ts)
-        if isinstance(value, str):
-            if tz_offset_re.search(value.strip()):
-                has_tz_hint = True
-            else:
-                has_naive_hint = True
-        elif stamp.tzinfo is None:
-            has_naive_hint = True
-        else:
-            has_tz_hint = True
-        parsed_values.append(stamp)
+    target_tz = ZoneInfo(timezone or analysis_timezone())
+    if isinstance(series.dtype, pd.DatetimeTZDtype):
+        return series.dt.tz_convert(target_tz).dt.tz_localize(None).astype("datetime64[ns]")
+    if pd.api.types.is_datetime64_dtype(series):
+        return series.astype("datetime64[ns]")
 
-    timezone_name = analysis_timezone()
-    target_tz = ZoneInfo(timezone_name)
+    text = series.astype("string").str.strip()
+    text = text.mask(text.eq(""))
+    present = text.notna()
+    has_offset = present & text.str.contains(_TZ_OFFSET).fillna(False).astype(bool)
+    local = present & ~has_offset
+    out = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    if local.any():
+        out[local] = pd.to_datetime(text[local], format="ISO8601", errors="coerce")
+    if has_offset.any():
+        converted = pd.to_datetime(text[has_offset], format="ISO8601", utc=True, errors="coerce")
+        out[has_offset] = converted.dt.tz_convert(target_tz).dt.tz_localize(None)
+    unparsed = present & out.isna()
+    if unparsed.any():
+        raise ValueError(
+            f"{int(unparsed.sum())} value(s) in column {series.name!r} are not ISO 8601 timestamps, "
+            f"for example {text[unparsed].iloc[0]!r}."
+        )
+    return out
 
-    if has_tz_hint:
-        if has_naive_hint:
-            warnings.warn(
-                "Mixed timezone-aware and timezone-naive timestamps detected. "
-                f"Assuming naive timestamps are in TIMEZONE_NAME='{timezone_name}' and converting all timestamps "
-                "to that timezone before dropping timezone info.",
-                UserWarning,
-                stacklevel=2,
-            )
-        normalized: list[pd.Timestamp] = []
-        for stamp in parsed_values:
-            if stamp is pd.NaT or pd.isna(stamp):
-                normalized.append(pd.NaT)
-                continue
-            if stamp.tzinfo is None:
-                stamp = stamp.tz_localize(target_tz)
-            else:
-                stamp = stamp.tz_convert(target_tz)
-            normalized.append(stamp.tz_localize(None))
-        return pd.Series(normalized, index=series.index, dtype="datetime64[ns]")
-
-    parsed = pd.Series(parsed_values, index=series.index)
-    naive = pd.to_datetime(parsed, errors="coerce")
-    return pd.Series(naive.to_numpy(dtype="datetime64[ns]"), index=series.index)
 
 def _match_column(columns: Iterable[str], candidate: str) -> str | None:
     normalized = {str(col).strip().lower(): col for col in columns}
@@ -482,7 +458,7 @@ def _standardize_cgm(df: pd.DataFrame, source: Path, sheet: str | None = None, *
         rename_map[column] = canonical
     out = df.loc[:, selected_cols].copy()
     out = out.rename(columns=rename_map)
-    out["timestamp"] = _parse_datetime(out["timestamp"])
+    out["timestamp"] = to_local_wall_clock(out["timestamp"])
     for _, column in glucose_cols:
         out[column] = pd.to_numeric(out[column], errors="coerce")
     out["glucose"] = out[[column for _, column in glucose_cols]].bfill(axis=1).iloc[:, 0]
@@ -628,7 +604,7 @@ def _standardize_bolus(df: pd.DataFrame, source: Path, sheet: str | None = None)
     if carb_col is not None:
         rename_map[carb_col] = "carb_grams"
     out = out.rename(columns=rename_map)
-    out["timestamp"] = _parse_datetime(out["timestamp"])
+    out["timestamp"] = to_local_wall_clock(out["timestamp"])
     out["bolus_units"] = pd.to_numeric(out["bolus_units"], errors="coerce")
     if "carb_grams" in out.columns:
         out["carb_grams"] = pd.to_numeric(out["carb_grams"], errors="coerce")
@@ -665,7 +641,7 @@ def _standardize_carbs(df: pd.DataFrame, source: Path, sheet: str | None = None,
         return pd.DataFrame()
     out = df.loc[:, [ts_col, carb_col]].copy()
     out = out.rename(columns={ts_col: "timestamp", carb_col: "carb_grams"})
-    out["timestamp"] = _parse_datetime(out["timestamp"])
+    out["timestamp"] = to_local_wall_clock(out["timestamp"])
     out["carb_grams"] = pd.to_numeric(out["carb_grams"], errors="coerce")
     out = out.dropna(subset=["timestamp", "carb_grams"])
     out["timestamp"] = out["timestamp"].dt.floor("5min")
@@ -708,9 +684,9 @@ def _standardize_basal(df: pd.DataFrame, source: Path, sheet: str | None = None)
         rename_map[end_col] = "end_timestamp"
     out = out.rename(columns=rename_map)
     if "start_timestamp" in out.columns:
-        out["start_timestamp"] = _parse_datetime(out["start_timestamp"])
+        out["start_timestamp"] = to_local_wall_clock(out["start_timestamp"])
     if "end_timestamp" in out.columns:
-        out["end_timestamp"] = _parse_datetime(out["end_timestamp"])
+        out["end_timestamp"] = to_local_wall_clock(out["end_timestamp"])
     out["basal_units_per_hour"] = pd.to_numeric(out["basal_units_per_hour"], errors="coerce")
     out = out.dropna(subset=["basal_units_per_hour"])
     out["source_file"] = source.name
@@ -726,7 +702,7 @@ def _standardize_activity(df: pd.DataFrame, source: Path, sheet: str | None = No
         return pd.DataFrame()
     out = df.loc[:, [ts_col, value_col]].copy()
     out.columns = ["timestamp", "activity_value"]
-    out["timestamp"] = _parse_datetime(out["timestamp"])
+    out["timestamp"] = to_local_wall_clock(out["timestamp"])
     out["activity_value"] = pd.to_numeric(out["activity_value"], errors="coerce")
     out = out.dropna(subset=["timestamp", "activity_value"])
     out["timestamp"] = out["timestamp"].dt.floor("5min")
@@ -769,14 +745,14 @@ def _load_canonical_normalized_table(path: Path) -> tuple[str, pd.DataFrame] | N
 
     if stem == "cgm" and {"timestamp", "glucose"} <= set(frame.columns):
         out = frame.copy()
-        out["timestamp"] = _parse_datetime(out["timestamp"])
+        out["timestamp"] = to_local_wall_clock(out["timestamp"])
         out["glucose"] = pd.to_numeric(out["glucose"], errors="coerce")
         out = out.dropna(subset=["timestamp", "glucose"]).reset_index(drop=True)
         return "cgm", out
 
     if stem == "bolus" and {"timestamp", "bolus_units"} <= set(frame.columns):
         out = frame.copy()
-        out["timestamp"] = _parse_datetime(out["timestamp"])
+        out["timestamp"] = to_local_wall_clock(out["timestamp"])
         out["bolus_units"] = pd.to_numeric(out["bolus_units"], errors="coerce")
         if "raw_bolus_units" in out.columns:
             out["raw_bolus_units"] = pd.to_numeric(out["raw_bolus_units"], errors="coerce")
@@ -787,22 +763,22 @@ def _load_canonical_normalized_table(path: Path) -> tuple[str, pd.DataFrame] | N
 
     if stem == "basal" and {"start_timestamp", "end_timestamp", "basal_units_per_hour"} <= set(frame.columns):
         out = frame.copy()
-        out["start_timestamp"] = _parse_datetime(out["start_timestamp"])
-        out["end_timestamp"] = _parse_datetime(out["end_timestamp"])
+        out["start_timestamp"] = to_local_wall_clock(out["start_timestamp"])
+        out["end_timestamp"] = to_local_wall_clock(out["end_timestamp"])
         out["basal_units_per_hour"] = pd.to_numeric(out["basal_units_per_hour"], errors="coerce")
         out = out.dropna(subset=["start_timestamp", "end_timestamp", "basal_units_per_hour"]).reset_index(drop=True)
         return "basal", out
 
     if stem == "activity" and {"timestamp", "activity_value"} <= set(frame.columns):
         out = frame.copy()
-        out["timestamp"] = _parse_datetime(out["timestamp"])
+        out["timestamp"] = to_local_wall_clock(out["timestamp"])
         out["activity_value"] = pd.to_numeric(out["activity_value"], errors="coerce")
         out = out.dropna(subset=["timestamp", "activity_value"]).reset_index(drop=True)
         return "activity", out
 
     if stem == "carbs" and {"timestamp", "carb_grams"} <= set(frame.columns):
         out = frame.copy()
-        out["timestamp"] = _parse_datetime(out["timestamp"])
+        out["timestamp"] = to_local_wall_clock(out["timestamp"])
         out["carb_grams"] = pd.to_numeric(out["carb_grams"], errors="coerce")
         out = out.dropna(subset=["timestamp", "carb_grams"]).reset_index(drop=True)
         return "carbs", out

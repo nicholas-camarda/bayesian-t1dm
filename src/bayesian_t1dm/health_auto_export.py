@@ -92,11 +92,22 @@ class HealthFeatureScreeningResult:
     message: str = ""
 
 
-def _parse_timestamp(value: Any) -> pd.Timestamp:
-    parsed = pd.to_datetime(value, errors="coerce")
-    if isinstance(parsed, pd.Timestamp) and parsed.tzinfo is not None:
-        parsed = parsed.tz_localize(None)
-    return parsed
+_UTC_OFFSET_SUFFIX = re.compile(r"\s*(?:Z|[+-]\d{2}:?\d{2})$")
+
+
+def _wall_clock(values: pd.Series) -> pd.Series:
+    """Parse Health Auto Export timestamps such as ``2026-05-01 08:00:00 -0400`` to naive wall-clock time.
+
+    The UTC offset is dropped, keeping the time the phone showed. Missing values become NaT; a value that is
+    present but is not an ISO 8601 timestamp raises ``ValueError``.
+    """
+    text = values.astype("string").str.strip()
+    text = text.mask(text.eq(""))
+    parsed = pd.to_datetime(text.str.replace(_UTC_OFFSET_SUFFIX, "", regex=True), format="ISO8601", errors="coerce")
+    unparsed = text.notna() & parsed.isna()
+    if unparsed.any():
+        raise ValueError(f"{int(unparsed.sum())} Health Auto Export timestamp(s) could not be read, for example {text[unparsed].iloc[0]!r}.")
+    return parsed.astype("datetime64[ns]")
 
 
 def _parse_series(series: pd.Series, *, floor: str | None = None) -> pd.Series:
@@ -108,11 +119,25 @@ def _parse_series(series: pd.Series, *, floor: str | None = None) -> pd.Series:
     return parsed
 
 
-def _safe_float(value: Any) -> float | None:
-    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
-    if pd.isna(numeric):
-        return None
-    return float(numeric)
+def _rows_frame(rows: Iterable[Any], columns: list[str]) -> pd.DataFrame:
+    """The export's list of row objects as a frame with (at least) ``columns``."""
+    return pd.DataFrame([row for row in rows if isinstance(row, dict)]).reindex(columns=columns)
+
+
+def _numeric(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce").astype(float)
+
+
+def _source_device(series: pd.Series) -> pd.Series:
+    return series.where(series.notna() & series.astype(bool), "").astype(str)
+
+
+def _nested_qty(series: pd.Series) -> pd.Series:
+    return _numeric(series.map(lambda value: value.get("qty") if isinstance(value, dict) else None))
+
+
+def _nested_units(series: pd.Series) -> pd.Series:
+    return series.map(lambda value: value.get("units") if isinstance(value, dict) else None)
 
 
 def _infer_covered_range(source_json_filename: str) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
@@ -127,99 +152,77 @@ def _infer_covered_range(source_json_filename: str) -> tuple[pd.Timestamp | None
 
 
 def _normalize_point_metric(metric_name: str, units: str | None, rows: Iterable[dict[str, Any]], *, source_file: str) -> pd.DataFrame:
-    records: list[dict[str, Any]] = []
-    for row in rows:
-        timestamp = _parse_timestamp(row.get("date"))
-        value = _safe_float(row.get("qty"))
-        if pd.isna(timestamp) or value is None:
-            continue
-        records.append(
-            {
-                "timestamp": timestamp,
-                "metric": metric_name,
-                "stat": "value",
-                "value": value,
-                "unit": units,
-                "source_file": source_file,
-                "source_device": str(row.get("source") or ""),
-            }
-        )
-    return pd.DataFrame(records)
+    frame = _rows_frame(rows, ["date", "qty", "source"])
+    out = pd.DataFrame(
+        {
+            "timestamp": _wall_clock(frame["date"]),
+            "metric": metric_name,
+            "stat": "value",
+            "value": _numeric(frame["qty"]),
+            "unit": units,
+            "source_file": source_file,
+            "source_device": _source_device(frame["source"]),
+        }
+    )
+    return out.dropna(subset=["timestamp", "value"]).reset_index(drop=True)
 
 
 def _normalize_glucose_metric(rows: Iterable[dict[str, Any]], *, source_file: str) -> pd.DataFrame:
-    records: list[dict[str, Any]] = []
-    for row in rows:
-        timestamp = _parse_timestamp(row.get("date"))
-        glucose = _safe_float(row.get("qty"))
-        if pd.isna(timestamp) or glucose is None:
-            continue
-        timestamp = timestamp.floor("5min")
-        records.append(
-            {
-                "timestamp": timestamp,
-                "glucose": glucose,
-                "source_file": source_file,
-                "source_label": "apple_health",
-                "glucose_source": "apple_health_blood_glucose",
-                "source_device": str(row.get("source") or ""),
-            }
-        )
-    return pd.DataFrame(records)
+    frame = _rows_frame(rows, ["date", "qty", "source"])
+    out = pd.DataFrame(
+        {
+            "timestamp": _wall_clock(frame["date"]).dt.floor("5min"),
+            "glucose": _numeric(frame["qty"]),
+            "source_file": source_file,
+            "source_label": "apple_health",
+            "glucose_source": "apple_health_blood_glucose",
+            "source_device": _source_device(frame["source"]),
+        }
+    )
+    return out.dropna(subset=["timestamp", "glucose"]).reset_index(drop=True)
 
 
 def _normalize_heart_rate_metric(rows: Iterable[dict[str, Any]], *, units: str | None, source_file: str) -> pd.DataFrame:
-    records: list[dict[str, Any]] = []
-    for row in rows:
-        timestamp = _parse_timestamp(row.get("date"))
-        if pd.isna(timestamp):
-            continue
-        for input_key, stat in [("Avg", "avg"), ("Min", "min"), ("Max", "max")]:
-            value = _safe_float(row.get(input_key))
-            if value is None:
-                continue
-            records.append(
-                {
-                    "timestamp": timestamp,
-                    "metric": "heart_rate",
-                    "stat": stat,
-                    "value": value,
-                    "unit": units,
-                    "source_file": source_file,
-                    "source_device": str(row.get("source") or ""),
-                }
-            )
-    return pd.DataFrame(records)
+    frame = _rows_frame(rows, ["date", "Avg", "Min", "Max", "source"])
+    timestamp = _wall_clock(frame["date"])
+    device = _source_device(frame["source"])
+    parts = [
+        pd.DataFrame(
+            {
+                "_row": range(len(frame)),
+                "_order": order,
+                "timestamp": timestamp,
+                "metric": "heart_rate",
+                "stat": stat,
+                "value": _numeric(frame[input_key]),
+                "unit": units,
+                "source_file": source_file,
+                "source_device": device,
+            }
+        )
+        for order, (input_key, stat) in enumerate([("Avg", "avg"), ("Min", "min"), ("Max", "max")])
+    ]
+    out = pd.concat(parts, ignore_index=True).sort_values(["_row", "_order"], kind="stable")
+    out = out.dropna(subset=["timestamp", "value"]).drop(columns=["_row", "_order"])
+    return out.reset_index(drop=True)
 
 
 def _normalize_sleep_metric(rows: Iterable[dict[str, Any]], *, source_file: str) -> pd.DataFrame:
-    records: list[dict[str, Any]] = []
-    for row in rows:
-        date = _parse_timestamp(row.get("date"))
-        sleep_start = _parse_timestamp(row.get("sleepStart"))
-        sleep_end = _parse_timestamp(row.get("sleepEnd"))
-        in_bed_start = _parse_timestamp(row.get("inBedStart"))
-        in_bed_end = _parse_timestamp(row.get("inBedEnd"))
-        if pd.isna(date):
-            continue
-        records.append(
-            {
-                "date": date.normalize(),
-                "sleep_start": sleep_start,
-                "sleep_end": sleep_end,
-                "in_bed_start": in_bed_start,
-                "in_bed_end": in_bed_end,
-                "total_sleep_hours": _safe_float(row.get("totalSleep")),
-                "in_bed_hours": _safe_float(row.get("inBed")),
-                "core_hours": _safe_float(row.get("core")),
-                "deep_hours": _safe_float(row.get("deep")),
-                "rem_hours": _safe_float(row.get("rem")),
-                "awake_hours": _safe_float(row.get("awake")),
-                "source_file": source_file,
-                "source_device": str(row.get("source") or ""),
-            }
-        )
-    return pd.DataFrame(records)
+    hour_columns = {"total_sleep_hours": "totalSleep", "in_bed_hours": "inBed", "core_hours": "core", "deep_hours": "deep", "rem_hours": "rem", "awake_hours": "awake"}
+    frame = _rows_frame(rows, ["date", "sleepStart", "sleepEnd", "inBedStart", "inBedEnd", *hour_columns.values(), "source"])
+    out = pd.DataFrame(
+        {
+            "date": _wall_clock(frame["date"]).dt.normalize(),
+            "sleep_start": _wall_clock(frame["sleepStart"]),
+            "sleep_end": _wall_clock(frame["sleepEnd"]),
+            "in_bed_start": _wall_clock(frame["inBedStart"]),
+            "in_bed_end": _wall_clock(frame["inBedEnd"]),
+            **{name: _numeric(frame[key]) for name, key in hour_columns.items()},
+            "source_file": source_file,
+            "source_device": _source_device(frame["source"]),
+        }
+    )
+    return out.dropna(subset=["date"]).reset_index(drop=True)
 
 
 def _normalize_activity_from_measurements(measurements: pd.DataFrame, *, source_file: str) -> pd.DataFrame:
@@ -239,33 +242,24 @@ def _normalize_activity_from_measurements(measurements: pd.DataFrame, *, source_
 
 
 def _normalize_workouts(rows: Iterable[dict[str, Any]], *, source_file: str) -> pd.DataFrame:
-    records: list[dict[str, Any]] = []
-    for row in rows:
-        distance = row.get("distance") if isinstance(row.get("distance"), dict) else {}
-        energy = row.get("activeEnergyBurned") if isinstance(row.get("activeEnergyBurned"), dict) else {}
-        avg_hr = row.get("avgHeartRate") if isinstance(row.get("avgHeartRate"), dict) else {}
-        max_hr = row.get("maxHeartRate") if isinstance(row.get("maxHeartRate"), dict) else {}
-        start = _parse_timestamp(row.get("start"))
-        end = _parse_timestamp(row.get("end"))
-        if pd.isna(start) or pd.isna(end):
-            continue
-        records.append(
-            {
-                "workout_id": str(row.get("id") or ""),
-                "workout_type": str(row.get("name") or ""),
-                "start_timestamp": start,
-                "end_timestamp": end,
-                "duration_seconds": _safe_float(row.get("duration")),
-                "distance_value": _safe_float(distance.get("qty")),
-                "distance_unit": distance.get("units"),
-                "active_energy_value": _safe_float(energy.get("qty")),
-                "active_energy_unit": energy.get("units"),
-                "avg_heart_rate": _safe_float(avg_hr.get("qty")),
-                "max_heart_rate": _safe_float(max_hr.get("qty")),
-                "source_file": source_file,
-            }
-        )
-    return pd.DataFrame(records)
+    frame = _rows_frame(rows, ["id", "name", "start", "end", "duration", "distance", "activeEnergyBurned", "avgHeartRate", "maxHeartRate"])
+    out = pd.DataFrame(
+        {
+            "workout_id": _source_device(frame["id"]),
+            "workout_type": _source_device(frame["name"]),
+            "start_timestamp": _wall_clock(frame["start"]),
+            "end_timestamp": _wall_clock(frame["end"]),
+            "duration_seconds": _numeric(frame["duration"]),
+            "distance_value": _nested_qty(frame["distance"]),
+            "distance_unit": _nested_units(frame["distance"]),
+            "active_energy_value": _nested_qty(frame["activeEnergyBurned"]),
+            "active_energy_unit": _nested_units(frame["activeEnergyBurned"]),
+            "avg_heart_rate": _nested_qty(frame["avgHeartRate"]),
+            "max_heart_rate": _nested_qty(frame["maxHeartRate"]),
+            "source_file": source_file,
+        }
+    )
+    return out.dropna(subset=["start_timestamp", "end_timestamp"]).reset_index(drop=True)
 
 
 def _bundle_metadata_columns() -> list[str]:
@@ -355,7 +349,7 @@ def _normalize_health_payload(payload: dict[str, Any], *, source_file: str) -> t
     cgm_frames: list[pd.DataFrame] = []
     measurement_frames: list[pd.DataFrame] = []
     sleep_frames: list[pd.DataFrame] = []
-    nutrition_rows: list[dict[str, Any]] = []
+    nutrition_frames: list[pd.DataFrame] = []
     ignored_metrics: list[str] = []
     glucose_present = False
 
@@ -373,10 +367,16 @@ def _normalize_health_payload(payload: dict[str, Any], *, source_file: str) -> t
             cgm_frames.append(_normalize_glucose_metric(rows, source_file=source_file))
             continue
         if metric_name in NUTRITION_METRICS:
-            nutrition_rows.extend(
-                {"timestamp": _parse_timestamp(row.get("date")), "nutrient": NUTRITION_METRICS[metric_name], "grams": row.get("qty"), "source_device": str(row.get("source") or "")}
-                for row in rows
-                if isinstance(row, dict)
+            frame = _rows_frame(rows, ["date", "qty", "source"])
+            nutrition_frames.append(
+                pd.DataFrame(
+                    {
+                        "timestamp": _wall_clock(frame["date"]),
+                        "nutrient": NUTRITION_METRICS[metric_name],
+                        "grams": _numeric(frame["qty"]),
+                        "source_device": _source_device(frame["source"]),
+                    }
+                )
             )
             continue
         if metric_name in SUPPORTED_POINT_METRICS:
@@ -395,10 +395,8 @@ def _normalize_health_payload(payload: dict[str, Any], *, source_file: str) -> t
         cgm = cgm.dropna(subset=["timestamp", "glucose"]).reset_index(drop=True)
         tables["cgm"] = cgm
 
-    if nutrition_rows:
-        long = pd.DataFrame(nutrition_rows)
-        long["timestamp"] = pd.to_datetime(long["timestamp"], errors="coerce")
-        long["grams"] = pd.to_numeric(long["grams"], errors="coerce")
+    if nutrition_frames:
+        long = pd.concat(nutrition_frames, ignore_index=True)
         long = long.dropna(subset=["timestamp", "grams"])
         if not long.empty:
             wide = long.pivot_table(index="timestamp", columns="nutrient", values="grams", aggfunc="sum").reset_index()

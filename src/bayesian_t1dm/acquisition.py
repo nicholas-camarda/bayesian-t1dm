@@ -13,7 +13,7 @@ from typing import Any, Iterable, Mapping, Protocol, Sequence
 import pandas as pd
 
 from .io import read_table
-from .ingest import IngestedData, build_export_manifest, load_tandem_exports, summarize_export_manifest
+from .ingest import IngestedData, build_export_manifest, load_tandem_exports, summarize_export_manifest, to_local_wall_clock
 from .observability import sanitize_fields
 from .paths import ProjectPaths, analysis_timezone
 from .quality import REQUIRED_WINDOW_KINDS, build_window_quality_row
@@ -326,61 +326,20 @@ def _hash_json_value(value: Any) -> str:
     return hashlib.sha256(_stable_json_dumps(value).encode('utf-8')).hexdigest()
 
 
-def _ensure_datetime(value: Any, *, timezone: str | None = None) -> pd.Timestamp | pd.NaT:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return pd.NaT
-    timestamp = pd.to_datetime(value, errors='coerce')
-    if pd.isna(timestamp):
-        return pd.NaT
-    if timezone:
-        try:
-            if timestamp.tzinfo is None:
-                timestamp = timestamp.tz_localize(timezone)
-            else:
-                timestamp = timestamp.tz_convert(timezone)
-        except Exception:
-            pass
-    return pd.Timestamp(timestamp)
-
-
 def _storage_timezone_name(timezone: str | None = None) -> str:
     return timezone or analysis_timezone()
 
 
-def _canonicalize_timestamp_series_for_storage(
-    series: pd.Series,
-    *,
-    timezone: str | None,
-) -> pd.Series:
-    target_timezone = _storage_timezone_name(timezone)
-    normalized: list[pd.Timestamp] = []
-    for value in series.tolist():
-        if value is None or (isinstance(value, float) and pd.isna(value)) or pd.isna(value):
-            normalized.append(pd.NaT)
-            continue
-        timestamp = _ensure_datetime(value, timezone=target_timezone)
-        if pd.isna(timestamp):
-            normalized.append(pd.NaT)
-            continue
-        stamp = pd.Timestamp(timestamp)
-        if stamp.tzinfo is not None:
-            try:
-                stamp = stamp.tz_convert(target_timezone).tz_localize(None)
-            except Exception:
-                stamp = stamp.tz_localize(None)
-        normalized.append(stamp)
-    return pd.Series(normalized, index=series.index, dtype="datetime64[ns]")
+def _to_float(value: Any) -> float:
+    """One value as a float; NaN when it is missing or not a number."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
 
 
 def _window_bounds_for_storage(window: ExportWindow) -> tuple[pd.Timestamp, pd.Timestamp]:
     return pd.Timestamp(window.start_date), pd.Timestamp(window.end_date + timedelta(days=1))
-
-
-def _record_timestamp(value: Any, *, timezone: str | None) -> pd.Timestamp | pd.NaT:
-    timestamp = _ensure_datetime(value, timezone=timezone)
-    if pd.isna(timestamp):
-        return pd.NaT
-    return _canonicalize_timestamp_series_for_storage(pd.Series([timestamp]), timezone=timezone).iloc[0]
 
 
 def _count_records_outside_window(
@@ -392,30 +351,21 @@ def _count_records_outside_window(
     require_all_timestamps: bool = False,
 ) -> int:
     start, end = _window_bounds_for_storage(window)
-    rejected = 0
-    for record in records:
-        if require_all_timestamps:
-            keys = [key for key in timestamp_candidates if key in record]
-        else:
-            key = _first_existing_key(record, timestamp_candidates)
-            keys = [] if key is None else [key]
-        if not keys:
-            continue
-        timestamps = [_record_timestamp(record.get(key), timezone=timezone) for key in keys]
-        parsed = [timestamp for timestamp in timestamps if not pd.isna(timestamp)]
-        if not parsed:
-            continue
-        outside = False
-        for key, timestamp in zip(keys, timestamps):
-            if pd.isna(timestamp):
-                continue
-            upper_exceeded = timestamp > end if "end" in str(key).lower() or "stop" in str(key).lower() else timestamp >= end
-            if timestamp < start or upper_exceeded:
-                outside = True
-                break
-        if outside:
-            rejected += 1
-    return rejected
+    if not records:
+        return 0
+    # Each record is judged by its own keys: records from different event types need not share field names.
+    chosen = [_first_existing_key(record, timestamp_candidates) for record in records]
+    if require_all_timestamps:
+        keys = [key for key in timestamp_candidates if any(key in record for record in records)]
+    else:
+        keys = list(dict.fromkeys(key for key in chosen if key is not None))
+    outside = pd.Series(False, index=range(len(records)))
+    for key in keys:
+        values = [record.get(key) if require_all_timestamps or chosen_key == key else None for record, chosen_key in zip(records, chosen)]
+        stamps = to_local_wall_clock(pd.Series(values, dtype=object), timezone=_storage_timezone_name(timezone))
+        upper = stamps.gt(end) if ("end" in str(key).lower() or "stop" in str(key).lower()) else stamps.ge(end)
+        outside |= stamps.notna() & (stamps.lt(start) | upper)
+    return int(outside.sum())
 
 
 def _filter_timestamp_window(
@@ -442,7 +392,7 @@ def _canonicalize_frame_for_storage(frame: pd.DataFrame, *, timezone: str | None
     for column in out.columns:
         if "timestamp" not in str(column).lower():
             continue
-        out[column] = _canonicalize_timestamp_series_for_storage(out[column], timezone=timezone)
+        out[column] = to_local_wall_clock(out[column], timezone=_storage_timezone_name(timezone))
     return out
 
 
@@ -538,9 +488,9 @@ def _normalize_cgm_records(
         glucose_key = _first_existing_key(record, glucose_candidates)
         if ts_key is None or glucose_key is None:
             continue
-        timestamp = _ensure_datetime(record.get(ts_key), timezone=timezone)
-        glucose = pd.to_numeric(pd.Series([record.get(glucose_key)]), errors='coerce').iloc[0]
-        if pd.isna(timestamp) or pd.isna(glucose):
+        timestamp = record.get(ts_key)
+        glucose = _to_float(record.get(glucose_key))
+        if timestamp is None or pd.isna(glucose):
             continue
         rows.append(
             {
@@ -558,7 +508,8 @@ def _normalize_cgm_records(
     if not rows:
         return pd.DataFrame(columns=['timestamp', 'glucose', 'glucose_source', 'source_file', 'source_label'])
     frame = pd.DataFrame(rows)
-    frame['timestamp'] = _canonicalize_timestamp_series_for_storage(frame['timestamp'], timezone=timezone)
+    frame['timestamp'] = to_local_wall_clock(frame['timestamp'], timezone=_storage_timezone_name(timezone))
+    frame = frame.loc[frame['timestamp'].notna()].reset_index(drop=True)
     frame['timestamp'] = pd.to_datetime(frame['timestamp'], errors='coerce').dt.floor('5min')
     frame, _ = _filter_timestamp_window(frame, window=window, timestamp_columns=['timestamp'])
     frame = frame.sort_values(['timestamp', 'glucose_source']).reset_index(drop=True)
@@ -599,9 +550,9 @@ def _normalize_bolus_records(
         units_key = _first_existing_key(record, units_candidates)
         if ts_key is None or units_key is None:
             continue
-        timestamp = _ensure_datetime(record.get(ts_key), timezone=timezone)
-        units = pd.to_numeric(pd.Series([record.get(units_key)]), errors='coerce').iloc[0]
-        if pd.isna(timestamp) or pd.isna(units):
+        timestamp = record.get(ts_key)
+        units = _to_float(record.get(units_key))
+        if timestamp is None or pd.isna(units):
             continue
         row: dict[str, Any] = {
             'timestamp': timestamp,
@@ -623,14 +574,15 @@ def _normalize_bolus_records(
         }
         carb_key = _first_existing_key(record, carbs_candidates)
         if carb_key is not None:
-            carb_value = pd.to_numeric(pd.Series([record.get(carb_key)]), errors='coerce').iloc[0]
+            carb_value = _to_float(record.get(carb_key))
             if not pd.isna(carb_value):
                 row['carb_grams'] = float(carb_value)
         rows.append(row)
     if not rows:
         return pd.DataFrame(columns=['timestamp', 'bolus_units', 'raw_bolus_units', 'source_file', 'source_label'])
     frame = pd.DataFrame(rows)
-    frame['timestamp'] = _canonicalize_timestamp_series_for_storage(frame['timestamp'], timezone=timezone)
+    frame['timestamp'] = to_local_wall_clock(frame['timestamp'], timezone=_storage_timezone_name(timezone))
+    frame = frame.loc[frame['timestamp'].notna()].reset_index(drop=True)
     frame['timestamp'] = pd.to_datetime(frame['timestamp'], errors='coerce').dt.floor('5min')
     frame, _ = _filter_timestamp_window(frame, window=window, timestamp_columns=['timestamp'])
     if frame.empty:
@@ -799,9 +751,9 @@ def _normalize_carb_records(
         carb_key = _first_existing_key(record, carb_candidates)
         if ts_key is None or carb_key is None:
             continue
-        timestamp = _ensure_datetime(record.get(ts_key), timezone=timezone)
-        carb_value = pd.to_numeric(pd.Series([record.get(carb_key)]), errors='coerce').iloc[0]
-        if pd.isna(timestamp) or pd.isna(carb_value):
+        timestamp = record.get(ts_key)
+        carb_value = _to_float(record.get(carb_key))
+        if timestamp is None or pd.isna(carb_value):
             continue
         rows.append(
             {
@@ -811,13 +763,14 @@ def _normalize_carb_records(
                 'source_label': endpoint_family,
                 'pump_serial': record.get('pump_serial'),
                 'tconnect_device_id': record.get('tconnect_device_id'),
-                **{key: pd.to_numeric(pd.Series([record.get(key)]), errors='coerce').iloc[0] for key in CALCULATOR_SETTING_COLUMNS},
+                **{key: _to_float(record.get(key)) for key in CALCULATOR_SETTING_COLUMNS},
             }
         )
     if not rows:
         return pd.DataFrame(columns=['timestamp', 'carb_grams', 'source_file', 'source_label', *CALCULATOR_SETTING_COLUMNS])
     frame = pd.DataFrame(rows)
-    frame['timestamp'] = _canonicalize_timestamp_series_for_storage(frame['timestamp'], timezone=timezone)
+    frame['timestamp'] = to_local_wall_clock(frame['timestamp'], timezone=_storage_timezone_name(timezone))
+    frame = frame.loc[frame['timestamp'].notna()].reset_index(drop=True)
     frame['timestamp'] = pd.to_datetime(frame['timestamp'], errors='coerce').dt.floor('5min')
     frame, _ = _filter_timestamp_window(frame, window=window, timestamp_columns=['timestamp'])
     group_cols = [column for column in ['timestamp', 'source_file', 'source_label', 'pump_serial', 'tconnect_device_id'] if column in frame.columns]
@@ -843,13 +796,13 @@ def _normalize_basal_records(
         rate_key = _first_existing_key(record, rate_candidates)
         if rate_key is None:
             continue
-        rate = pd.to_numeric(pd.Series([record.get(rate_key)]), errors='coerce').iloc[0]
+        rate = _to_float(record.get(rate_key))
         if pd.isna(rate):
             continue
         start_key = _first_existing_key(record, start_candidates)
         end_key = _first_existing_key(record, end_candidates)
-        start = _ensure_datetime(record.get(start_key), timezone=timezone) if start_key is not None else pd.NaT
-        end = _ensure_datetime(record.get(end_key), timezone=timezone) if end_key is not None else pd.NaT
+        start = record.get(start_key) if start_key is not None else None
+        end = record.get(end_key) if end_key is not None else None
         rows.append(
             {
                 'start_timestamp': start,
@@ -864,8 +817,8 @@ def _normalize_basal_records(
     if not rows:
         return pd.DataFrame(columns=['start_timestamp', 'end_timestamp', 'basal_units_per_hour', 'source_file', 'source_label'])
     frame = pd.DataFrame(rows)
-    frame['start_timestamp'] = _canonicalize_timestamp_series_for_storage(frame['start_timestamp'], timezone=timezone)
-    frame['end_timestamp'] = _canonicalize_timestamp_series_for_storage(frame['end_timestamp'], timezone=timezone)
+    frame['start_timestamp'] = to_local_wall_clock(frame['start_timestamp'], timezone=_storage_timezone_name(timezone))
+    frame['end_timestamp'] = to_local_wall_clock(frame['end_timestamp'], timezone=_storage_timezone_name(timezone))
     frame = frame.sort_values(['start_timestamp', 'end_timestamp']).reset_index(drop=True)
     if frame['start_timestamp'].notna().any():
         next_starts = frame['start_timestamp'].shift(-1)
@@ -903,9 +856,9 @@ def _normalize_activity_records(
         value_key = _first_existing_key(record, value_candidates)
         if ts_key is None or value_key is None:
             continue
-        timestamp = _ensure_datetime(record.get(ts_key), timezone=timezone)
-        value = pd.to_numeric(pd.Series([record.get(value_key)]), errors='coerce').iloc[0]
-        if pd.isna(timestamp) or pd.isna(value):
+        timestamp = record.get(ts_key)
+        value = _to_float(record.get(value_key))
+        if timestamp is None or pd.isna(value):
             continue
         rows.append(
             {
@@ -920,7 +873,8 @@ def _normalize_activity_records(
     if not rows:
         return pd.DataFrame(columns=['timestamp', 'activity_value', 'source_file', 'source_label'])
     frame = pd.DataFrame(rows)
-    frame['timestamp'] = _canonicalize_timestamp_series_for_storage(frame['timestamp'], timezone=timezone)
+    frame['timestamp'] = to_local_wall_clock(frame['timestamp'], timezone=_storage_timezone_name(timezone))
+    frame = frame.loc[frame['timestamp'].notna()].reset_index(drop=True)
     frame['timestamp'] = pd.to_datetime(frame['timestamp'], errors='coerce').dt.floor('5min')
     frame, _ = _filter_timestamp_window(frame, window=window, timestamp_columns=['timestamp'])
     group_cols = [column for column in ['timestamp', 'source_file', 'source_label', 'pump_serial', 'tconnect_device_id'] if column in frame.columns]
@@ -969,7 +923,7 @@ def normalize_tconnectsync_payloads(
     carb_frames = [frame for frame in [*carb_frames, carb_from_bolus] if not frame.empty]
     if carb_frames:
         carbs = pd.concat(carb_frames, ignore_index=True, sort=False)
-        carbs['timestamp'] = _canonicalize_timestamp_series_for_storage(carbs['timestamp'], timezone=timezone)
+        carbs['timestamp'] = to_local_wall_clock(carbs['timestamp'], timezone=_storage_timezone_name(timezone))
         carbs['carb_grams'] = pd.to_numeric(carbs['carb_grams'], errors='coerce')
         sort_columns = [column for column in ['timestamp', '_carb_source_priority', 'source_file', 'source_label'] if column in carbs.columns]
         if sort_columns:
@@ -1304,10 +1258,13 @@ def _pump_log_chunks(start: date, end: date) -> list[tuple[str, str]]:
 
 
 def _shift_timestamp_text(value: Any, minutes: int) -> str | None:
-    timestamp = _ensure_datetime(value)
-    if pd.isna(timestamp):
+    if value is None:
         return None
-    return (timestamp + pd.Timedelta(minutes=minutes)).isoformat()
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return (parsed + timedelta(minutes=minutes)).isoformat()
 
 
 def _device_fields_for_record(*, pump_serial: str | None, tconnect_device_id: str | None) -> dict[str, str]:
@@ -1324,15 +1281,15 @@ _TANDEM_EPOCH = pd.Timestamp('2008-01-01')
 
 
 def _cgm_sensor_time(event_timestamp: Any, egv_seconds: Any) -> str | None:
-    """Sensor measurement time of a CGM reading, in the same local offset as the pump event time."""
-    seconds = pd.to_numeric(pd.Series([egv_seconds]), errors='coerce').iloc[0]
-    received = pd.to_datetime(event_timestamp, errors='coerce')
-    if pd.isna(seconds) or float(seconds) <= 0 or pd.isna(received):
+    """Sensor measurement time of a CGM reading as pump wall-clock time, without a UTC offset.
+
+    The pump counts seconds in its own wall-clock time, which is the storage convention. The receipt event's
+    offset is not attached: across a daylight-saving change the reading and its receipt can have different offsets.
+    """
+    seconds = _to_float(egv_seconds)
+    if pd.isna(seconds) or float(seconds) <= 0 or pd.isna(pd.to_datetime(event_timestamp, errors='coerce')):
         return None
-    measured = _TANDEM_EPOCH + pd.Timedelta(seconds=float(seconds))
-    if received.tzinfo is not None:
-        measured = measured.tz_localize(received.tzinfo)
-    return measured.isoformat()
+    return (_TANDEM_EPOCH + pd.Timedelta(seconds=float(seconds))).isoformat()
 
 
 def _tconnectsync_event_payloads(
@@ -1374,7 +1331,7 @@ def _tconnectsync_event_payloads(
                 }
             )
         elif name == 'LID_BASAL_DELIVERY':
-            commanded_rate = pd.to_numeric(pd.Series([record.get('commandedRate')]), errors='coerce').iloc[0]
+            commanded_rate = _to_float(record.get('commandedRate'))
             payloads['basal'].append(
                 {
                     'startDateTime': event_timestamp,
@@ -1392,7 +1349,7 @@ def _tconnectsync_event_payloads(
                 errors='coerce',
             ).iloc[0]
             if bolus_id is not None and not pd.isna(carb_amount) and float(carb_amount) > 0:
-                carb_ratio = pd.to_numeric(pd.Series([record.get('carbRatioRaw')]), errors='coerce').iloc[0]
+                carb_ratio = _to_float(record.get('carbRatioRaw'))
                 carb_requests[str(bolus_id)] = {
                     'eventDateTime': event_timestamp,
                     'carbs': float(carb_amount),
@@ -1406,15 +1363,15 @@ def _tconnectsync_event_payloads(
                 }
         elif name == 'LID_BOLUS_REQUESTED_MSG2':
             bolus_id = record.get('bolusId')
-            isf = pd.to_numeric(pd.Series([record.get('isf')]), errors='coerce').iloc[0]
-            target = pd.to_numeric(pd.Series([record.get('targetBg')]), errors='coerce').iloc[0]
+            isf = _to_float(record.get('isf'))
+            target = _to_float(record.get('targetBg'))
             if bolus_id is not None:
                 calculator_settings[str(bolus_id)] = {
                     'isf_mgdl_per_unit': None if pd.isna(isf) or float(isf) <= 0 else float(isf),
                     'target_bg_mgdl': None if pd.isna(target) or float(target) <= 0 else float(target),
                 }
         elif name == 'LID_BOLUS_DELIVERY':
-            delivered_total = pd.to_numeric(pd.Series([record.get('deliveredTotal')]), errors='coerce').iloc[0]
+            delivered_total = _to_float(record.get('deliveredTotal'))
             delivered_bolus_id = record.get('bolusid') if record.get('bolusid') is not None else record.get('bolusId')
             if delivered_bolus_id is not None and not pd.isna(delivered_total) and float(delivered_total) > 0:
                 delivered_bolus_ids.add(str(delivered_bolus_id))
@@ -1432,13 +1389,13 @@ def _tconnectsync_event_payloads(
                     'bolus_source_raw': record.get('bolusSourceRaw'),
                     'requested_now_units': (
                         None
-                        if pd.isna(pd.to_numeric(pd.Series([record.get('requestedNow')]), errors='coerce').iloc[0])
-                        else float(pd.to_numeric(pd.Series([record.get('requestedNow')]), errors='coerce').iloc[0]) / 1000.0
+                        if pd.isna(_to_float(record.get('requestedNow')))
+                        else float(_to_float(record.get('requestedNow'))) / 1000.0
                     ),
                     'requested_later_units': (
                         None
-                        if pd.isna(pd.to_numeric(pd.Series([record.get('requestedLater')]), errors='coerce').iloc[0])
-                        else float(pd.to_numeric(pd.Series([record.get('requestedLater')]), errors='coerce').iloc[0]) / 1000.0
+                        if pd.isna(_to_float(record.get('requestedLater')))
+                        else float(_to_float(record.get('requestedLater'))) / 1000.0
                     ),
                     **device_fields,
                 }
@@ -2000,6 +1957,36 @@ def _load_archived_window_payloads(window_dir: Path) -> dict[str, Any]:
     return payloads
 
 
+def normalize_tconnectsync_window(
+    workspace: ProjectPaths,
+    window_dir: str | Path,
+    *,
+    timezone: str | None = None,
+    pump_serial: str | None = None,
+) -> NormalizedWindowResult:
+    """Rebuild one window's normalized tables and window manifest from its archived raw responses.
+
+    Writes only inside ``window_dir``, so windows can be normalized in parallel.
+    """
+    window_dir = Path(window_dir).expanduser().resolve()
+    window = _window_from_id(window_dir.name)
+    if not (window_dir / "raw").exists():
+        raise AcquisitionError(f"Window has no archived raw responses: {window_dir}")
+    if _window_manifest_path(workspace, window).parent.resolve() != window_dir:
+        raise AcquisitionError(f"{window_dir} is not under the project's Tandem archive {workspace.cloud_raw / 'tconnectsync'}.")
+    payloads = _load_archived_window_payloads(window_dir)
+    return _write_tconnectsync_window_artifacts(
+        workspace=workspace,
+        window=window,
+        endpoint_family="tconnectsync",
+        payloads=payloads,
+        timezone=timezone or analysis_timezone(),
+        pump_serial=pump_serial,
+        payload_hash_source=payloads,
+        write_raw=False,
+    )
+
+
 def normalize_tconnectsync_archive(
     workspace: ProjectPaths,
     *,
@@ -2043,17 +2030,7 @@ def normalize_tconnectsync_archive(
             report_lines.append(f"- {window_dir.name}: skipped (existing normalized artifacts present)")
             continue
 
-        payloads = _load_archived_window_payloads(window_dir)
-        result = _write_tconnectsync_window_artifacts(
-            workspace=workspace,
-            window=_window_from_id(window_dir.name),
-            endpoint_family="tconnectsync",
-            payloads=payloads,
-            timezone=selected_timezone,
-            pump_serial=pump_serial,
-            payload_hash_source=payloads,
-            write_raw=False,
-        )
+        result = normalize_tconnectsync_window(workspace, window_dir, timezone=selected_timezone, pump_serial=pump_serial)
         results.append(result)
         report_lines.append(
             f"- {window_dir.name}: normalized ({'complete' if result.is_complete_window else 'incomplete'}), "
@@ -2061,13 +2038,8 @@ def normalize_tconnectsync_archive(
         )
 
     global_manifest_path = Path(manifest_path or (workspace.cloud_raw / "tandem_export_manifest.csv"))
-    try:
-        data = load_tandem_exports(workspace.cloud_raw)
-        _write_manifest_path = global_manifest_path
-        _write_manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        build_export_manifest(data).to_csv(_write_manifest_path, index=False, date_format="%Y-%m-%dT%H:%M:%S")
-    except Exception as exc:
-        report_lines.extend(["", f"- manifest_refresh_error: {exc}"])
+    global_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    build_export_manifest(load_tandem_exports(workspace.cloud_raw)).to_csv(global_manifest_path, index=False, date_format="%Y-%m-%dT%H:%M:%S")
 
     summary_path = Path(report_path or (workspace.reports / "normalize_raw_summary.md"))
     summary_path.parent.mkdir(parents=True, exist_ok=True)

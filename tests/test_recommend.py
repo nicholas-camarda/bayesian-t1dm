@@ -15,7 +15,7 @@ from bayesian_t1dm.recommend import Scenario, build_recommendation_policy, recom
 
 
 class DummyModel:
-    def scenario_forecasts(self, fit, scenarios):
+    def scenario_forecasts(self, fit, scenarios, *, target_bg=None):
         outputs = []
         for name, frame in scenarios:
             if name == "current":
@@ -134,7 +134,7 @@ class RecordingModel:
     def __init__(self) -> None:
         self.frames_by_name: dict[str, pd.DataFrame] = {}
 
-    def scenario_forecasts(self, fit, scenarios):
+    def scenario_forecasts(self, fit, scenarios, *, target_bg=None):
         outputs = []
         for name, frame in scenarios:
             self.frames_by_name[name] = frame.copy()
@@ -343,7 +343,7 @@ def test_icr_scenario_direction_reduces_insulin_when_ratio_increases():
 
 def test_low_posterior_probability_cannot_surface_recommendation():
     class LowPosteriorModel:
-        def scenario_forecasts(self, fit, scenarios):
+        def scenario_forecasts(self, fit, scenarios, *, target_bg=None):
             outputs = []
             for name, _frame in scenarios:
                 mean = np.array([140.0, 112.0]) if name == "current" else np.array([110.0, 130.0])

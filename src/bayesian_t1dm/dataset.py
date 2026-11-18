@@ -12,14 +12,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, fields
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
-from .acquisition import normalize_tconnectsync_archive
+from .acquisition import normalize_tconnectsync_window
 from .features import FeatureConfig
 from .health_auto_export import (
     AnalysisReadyHealthDataset,
@@ -30,12 +33,12 @@ from .health_auto_export import (
     summarize_apple_health_span,
 )
 from .ingest import IngestedData, TandemCoverage, attach_health_auto_export, load_tandem_exports, summarize_coverage, write_export_manifest
-from .paths import ProjectPaths
+from .paths import ProjectPaths, analysis_timezone
 from .quality import DataQualitySummary, assess_data_quality, assess_prepared_feature_plausibility
 from .report_page import plain
 
 # Bump when merge, cleaning or feature code changes what the build produces; a version change forces a rebuild.
-DATASET_VERSION = 5
+DATASET_VERSION = 6
 HORIZON_MINUTES = 30
 CARB_LOG_NAMES = ("carbs.csv", "carb_log.csv")
 
@@ -50,6 +53,7 @@ class InputFile:
     kind: str
     size: int
     sha256: str
+    mtime_ns: int
 
 
 @dataclass(frozen=True)
@@ -92,11 +96,20 @@ def raw_input_files(raw_root: Path) -> list[tuple[Path, str]]:
     return found
 
 
-def fingerprint_inputs(raw_root: Path) -> list[InputFile]:
-    return [
-        InputFile(path=path.relative_to(raw_root).as_posix(), kind=kind, size=path.stat().st_size, sha256=_sha256(path))
-        for path, kind in raw_input_files(raw_root)
-    ]
+def fingerprint_inputs(raw_root: Path, *, known: list[dict[str, Any]] | None = None) -> list[InputFile]:
+    """SHA-256 of every raw input.
+
+    A file whose size and modification time match its entry in ``known`` (the previous build's inputs) keeps the
+    recorded hash instead of being read again; any other file is hashed.
+    """
+    recorded = {(item["path"], item["size"], item.get("mtime_ns")): item["sha256"] for item in known or []}
+    fingerprints: list[InputFile] = []
+    for path, kind in raw_input_files(raw_root):
+        relative = path.relative_to(raw_root).as_posix()
+        stat = path.stat()
+        sha256 = recorded.get((relative, stat.st_size, stat.st_mtime_ns)) or _sha256(path)
+        fingerprints.append(InputFile(path=relative, kind=kind, size=stat.st_size, sha256=sha256, mtime_ns=stat.st_mtime_ns))
+    return fingerprints
 
 
 def _git_commit(repo_root: Path) -> str:
@@ -188,13 +201,36 @@ def _tandem_span(data: IngestedData) -> tuple[pd.Timestamp | None, pd.Timestamp 
     return (None, None) if combined.empty else (pd.Timestamp(combined.min()), pd.Timestamp(combined.max()))
 
 
+def _normalize_windows(paths: ProjectPaths, tandem_root: Path, diff: dict[str, list[str]], *, rebuild_all: bool, log) -> list[str]:
+    """Rebuild normalized Tandem windows from their raw responses, in parallel.
+
+    Every window is rebuilt on a first build, a code version change or ``--force``; otherwise only windows whose
+    raw files changed or that have no normalized tables yet.
+    """
+    if not tandem_root.exists():
+        return []
+    archived = sorted(p.parent.name for p in tandem_root.glob("*/raw"))
+    if rebuild_all:
+        windows = archived
+    else:
+        missing = {w for w in archived if not (tandem_root / w / "normalized").exists()}
+        windows = sorted(set(_changed_tandem_windows(diff)) | missing)
+    if not windows:
+        return []
+    workers = min(len(windows), os.cpu_count() or 1)
+    log(f"Normalizing {len(windows)} Tandem windows on {workers} processes...")
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(partial(normalize_tconnectsync_window, paths, timezone=analysis_timezone()), [tandem_root / w for w in windows]))
+    return windows
+
+
 def build_merged_dataset(paths: ProjectPaths, *, raw_root: str | Path | None = None, force: bool = False, log=print) -> tuple[MergedDataset, bool]:
     """Build the merged dataset if any raw input changed. Returns (dataset, rebuilt)."""
     raw_root = Path(raw_root or paths.cloud_raw).expanduser().resolve()
     out_dir = merged_dir(raw_root)
     log("Fingerprinting raw inputs...")
-    inputs = fingerprint_inputs(raw_root)
     previous = _read_manifest(out_dir)
+    inputs = fingerprint_inputs(raw_root, known=previous["inputs"] if previous else None)
     diff = _input_diff(previous["inputs"] if previous else [], inputs)
     unchanged = previous is not None and previous.get("dataset_version") == DATASET_VERSION and not any(diff.values())
     if unchanged and not force:
@@ -206,19 +242,8 @@ def build_merged_dataset(paths: ProjectPaths, *, raw_root: str | Path | None = N
     else:
         log(f"Inputs changed: {len(diff['added'])} added, {len(diff['changed'])} changed, {len(diff['removed'])} removed.")
 
-    tandem_root = raw_root / "tconnectsync"
-    if tandem_root.exists():
-        missing = sorted(p.parent.name for p in tandem_root.glob("*/raw") if not (p.parent / "normalized").exists())
-        windows = sorted(set(_changed_tandem_windows(diff) if previous else []) | set(missing))
-        for window_id in windows:
-            log(f"Normalizing Tandem window {window_id}...")
-            normalize_tconnectsync_archive(
-                paths,
-                raw_root=tandem_root,
-                window_id=window_id,
-                force=True,
-                report_path=paths.output_source / "normalize_raw_summary.md",
-            )
+    rebuild_all = force or previous is None or previous.get("dataset_version") != DATASET_VERSION
+    normalized_windows = _normalize_windows(paths, raw_root / "tconnectsync", diff, rebuild_all=rebuild_all, log=log)
 
     log("Reading Tandem data...")
     tandem = load_tandem_exports(raw_root, include_health_auto_export=False)
@@ -258,6 +283,7 @@ def build_merged_dataset(paths: ProjectPaths, *, raw_root: str | Path | None = N
         "horizon_minutes": HORIZON_MINUTES,
         "inputs": [asdict(item) for item in inputs],
         "input_changes": diff,
+        "normalized_windows": normalized_windows,
         "dataset": {
             "feature_columns": list(dataset.feature_columns),
             "tandem_feature_columns": list(dataset.tandem_feature_columns),
@@ -308,7 +334,7 @@ def load_merged_dataset(raw_root: str | Path, *, inputs: list[InputFile] | None 
         raise StaleDatasetError(f"No merged dataset in {out_dir}. Run `bayesian-t1dm build-dataset` first.")
     if manifest.get("dataset_version") != DATASET_VERSION:
         raise StaleDatasetError("The merged dataset was built by an older version of the code. Run `bayesian-t1dm build-dataset`.")
-    current = inputs if inputs is not None else fingerprint_inputs(raw_root)
+    current = inputs if inputs is not None else fingerprint_inputs(raw_root, known=manifest["inputs"])
     diff = _input_diff(manifest["inputs"], current)
     if any(diff.values()):
         raise StaleDatasetError(

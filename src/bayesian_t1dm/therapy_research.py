@@ -2764,9 +2764,10 @@ def _archived_pump_settings(file_name: str, payload: Mapping[str, Any]) -> list[
 
     Two archive generations exist: ``pumper.json`` (tconnectsync 3.x, the current Tandem Source API)
     and ``pump_event_metadata.json`` (tconnectsync 2.x, windows collected before mid-2026). Both are
-    read into the same shape; profile time segments are exposed as ``tDependentSegs``.
+    read into the same shape; profile time segments are exposed as ``tDependentSegs``. Each snapshot is dated by
+    when the pump uploaded it, not by the window it was archived with: every window collected on the same day
+    holds the same, current snapshot.
     """
-    requested_end = pd.to_datetime(payload.get("requested_end"), errors="coerce")
     found: list[tuple[pd.Timestamp, dict[str, Any]]] = []
     if file_name == "pumper.json":
         selected = set(payload.get("selected_pump_serials") or [])
@@ -2787,15 +2788,15 @@ def _archived_pump_settings(file_name: str, payload: Mapping[str, Any]) -> list[
                 ],
             }
             uploaded = pd.to_datetime(settings.get("uploadedTimeStamp"), errors="coerce", utc=True)
-            when = requested_end if pd.notna(requested_end) else uploaded.tz_localize(None) if pd.notna(uploaded) else pd.Timestamp.min
+            when = uploaded.tz_localize(None) if pd.notna(uploaded) else pd.Timestamp.min
             max_bolus = (details.get("globalMaxBolusSettings") or {}).get("maxBolus", 25000)
             found.append((pd.Timestamp(when), {"profiles": profiles, "maxBolus": max_bolus}))
     else:
         last_upload = (payload.get("selected_pump") or {}).get("lastUpload")
         settings = last_upload.get("settings") if isinstance(last_upload, Mapping) else None
         if isinstance(settings, Mapping):
-            uploaded = pd.to_datetime(last_upload.get("lastUploadedAt"), errors="coerce")
-            when = requested_end if pd.notna(requested_end) else uploaded if pd.notna(uploaded) else pd.Timestamp.min
+            uploaded = pd.to_datetime(last_upload.get("lastUploadedAt"), errors="coerce", utc=True)
+            when = uploaded.tz_localize(None) if pd.notna(uploaded) else pd.Timestamp.min
             max_bolus = (settings.get("pumpSettings") or {}).get("maxBolus", 25000)
             found.append((pd.Timestamp(when), {"profiles": settings.get("profiles"), "maxBolus": max_bolus}))
     return found

@@ -17,7 +17,8 @@ import pandas as pd
 
 from . import report_page as rp
 from .health_auto_export import ModelDataPreparationResult
-from .therapy_research import LatentMealResearchResult, TherapyInfraValidationResult, TherapyResearchResult, summarize_overnight_basal_evidence
+from .dataset import HORIZON_MINUTES
+from .therapy_research import HIGH_FAT_GRAMS, HIGH_PROTEIN_GRAMS, LOGGED_FOOD_MATCH_MINUTES, LatentMealResearchResult, TherapyInfraValidationResult, TherapyResearchResult, summarize_overnight_basal_evidence
 
 FIT_ERROR_GUIDE_MGDL = 10.0
 FORECAST_INTERVAL_PERCENT = 80
@@ -200,7 +201,7 @@ def _forecast_trace_figure(summary: dict[str, Any]) -> str:
         figure
         + rp.legend([("#3B3B3B", "CGM", False), (rp.PRIMARY, f"model forecast with {FORECAST_INTERVAL_PERCENT}% range", False)])
         + rp.caption(
-            f"Last 48 hours of validation period {rp.esc(fold.get('fold'))}. Each point is the forecast made 30 minutes earlier."
+            f"Last 48 hours of validation period {rp.esc(fold.get('fold'))}. Each point is the forecast made {HORIZON_MINUTES} minutes earlier."
             + (
                 f" At {out_of_range} of {len(frame)} time points the forecast or its range went outside {TRACE_CLIP_MGDL[0]:.0f} to {TRACE_CLIP_MGDL[1]:.0f} mg/dL and is drawn at that edge."
                 if out_of_range
@@ -328,20 +329,20 @@ def write_run_review_html(summary: dict[str, Any], path: str | Path) -> Path:
         rp.details(
             "Details: model fitting checks",
             rp.table(["fit", "chains", "divergences", "R-hat (max)", "effective samples (min)", "status"], sampler_rows, numeric=[1, 2, 3, 4])
-            + rp.caption("OK means R-hat under 1.01, no divergences and at least 100 effective samples per chain. Anything else means the sampler did not settle on an answer and the fit is not reliable.")
+            + rp.caption(f"OK means R-hat under {rp.SAMPLER_RHAT_MAX}, no divergences and at least {rp.SAMPLER_ESS_PER_CHAIN} effective samples per chain. Anything else means the sampler did not settle on an answer and the fit is not reliable.")
             if sampler_rows
             else "<p>No fitting diagnostics were recorded.</p>",
         ),
         rp.glossary(
             [
                 ("Forecast error", "Average distance in mg/dL between the 30-minute forecast and the CGM reading that followed (mean absolute error)."),
-                ("Baseline", "Forecasting that glucose in 30 minutes equals glucose now. A useful model must beat it."),
+                ("Baseline", f"Forecasting that glucose in {HORIZON_MINUTES} minutes equals glucose now. A useful model must beat it."),
                 (f"{FORECAST_INTERVAL_PERCENT}% range", f"The band the model expects to contain the real value {FORECAST_INTERVAL_PERCENT}% of the time."),
                 ("Validation period", "A later stretch of data held out from training, used to test the model as if forecasting the future."),
             ]
         ),
     ]
-    return _write(path, rp.page(title="Glucose Forecast Check", question="Can the model forecast glucose 30 minutes ahead?", subtitle=_generated(), body=body))
+    return _write(path, rp.page(title="Glucose Forecast Check", question=f"Can the model forecast glucose {HORIZON_MINUTES} minutes ahead?", subtitle=_generated(), body=body))
 
 
 # ---------------------------------------------------------------------------
@@ -785,7 +786,7 @@ def write_latent_meal_review_html(
             + rp.caption(
                 (f"Logged food (for example Bevel) ran {float(sensitivity['logged_food_scale'].iloc[0]):.2f} times your pump entry for the same meal "
                  f"(median over {int(sensitivity['logged_food_pairs'].iloc[0])} meals). " if math.isfinite(float(sensitivity["logged_food_scale"].iloc[0])) else "")
-                + "Both analyses use your current setting. High fat or protein means at least 20 g fat or 25 g protein logged within 30 minutes; breakfasts "
+                + f"Both analyses use your current setting. High fat or protein means at least {HIGH_FAT_GRAMS:g} g fat or {HIGH_PROTEIN_GRAMS:g} g protein logged within {LOGGED_FOOD_MATCH_MINUTES} minutes; breakfasts "
                 "without logged food are kept. The combined count averages your entry with the logged-food carbs rescaled to your entries, so it can reduce "
                 "noise but not move the overall level. The headline above stays on your pump entries."
             ),
