@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from bayesian_t1dm.context_rules import exercise_intervals
 from bayesian_t1dm import episodes as ep
 from bayesian_t1dm.outcomes import DayPart
 
@@ -31,7 +32,7 @@ NO_SITES = pd.DataFrame(columns=["timestamp", "kind"])
 def _classify(grid, sites=NO_SITES, workouts=None, delivery=None):
     cgm = grid[["timestamp", "glucose"]]
     found = ep.find_episodes(cgm, start=grid["timestamp"].min(), end=grid["timestamp"].max() + pd.Timedelta(minutes=5))
-    return ep.classify_all(ep.describe_episodes(found, grid, sites, None, delivery, workouts, site_coverage_from=START))
+    return ep.classify_all(ep.describe_episodes(found, grid, sites, None, delivery, exercise_intervals(workouts, None), site_coverage_from=START))
 
 
 def test_episodes_need_their_minimum_length():
@@ -92,7 +93,7 @@ def test_exercise_effect_compares_lows_after_meals_with_and_without_a_recent_wor
         low = grid["timestamp"].between(when + pd.Timedelta(hours=1), when + pd.Timedelta(hours=2))
         grid.loc[low, "glucose"] = 60.0
     workouts = pd.DataFrame({"start_timestamp": [m - pd.Timedelta(hours=5) for m in meals[:5]], "end_timestamp": [m - pd.Timedelta(hours=4) for m in meals[:5]], "duration_seconds": 3600.0})
-    result = ep.exercise_effect(grid, workouts)
+    result = ep.exercise_effect(grid, exercise_intervals(workouts, None))
     assert result["after_workout_meals"] == 5 and result["after_workout_lows"] == 5 and result["other_meals"] == 5 and result["other_lows"] == 0
     assert result["after_workout_interval"][0] > result["other_interval"][1]
 

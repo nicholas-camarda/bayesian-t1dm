@@ -56,3 +56,10 @@ def test_overlap_reports_kinds_and_can_ignore_the_meal_itself():
     assert meal_flags.overlaps(intervals, pd.Timestamp("2026-03-01 08:00"), pd.Timestamp("2026-03-01 11:00")) == ["food_without_pump_carbs"]
     assert meal_flags.overlaps(intervals, pd.Timestamp("2026-03-01 12:30"), pd.Timestamp("2026-03-01 14:00")) == []
     assert meal_flags.overlaps(intervals, pd.Timestamp("2026-03-01 08:00"), pd.Timestamp("2026-03-01 11:00"), ignore_event_within=(pd.Timestamp("2026-03-01 09:00"), 30)) == []
+
+
+def test_a_jump_across_a_cgm_gap_is_not_a_rise():
+    # Two readings three hours apart differ by 50 mg/dL; no reading in between, so there is no rise within an hour.
+    times = pd.to_datetime(["2026-03-01 06:00", "2026-03-01 09:00"])
+    frame = pd.DataFrame({"timestamp": times, "glucose": [100.0, 150.0], "explicit_carb_grams": 0.0, "bolus_units": 0.0})
+    assert meal_flags.possible_unlogged_food(frame, None).empty

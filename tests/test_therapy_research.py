@@ -638,7 +638,7 @@ def test_first_meal_registry_ignores_implausible_workout_flags_and_schedule_chan
     windows = build_first_meal_clean_window_registry(research_frame)
 
     assert len(windows) == 2
-    assert windows["recent_workout_6h"].sum() == 0
+    assert windows["in_exercise"].sum() == 0  # the registry reads the shared exercise rule, not the frame's workout flags
     assert windows["closed_loop_confounding_premeal"].sum() == 0
     assert windows["included"].sum() == 2
 
@@ -677,8 +677,8 @@ def test_latent_meal_tiered_window_registry_preserves_clean_gate_and_marks_relax
             "included": [1, 0, 0, 0, 0, 0],
             "exclusion_reasons": [
                 "",
-                "recent_workout_6h",
-                "recent_workout_6h|closed_loop_confounding_premeal",
+                "exercise",
+                "exercise|closed_loop_confounding_premeal",
                 "premeal_bg_out_of_range|steep_premeal_slope",
                 "postmeal_additional_bolus_120m|recent_bolus_4h",
                 "poor_cgm_coverage",
@@ -913,3 +913,16 @@ def test_rows_in_an_excluded_period_never_count_as_clean_basal_time():
     assert with_exclusion.loc[inside, "basal_context"].sum() == 0
     assert with_exclusion.loc[inside, "context_event_excluded"].eq(1).all()
     pd.testing.assert_series_equal(with_exclusion.loc[~inside, "basal_context"], without.loc[~inside, "basal_context"])
+
+
+def test_a_first_meal_inside_the_shared_exercise_rule_is_excluded_as_exercise():
+    from bayesian_t1dm.context_rules import exercise_intervals
+
+    dataset = _build_prepared_dataset(apple=True)
+    research_frame = build_therapy_research_frame(dataset, segments=parse_therapy_segments(), meal_proxy_mode="strict")
+    plain = build_first_meal_clean_window_registry(research_frame)
+    meal = plain["timestamp"].min()
+    workouts = pd.DataFrame({"start_timestamp": [meal - pd.Timedelta(hours=2)], "end_timestamp": [meal - pd.Timedelta(hours=1)], "duration_seconds": [3600.0]})
+    flagged = build_first_meal_clean_window_registry(research_frame, exercise=exercise_intervals(workouts, None))
+    row = flagged[flagged["timestamp"].eq(meal)].iloc[0]
+    assert row["in_exercise"] == 1 and "exercise" in row["exclusion_reasons"].split("|") and plain["in_exercise"].sum() == 0

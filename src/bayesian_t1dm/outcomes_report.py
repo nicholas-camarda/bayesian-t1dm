@@ -2,96 +2,21 @@
 
 from __future__ import annotations
 
-import datetime as dt
 import html
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from .dataset import MergedDataset, merged_dir
+from .analysis_data import AnalysisData
 from .outcomes import (
     LOW_LIMIT_PERCENT,
     VERY_LOW_LIMIT_PERCENT,
-    DayPart,
     baseline_table,
     day_part_table,
-    day_parts_from_starts,
     daily_metrics,
     passes_low_limits,
-    segment_starts_in_force,
 )
-from .pump_profiles import ProfileHistory
-
-
-def current_day_parts(merged: MergedDataset, raw_root: str | Path) -> tuple[list[DayPart], str]:
-    """Time-of-day bins from the segments of the profile the latest pump is running.
-
-    The bins are the profile's segments as of the last day its edits are visible; an edit made after the latest
-    download would not appear until the edits are fetched again.
-    """
-    events = pd.read_parquet(merged_dir(raw_root) / "tables" / "pump_profile_events.parquet")
-    visible = {
-        pump: (dt.date.fromisoformat(item["edits_visible"][0][:10]), dt.date.fromisoformat(item["edits_visible"][1][:10]))
-        for pump, item in merged.manifest["pump_profile_history"].items()
-    }
-    cgm = merged.tandem_data.cgm
-    latest_pump = str(int(cgm.sort_values("timestamp")["pump_serial"].dropna().iloc[-1]))
-    if latest_pump not in visible:
-        raise ValueError(f"The pump profile history has no visible segments for pump {latest_pump}; time-of-day bins cannot be built.")
-    history = ProfileHistory(events, visible)
-    now = pd.Timestamp(cgm["timestamp"].max()).to_pydatetime()
-    profile_id = history.active_profile(latest_pump, now)
-    starts = segment_starts_in_force(history, latest_pump, dt.datetime.combine(visible[latest_pump][1], dt.time(12)))
-    if profile_id is None or not starts:
-        raise ValueError(f"No profile segments are visible for pump {latest_pump}.")
-    source = f"pump {latest_pump}, profile {profile_id}, segments as last seen on {visible[latest_pump][1]}"
-    return day_parts_from_starts(starts), source
-
-
-def profile_history(merged: MergedDataset, raw_root: str | Path) -> ProfileHistory:
-    """The pump's profile history replayed from its own edit and switch events."""
-    events = pd.read_parquet(merged_dir(raw_root) / "tables" / "pump_profile_events.parquet")
-    visible = {
-        pump: (dt.date.fromisoformat(item["edits_visible"][0][:10]), dt.date.fromisoformat(item["edits_visible"][1][:10]))
-        for pump, item in merged.manifest["pump_profile_history"].items()
-    }
-    return ProfileHistory(events, visible)
-
-
-def active_profile_now(merged: MergedDataset, raw_root: str | Path) -> tuple[str, int]:
-    """The latest pump and the profile it runs as of the last day its edits are visible."""
-    events = pd.read_parquet(merged_dir(raw_root) / "tables" / "pump_profile_events.parquet")
-    visible = {
-        pump: (dt.date.fromisoformat(item["edits_visible"][0][:10]), dt.date.fromisoformat(item["edits_visible"][1][:10]))
-        for pump, item in merged.manifest["pump_profile_history"].items()
-    }
-    pump = str(int(merged.tandem_data.cgm.sort_values("timestamp")["pump_serial"].dropna().iloc[-1]))
-    profile = ProfileHistory(events, visible).active_profile(pump, dt.datetime.combine(visible[pump][1], dt.time(23, 59)))
-    return pump, int(profile)
-
-
-def current_segment_settings(merged: MergedDataset, raw_root: str | Path) -> dict[float, dict[str, float]]:
-    """The I:C and CF each pump segment holds now, from the latest profile edits, keyed by the segment's start minute."""
-    events = pd.read_parquet(merged_dir(raw_root) / "tables" / "pump_profile_events.parquet")
-    visible = {
-        pump: (dt.date.fromisoformat(item["edits_visible"][0][:10]), dt.date.fromisoformat(item["edits_visible"][1][:10]))
-        for pump, item in merged.manifest["pump_profile_history"].items()
-    }
-    cgm = merged.tandem_data.cgm
-    pump = str(int(cgm.sort_values("timestamp")["pump_serial"].dropna().iloc[-1]))
-    history = ProfileHistory(events, visible)
-    end_of_history = dt.datetime.combine(visible[pump][1], dt.time(23, 59))
-    profile_id = history.active_profile(pump, end_of_history)
-    settings: dict[float, dict[str, float]] = {}
-    for minute in range(0, 24 * 60, 15):
-        segment = history.segment_in_force(pump, profile_id, end_of_history, minute_of_day=minute)
-        if segment is not None:
-            settings[float(segment["start_minutes"])] = {
-                "icr": segment["carb_ratio_g_per_unit"], "cf": segment["isf_mgdl_per_unit"],
-                "basal": segment.get("basal_units_per_hour", float("nan")), "target": segment["target_bg_mgdl"],
-            }
-    return settings
 
 
 def _fmt(value: float, digits: int = 1) -> str:
@@ -134,13 +59,13 @@ table{{border-collapse:collapse;width:100%;margin:.5rem 0 1.5rem;font-size:13px}
 """
 
 
-def write_outcomes(merged: MergedDataset, raw_root: str | Path, output_dir: str | Path) -> dict[str, Path]:
+def write_outcomes(analysis: AnalysisData, output_dir: str | Path) -> dict[str, Path]:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    cgm = merged.tandem_data.cgm
+    cgm = analysis.cgm
     latest = pd.Timestamp(cgm["timestamp"].max())
     as_of = latest.normalize()  # the last full day ends here; the partial day is left out
-    parts, source = current_day_parts(merged, raw_root)
+    parts, source = analysis.day_parts()
     baseline = baseline_table(cgm, as_of=as_of)
     by_part = day_part_table(cgm, parts, as_of=as_of)
     daily = daily_metrics(cgm)

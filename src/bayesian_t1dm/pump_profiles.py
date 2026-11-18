@@ -65,6 +65,14 @@ PROFILE_SETTING_COLUMNS = (
 )
 
 
+def pump_key(value: Any) -> str:
+    """The one string form of a pump serial: ``1453346.0``, ``1453346`` and ``" 1453346"`` all become ``1453346``; missing is ``""``."""
+    if value is None or (isinstance(value, float) and np.isnan(value)) or value is pd.NA:
+        return ""
+    text = str(value).strip()
+    return text[:-2] if text.endswith(".0") else text
+
+
 def _word_reversed(payload: np.ndarray) -> np.ndarray:
     """Undo Tandem Source's per-word byte reversal of the 16 payload bytes (rows of shape (n, 16))."""
     return payload.reshape(-1, 4, 4)[:, :, ::-1].reshape(-1, 16)
@@ -327,7 +335,7 @@ class ProfileHistory:
         out = pd.DataFrame(index=carbs.index, columns=list(PROFILE_SETTING_COLUMNS), dtype=float)
         if carbs.empty or "pump_serial" not in carbs.columns:
             return out  # carbs from hand-kept logs belong to no pump
-        serials = carbs["pump_serial"].map(lambda v: "" if pd.isna(v) else str(v).removesuffix(".0"))
+        serials = carbs["pump_serial"].map(pump_key)
         # The profile is read at the moment the pump recorded (``event_time``), not at its 5-minute grid slot, so an
         # edit made inside the slot applies to the meals after it and not to those before.
         moments = pd.to_datetime(carbs["timestamp"])

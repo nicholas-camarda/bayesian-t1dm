@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from . import episodes as ep
+from .context_rules import EXERCISE_AFTER_HOURS
 from .controller import basal_signal, controller_summary, delivery_intervals
 from .outcomes import (
     LOW_LIMIT_PERCENT,
@@ -254,13 +255,13 @@ LATEST_EPISODES = 30
 
 
 def episodes_payload(
-    cgm: pd.DataFrame, grid: pd.DataFrame, parts: list[DayPart], site_events: pd.DataFrame, rates: pd.DataFrame, unlogged: pd.DataFrame, workouts: pd.DataFrame, *, as_of: pd.Timestamp, days: int = SERIES_DAYS
+    cgm: pd.DataFrame, grid: pd.DataFrame, parts: list[DayPart], site_events: pd.DataFrame, rates: pd.DataFrame, unlogged: pd.DataFrame, exercise: pd.DataFrame, workouts: pd.DataFrame, *, site_observed_from: pd.Timestamp, as_of: pd.Timestamp, days: int = SERIES_DAYS
 ) -> tuple[dict[str, Any], pd.DataFrame]:
     """Episodes of the last ``days`` days with their patterns, the repeats, the exercise effect and what each trace looks like,
     and the classified episodes themselves."""
     found = ep.find_episodes(cgm, start=as_of - pd.Timedelta(days=days), end=as_of)
     delivery = delivery_intervals(rates) if rates is not None and not rates.empty else None
-    classified = ep.classify_all(ep.describe_episodes(found, grid, site_events, unlogged, delivery, workouts, site_coverage_from=rates["timestamp"].min() if rates is not None and not rates.empty else None))
+    classified = ep.classify_all(ep.describe_episodes(found, grid, site_events, unlogged, delivery, exercise, site_coverage_from=site_observed_from))
     series = grid.assign(timestamp=pd.to_datetime(grid["timestamp"])).set_index("timestamp").sort_index()
     latest = []
     for row in classified.sort_values("start", ascending=False).head(LATEST_EPISODES).itertuples(index=False):
@@ -281,20 +282,20 @@ def episodes_payload(
     payload = {
         "days": days, "labels": {**ep.HIGH_PATTERNS, **ep.LOW_PATTERNS}, "counts": counts, "highs": int((classified["kind"] == "high").sum()) if not classified.empty else 0,
         "lows": int((classified["kind"] == "low").sum()) if not classified.empty else 0, "latest": latest,
-        "repeats": ep.repeats(classified, parts), "exercise": exercise_over_logged_period(grid, workouts),
+        "repeats": ep.repeats(classified, parts), "exercise": exercise_over_logged_period(grid, exercise, workouts),
         "site": ep.site_change_link(classified, site_events), "playbook": {k: {"points_at": v[0], "advice": v[1]} for k, v in ep.PLAYBOOK.items()},
     }
     return payload, classified
 
 
-def exercise_over_logged_period(grid: pd.DataFrame, workouts: pd.DataFrame) -> dict[str, Any]:
-    """The exercise effect over the whole period the workout log covers (first workout to last, plus 12 hours): outside it a
-    meal would count as 'not after a workout' only because no workout was recorded."""
+def exercise_over_logged_period(grid: pd.DataFrame, exercise: pd.DataFrame, workouts: pd.DataFrame) -> dict[str, Any]:
+    """The exercise effect over the whole period the workout log covers (first workout to last, plus the hours after): outside it a
+    meal would count as 'not during exercise' only because no workout was recorded."""
     if workouts is None or workouts.empty:
         return {}
-    start, end = pd.to_datetime(workouts["start_timestamp"]).min(), pd.to_datetime(workouts["end_timestamp"]).max() + pd.Timedelta(hours=ep.EXERCISE_WINDOW_MINUTES / 60)
+    start, end = pd.to_datetime(workouts["start_timestamp"]).min(), pd.to_datetime(workouts["end_timestamp"]).max() + pd.Timedelta(hours=EXERCISE_AFTER_HOURS)
     stamp = pd.to_datetime(grid["timestamp"])
-    result = ep.exercise_effect(grid[(stamp >= start) & (stamp <= end)], workouts)
+    result = ep.exercise_effect(grid[(stamp >= start) & (stamp <= end)], exercise)
     return {**result, "from": str(start.date()), "to": str(end.date())} if result else {}
 
 
@@ -306,6 +307,6 @@ def episode_problem_areas(payload: dict[str, Any]) -> list[dict[str, str]]:
     ex = payload.get("exercise") or {}
     # Only when the ranges are apart: after-workout lows clearly above the others.
     if ex.get("after_workout_meals", 0) >= 30 and ex.get("other_meals", 0) >= 30 and ex["after_workout_interval"][0] > ex["other_interval"][1]:
-        areas.append({"level": "watch", "tab": "episodes", "title": "Lows follow meals after workouts more often",
-                      "summary": f"Within 12 hours after a workout, {ex['after_workout_share']:.0%} of meal boluses were followed by a low within 4 hours ({ex['after_workout_meals']} meals), against {ex['other_share']:.0%} otherwise ({ex['other_meals']} meals), {ex['from']} to {ex['to']}."})
+        areas.append({"level": "watch", "tab": "episodes", "title": "Lows follow meals during or after exercise more often",
+                      "summary": f"During exercise or within {EXERCISE_AFTER_HOURS:.0f} hours after it, {ex['after_workout_share']:.0%} of meal boluses were followed by a low within 4 hours ({ex['after_workout_meals']} meals), against {ex['other_share']:.0%} otherwise ({ex['other_meals']} meals), {ex['from']} to {ex['to']}."})
     return areas

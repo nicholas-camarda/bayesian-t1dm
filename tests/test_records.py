@@ -54,3 +54,14 @@ def test_saving_keeps_the_previous_version(tmp_path):
     save_records(first.assign(status="entered"), path)
     assert list(load_records(path).columns) == RECORD_COLUMNS and len(list((path.parent / "archive").glob("*.csv"))) == 1
     assert not np.isnan(load_records(path).loc[0, "old_value"])
+
+
+def test_the_serial_form_does_not_change_whether_a_proposal_is_matched():
+    from bayesian_t1dm.pump_profiles import pump_key
+
+    assert {pump_key(v) for v in ("1453346.0", "1453346", 1453346.0, " 1453346 ")} == {"1453346"} and pump_key(np.nan) == "" and pump_key(None) == ""
+    proposal = Proposal(setting="breakfast I:C", status="proposed", reason="r", pump_serial="1453346.0", profile_id=0.0, segment_start_minutes=300.0,
+                        affected_hours="05:00-13:00", current_value=7.0, proposed_value=6.5, direction="adds insulin")
+    records, _ = register_proposal(load_records("/nonexistent/x.csv"), proposal, as_of=pd.Timestamp("2026-11-18"))
+    synced = sync_with_pump(records, pd.DataFrame([_change("2026-11-19 09:30", 300.0, pump="1453346")]), PARTS, since=pd.Timestamp("2026-11-15"))
+    assert synced["origin"].tolist() == ["system"] and synced.loc[0, "status"] == "entered" and synced.loc[0, "pump_serial"] == "1453346"

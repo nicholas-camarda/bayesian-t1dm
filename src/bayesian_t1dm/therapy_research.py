@@ -13,6 +13,8 @@ from .evaluate import walk_forward_splits
 from .features import MEAL_RECORD_COLUMNS, FeatureConfig, FeatureFrame, recompute_scenario_features
 from .health_auto_export import AnalysisReadyHealthDataset
 from . import meal_flags
+from .context_rules import inside_intervals
+from .pump_profiles import pump_key
 from .latent_meal_trajectory import (
     MIN_LOGGED_MEALS_FOR_ICR,
     CarbSensitivityObservation,
@@ -2089,8 +2091,11 @@ def build_first_meal_clean_window_registry(
     premeal_minutes: int = 30,
     postmeal_minutes: int = 180,
     unlogged: pd.DataFrame | None = None,
+    exercise: pd.DataFrame | None = None,
     meal_segments: tuple[str, ...] = ("morning",),
 ) -> pd.DataFrame:
+    """One row per first-meal candidate with its exclusion reasons. ``exercise`` is the shared exercise rule
+    (``context_rules.exercise_intervals``): a meal that starts inside it is excluded as ``exercise``."""
     columns = [
         "candidate_id",
         "meal_id",
@@ -2108,7 +2113,7 @@ def build_first_meal_clean_window_registry(
         "premeal_glucose",
         "premeal_delta_30m",
         "premeal_iob",
-        "recent_workout_6h",
+        "in_exercise",
         "closed_loop_confounding_premeal",
         "prior_bolus_4h",
         "postmeal_additional_bolus_120m",
@@ -2167,9 +2172,7 @@ def build_first_meal_clean_window_registry(
 
         premeal_iob_series = pd.to_numeric(pre.get("iob_units"), errors="coerce").dropna()
         premeal_iob = float(premeal_iob_series.iloc[-1]) if not premeal_iob_series.empty else float(pd.to_numeric(pd.Series([getattr(candidate, "iob_units", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-        workout_summary_trustworthy = bool(pd.to_numeric(pd.Series([getattr(candidate, "workout_summary_trustworthy", 1.0)]), errors="coerce").fillna(1.0).iloc[0] > 0)
-        recent_workout_6h_raw = bool(pd.to_numeric(pd.Series([getattr(candidate, "recent_workout_6h", 0.0)]), errors="coerce").fillna(0.0).iloc[0] > 0)
-        recent_workout_6h = recent_workout_6h_raw and workout_summary_trustworthy
+        in_exercise = bool(exercise is not None and inside_intervals(pd.Series([timestamp]), exercise)[0])
         meaningful_basal_transition_premeal = bool(pd.to_numeric(pre.get("meaningful_basal_rate_change"), errors="coerce").fillna(0.0).max() > 0)
         stacked_bolus_premeal = bool(pd.to_numeric(pre.get("stacked_bolus_state"), errors="coerce").fillna(0.0).max() > 0)
         closed_loop_confounding_premeal = meaningful_basal_transition_premeal or stacked_bolus_premeal
@@ -2194,8 +2197,8 @@ def build_first_meal_clean_window_registry(
             exclusion_reasons.append("premeal_bg_out_of_range")
         if not np.isfinite(premeal_delta_30m) or abs(premeal_delta_30m) > 20.0:
             exclusion_reasons.append("steep_premeal_slope")
-        if recent_workout_6h:
-            exclusion_reasons.append("recent_workout_6h")
+        if in_exercise:
+            exclusion_reasons.append("exercise")
         if closed_loop_confounding_premeal:
             exclusion_reasons.append("closed_loop_confounding_premeal")
         if postmeal_additional_bolus_120m:
@@ -2253,7 +2256,7 @@ def build_first_meal_clean_window_registry(
                 "premeal_glucose": float(premeal_glucose) if np.isfinite(premeal_glucose) else float("nan"),
                 "premeal_delta_30m": premeal_delta_30m,
                 "premeal_iob": premeal_iob,
-                "recent_workout_6h": int(recent_workout_6h),
+                "in_exercise": int(in_exercise),
                 "closed_loop_confounding_premeal": int(closed_loop_confounding_premeal),
                 "prior_bolus_4h": int(prior_bolus_4h),
                 "postmeal_additional_bolus_120m": int(postmeal_additional_bolus_120m),
@@ -2295,7 +2298,7 @@ LATENT_MEAL_ANALYSIS_TIERS: tuple[dict[str, Any], ...] = (
         "analysis_tier": "workout_context_allowed",
         "analysis_tier_rank": 1,
         "analysis_tier_label": "Workout context allowed",
-        "allowed_reasons": frozenset({"recent_workout_6h"}),
+        "allowed_reasons": frozenset({"exercise"}),
         "confidence_multiplier": 0.88,
         "uncertainty_multiplier": 1.12,
     },
@@ -2303,7 +2306,7 @@ LATENT_MEAL_ANALYSIS_TIERS: tuple[dict[str, Any], ...] = (
         "analysis_tier": "controller_context_allowed",
         "analysis_tier_rank": 2,
         "analysis_tier_label": "Controller context allowed",
-        "allowed_reasons": frozenset({"recent_workout_6h", "closed_loop_confounding_premeal"}),
+        "allowed_reasons": frozenset({"exercise", "closed_loop_confounding_premeal"}),
         "confidence_multiplier": 0.78,
         "uncertainty_multiplier": 1.22,
     },
@@ -2311,7 +2314,7 @@ LATENT_MEAL_ANALYSIS_TIERS: tuple[dict[str, Any], ...] = (
         "analysis_tier": "baseline_drift_allowed",
         "analysis_tier_rank": 3,
         "analysis_tier_label": "Baseline drift allowed",
-        "allowed_reasons": frozenset({"recent_workout_6h", "closed_loop_confounding_premeal", "premeal_bg_out_of_range", "steep_premeal_slope"}),
+        "allowed_reasons": frozenset({"exercise", "closed_loop_confounding_premeal", "premeal_bg_out_of_range", "steep_premeal_slope"}),
         "confidence_multiplier": 0.70,
         "uncertainty_multiplier": 1.38,
     },
@@ -2321,7 +2324,7 @@ LATENT_MEAL_ANALYSIS_TIERS: tuple[dict[str, Any], ...] = (
         "analysis_tier_label": "Exploratory CGM quality only",
         "allowed_reasons": frozenset(
             {
-                "recent_workout_6h",
+                "exercise",
                 "closed_loop_confounding_premeal",
                 "premeal_bg_out_of_range",
                 "steep_premeal_slope",
@@ -3469,7 +3472,7 @@ def _effective_icr_evidence(
                     continue
                 meals.append({
                     "row": metric_row, "stated": stated, "icr": round(icr, 2), "cf": round(cf), "source": source, "timestamp": pd.Timestamp(metric_row.timestamp),
-                    "pump": str(getattr(metric_row, "pump_serial", "")), "profile": _unknown_as(_as_float(getattr(metric_row, "profile_id", np.nan))),
+                    "pump": pump_key(getattr(metric_row, "pump_serial", "")), "profile": _unknown_as(_as_float(getattr(metric_row, "profile_id", np.nan))),
                     "segment_start": _unknown_as(_as_float(getattr(metric_row, "profile_segment_start_minutes", np.nan))),
                 })
             base = {"analysis": analysis, "logged_food_scale": bevel_scale, "logged_food_pairs": bevel_pairs}
@@ -4617,6 +4620,8 @@ def run_latent_meal_icr_research(
     therapy_settings: LatentMealTherapySettings | None = None,
     excluded_periods: tuple[ExcludedPeriod, ...] = (),
     nutrition: pd.DataFrame | None = None,
+    unlogged: pd.DataFrame | None = None,
+    exercise: pd.DataFrame | None = None,
     meal_segments: tuple[str, ...] = ("morning",),
 ) -> LatentMealResearchResult:
     if research_scope not in {"foundation", "full"}:
@@ -4624,8 +4629,9 @@ def run_latent_meal_icr_research(
     segments = segments or parse_therapy_segments()
     research_frame = build_therapy_research_frame(dataset, segments=segments, meal_proxy_mode=meal_proxy_mode, excluded_periods=excluded_periods)
     meal_event_registry = build_meal_event_registry(research_frame)
-    unlogged = meal_flags.unlogged_intervals(research_frame, nutrition)
-    clean_meal_windows = build_first_meal_clean_window_registry(research_frame, unlogged=unlogged, meal_segments=meal_segments)
+    if unlogged is None:
+        unlogged = meal_flags.unlogged_intervals(research_frame, nutrition)
+    clean_meal_windows = build_first_meal_clean_window_registry(research_frame, unlogged=unlogged, exercise=exercise, meal_segments=meal_segments)
     first_meal_exclusion_summary = build_first_meal_exclusion_summary(clean_meal_windows)
     if research_scope == "foundation":
         gate, gate_markdown = _latent_meal_gate(dataset, clean_meal_windows, research_scope=research_scope)

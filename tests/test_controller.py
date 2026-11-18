@@ -150,3 +150,20 @@ def test_a_long_window_is_not_cut_short_by_a_later_short_one():
     meals = pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-01 08:00", "2026-06-01 09:00"]), "window_hours": [4.0, 2.0]})
     times = pd.Series(pd.to_datetime(["2026-06-01 07:59", "2026-06-01 11:30", "2026-06-01 12:01", "2026-06-01 12:30"]))
     assert controller._inside_windows(times, meals).tolist() == [False, True, False, False]  # 08:00 + 4 h reaches 12:00 although the 09:00 + 2 h meal ends at 11:00
+
+
+def test_a_day_with_no_clean_glucose_does_not_make_glucose_and_lows_unknown_for_the_window():
+    frame = _days([0.4] * 20, below_70=5.0)
+    frame.loc[0, ["mean_glucose", "below_70_pct", "below_54_pct"]] = np.nan
+    row = _signal(frame)
+    assert row["mean_glucose"] == pytest.approx(150.0) and row["below_70_pct"] == pytest.approx(5.0) and row["days_with_glucose"] == 19
+    assert row["signal"].startswith("controller adds insulin but lows are over a limit")
+    nothing = _signal(_days([0.4] * 20).assign(mean_glucose=np.nan, below_70_pct=np.nan, below_54_pct=np.nan))
+    assert nothing["signal"].startswith("no clean glucose") and nothing["days_with_glucose"] == 0
+
+
+def test_a_window_that_wraps_midnight_belongs_to_the_day_it_started():
+    wrap = DayPart("21:00-04:00", 21 * 60, 4 * 60)
+    stamps = pd.Series(pd.to_datetime(["2026-06-05 22:00", "2026-06-06 01:00", "2026-06-06 23:00"]))  # readings inside the bin
+    assert wrap.analysis_date(stamps).tolist() == [pd.Timestamp("2026-06-05")] * 2 + [pd.Timestamp("2026-06-06")]
+    assert DayPart("05:00-09:00", 300, 540).analysis_date(stamps).tolist() == list(stamps.dt.normalize())

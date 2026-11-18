@@ -106,7 +106,8 @@ def evaluate_change(
     from .outcomes import READING_MINUTES, MIN_DAY_COVERAGE, _prepare
 
     frame = _prepare(cgm)
-    frame = frame[part.contains(frame["minute"])]
+    frame = frame[part.contains(frame["minute"])].copy()
+    frame["date"] = part.analysis_date(frame["timestamp"])
     expected = part.hours * 60 / READING_MINUTES
 
     def daily(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:

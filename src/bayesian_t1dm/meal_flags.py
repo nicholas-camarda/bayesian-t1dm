@@ -87,9 +87,9 @@ def bevel_missing(research_frame: pd.DataFrame, nutrition: pd.DataFrame | None) 
 def possible_unlogged_food(research_frame: pd.DataFrame, nutrition: pd.DataFrame | None) -> pd.DataFrame:
     frame = research_frame[["timestamp", "glucose"]].copy()
     frame["timestamp"] = pd.to_datetime(frame["timestamp"])
-    frame = frame.sort_values("timestamp").set_index("timestamp")
-    glucose = pd.to_numeric(frame["glucose"], errors="coerce")
-    steps = RISE_WINDOW_MINUTES // 5
+    frame = frame.sort_values("timestamp").drop_duplicates("timestamp").set_index("timestamp")
+    glucose = pd.to_numeric(frame["glucose"], errors="coerce").resample("5min").first()  # one slot per 5 minutes, NaN in gaps
+    steps = RISE_WINDOW_MINUTES // 5  # slots, so the shift is a time span even across CGM gaps
     rise = glucose.shift(-steps) - glucose
     starts = rise[rise.ge(RISE_MGDL)].index
     if len(starts) == 0:

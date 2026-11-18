@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 from typing import Sequence
 
 import numpy as np
 import pandas as pd
 
+from .context_rules import CGM_MAX_MGDL, CGM_MIN_MGDL
 from .ingest import IngestedData
 from .insulin import expand_bolus_series_to_grid, expand_bolus_to_grid
 from .pump_profiles import PROFILE_SETTING_COLUMNS
@@ -39,6 +40,7 @@ class FeatureFrame:
     target_column: str
     horizon_minutes: int
     config: FeatureConfig
+    analysis_grid: pd.DataFrame = field(default_factory=pd.DataFrame)  # every 5-minute slot, before rows without a target are dropped
 
 
 def _freq_minutes(freq: str) -> int:
@@ -110,7 +112,7 @@ def _aggregate_cgm(
     cgm = data.cgm.copy()
     cgm["timestamp"] = pd.to_datetime(cgm["timestamp"]).dt.floor(freq)
     cgm["glucose"] = pd.to_numeric(cgm["glucose"], errors="coerce")
-    cgm["cgm_invalid"] = cgm["glucose"].isna() | cgm["glucose"].le(0.0) | cgm["glucose"].lt(40.0) | cgm["glucose"].gt(400.0)
+    cgm["cgm_invalid"] = ~cgm["glucose"].between(CGM_MIN_MGDL, CGM_MAX_MGDL)
     invalid = cgm.groupby("timestamp", as_index=False).agg(cgm_invalid=("cgm_invalid", "sum"))
     cgm = cgm.loc[~cgm["cgm_invalid"]].copy()
     cgm = cgm.groupby("timestamp", as_index=False).agg(glucose_observed=("glucose", "mean"))
@@ -426,11 +428,33 @@ def build_feature_frame(data: IngestedData, config: FeatureConfig | None = None)
     if feature_columns:
         fill_columns = [column for column in feature_columns if column != "glucose"]
         frame[fill_columns] = frame[fill_columns].fillna(0.0)
+    analysis_grid = frame.copy()
     frame = frame.dropna(subset=["glucose", "target_glucose"]).reset_index(drop=True)
     return FeatureFrame(
         frame=frame,
+        analysis_grid=analysis_grid,
         feature_columns=feature_columns,
         target_column="target_glucose",
         horizon_minutes=config.horizon_minutes,
         config=config,
     )
+
+
+ANALYSIS_GRID_COLUMNS = ["timestamp", "glucose", "glucose_carried_forward", "bolus_units", "carb_grams", "iob_units", "carb_ratio_g_per_unit"]
+
+
+def build_analysis_grid(data: IngestedData, config: FeatureConfig | None = None) -> pd.DataFrame:
+    """Every 5-minute slot of the record with what the pump logged in it, for the analyses that need events, not forecasts.
+
+    ``glucose`` is the observed reading only (NaN where there is none); ``glucose_carried_forward`` marks slots where the
+    forecasting frame holds the previous reading instead. Slots without a future glucose to forecast are kept, so every
+    bolus and carbohydrate entry in the tables is on the grid.
+    """
+    built = build_feature_frame(data, config)
+    grid = built.analysis_grid
+    if grid.empty:
+        return pd.DataFrame(columns=ANALYSIS_GRID_COLUMNS)
+    out = grid.copy()
+    out["glucose_carried_forward"] = out["glucose"].notna() & out["glucose_observed"].isna()
+    out["glucose"] = out["glucose_observed"]
+    return out[[column for column in ANALYSIS_GRID_COLUMNS if column in out.columns]].reset_index(drop=True)
