@@ -107,7 +107,6 @@ def daily_controller_pattern(
         return pd.DataFrame()
     stamp = intervals["timestamp"]
     mode = _mode_at(stamp, modes)
-    exercise_times = modes.loc[modes["mode"].eq(2), "timestamp"].to_numpy(dtype="datetime64[ns]") if not modes.empty else np.array([], dtype="datetime64[ns]")
     # "within an hour after exercise mode began or ended": any mode change away from exercise counts as an end.
     exercise_ends = modes.loc[modes["mode"].shift(1).eq(2) & modes["mode"].ne(2), "timestamp"].to_numpy(dtype="datetime64[ns]") if not modes.empty else np.array([], dtype="datetime64[ns]")
     keep = ~_near_after(stamp, meal_times, AFTER_MEAL_HOURS)
