@@ -67,7 +67,7 @@ def test_a_low_after_a_workout_and_a_meal_bolus_is_named_and_a_short_walk_does_n
     glucose = _series([(120, 40), (60, 6), (120, 10)])
     grid = _grid(glucose, bolus={"2026-06-01 02:00": 4.0})
     long = pd.DataFrame({"start_timestamp": [START], "end_timestamp": [pd.Timestamp("2026-06-01 01:00")], "duration_seconds": [3600.0]})
-    short = long.assign(duration_seconds=[600.0])
+    short = long.assign(duration_seconds=[300.0])
     assert _classify(grid, workouts=long).iloc[0]["pattern"] == "after_exercise"
     assert _classify(grid, workouts=short).iloc[0]["pattern"] != "after_exercise"
 

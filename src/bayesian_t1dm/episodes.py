@@ -29,7 +29,7 @@ LATE_DROP_MGDL = 120.0
 LATE_DROP_MINUTES = 90
 STACKED_IOB_UNITS = 2.0
 EXERCISE_WINDOW_MINUTES = 12 * 60
-MIN_WORKOUT_MINUTES = 30      # a workout counts as exercise only from this length: a 10-minute walk does not
+MIN_WORKOUT_MINUTES = 10      # a workout counts as exercise from this length, walks included
 BOLUS_LOOKBACK_MINUTES = 240
 CORRECTION_LOOKBACK_MINUTES = 180
 REPEAT_MIN_EPISODES = 4
@@ -273,7 +273,7 @@ def wilson(successes: int, n: int, z: float = 1.645) -> tuple[float, float]:
 
 def exercise_effect(grid: pd.DataFrame, workouts: pd.DataFrame, *, min_bolus: float = 1.5) -> dict:
     """How often a meal bolus is followed by a low within 4 hours, for meals within 12 hours after a workout of at least
-    30 minutes and for the others."""
+    10 minutes and for the others."""
     frame = grid.copy()
     frame["timestamp"] = pd.to_datetime(frame["timestamp"])
     frame = frame.sort_values("timestamp").reset_index(drop=True)

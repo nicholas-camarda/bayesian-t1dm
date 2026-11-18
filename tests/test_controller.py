@@ -21,7 +21,11 @@ def _cgm(days=3, glucose=130.0):
 
 
 NO_MODES = pd.DataFrame(columns=["pump_serial", "sequence", "timestamp", "mode"])
-NO_MEALS = np.array([], dtype="datetime64[ns]")
+NO_MEALS = pd.DataFrame({"timestamp": pd.to_datetime([]), "window_hours": []})
+
+
+def _meals(*times, hours=4.0):
+    return pd.DataFrame({"timestamp": pd.to_datetime(list(times)), "window_hours": hours})
 
 
 def test_extra_insulin_is_the_commanded_rate_over_the_profile_rate_as_a_share_of_the_profile():
@@ -33,7 +37,7 @@ def test_extra_insulin_is_the_commanded_rate_over_the_profile_rate_as_a_share_of
 
 
 def test_time_after_a_meal_or_bolus_is_left_out_and_a_day_with_too_little_left_does_not_count():
-    meals = np.array([np.datetime64("2026-06-01 00:00"), np.datetime64("2026-06-02 02:00")], dtype="datetime64[ns]")
+    meals = _meals("2026-06-01 00:00", "2026-06-02 02:00")
     daily = controller.daily_controller_pattern(_rates(), NO_MODES, _cgm(), meals, [NIGHT])
     # Day 1: the first 4 of 5 hours are after the meal, leaving 1 hour (under 70%): the day does not count.
     # Day 2: a meal at 02:00 leaves 00:00-02:00 only (2 of 5 hours): not counted either. Day 3 is clean.
@@ -66,7 +70,7 @@ def _days(fractions, hours=5.0, rate=0.7, glucose=150.0, below_70=0.5, part="00:
     fractions = np.asarray(fractions, dtype=float)
     hours = np.broadcast_to(np.asarray(hours, dtype=float), fractions.shape)
     units = rate * hours
-    return pd.DataFrame({"date": pd.date_range(start, periods=len(fractions)), "part": part, "clean_hours": hours, "profile_units": units, "excess_units": fractions * units,
+    return pd.DataFrame({"date": pd.date_range(start, periods=len(fractions)), "part": part, "clean_hours": hours, "commanded_units": units + fractions * units, "profile_units": units, "excess_units": fractions * units,
                          "excess_fraction": fractions, "profile_rate": rate, "mean_glucose": glucose, "below_70_pct": below_70, "below_54_pct": 0.0})
 
 
@@ -119,7 +123,7 @@ def test_basal_signal_looks_only_at_the_most_recent_28_days_and_needs_enough_cle
 
 def test_loose_clean_time_rule_lets_a_partial_day_count_when_asked():
     rates = _rates(days=1)
-    meals = np.array([np.datetime64("2026-06-01 00:00")], dtype="datetime64[ns]")  # leaves 1 of 5 hours: under 70%
+    meals = _meals("2026-06-01 00:00")  # leaves 1 of 5 hours: under 70%
     strict = controller.daily_controller_pattern(rates, NO_MODES, _cgm(days=1), meals, [NIGHT])
     loose = controller.daily_controller_pattern(rates, NO_MODES, _cgm(days=1), meals, [NIGHT], min_clean_fraction=None, min_clean_hours=0.5)
     assert strict.empty and len(loose) == 1 and loose.loc[0, "clean_hours"] == pytest.approx(1.0, abs=0.1) and loose.loc[0, "profile_rate"] == 1.0
@@ -130,3 +134,19 @@ def test_a_segment_short_of_clean_time_widens_its_window_and_says_so():
     frame = _days([0.4] * 60).assign(date=dates)
     row = _signal(frame)
     assert row["window_days"] == 56 and row["days"] >= 10 and row["signal"] == "basal likely too low"
+
+
+def test_meal_windows_scale_with_the_meal_and_ignore_small_entries_and_automatic_corrections():
+    carbs = pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-01 08:00", "2026-06-01 10:00", "2026-06-01 12:00", "2026-06-01 14:00"]), "carb_grams": [10.0, 18.0, 35.0, 60.0]})
+    bolus = pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-01 09:00", "2026-06-01 11:00", "2026-06-01 13:00", "2026-06-01 15:00"]), "bolus_units": [0.3, 1.5, 3.0, 6.0]})
+    windows = controller.meal_windows(bolus, carbs)
+    assert windows["timestamp"].dt.hour.tolist() == [10, 11, 12, 13, 14, 15]  # the 10 g entry and the 0.3 U correction set no window
+    assert windows["window_hours"].tolist() == [2.0, 2.0, 3.0, 3.0, 4.0, 4.0]
+    strict = controller.meal_windows(bolus, carbs, strict=True)
+    assert len(strict) == 7 and set(strict["window_hours"]) == {4.0}  # every carb entry and the bolus of 0.5 U or more
+
+
+def test_a_long_window_is_not_cut_short_by_a_later_short_one():
+    meals = pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-01 08:00", "2026-06-01 09:00"]), "window_hours": [4.0, 2.0]})
+    times = pd.Series(pd.to_datetime(["2026-06-01 07:59", "2026-06-01 11:30", "2026-06-01 12:01", "2026-06-01 12:30"]))
+    assert controller._inside_windows(times, meals).tolist() == [False, True, False, False]  # 08:00 + 4 h reaches 12:00 although the 09:00 + 2 h meal ends at 11:00

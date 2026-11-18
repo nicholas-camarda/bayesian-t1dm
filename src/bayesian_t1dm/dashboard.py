@@ -170,6 +170,8 @@ def build_dashboard_data(
     pump_serial: str,
     profile_id: float,
     episodes: dict[str, Any] | None = None,
+    controller_daily_strict: pd.DataFrame | None = None,
+    current_rates: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     baselines = baseline_table(cgm, as_of=as_of)
     by_part_90 = day_part_table(cgm, parts, as_of=as_of, days=90)
@@ -195,10 +197,13 @@ def build_dashboard_data(
                      "upper": float(row.effective_icr_upper_90), "n": int(row.n_meals), "start": str(pd.Timestamp(row.period_start).date()), "end": str(pd.Timestamp(row.period_end).date()),
                      "current": chosen is row, "now": now, "latest": chosen is None and row is latest}
                 )
-    signals = basal_signal(controller_daily) if not controller_daily.empty else pd.DataFrame(columns=["part", "profile_rate", "window_days", "days", "clean_hours", "share_over_x", "share_over_lo", "share_over_hi", "prob_rule_met", "pooled_excess", "excess_lo", "excess_hi", "mean_glucose", "below_70_pct", "below_54_pct", "signal"])
+    signals = basal_signal(controller_daily, current_rates) if not controller_daily.empty else pd.DataFrame(columns=["part", "profile_rate", "window_days", "days", "clean_hours", "share_over_x", "share_over_lo", "share_over_hi", "prob_rule_met", "pooled_excess", "excess_lo", "excess_hi", "mean_glucose", "below_70_pct", "below_54_pct", "signal"])
+    if controller_daily_strict is not None and not controller_daily_strict.empty and not signals.empty:
+        strict = basal_signal(controller_daily_strict, current_rates)
+        signals = signals.merge(strict[["part", "days", "clean_hours", "pooled_excess", "signal"]].rename(columns={"days": "strict_days", "clean_hours": "strict_hours", "pooled_excess": "strict_excess", "signal": "strict_signal"}), on="part", how="left")
     summary = controller_summary(controller_daily) if not controller_daily.empty else pd.DataFrame()
     night = controller_daily[controller_daily["part"].eq(controller_daily["part"].iloc[0])] if not controller_daily.empty else pd.DataFrame()
-    nightly = [{"date": str(pd.Timestamp(r.date).date()), "excess": r.excess_fraction, "glucose": r.mean_glucose} for r in night.sort_values("date").itertuples(index=False)] if not night.empty else []
+    nightly = [{"date": str(pd.Timestamp(r.date).date()), "excess": r.excess_fraction, "glucose": r.mean_glucose} for r in night[night["date"] >= night["date"].max() - pd.Timedelta(days=180)].sort_values("date").itertuples(index=False)] if not night.empty else []
 
     problems = find_problem_areas(segments, evidence_rows, signals, episodes, proposal_row)
     overnight_flagged = any(a["title"].startswith("Basal likely too low") for a in problems)

@@ -49,6 +49,16 @@ def current_day_parts(merged: MergedDataset, raw_root: str | Path) -> tuple[list
     return day_parts_from_starts(starts), source
 
 
+def profile_history(merged: MergedDataset, raw_root: str | Path) -> ProfileHistory:
+    """The pump's profile history replayed from its own edit and switch events."""
+    events = pd.read_parquet(merged_dir(raw_root) / "tables" / "pump_profile_events.parquet")
+    visible = {
+        pump: (dt.date.fromisoformat(item["edits_visible"][0][:10]), dt.date.fromisoformat(item["edits_visible"][1][:10]))
+        for pump, item in merged.manifest["pump_profile_history"].items()
+    }
+    return ProfileHistory(events, visible)
+
+
 def active_profile_now(merged: MergedDataset, raw_root: str | Path) -> tuple[str, int]:
     """The latest pump and the profile it runs as of the last day its edits are visible."""
     events = pd.read_parquet(merged_dir(raw_root) / "tables" / "pump_profile_events.parquet")
