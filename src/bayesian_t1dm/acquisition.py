@@ -1258,6 +1258,34 @@ def _pump_log_chunks(start: date, end: date) -> list[tuple[str, str]]:
     return chunks
 
 
+PROFILE_EDIT_EVENT = 68
+
+
+def _fetch_profile_edit_chunks(adapter: object, device_id: str, chunks: Sequence[tuple[str, str]]) -> list[dict[str, Any]]:
+    """Segment-edit events (code 68) for each date chunk.
+
+    Tandem Source leaves code 68 out of its default event list, so it is asked for by name. The server answers a
+    filtered request with more than the code asked for, so only the 68 records are kept.
+    """
+    responses = []
+    for chunk_start, chunk_end in chunks:
+        response = adapter.get_pump_logs(device_id, chunk_start, chunk_end, event_ids_filter=[PROFILE_EDIT_EVENT])
+        events = [event for event in response.get('events') or [] if event.get('eventCode') == PROFILE_EDIT_EVENT]
+        responses.append({'start': chunk_start, 'end': chunk_end, 'response': {'events': events}})
+    return responses
+
+
+def _profile_edit_payload(window_id: str, serial: str, device_id: str, responses: list[dict[str, Any]], created_at: Any) -> dict[str, Any]:
+    return {
+        'window_id': window_id,
+        'endpoint_family': 'pump_profile_edits',
+        'pump_serial': serial,
+        'pump_device_id': device_id,
+        'chunks': responses,
+        'created_at': created_at,
+    }
+
+
 def _shift_timestamp_text(value: Any, minutes: int) -> str | None:
     if value is None:
         return None
@@ -1972,6 +2000,33 @@ def backfill_tandem_exports(
     )
 
 
+def backfill_profile_edits(client: TConnectSyncSourceClient, credentials: TandemCredentials, workspace: ProjectPaths, *, log=print) -> list[Path]:
+    """Fetch segment-edit events (code 68) for archived windows that hold pump-logs JSON but no edits file.
+
+    Adds ``pump_profile_edits_<serial>_<device>.json`` beside each window's existing raw files; nothing already
+    archived is rewritten. A window's chunks are the date ranges its own pump-logs file requested.
+    """
+    client.login(credentials)
+    adapter = client._load_adapter()
+    written: list[Path] = []
+    for logs_path in sorted(workspace.cloud_raw.glob('tconnectsync/*/raw/pump_logs_*.json')):
+        if logs_path.name.endswith('.meta.json'):
+            continue
+        edits_path = logs_path.with_name(logs_path.name.replace('pump_logs_', 'pump_profile_edits_', 1))
+        if edits_path.exists():
+            continue
+        payload = json.loads(logs_path.read_text(encoding='utf-8'))
+        if not any(chunk['response'].get('events') for chunk in payload['chunks']):
+            continue
+        chunks = [(chunk['start'], chunk['end']) for chunk in payload['chunks']]
+        responses = _fetch_profile_edit_chunks(adapter, str(payload['pump_device_id']), chunks)
+        _write_json(edits_path, _profile_edit_payload(str(payload['window_id']), str(payload['pump_serial']), str(payload['pump_device_id']), responses, payload.get('created_at')))
+        count = sum(len(chunk['response']['events']) for chunk in responses)
+        log(f"{logs_path.parent.parent.name}: {count} segment edit events for pump {payload['pump_serial']}")
+        written.append(edits_path)
+    return written
+
+
 def _window_from_id(window_id: str) -> ExportWindow:
     start_text, end_text = window_id.split("__", 1)
     return ExportWindow(start_date=date.fromisoformat(start_text), end_date=date.fromisoformat(end_text))
@@ -2265,6 +2320,11 @@ class TConnectSyncSourceClient:
                 'created_at': created_at,
             }
             raw_files[logs_path] = logs_payload
+            if events:  # a pump with no events in this window has no edits to see
+                edit_responses = _fetch_profile_edit_chunks(adapter, device_id, _pump_log_chunks(window.start_date, window.end_date))
+                edits_path = raw_dir / f'pump_profile_edits_{serial or "unknown"}_{device_id}.json'
+                raw_files[edits_path] = _profile_edit_payload(window.window_id, serial, device_id, edit_responses, created_at)
+                extra_raw_artifacts.append(RawApiArtifact(endpoint_family='pump_profile_edits', path=edits_path, metadata_path=None, metadata={}))
             extra_raw_artifacts.append(
                 RawApiArtifact(
                     endpoint_family='pump_logs',

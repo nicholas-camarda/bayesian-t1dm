@@ -84,9 +84,8 @@ def segment_starts_in_force(history, pump_serial: str, moment: dt.datetime, *, s
     if profile_id is None:
         return []
     starts: set[int] = set()
-    day = moment.replace(hour=0, minute=0, second=0, microsecond=0)
     for minute in range(0, 24 * 60, step_minutes):
-        segment = history.segment_in_force(pump_serial, profile_id, day + dt.timedelta(minutes=minute))
+        segment = history.segment_in_force(pump_serial, profile_id, moment, minute_of_day=minute)
         if segment is not None:
             starts.add(int(segment["start_minutes"]))
     return sorted(starts)

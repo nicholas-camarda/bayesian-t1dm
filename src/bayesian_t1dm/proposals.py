@@ -94,11 +94,13 @@ def propose_breakfast_icr(
     segment_ends: dict[float, float],
     *,
     as_of: pd.Timestamp,
+    current_icr: dict[float, float] | None = None,
 ) -> Proposal:
     """The breakfast I:C proposal, or a held proposal that says why not.
 
     ``segment_ends`` maps a pump segment's start (minutes after midnight) to the start of the next, which bounds the
-    affected hours.
+    affected hours. ``current_icr`` maps a segment's start to the I:C the pump holds now: when the person has
+    already changed it since the last breakfast, evidence at the old setting is reported but nothing is proposed.
     """
     if evidence is None or evidence.empty:
         return _held("no breakfast evidence")
@@ -125,6 +127,17 @@ def propose_breakfast_icr(
         current_value=float(row["programmed_icr"]), breakfasts=int(row["n_meals"]),
         estimate=float(row["effective_icr"]), estimate_lower_90=float(row["effective_icr_lower_90"]), estimate_upper_90=float(row["effective_icr_upper_90"]),
     )
+    held_now = (current_icr or {}).get(segment)
+    if held_now is not None and round_step(held_now) != round_step(float(row["programmed_icr"])):
+        identity["current_value"] = float(held_now)
+        verdict = "supports" if np.isfinite(row["effective_icr"]) and abs(row["effective_icr"] - held_now) < abs(row["effective_icr"] - float(row["programmed_icr"])) else "does not clearly support"
+        return _held(
+            f"the pump now holds {held_now:.1f} g/U, changed after the last breakfast at {row['programmed_icr']:.1f} g/U; "
+            f"the {int(row['n_meals'])} breakfasts at {row['programmed_icr']:.1f} behaved like {row['effective_icr']:.1f} g/U "
+            f"(90% range {row['effective_icr_lower_90']:.1f}-{row['effective_icr_upper_90']:.1f}), which {verdict} the change. "
+            f"Evidence at {held_now:.1f} is accumulating",
+            **identity,
+        )
     if int(row["n_meals"]) < MIN_LOGGED_MEALS_FOR_ICR or not np.isfinite(row["effective_icr"]):
         return _held(f"only {int(row['n_meals'])} breakfasts at the current setting ({row['programmed_icr']:.1f} g/U); {MIN_LOGGED_MEALS_FOR_ICR} are needed", **identity)
     current, estimate = float(row["programmed_icr"]), float(row["effective_icr"])

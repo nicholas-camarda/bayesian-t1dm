@@ -18,8 +18,9 @@ Source serializes each 4-byte word of the pump's little-endian record in reverse
 below are pumpX2's (``IdpTimeDependentSegmentHistoryLog``, ``IdpActionHistoryLog``) after that reversal.
 
 The pump-logs JSON that tconnectsync 3.x downloads carries event 69 (decoded by the server) but not event 68,
-so segment values are known only while the binary archive (tconnectsync 2.x windows) covers the pump; after
-that, edits are invisible and the history is not used. Profile switches stay known.
+which Tandem Source leaves out of its default event list. Event 68 is requested by name and archived as
+``pump_profile_edits_*.json`` (decoded by the server), so edits are known from the binary archive (tconnectsync
+2.x windows) and from those files; where neither covers the pump, edits are invisible and the history is not used.
 """
 
 from __future__ import annotations
@@ -121,6 +122,37 @@ def _binary_events(path: Path, pump_serial: str) -> list[dict[str, Any]]:
     return rows
 
 
+def _edit_json_events(path: Path) -> list[dict[str, Any]]:
+    """Segment edits (event 68) from ``pump_profile_edits_*.json``, decoded by the server.
+
+    ``carbRatio`` is in mg/U like the binary record, ``basalRate`` in mU/h, and ``status`` lists the set value bits.
+    """
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    pump_serial = str(payload["pump_serial"])
+    rows = []
+    for chunk in payload["chunks"]:
+        for event in chunk["response"].get("events") or []:
+            props = event["eventProperties"]
+            rows.append(
+                {
+                    "pump_serial": pump_serial,
+                    "timestamp": pd.Timestamp(event["pumpDateTime"]).to_pydatetime(),
+                    "sequence": int(event["sequenceNumber"]),
+                    "event": SEGMENT_EVENT,
+                    "profile_id": int(props["idp"]),
+                    "status": SEGMENT_COMPLETE_STATUS if sorted(props["status"]) == [0, 1, 2, 3] else sum(1 << int(bit) for bit in props["status"]),
+                    "segment_index": int(props["segmentIndex"]),
+                    "modification": int(props["modificationType"]),
+                    "start_minutes": int(props["startTime"]),
+                    "basal_units_per_hour": int(props["basalRate"]) / 1000.0,
+                    "isf_mgdl_per_unit": int(props["isf"]),
+                    "target_bg_mgdl": int(props["targetBg"]),
+                    "carb_ratio_g_per_unit": int(props["carbRatio"]) / 1000.0,
+                }
+            )
+    return rows
+
+
 def _json_events(path: Path) -> list[dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     pump_serial = str(payload["pump_serial"])
@@ -156,7 +188,7 @@ def _window_dates(window_dir: Path) -> tuple[dt.date, dt.date]:
 def decode_profile_events(tandem_root: str | Path) -> tuple[pd.DataFrame, dict[str, tuple[dt.date, dt.date]]]:
     """All profile events in the archive, and for each pump the span over which its segment edits are visible.
 
-    The visible span is the first unbroken run of windows holding that pump's binary events: before or after it,
+    The visible span is the first unbroken run of windows holding that pump's segment-edit events (binary archive or ``pump_profile_edits`` JSON): before or after it,
     an edit may have happened that the archive does not show.
     """
     tandem_root = Path(tandem_root)
@@ -176,6 +208,9 @@ def decode_profile_events(tandem_root: str | Path) -> tuple[pd.DataFrame, dict[s
         for path in sorted(raw.glob("pump_logs_*.json")):
             if not path.name.endswith(".meta.json"):
                 rows.extend(_json_events(path))
+        for path in sorted(raw.glob("pump_profile_edits_*.json")):
+            rows.extend(_edit_json_events(path))
+            binary_windows.setdefault(str(json.loads(path.read_text(encoding="utf-8"))["pump_serial"]), []).append(_window_dates(window_dir))
     frame = pd.DataFrame(rows, columns=list(PROFILE_EVENT_COLUMNS))
     frame = frame.drop_duplicates(subset=["pump_serial", "sequence"]).sort_values(["pump_serial", "sequence"]).reset_index(drop=True)
     visible: dict[str, tuple[dt.date, dt.date]] = {}
@@ -259,8 +294,12 @@ class ProfileHistory:
         k = bisect.bisect_right(times, timestamp) - 1
         return profiles[k] if k >= 0 else None
 
-    def segment_in_force(self, pump_serial: str, profile_id: int, timestamp: dt.datetime) -> dict[str, float] | None:
-        """The profile's segment covering ``timestamp``'s time of day, or None when the archive cannot show it."""
+    def segment_in_force(self, pump_serial: str, profile_id: int, timestamp: dt.datetime, *, minute_of_day: int | None = None) -> dict[str, float] | None:
+        """The profile's segment covering a time of day, as the profile stood at ``timestamp``, or None when the archive cannot show it.
+
+        The time of day is ``timestamp``'s unless ``minute_of_day`` is given, which asks about another hour of the day
+        under the profile as it stood at ``timestamp`` (the table now, for example, at each hour).
+        """
         span = self.visible.get(pump_serial)
         if span is None or not span[0] <= timestamp.date() <= span[1]:
             return None
@@ -269,7 +308,7 @@ class ProfileHistory:
         if k < 0:
             return None
         table = tables[k]
-        minute = timestamp.hour * 60 + timestamp.minute
+        minute = timestamp.hour * 60 + timestamp.minute if minute_of_day is None else minute_of_day
         covering = None
         for index, segment in enumerate(table):
             if segment is not None and segment["start_minutes"] <= minute and (covering is None or segment["start_minutes"] > table[covering]["start_minutes"]):

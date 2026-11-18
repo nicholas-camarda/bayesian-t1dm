@@ -181,9 +181,11 @@ def test_tconnectsync_client_queries_overlapping_pumps_and_archives_v3_responses
     # The retired 2023 pump does not overlap the window; the other two are both queried.
     assert {call[0] for call in adapter.calls} == {"uuid-old", "uuid-mobi"}
     # A 30-day window is paged in requests of at most 28 days, asking for every event type.
-    old_calls = [call for call in adapter.calls if call[0] == "uuid-old"]
+    old_calls = [call for call in adapter.calls if call[0] == "uuid-old" and call[3] is None]
     assert [(call[1], call[2]) for call in old_calls] == [("2025-07-05", "2025-08-01"), ("2025-08-02", "2025-08-03")]
-    assert all(call[3] is None for call in old_calls)
+    # Segment edits (event 68) are left out of Tandem Source's default list, so they are requested by name.
+    edit_calls = [call for call in adapter.calls if call[3] == [68]]
+    assert {call[0] for call in edit_calls} <= {"uuid-old", "uuid-mobi"} and edit_calls
 
     # Events repeated across the two pages are counted once.
     assert result.row_counts["cgm"] == 1

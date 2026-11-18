@@ -87,3 +87,12 @@ def test_the_segment_with_most_recent_breakfasts_is_the_one_proposed_for():
 
 def test_constants_match_the_written_plan():
     assert proposals.MAX_STEP_FRACTION == pytest.approx(0.10) and proposals.HOLD_DAYS == 14 and proposals.AFTER_MEAL_HOURS == 4
+
+
+def test_a_change_already_entered_is_reported_not_proposed_again():
+    evidence = pd.DataFrame([_row()])
+    result = propose_breakfast_icr(evidence, _cgm(), ENDS, as_of=AS_OF, current_icr={SEGMENT: 6.5})
+    assert result.status == "held" and "pump now holds 6.5" in result.reason and "supports the change" in result.reason
+    assert result.current_value == 6.5
+    same = propose_breakfast_icr(evidence, _cgm(), ENDS, as_of=AS_OF, current_icr={SEGMENT: 7.0})
+    assert same.status == "proposed"
