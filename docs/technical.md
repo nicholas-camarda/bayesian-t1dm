@@ -8,9 +8,9 @@ The active pipeline is:
 2. `tconnectsync` logs in to Tandem Source and queries API windows directly
 3. raw API responses are archived under `~/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm/data/raw/tconnectsync/<window_id>/raw/`
 4. normalized CGM, bolus, basal, and activity tables are written beside the raw responses
-5. optional Health Auto Export bundles are archived under `data/raw/health_auto_export/<export_id>/...`
-6. imported Apple Health tables are unified with deterministic latest-export-wins overlap resolution
-7. `build-dataset` fingerprints every raw input (SHA-256), and only when one changed: normalizes new Tandem windows, reads Tandem once, adds every Apple Health export JSON (byte-identical copies once, newest export wins where they overlap), builds the 5-minute dataset and writes it with `validation_report.md` to `data/merged/`. Analyses load that dataset and refuse to run if a raw file changed since the build.
+5. optional Health Auto Export JSON files are read directly from anywhere under `data/raw/health_auto_export/`
+6. `build-dataset` fingerprints every raw input (SHA-256), and only when one changed: normalizes changed Tandem windows in parallel, reads Tandem once, adds every Apple Health export JSON (byte-identical copies once, newest export wins where they overlap), builds the 5-minute dataset and writes it with `validation_report.md` to `data/merged/`. Analyses load that dataset and refuse to run if a raw file changed since the build.
+7. a file whose size and modification time match the previous build keeps its recorded hash instead of being read again, so the staleness check takes about a second; any file whose modification time changed is re-hashed, so a sync that touches a file without changing it does not trigger a rebuild. A first build, `--force` or a change of `DATASET_VERSION` in the code re-normalizes every window
 8. a per-window Tandem manifest records coverage, hashes, timestamps, and pump identity
 9. a Tandem 5-minute feature frame is built
 10. canonical Apple Health context is merged onto Tandem feature-frame timestamps when available to create the final prepared dataset
@@ -73,13 +73,14 @@ The downstream ingest manifest, which is derived after normalization, still chec
 
 ### Raw Repair and Canonical Timestamp Contract
 
-`bayesian-t1dm normalize-raw` rebuilds `normalized/*.csv` and `window_manifest.csv` from archived `raw/*.json` payloads without refetching.
+`build-dataset` rebuilds `normalized/*.csv` and `window_manifest.csv` from the archived raw responses itself, without refetching. `bayesian-t1dm normalize-raw` does the same for one window or all windows by hand and then refreshes `tandem_export_manifest.csv`.
 
 Normalized CSV contract:
 
-- timestamps are stored as timezone-naive local timestamps in `TIMEZONE_NAME`
-- source/raw metadata may still retain offsets
-- mixed tz-aware and tz-naive raw payload timestamps are normalized elementwise before manifest building and CSV write-out
+- timestamps are stored as timezone-naive local wall-clock timestamps in `TIMEZONE_NAME`
+- a value with a UTC offset is converted to `TIMEZONE_NAME`; a value without one is already local time; a value that is present but not ISO 8601 stops the build with an error rather than dropping the row
+- a CGM reading's time is the sensor's measurement time on the pump clock, stored without an offset. Example: a reading measured at 01:58 on the day clocks jump forward and received at 03:01 is stored at 01:58. Attaching the receipt's offset (EDT) to the measurement (EST) would have moved it an hour
+- Apple Health times keep the wall-clock time the phone recorded and drop its offset
 
 Per-window manifest fields now include:
 
@@ -258,13 +259,12 @@ Operational notes:
 
 Canonical research loop:
 
-1. `bayesian-t1dm normalize-raw` when raw Tandem payloads have changed or need repair.
-2. `bayesian-t1dm build-dataset` to merge any new raw data into `data/merged/` (a no-op when nothing changed).
-3. `bayesian-t1dm research-latent-meal-icr --research-scope foundation` to inspect honest meal-truth semantics and first-meal clean-window readiness.
-4. `bayesian-t1dm research-latent-meal-icr --research-scope full` only after the foundation cohort is actually ready for latent fitting.
-5. `bayesian-t1dm status` when you want the combined snapshot across therapy, forecast, and latent-meal lanes.
-6. `bayesian-t1dm run --skip-recommendations` only as a secondary forecast diagnostic.
-7. `bayesian-t1dm review-therapy-evidence` only when you need secondary therapy identifiability context.
+1. `bayesian-t1dm build-dataset` to normalize and merge any new raw data into `data/merged/` (about a second when nothing changed, under a minute for a full rebuild).
+2. `bayesian-t1dm research-latent-meal-icr --research-scope foundation` to inspect honest meal-truth semantics and first-meal clean-window readiness.
+3. `bayesian-t1dm research-latent-meal-icr --research-scope full` only after the foundation cohort is actually ready for latent fitting.
+4. `bayesian-t1dm status` when you want the combined snapshot across therapy, forecast, and latent-meal lanes.
+5. `bayesian-t1dm run --skip-recommendations` only as a secondary forecast diagnostic.
+6. `bayesian-t1dm review-therapy-evidence` only when you need secondary therapy identifiability context.
 
 Artifact reading order:
 
@@ -277,7 +277,7 @@ If the latent-meal foundation cohort is blocked or empty, debug cohort quality, 
 
 Step-by-step behavior:
 
-1. `normalize-raw` rebuilds normalized Tandem tables from archived `tconnectsync` raw payloads.
+1. `normalize-raw` rebuilds normalized Tandem tables from archived `tconnectsync` raw payloads by hand; `build-dataset` does this itself for changed windows.
 2. `build-dataset` merges Tandem and Apple Health into one deduplicated 5-minute dataset when raw inputs change, and writes `validation_report.md` (inputs, spans, row counts, completeness and plausibility checks).
 3. `research-latent-meal-icr --research-scope foundation` audits meal-truth semantics, builds the first-meal clean-window cohort, and tells you whether the accepted cohort is ready for Phase C. This is the main scientific checkpoint.
 4. `research-latent-meal-icr --research-scope full` runs the constrained first-meal latent-response approximation on accepted windows only and writes research-only posterior, confidence, and model-comparison artifacts.

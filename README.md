@@ -54,7 +54,7 @@ bayesian-t1dm build-dataset
 bayesian-t1dm status
 ```
 
-`backfill` saves Tandem Source responses untouched under `data/raw/tconnectsync/<window>/raw/` and cleaned tables next to them. `build-dataset` merges all Tandem and Apple Health data into one deduplicated, validated dataset; it does work only when a raw file changed, and every analysis refuses to run on a dataset older than its raw files.
+`backfill` saves Tandem Source responses untouched under `data/raw/tconnectsync/<window>/raw/` and cleaned tables next to them. `build-dataset` merges all Tandem and Apple Health data into one deduplicated, validated dataset; it does work only when a raw file changed (a full rebuild takes under a minute; an unchanged check about a second), and every analysis refuses to run on a dataset older than its raw files.
 
 ## Data
 
@@ -68,7 +68,7 @@ Everything lives in the project folder set by `BAYESIAN_T1DM_CLOUD_ROOT` (the Pr
 | `data/raw/context_events.csv` | Days to leave out of meal and basal analyses, `start_date,end_date,reason` (for example a steroid injection) |
 | `data/merged/` | The merged dataset, `validation_report.md` and input fingerprints (written by `build-dataset`) |
 
-Food logged in Apple Health (for example by Bevel, with carbs, protein and fat) is read from the same exports and used only in labelled sensitivity analyses: breakfasts high in fat or protein are set aside, and a combined carb count is rescaled to your pump entries first. The headline I:C stays on the carbs you entered on the pump. Carbs entered in the pump's bolus calculator are read from the pump events, together with the I:C ratio and correction factor the calculator used, so each meal is judged against the setting in force that day. The latent-meal analysis reads your programmed profile from the newest Tandem window; `--therapy-settings file.json` overrides it with this format:
+Food logged in Apple Health (for example by Bevel, with carbs, protein and fat) is read from the same exports and used only in labelled sensitivity analyses: breakfasts high in fat or protein are set aside, and a combined carb count is rescaled to your pump entries first. The headline I:C stays on the carbs you entered on the pump. Carbs entered in the pump's bolus calculator are read from the pump events, together with the I:C ratio and correction factor the calculator used, so each meal is judged against the setting in force that day. The latent-meal analysis reads your programmed profile from the most recently uploaded pump settings in the Tandem archive; `--therapy-settings file.json` overrides it with this format:
 
 ```json
 {

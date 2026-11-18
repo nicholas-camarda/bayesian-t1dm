@@ -243,6 +243,14 @@ def build_merged_dataset(paths: ProjectPaths, *, raw_root: str | Path | None = N
         log(f"Inputs changed: {len(diff['added'])} added, {len(diff['changed'])} changed, {len(diff['removed'])} removed.")
 
     rebuild_all = force or previous is None or previous.get("dataset_version") != DATASET_VERSION
+    if previous is None:
+        rebuild_reason = "first build"
+    elif force:
+        rebuild_reason = "rebuild requested with --force"
+    elif previous.get("dataset_version") != DATASET_VERSION:
+        rebuild_reason = f"the code's dataset version changed from {previous.get('dataset_version')} to {DATASET_VERSION}"
+    else:
+        rebuild_reason = "raw files changed"
     normalized_windows = _normalize_windows(paths, raw_root / "tconnectsync", diff, rebuild_all=rebuild_all, log=log)
 
     log("Reading Tandem data...")
@@ -283,6 +291,7 @@ def build_merged_dataset(paths: ProjectPaths, *, raw_root: str | Path | None = N
         "horizon_minutes": HORIZON_MINUTES,
         "inputs": [asdict(item) for item in inputs],
         "input_changes": diff,
+        "rebuild_reason": rebuild_reason,
         "normalized_windows": normalized_windows,
         "dataset": {
             "feature_columns": list(dataset.feature_columns),
@@ -406,6 +415,10 @@ def _span_text(start: Any, end: Any) -> str:
     return f"{start_ts:%b %d, %Y} to {end_ts:%b %d, %Y}"
 
 
+def _count_text(count: int, noun: str) -> str:
+    return f"{count:,} {noun}{'' if count == 1 else 's'}"
+
+
 def _validation_report(manifest: dict[str, Any]) -> str:
     spans = manifest["spans"]
     counts = manifest["row_counts"]
@@ -428,6 +441,7 @@ def _validation_report(manifest: dict[str, Any]) -> str:
         f"covering {_span_text(spans['apple_start'], spans['apple_end'])}.",
         f"- Hand-kept carb logs: {kinds.get('carb_log', 0)}.",
         f"- Changes since the last build: {len(changes['added'])} files added, {len(changes['changed'])} changed, {len(changes['removed'])} removed.",
+        f"- Rebuilt because: {manifest['rebuild_reason']}; {len(manifest['normalized_windows'])} Tandem windows re-normalized from their raw files.",
         "",
         "## What came out",
         "",
@@ -443,17 +457,18 @@ def _validation_report(manifest: dict[str, Any]) -> str:
         "",
         "| check | result |",
         "| --- | --- |",
-        f"| Tandem downloads complete | {plain(quality['status'])}; {quality['incomplete_window_count']} windows missing requested days or a data type |",
+        f"| Tandem downloads complete | {plain(quality['status'])}; {_count_text(quality['incomplete_window_count'], 'window')} missing requested days or a data type |",
     ]
     cgm_coverage = pd.Series(manifest.get("cgm_slot_coverage_by_window") or [], dtype=float).dropna()
     if not cgm_coverage.empty:
         lines.append(
             f"| CGM readings per window | median {cgm_coverage.median() * 100:.1f}% of 5-minute slots (lowest {cgm_coverage.min() * 100:.1f}%); "
-            f"{int((cgm_coverage < 0.9).sum())} windows under 90% |"
+            f"{_count_text(int((cgm_coverage < 0.9).sum()), 'window')} under 90% |"
         )
     for reason, count in sorted((quality.get("reason_counts") or {}).items(), key=lambda kv: -kv[1]):
         lines.append(f"| windows where {plain(reason)} | {count} |")
-    lines.append(f"| 5-minute data plausible | {plain(quality.get('normalized_plausibility_status'))} |")
+    flagged = f"{_count_text(len(plausibility), 'check')} flagged, listed below" if plausibility else "no checks flagged"
+    lines.append(f"| 5-minute data plausible | {plain(quality.get('normalized_plausibility_status'))}; {flagged} |")
     for reason, count in sorted(plausibility.items(), key=lambda kv: -kv[1]):
         lines.append(f"| rows with {plain(reason)} | {count:,} |")
     lines += [
