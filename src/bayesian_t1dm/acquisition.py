@@ -15,7 +15,7 @@ import pandas as pd
 
 from .features import CALCULATOR_SETTING_COLUMNS
 from .io import read_table
-from .ingest import IngestedData, build_export_manifest, load_tandem_exports, summarize_export_manifest, to_local_wall_clock
+from .ingest import IngestedData, build_export_manifest, load_tandem_exports, summarize_export_manifest, reconcile_carb_entries, to_local_wall_clock
 from .observability import sanitize_fields
 from .paths import ProjectPaths, analysis_timezone
 from .quality import REQUIRED_WINDOW_KINDS, build_window_quality_row
@@ -761,6 +761,7 @@ def _normalize_carb_records(
                 'timestamp': timestamp,
                 'carb_grams': float(carb_value),
                 'source_file': source_label,
+                'source_seq_num': record.get('source_seq_num'),
                 'source_label': endpoint_family,
                 'pump_serial': record.get('pump_serial'),
                 'tconnect_device_id': record.get('tconnect_device_id'),
@@ -776,12 +777,7 @@ def _normalize_carb_records(
     frame['event_time'] = pd.to_datetime(frame['timestamp'], errors='coerce')
     frame['timestamp'] = frame['event_time'].dt.floor('5min')
     frame, _ = _filter_timestamp_window(frame, window=window, timestamp_columns=['timestamp'])
-    group_cols = [column for column in ['timestamp', 'source_file', 'source_label', 'pump_serial', 'tconnect_device_id'] if column in frame.columns]
-    return frame.groupby(group_cols, as_index=False, dropna=False).agg(
-        carb_grams=('carb_grams', 'sum'),
-        event_time=('event_time', 'min'),
-        **{key: (key, 'first') for key in CALCULATOR_SETTING_COLUMNS},
-    )
+    return frame
 
 
 def _normalize_basal_records(
@@ -932,8 +928,7 @@ def normalize_tconnectsync_payloads(
         sort_columns = [column for column in ['timestamp', '_carb_source_priority', 'source_file', 'source_label'] if column in carbs.columns]
         if sort_columns:
             carbs = carbs.sort_values(sort_columns, na_position='last')
-        carbs = carbs.drop_duplicates(subset=['timestamp', 'carb_grams'], keep='first')
-        carbs = carbs.drop(columns=[column for column in ['_carb_source_priority'] if column in carbs.columns])
+        carbs = reconcile_carb_entries(carbs)
     else:
         carbs = pd.DataFrame(columns=['timestamp', 'carb_grams', 'source_file'])
     basal = _normalize_basal_records(basal_records, source_label=source_label, endpoint_family=endpoint_family, timezone=timezone, window=window)
