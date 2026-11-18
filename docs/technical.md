@@ -11,6 +11,7 @@
 | E | Lunch and dinner I:C | E1 per segment evidence; E2 stricter eligibility; E3 proposals | planned |
 | F | Basal from the controller pattern | F1 commanded vs profile rate; F2 lows as a hard stop; F3 proposals | planned |
 | G | Correction factor | G1 correction-only boluses | planned |
+| H | What happened in each long high or low, and how to respond | H1 episode finder; H2 pattern and evidence; H3 repeats by pump segment; H4 playbook | Episodes tab |
 
 The goal throughout is more time in 70-180 mg/dL with time below 70 under 4% and below 54 under 1%. A proposal changes one setting by at most 10% and is held 14 days before the next. The system proposes and measures; the person enters the change on the pump.
 

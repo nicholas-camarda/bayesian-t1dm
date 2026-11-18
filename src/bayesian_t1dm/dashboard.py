@@ -13,7 +13,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .controller import basal_signal, controller_summary
+from . import episodes as ep
+from .controller import basal_signal, controller_summary, delivery_intervals
 from .outcomes import (
     LOW_LIMIT_PERCENT,
     TARGET_HIGH,
@@ -168,10 +169,12 @@ def build_dashboard_data(
     run: dict[str, Any],
     pump_serial: str,
     profile_id: float,
+    episodes: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     baselines = baseline_table(cgm, as_of=as_of)
     by_part_90 = day_part_table(cgm, parts, as_of=as_of, days=90)
     by_part_14 = day_part_table(cgm, parts, as_of=as_of, days=14)
+    episodes_detail = episodes
     episodes = episodes_by_hour(cgm, as_of=as_of)
 
     evidence_rows: list[dict[str, Any]] = []
@@ -198,6 +201,14 @@ def build_dashboard_data(
     nightly = [{"date": str(pd.Timestamp(r.date).date()), "excess": r.excess_fraction, "glucose": r.mean_glucose} for r in night.sort_values("date").itertuples(index=False)] if not night.empty else []
 
     problems = find_problem_areas(segments, evidence_rows, signals, episodes, proposal_row)
+    overnight_flagged = any(a["title"].startswith("Basal likely too low") for a in problems)
+    if episodes_detail:
+        extra = episode_problem_areas(episodes_detail)
+        if overnight_flagged:
+            for area in extra:
+                if area["title"].startswith("Overnight low"):
+                    area["summary"] += " Basal is also flagged as too low in the same hours: the controller adds insulin on most nights, so check whether these lows followed nights it over-delivered before changing basal."
+        problems = [a for a in problems if a["level"] != "ok"] + extra + [a for a in problems if a["level"] == "ok"]
     change_rows = []
     for r in records.sort_values("entered_on", na_position="last").itertuples(index=False):
         change_rows.append({"id": r.record_id, "origin": r.origin, "setting": r.setting, "segment": hhmm(r.segment_start_minutes), "old": r.old_value, "new": r.new_value,
@@ -221,6 +232,7 @@ def build_dashboard_data(
             "proposal": proposal_row,
             "changes": change_rows,
             "controller": {"nightly": nightly, "signals": signals.to_dict("records"), "summary": summary.to_dict("records")},
+            "episode_detail": episodes_detail,
             "problems": problems,
             "low_limits_ok": bool(passes_low_limits(baselines.iloc[-1])),
         }
@@ -230,3 +242,65 @@ def build_dashboard_data(
 def to_script_json(data: dict[str, Any]) -> str:
     """JSON safe to place inside a ``<script>`` element."""
     return json.dumps(data, separators=(",", ":")).replace("</", "<\\/").replace("<!--", "<\\!--")
+
+
+TRACE_HOURS = 3
+LATEST_EPISODES = 30
+
+
+def episodes_payload(
+    cgm: pd.DataFrame, grid: pd.DataFrame, parts: list[DayPart], site_events: pd.DataFrame, rates: pd.DataFrame, unlogged: pd.DataFrame, workouts: pd.DataFrame, *, as_of: pd.Timestamp, days: int = SERIES_DAYS
+) -> tuple[dict[str, Any], pd.DataFrame]:
+    """Episodes of the last ``days`` days with their patterns, the repeats, the exercise effect and what each trace looks like,
+    and the classified episodes themselves."""
+    found = ep.find_episodes(cgm, start=as_of - pd.Timedelta(days=days), end=as_of)
+    delivery = delivery_intervals(rates) if rates is not None and not rates.empty else None
+    classified = ep.classify_all(ep.describe_episodes(found, grid, site_events, unlogged, delivery, workouts, site_coverage_from=rates["timestamp"].min() if rates is not None and not rates.empty else None))
+    series = grid.assign(timestamp=pd.to_datetime(grid["timestamp"])).set_index("timestamp").sort_index()
+    latest = []
+    for row in classified.sort_values("start", ascending=False).head(LATEST_EPISODES).itertuples(index=False):
+        t0, t1 = row.start - pd.Timedelta(hours=TRACE_HOURS), row.end + pd.Timedelta(hours=TRACE_HOURS)
+        window = series[(series.index >= t0) & (series.index <= t1)]
+        offsets = ((window.index - t0).total_seconds() / 60).astype(int)
+        bolus, carbs = window["bolus_units"].fillna(0.0), window["carb_grams"].fillna(0.0)
+        sites = site_events[(site_events["timestamp"] >= t0) & (site_events["timestamp"] <= t1)]["timestamp"] if not site_events.empty else []
+        part = next((p.name for p in parts if p.contains(np.array([row.start.hour * 60 + row.start.minute]))[0]), "")
+        latest.append(
+            {"kind": row.kind, "start": row.start, "end": row.end, "hours": row.hours, "extreme": row.extreme, "pattern": row.pattern, "label": {**ep.HIGH_PATTERNS, **ep.LOW_PATTERNS}[row.pattern],
+             "evidence": row.evidence, "segment": part,
+             "trace": {"t0": t0, "step": 5, "glucose": [None if not np.isfinite(g) else float(g) for g in window["glucose"]],
+                       "boluses": [[int(o), float(u)] for o, u in zip(offsets, bolus) if u > 0], "carbs": [[int(o), float(g)] for o, g in zip(offsets, carbs) if g > 0],
+                       "sites": [int((t - t0).total_seconds() / 60) for t in sites], "start_offset": TRACE_HOURS * 60, "end_offset": int((row.end - t0).total_seconds() / 60)}}
+        )
+    counts = (classified.groupby(["kind", "pattern"]).size().reset_index(name="n").to_dict("records")) if not classified.empty else []
+    payload = {
+        "days": days, "labels": {**ep.HIGH_PATTERNS, **ep.LOW_PATTERNS}, "counts": counts, "highs": int((classified["kind"] == "high").sum()) if not classified.empty else 0,
+        "lows": int((classified["kind"] == "low").sum()) if not classified.empty else 0, "latest": latest,
+        "repeats": ep.repeats(classified, parts), "exercise": exercise_over_logged_period(grid, workouts),
+        "site": ep.site_change_link(classified, site_events), "playbook": {k: {"points_at": v[0], "advice": v[1]} for k, v in ep.PLAYBOOK.items()},
+    }
+    return payload, classified
+
+
+def exercise_over_logged_period(grid: pd.DataFrame, workouts: pd.DataFrame) -> dict[str, Any]:
+    """The exercise effect over the whole period the workout log covers (first workout to last, plus 12 hours): outside it a
+    meal would count as 'not after a workout' only because no workout was recorded."""
+    if workouts is None or workouts.empty:
+        return {}
+    start, end = pd.to_datetime(workouts["start_timestamp"]).min(), pd.to_datetime(workouts["end_timestamp"]).max() + pd.Timedelta(hours=ep.EXERCISE_WINDOW_MINUTES / 60)
+    stamp = pd.to_datetime(grid["timestamp"])
+    result = ep.exercise_effect(grid[(stamp >= start) & (stamp <= end)], workouts)
+    return {**result, "from": str(start.date()), "to": str(end.date())} if result else {}
+
+
+def episode_problem_areas(payload: dict[str, Any]) -> list[dict[str, str]]:
+    areas = []
+    for r in payload["repeats"]:
+        areas.append({"level": "watch", "tab": "episodes", "title": f"{r['label']} repeats at {r['segment']}",
+                      "summary": f"{r['n']} of {r['of']} {r['kind']} episodes in this segment over the last {payload['days']} days fit this pattern. It points at {r['points_at']}."})
+    ex = payload.get("exercise") or {}
+    # Only when the ranges are apart: after-workout lows clearly above the others.
+    if ex.get("after_workout_meals", 0) >= 30 and ex.get("other_meals", 0) >= 30 and ex["after_workout_interval"][0] > ex["other_interval"][1]:
+        areas.append({"level": "watch", "tab": "episodes", "title": "Lows follow meals after workouts more often",
+                      "summary": f"Within 12 hours after a workout, {ex['after_workout_share']:.0%} of meal boluses were followed by a low within 4 hours ({ex['after_workout_meals']} meals), against {ex['other_share']:.0%} otherwise ({ex['other_meals']} meals), {ex['from']} to {ex['to']}."})
+    return areas

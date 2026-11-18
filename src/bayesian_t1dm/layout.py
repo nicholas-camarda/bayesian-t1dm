@@ -26,6 +26,7 @@ RUN_LAYOUT: dict[str, str] = {
     "C_changes/change_log.md": "proposals/change_log.md",
     "F_basal/basal_signal.csv": "proposals/basal_signal.csv",
     "F_basal/supporting/controller_daily.csv": "proposals/controller_daily.csv",
+    "H_episodes/episodes.csv": "proposals/episodes.csv",
     "00_General/validation_report.md": "merged/validation_report.md",
 }
 REQUIRED = ("index.html", "A_outcomes/outcomes_report.html", "B_icr/icr_proposal.md", "B_icr/segment_summary.csv")

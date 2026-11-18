@@ -31,7 +31,7 @@ h2{font-size:17px;margin:26px 0 4px}h2:first-child{margin-top:0}.lead{color:var(
 .grid{display:grid;gap:12px}.g4{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}.g2{grid-template-columns:repeat(auto-fit,minmax(420px,1fr))}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
 .tile .k{color:var(--ink3);font-size:13px}.tile .v{font-size:28px;font-weight:650;line-height:1.15;font-variant-numeric:tabular-nums}.tile .n{color:var(--ink2);font-size:13px}
-.badge{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:650;border-radius:999px;padding:2px 9px}
+.badge{flex-shrink:0;white-space:nowrap;display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:650;border-radius:999px;padding:2px 9px}
 .b-act{background:var(--actbg);color:var(--act)}.b-watch{background:var(--warnbg);color:var(--warn)}.b-ok{background:var(--okbg);color:var(--ok)}
 .problem{display:flex;gap:12px;align-items:flex-start}.problem h3{margin:0 0 2px;font-size:15px}.problem p{margin:0;color:var(--ink2)}
 .btn{background:none;border:1px solid var(--line);color:var(--ink);border-radius:8px;padding:5px 10px;font:inherit;font-size:13px;cursor:pointer;margin-top:8px}.btn:hover{border-color:var(--blue)}
@@ -54,6 +54,7 @@ details{margin-top:8px}summary{cursor:pointer;color:var(--ink2);font-size:13px}
 <main class="wrap">
 <section class="tab" id="t-today"></section>
 <section class="tab" id="t-glucose"></section>
+<section class="tab" id="t-episodes"></section>
 <section class="tab" id="t-meals"></section>
 <section class="tab" id="t-basal"></section>
 <section class="tab" id="t-settings"></section>
@@ -95,7 +96,7 @@ function axes(svg, m, w, h, xs, ys, xticks, yticks, xfmt, yfmt, ylab){
 }
 
 /* ---- tabs ---- */
-const TABS = [['today','Today'],['glucose','Glucose'],['meals','Meals (I:C)'],['basal','Basal'],['settings','Changes'],['about','About']];
+const TABS = [['today','Today'],['glucose','Glucose'],['episodes','Episodes'],['meals','Meals (I:C)'],['basal','Basal'],['settings','Changes'],['about','About']];
 const nav = $('#nav');
 TABS.forEach(([id,label]) => { const b = document.createElement('button'); b.textContent = label; b.setAttribute('role','tab'); b.dataset.tab = id; b.onclick = () => go(id); nav.appendChild(b); });
 function go(id){ TABS.forEach(([t]) => $('#t-'+t).classList.toggle('on', t===id)); nav.querySelectorAll('button').forEach(b => b.setAttribute('aria-selected', b.dataset.tab===id)); (RENDER[id]||(()=>{}))(); window.scrollTo(0,0); try { history.replaceState(null,'','#'+id); } catch (e) { /* a page opened from a restricted origin cannot change its address */ } }
@@ -191,6 +192,51 @@ function episodeChart(host){
       const r=el('rect',{x,y:ys(v),width:Math.max(2,bwid),height:h-m.b-ys(v),rx:2,fill:css(c)},svg); r.onmousemove=ev=>showTip(ev,`<b>${String(k).padStart(2,'0')}:00-${String(k+1).padStart(2,'0')}:00</b><br>${v} ${name} started`); r.onmouseleave=hideTip; }); } });
 }
 
+
+/* ---- Episodes ---- */
+let openEpisode = 0;
+function renderEpisodes(){
+  const t = $('#t-episodes'), E = D.episode_detail;
+  if (!E) { t.innerHTML = '<h2>Episodes</h2><p class="lead">No episode data in this run.</p>'; return; }
+  const cnt = (kind, p) => (E.counts.find(c => c.kind===kind && c.pattern===p) || {n:0}).n;
+  const patterns = Object.keys(E.labels).filter(p => cnt('high',p) + cnt('low',p) > 0);
+  let h = `<h2>Long highs and lows, and what surrounded them</h2><p class="lead">A high is glucose above 250 mg/dL for 90 minutes or more; a low is below 70 for 15 minutes or more. Each is matched to the pattern the recorded data best support: insulin and carbs given before it, corrections during it, site changes, workouts and food you did not log. A pattern is not a diagnosis; where one repeats at the same time of day it points at the setting that governs those hours. Last ${E.days} days.</p>
+  <div class="grid g4">${tile('Long highs', E.highs, 'above 250 for 90 min or more')}${tile('Lows', E.lows, 'below 70 for 15 min or more')}${tile('Most common high', (()=>{const m=Object.keys(E.labels).map(p=>[p,cnt('high',p)]).sort((a,b)=>b[1]-a[1])[0]; return m&&m[1]?m[1]:0})(), (()=>{const m=Object.keys(E.labels).map(p=>[p,cnt('high',p)]).sort((a,b)=>b[1]-a[1])[0]; return m&&m[1]?E.labels[m[0]]:'none'})())}${tile('Most common low', (()=>{const m=Object.keys(E.labels).map(p=>[p,cnt('low',p)]).sort((a,b)=>b[1]-a[1])[0]; return m&&m[1]?m[1]:0})(), (()=>{const m=Object.keys(E.labels).map(p=>[p,cnt('low',p)]).sort((a,b)=>b[1]-a[1])[0]; return m&&m[1]?E.labels[m[0]]:'none'})())}</div>`;
+  h += `<h2>What repeats</h2>`;
+  h += E.repeats.length ? `<p class="lead">A pattern counts as repeating when at least 4 episodes of one kind fall in a pump segment and at least half of them fit it.</p><div class="grid">` + E.repeats.map(r => `<div class="card problem"><span class="badge b-watch">● ${esc(r.kind)}s</span><div><h3>${esc(r.label)} at ${esc(r.segment)}</h3><p>${r.n} of ${r.of} episodes in this segment. Points at: ${esc(r.points_at)}.</p><p style="margin-top:4px">${esc(r.advice)}</p></div></div>`).join('') + `</div>` : `<p class="lead">No pattern repeats in one segment yet.</p>`;
+  h += `<h2>What your data say about each pattern</h2><div class="grid g2">`;
+  patterns.forEach(p => { const pb = E.playbook[p] || {}; let extra = '';
+    if (p==='after_exercise' && E.exercise && E.exercise.after_workout_meals) { const x=E.exercise; extra = `<p class="note"><b>Your numbers:</b> after a workout (within 12 h) ${(x.after_workout_share*100).toFixed(1)}% of meal boluses were followed by a low within 4 hours (${x.after_workout_lows} of ${x.after_workout_meals}, ${x.from} to ${x.to}; 90% range ${(x.after_workout_interval[0]*100).toFixed(0)}-${(x.after_workout_interval[1]*100).toFixed(0)}%), against ${(x.other_share*100).toFixed(1)}% otherwise (${x.other_lows} of ${x.other_meals}; ${(x.other_interval[0]*100).toFixed(0)}-${(x.other_interval[1]*100).toFixed(0)}%). Workouts of 30 minutes or more. ${x.after_workout_interval[0]>x.other_interval[1]?'The ranges are apart: lows are more common after workouts.':'The ranges overlap: your data show no clear difference, so a workout alone does not explain these lows.'}</p>`; }
+    if (p==='site_or_insulin' && E.site && E.site.long_highs) { const x=E.site; extra = `<p class="note"><b>Your numbers:</b> ${x.linked} of ${x.long_highs} highs of 3 hours or more ended within an hour after a site change; chance alone would give about ${(x.chance_share*100).toFixed(0)}%. With so few, this is not evidence of a site problem pattern.</p>`; }
+    if (p==='meal_dosed_high' || p==='meal_underdosed') extra = `<p class="note">The <a href="#meals" data-go="meals">Meals (I:C)</a> tab shows whether the segment's I:C fits these meals.</p>`;
+    h += `<div class="card"><h3 style="margin:0 0 2px;font-size:15px">${esc(E.labels[p])}</h3><p style="margin:0;color:var(--ink2)"><b>${cnt('high',p)+cnt('low',p)}</b> episodes (${cnt('high',p)} high, ${cnt('low',p)} low). Points at ${esc(pb.points_at||'')}.</p><p style="margin:6px 0 0">${esc(pb.advice||'')}</p>${extra}</div>`; });
+  h += `</div><h2>Look at one</h2><p class="lead">The latest ${E.latest.length}. Pick one to see its glucose, the insulin and carbs around it, and why it got its pattern.</p><div class="card"><div class="scroll"><table id="eptable"></table></div></div><div class="card" style="margin-top:12px"><div id="epdetail"></div></div>`;
+  t.innerHTML = h; t.querySelectorAll('[data-go]').forEach(a => a.onclick = ev => { ev.preventDefault(); go(a.dataset.go); });
+  $('#eptable').innerHTML = `<tr><th class="l">Started</th><th class="l">Kind</th><th>Hours</th><th>Peak / low</th><th class="l">Segment</th><th class="l">Pattern</th></tr>` + E.latest.map((e,i) => `<tr data-i="${i}" style="cursor:pointer;${i===openEpisode?'background:var(--grid)':''}"><td class="l">${when(e.start)}</td><td class="l">${e.kind}</td><td>${e.hours.toFixed(1)}</td><td>${f0(e.extreme)}</td><td class="l">${esc(e.segment)}</td><td class="l">${esc(e.label)}</td></tr>`).join('');
+  $('#eptable').querySelectorAll('tr[data-i]').forEach(r => r.onclick = () => { openEpisode = +r.dataset.i; renderEpisodes(); });
+  if (E.latest.length) episodeDetail($('#epdetail'), E.latest[openEpisode]);
+}
+function episodeDetail(host, e){
+  const tr = e.trace; const hdr = document.createElement('div');
+  hdr.innerHTML = `<h3 style="margin:0 0 2px;font-size:15px">${esc(e.label)}</h3><p style="margin:0 0 8px;color:var(--ink2)">${esc(e.evidence)}.</p><div class="legend"><span><i style="background:var(--blue)"></i>glucose</span><span><i style="background:var(--orange);border-radius:50%"></i>insulin given (size = units)</span><span><i style="background:var(--ink)"></i>carbs logged</span><span><i style="background:var(--red)"></i>site change</span></div>`;
+  host.innerHTML = ''; host.appendChild(hdr); const box = document.createElement('div'); host.appendChild(box);
+  const m={l:40,r:10,t:10,b:58}; const g = tr.glucose; const n = g.length;
+  chart(box, 280, (svg,w,h) => {
+    const xs=scale(0,(n-1)*tr.step,m.l,w-m.r), lo=Math.min(40,...g.filter(v=>v!=null)), hi=Math.max(300,...g.filter(v=>v!=null))+10, ys=scale(lo,hi,h-m.b,m.t);
+    el('rect',{x:xs(tr.start_offset),y:m.t,width:Math.max(2,xs(tr.end_offset)-xs(tr.start_offset)),height:h-m.t-m.b,fill:css(e.kind==='high'?'--orange':'--red'),opacity:.12},svg);
+    [70,180,250].forEach(v => { el('line',{x1:m.l,x2:w-m.r,y1:ys(v),y2:ys(v),stroke:css('--grid')},svg); txt(svg,m.l-6,ys(v)+4,v,{'text-anchor':'end'}); });
+    const t0ms = new Date(tr.t0).getTime();
+    for (let k=0;k<=(n-1)*tr.step;k+=tr.step){ const d = new Date(t0ms + k*60000); if (d.getMinutes()===0 && d.getHours()%1===0 && (k%60===0 || true)) { txt(svg,xs(k),h-m.b+16,String(d.getHours()).padStart(2,'0')+':00',{'text-anchor':'middle'}); } }
+    el('path',{d:g.map((v,i)=>v==null?'':(i&&g[i-1]!=null?'L':'M')+xs(i*tr.step)+' '+ys(v)).join(''),fill:'none',stroke:css('--blue'),'stroke-width':2.2,'stroke-linejoin':'round'},svg);
+    tr.sites.forEach(o => { el('line',{x1:xs(o),x2:xs(o),y1:m.t,y2:h-m.b,stroke:css('--red'),'stroke-width':2,'stroke-dasharray':'4 3'},svg); });
+    tr.boluses.forEach(([o,u]) => { const c = el('circle',{cx:xs(o),cy:h-m.b+32,r:Math.max(3,Math.min(9,3+u*1.4)),fill:css('--orange'),stroke:css('--card'),'stroke-width':1.5},svg); c.onmousemove = ev => showTip(ev,`<b>${u.toFixed(2)} U</b>`); c.onmouseleave = hideTip; });
+    tr.carbs.forEach(([o,gr]) => { const c = el('rect',{x:xs(o)-4,y:h-m.b+44,width:8,height:8,fill:css('--ink'),rx:1.5},svg); c.onmousemove = ev => showTip(ev,`<b>${gr.toFixed(0)} g carbs</b>`); c.onmouseleave = hideTip; });
+    const hit = el('rect',{x:m.l,y:m.t,width:w-m.l-m.r,height:h-m.t-m.b,fill:'transparent'},svg);
+    hit.onmousemove = ev => { const r=svg.getBoundingClientRect(); const x=(ev.clientX-r.left)*(w/r.width); const i=Math.max(0,Math.min(n-1,Math.round((x-m.l)/(w-m.l-m.r)*(n-1)))); const d=new Date(new Date(tr.t0).getTime()+i*tr.step*60000); showTip(ev,`<b>${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}</b><br>${g[i]==null?'no reading':f0(g[i])+' mg/dL'}`); };
+    hit.onmouseleave = hideTip;
+  });
+}
+
 /* ---- Meals (I:C) ---- */
 let showAll = false;
 function renderMeals(){
@@ -261,10 +307,10 @@ function renderAbout(){
   <p><b>Meals (I:C)</b> compares each meal's glucose trace with what the pump's carb ratio predicts. It assumes the correction factor is right, and the ratio it finds includes any consistent miscounting of carbohydrate.</p>
   <p><b>Basal</b> reads the controller's own deliveries. Sleep mode aims for a higher glucose (112.5 to 120 mg/dL) than daytime, so some extra insulin at night is expected.</p>
   <p><b>Changes</b> are judged before versus after in one person: other things change in the same weeks, so a result is a pattern, not proof.</p></div>
-  <h2>Where the detail lives</h2><div class="card"><p>Tables behind each chart are in the folders next to this page: <code>A_outcomes/</code>, <code>B_icr/</code>, <code>C_changes/</code>, <code>F_basal/</code> and <code>00_General/</code>. Each has a <code>supporting/</code> folder for diagnostics.</p>
+  <h2>Where the detail lives</h2><div class="card"><p>Tables behind each chart are in the folders next to this page: <code>A_outcomes/</code>, <code>B_icr/</code>, <code>C_changes/</code>, <code>F_basal/</code>, <code>H_episodes/</code> and <code>00_General/</code>. Each has a <code>supporting/</code> folder for diagnostics.</p>
   <p class="note">Run ${esc(D.run.run_id||'')} · commit ${esc((D.run.commit||'').slice(0,8))} · built ${esc(D.run.built||'')}</p></div>`;
 }
-const RENDER={today:renderToday,glucose:renderGlucose,meals:renderMeals,basal:renderBasal,settings:renderSettings,about:renderAbout};
+const RENDER={today:renderToday,glucose:renderGlucose,episodes:renderEpisodes,meals:renderMeals,basal:renderBasal,settings:renderSettings,about:renderAbout};
 const startTab = (location.hash || '').slice(1); go(startTab in RENDER ? startTab : 'today');
 </script>
 </body>
