@@ -71,9 +71,9 @@ def test_profile_history_replays_edits_copies_deletes_and_switches(tmp_path):
         carbs = pd.DataFrame({"timestamp": [when], "pump_serial": ["1453346"]})
         return history.settings_for(carbs).iloc[0].tolist()
 
-    assert at(dt.datetime(2025, 9, 1, 8, 0)) == [0, 1, 7.0, 65, 110]  # before the edit: midnight segment
-    assert at(dt.datetime(2025, 9, 3, 8, 0)) == [0, 1, 7.5, 55, 110]  # the edited segment now starts at 07:00
-    assert at(dt.datetime(2025, 9, 3, 6, 0)) == [0, 1, 7.0, 65, 110]
+    assert at(dt.datetime(2025, 9, 1, 8, 0)) == [0, 1, 7.0, 65, 110, 0]  # before the edit: midnight segment
+    assert at(dt.datetime(2025, 9, 3, 8, 0)) == [0, 1, 7.5, 55, 110, 420]  # the edited segment now starts at 07:00
+    assert at(dt.datetime(2025, 9, 3, 6, 0)) == [0, 1, 7.0, 65, 110, 0]
     # The copy starts as Main was when copied, then diverges; Main is untouched.
     copy = history.segment_in_force("1453346", 3, dt.datetime(2025, 9, 4, 12, 0))
     assert (copy["carb_ratio_g_per_unit"], copy["start_minutes"]) == (9.0, 0)

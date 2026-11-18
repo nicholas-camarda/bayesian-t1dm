@@ -3185,6 +3185,9 @@ EFFECTIVE_ICR_EVIDENCE_COLUMNS = [
     "period_start",
     "period_end",
     "is_current_setting",
+    "pump_serial",
+    "profile_id",
+    "pump_segment_start_minutes",
     "logged_meal_windows",
     "n_meals",
     "sensitivity_ratio",
@@ -3381,6 +3384,25 @@ def _resolve_meal_settings(rows: list[Any], segment: str, settings: LatentMealTh
     ]
 
 
+def _had_correction_bolus(meal: dict[str, Any]) -> bool:
+    """True when the bolus calculator recorded a correction portion (an unrecorded one counts as none)."""
+    value = _as_float(getattr(meal["row"], "correction_bolus_units", np.nan))
+    return bool(np.isfinite(value) and value > 0.05)
+
+
+# Re-pools of a period with fewer or different meals. A proposal needs these to agree with the primary on direction.
+AGREEMENT_CHECKS: tuple[tuple[str, Any], ...] = (
+    ("without looser tiers (clean, workout and controller context only)", lambda rank, meal: rank <= 2),
+    ("clean reference breakfasts only", lambda rank, meal: rank == 0),
+    ("without correction boluses", lambda rank, meal: not _had_correction_bolus(meal)),
+)
+
+
+def _unknown_as(value: float, unknown: float = -1.0) -> float:
+    """A group key for a value the archive does not show (NaN never equals itself, so it cannot be a key)."""
+    return unknown if not np.isfinite(value) else float(value)
+
+
 def _effective_icr_evidence(
     window_metrics: pd.DataFrame,
     trajectories: Mapping[str, MealWindowTrajectory],
@@ -3430,21 +3452,34 @@ def _effective_icr_evidence(
                 stated = carbs_for(metric_row)
                 if not np.isfinite(stated) or stated <= 0 or not include(metric_row):
                     continue
-                meals.append({"row": metric_row, "stated": stated, "icr": round(icr, 2), "cf": cf, "source": source, "timestamp": pd.Timestamp(metric_row.timestamp)})
+                meals.append({
+                    "row": metric_row, "stated": stated, "icr": round(icr, 2), "cf": round(cf), "source": source, "timestamp": pd.Timestamp(metric_row.timestamp),
+                    "pump": str(getattr(metric_row, "pump_serial", "")), "profile": _unknown_as(_as_float(getattr(metric_row, "profile_id", np.nan))),
+                    "segment_start": _unknown_as(_as_float(getattr(metric_row, "profile_segment_start_minutes", np.nan))),
+                })
             base = {"analysis": analysis, "logged_food_scale": bevel_scale, "logged_food_pairs": bevel_pairs}
             if not meals:
                 rows.append({**base, "segment": segment, "programmed_icr": float(settings.icr_for_segment(segment)), "settings_source": "pump profile",
                              "period_start": None, "period_end": None, "is_current_setting": True, "logged_meal_windows": 0,
                              **pool_effective_icr([], programmed_icr=float(settings.icr_for_segment(segment))).to_dict()})
                 continue
-            periods: list[list[dict[str, Any]]] = []
+            # A settings period is a run of breakfasts with the same I:C and CF among those of one pump, profile and
+            # pump segment (the pump segment is the time-of-day slice the pump's own settings are set for). Runs
+            # are formed inside that subsequence, so a stay on another profile in between does not split one, while
+            # an edit to this profile's own setting does.
+            by_slice: dict[tuple[str, float, float], list[list[dict[str, Any]]]] = {}
             for meal in meals:
-                if periods and (periods[-1][-1]["icr"], periods[-1][-1]["cf"]) == (meal["icr"], meal["cf"]):
-                    periods[-1].append(meal)
+                slice_runs = by_slice.setdefault((meal["pump"], meal["profile"], meal["segment_start"]), [])
+                if slice_runs and (slice_runs[-1][-1]["icr"], slice_runs[-1][-1]["cf"]) == (meal["icr"], meal["cf"]):
+                    slice_runs[-1].append(meal)
                 else:
-                    periods.append([meal])
+                    slice_runs.append([meal])
+            latest = max(meals, key=lambda meal: meal["timestamp"])
+            periods = sorted((run for runs in by_slice.values() for run in runs), key=lambda run: run[0]["timestamp"])
+            current_slice_runs = {id(runs[-1]) for key, runs in by_slice.items() if key[:2] == (latest["pump"], latest["profile"])}
             for index, period in enumerate(periods):
                 observations: list[CarbSensitivityObservation] = []
+                observed: list[tuple[dict[str, Any], int, CarbSensitivityObservation]] = []
                 for meal in period:
                     trajectory = trajectories.get(str(meal["row"].meal_id))
                     if trajectory is None:
@@ -3463,19 +3498,26 @@ def _effective_icr_evidence(
                     )
                     if observation is not None:
                         observations.append(observation)
+                        observed.append((meal, int(tier["analysis_tier_rank"]), observation))
+                period_fields = {
+                    **base,
+                    "segment": segment,
+                    "settings_source": " and ".join(sorted({meal["source"] for meal in period})),
+                    "period_start": period[0]["timestamp"],
+                    "period_end": period[-1]["timestamp"],
+                    "is_current_setting": id(period) in current_slice_runs,
+                    "pump_serial": period[0]["pump"],
+                    "profile_id": period[0]["profile"],
+                    "pump_segment_start_minutes": period[0]["segment_start"],
+                }
                 estimate = pool_effective_icr(observations, programmed_icr=period[0]["icr"])
-                rows.append(
-                    {
-                        **base,
-                        "segment": segment,
-                        "settings_source": " and ".join(sorted({meal["source"] for meal in period})),
-                        "period_start": period[0]["timestamp"],
-                        "period_end": period[-1]["timestamp"],
-                        "is_current_setting": index == len(periods) - 1,
-                        "logged_meal_windows": len(period),
-                        **estimate.to_dict(),
-                    }
-                )
+                rows.append({**period_fields, "logged_meal_windows": len(period), **estimate.to_dict()})
+                if analysis == "primary":
+                    # Checks on the same period that a proposal must agree with.
+                    for check, keep in AGREEMENT_CHECKS:
+                        subset = [item for meal, rank, item in observed if keep(rank, meal)]
+                        check_estimate = pool_effective_icr(subset, programmed_icr=period[0]["icr"])
+                        rows.append({**period_fields, "analysis": check, "logged_meal_windows": len(subset), **check_estimate.to_dict()})
     return pd.DataFrame(rows, columns=EFFECTIVE_ICR_EVIDENCE_COLUMNS)
 
 

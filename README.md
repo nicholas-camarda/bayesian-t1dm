@@ -9,6 +9,8 @@ It is research and decision support, not a medical device; nothing here changes 
 | Question | Command | Answer page |
 | --- | --- | --- |
 | Is my morning I:C ratio right? | `research-latent-meal-icr --research-scope full` | `output/latent_meal/latent_meal_review.html` |
+| Which breakfast I:C change does the evidence support? | `propose-breakfast-icr` | `output/proposals/breakfast_proposal.md` |
+| Where do time in range, lows and highs stand? | `report-outcomes` | `output/outcomes/outcomes_report.html` |
 | Is there enough clean overnight data to judge basal? | `review-therapy-evidence` | `output/therapy/therapy_review.html` |
 | Can glucose be forecast 30 minutes ahead better than "it stays the same"? | `run --skip-recommendations` | `output/forecast/forecast_review.html` |
 | Is the Tandem data complete? | `ingest` | `output/source/coverage_review.html` |

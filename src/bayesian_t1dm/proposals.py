@@ -1,0 +1,207 @@
+"""Breakfast I:C proposals: one small change the evidence supports, or the reason there is none.
+
+A proposal is made for the current setting of the pump segment that covers most recent breakfasts. It needs:
+
+1. at least ``MIN_LOGGED_MEALS_FOR_ICR`` breakfasts at the current setting;
+2. the current I:C outside the primary 90% interval for the effective I:C;
+3. every check that can be assessed to point the same way as the primary: the re-pool without the looser tiers, the
+   clean breakfasts alone (assessable once 5 have accumulated), the breakfasts without a correction bolus, and the
+   two logged-food (Bevel) sensitivities;
+4. for a change that adds insulin (a smaller g/U), time below 70 under 4% and below 54 under 1% over the affected
+   hours plus the 4 hours after, in the last 90 days. A change that removes insulin needs no such condition.
+
+The step is the smaller of 10% of the current value and the distance to the estimate, rounded to 0.1 g/U, toward
+the estimate. The proposal is a statement about one person's data; the person enters it on the pump, and its effect
+is judged afterwards by the comparison written into the proposal (``EVALUATION``).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+from .latent_meal_trajectory import MIN_LOGGED_MEALS_FOR_ICR
+from .outcomes import DayPart, LOW_LIMIT_PERCENT, VERY_LOW_LIMIT_PERCENT, passes_low_limits, pooled_metrics
+
+MAX_STEP_FRACTION = 0.10
+STEP_ROUNDING = 0.1
+RECENT_DAYS = 90
+AFTER_MEAL_HOURS = 4
+HOLD_DAYS = 14
+EVALUATION = (
+    f"Compare the {HOLD_DAYS} days before the change with the {HOLD_DAYS} days after it, over the affected hours plus "
+    f"{AFTER_MEAL_HOURS} hours: time in range 70-180 mg/dL with a day-level bootstrap 90% interval, time below 70 (limit "
+    f"{LOW_LIMIT_PERCENT:.0f}%) and below 54 (limit {VERY_LOW_LIMIT_PERCENT:.0f}%), and the re-estimated effective I:C. "
+    "Days listed in context_events.csv are left out. Before-versus-after in one person is associational."
+)
+PRIMARY = "primary"
+
+
+@dataclass(frozen=True)
+class Proposal:
+    setting: str
+    status: str  # "proposed" or "held"
+    reason: str
+    pump_serial: str = ""
+    profile_id: float = float("nan")
+    segment_start_minutes: float = float("nan")
+    affected_hours: str = ""
+    current_value: float = float("nan")
+    proposed_value: float = float("nan")
+    direction: str = ""  # "adds insulin" or "removes insulin"
+    estimate: float = float("nan")
+    estimate_lower_90: float = float("nan")
+    estimate_upper_90: float = float("nan")
+    breakfasts: int = 0
+    checks: dict[str, str] = field(default_factory=dict)
+    safety: dict[str, float] = field(default_factory=dict)
+    evaluation: str = EVALUATION
+
+    def to_row(self) -> dict[str, Any]:
+        row = {key: value for key, value in self.__dict__.items() if key not in {"checks", "safety"}}
+        row["checks"] = "; ".join(f"{name}: {result}" for name, result in self.checks.items())
+        row["safety"] = "; ".join(f"{name} {value:.2f}" for name, value in self.safety.items())
+        return row
+
+
+def round_step(value: float) -> float:
+    return round(round(value / STEP_ROUNDING) * STEP_ROUNDING, 1)
+
+
+def proposed_step(current: float, estimate: float) -> float:
+    """The new I:C: the smaller of a 10% move and the distance to the estimate, toward the estimate."""
+    distance = abs(estimate - current)
+    move = min(MAX_STEP_FRACTION * current, distance)
+    return round_step(current + np.sign(estimate - current) * move)
+
+
+def affected_part(start_minutes: int, next_start_minutes: int) -> DayPart:
+    """The pump segment's hours plus the 4 hours after, which its I:C still acts on."""
+    end = (next_start_minutes + AFTER_MEAL_HOURS * 60) % (24 * 60)
+    return DayPart(f"{start_minutes // 60:02d}:{start_minutes % 60:02d}-{end // 60:02d}:{end % 60:02d}", int(start_minutes), int(end))
+
+
+def _held(reason: str, **fields: Any) -> Proposal:
+    return Proposal(setting="breakfast I:C", status="held", reason=reason, **fields)
+
+
+def propose_breakfast_icr(
+    evidence: pd.DataFrame,
+    cgm: pd.DataFrame,
+    segment_ends: dict[float, float],
+    *,
+    as_of: pd.Timestamp,
+) -> Proposal:
+    """The breakfast I:C proposal, or a held proposal that says why not.
+
+    ``segment_ends`` maps a pump segment's start (minutes after midnight) to the start of the next, which bounds the
+    affected hours.
+    """
+    if evidence is None or evidence.empty:
+        return _held("no breakfast evidence")
+    frame = evidence.copy()
+    for column in ("period_start", "period_end"):
+        frame[column] = pd.to_datetime(frame[column], errors="coerce")
+    primary = frame[frame["analysis"].eq(PRIMARY) & frame["is_current_setting"].astype(bool)]
+    recent = frame[frame["analysis"].eq(PRIMARY) & (frame["period_end"] >= as_of - pd.Timedelta(days=RECENT_DAYS))]
+    if primary.empty or recent.empty:
+        return _held("no breakfast in the last 90 days")
+    # The segment covering most recent breakfasts, on the pump and profile now running.
+    now = primary.sort_values("period_end").iloc[-1]
+    on_now = recent[recent["pump_serial"].eq(now["pump_serial"]) & recent["profile_id"].eq(now["profile_id"])]
+    if on_now.empty:
+        on_now = recent
+    counts = on_now.groupby("pump_segment_start_minutes")["n_meals"].sum()
+    segment = float(counts.idxmax())
+    candidates = primary[primary["pump_segment_start_minutes"].eq(segment) & primary["pump_serial"].eq(now["pump_serial"]) & primary["profile_id"].eq(now["profile_id"])]
+    if candidates.empty:
+        return _held(f"the segment starting {int(segment) // 60:02d}:{int(segment) % 60:02d} has no current-setting period", segment_start_minutes=segment)
+    row = candidates.sort_values("period_end").iloc[-1]
+    identity = dict(
+        pump_serial=str(row["pump_serial"]), profile_id=float(row["profile_id"]), segment_start_minutes=segment,
+        current_value=float(row["programmed_icr"]), breakfasts=int(row["n_meals"]),
+        estimate=float(row["effective_icr"]), estimate_lower_90=float(row["effective_icr_lower_90"]), estimate_upper_90=float(row["effective_icr_upper_90"]),
+    )
+    if int(row["n_meals"]) < MIN_LOGGED_MEALS_FOR_ICR or not np.isfinite(row["effective_icr"]):
+        return _held(f"only {int(row['n_meals'])} breakfasts at the current setting ({row['programmed_icr']:.1f} g/U); {MIN_LOGGED_MEALS_FOR_ICR} are needed", **identity)
+    current, estimate = float(row["programmed_icr"]), float(row["effective_icr"])
+    if row["effective_icr_lower_90"] <= current <= row["effective_icr_upper_90"]:
+        return _held("the current setting is inside the evidence interval", **identity)
+
+    # Checks: the other analyses of the same period must agree on the direction when they can be assessed.
+    same = frame[
+        ~frame["analysis"].eq(PRIMARY)
+        & frame["pump_serial"].eq(row["pump_serial"]) & frame["profile_id"].eq(row["profile_id"])
+        & frame["pump_segment_start_minutes"].eq(segment) & frame["period_start"].eq(row["period_start"])
+        & frame["programmed_icr"].eq(row["programmed_icr"])
+    ]
+    side = np.sign(estimate - current)
+    checks: dict[str, str] = {}
+    disagree: list[str] = []
+    for check in same.itertuples(index=False):
+        if int(check.n_meals) < MIN_LOGGED_MEALS_FOR_ICR or not np.isfinite(check.effective_icr):
+            checks[str(check.analysis)] = f"not assessable ({int(check.logged_meal_windows)} breakfasts)"
+        elif np.sign(check.effective_icr - current) == side:
+            checks[str(check.analysis)] = f"agrees ({check.effective_icr:.1f} g/U, {int(check.n_meals)} breakfasts)"
+        else:
+            checks[str(check.analysis)] = f"disagrees ({check.effective_icr:.1f} g/U, {int(check.n_meals)} breakfasts)"
+            disagree.append(str(check.analysis))
+    direction = "adds insulin" if side < 0 else "removes insulin"
+    next_start = segment_ends.get(segment)
+    part = affected_part(int(segment), int(next_start)) if next_start is not None else None
+    if disagree:
+        return _held("a check points the other way: " + ", ".join(disagree), direction=direction, checks=checks, **identity)
+    safety: dict[str, float] = {}
+    if side < 0:
+        if part is None:
+            return _held("the hours this setting governs are unknown, so the low limits cannot be checked", direction=direction, checks=checks, **identity)
+        metrics = pooled_metrics(cgm, start=as_of - pd.Timedelta(days=RECENT_DAYS), end=as_of, part=part)
+        safety = {"time below 70 (%)": metrics["time_below_70_pct"], "time below 54 (%)": metrics["time_below_54_pct"]}
+        if not passes_low_limits(metrics):
+            return _held(
+                f"adding insulin is not allowed: over {part.name} time below 70 is {metrics['time_below_70_pct']:.1f}% and below 54 is {metrics['time_below_54_pct']:.2f}%",
+                direction=direction, checks=checks, safety=safety, affected_hours=part.name, **identity,
+            )
+    proposed = proposed_step(current, estimate)
+    if proposed == round_step(current):
+        return _held("the step rounds to no change", direction=direction, checks=checks, safety=safety, **identity)
+    return Proposal(
+        setting="breakfast I:C", status="proposed",
+        reason=f"carbs behaved like {estimate:.1f} g/U (90% range {row['effective_icr_lower_90']:.1f}-{row['effective_icr_upper_90']:.1f}) against the programmed {current:.1f}",
+        direction=direction, proposed_value=proposed, checks=checks, safety=safety,
+        affected_hours=part.name if part else "", **identity,
+    )
+
+
+def segment_ends_from_parts(parts: list[DayPart]) -> dict[float, float]:
+    """Map each pump segment start to the start of the next, from the day parts built on the pump's segments."""
+    return {float(part.start_minutes): float(part.end_minutes) for part in parts}
+
+
+def proposal_markdown(proposal: Proposal, *, as_of: pd.Timestamp) -> str:
+    def hhmm(minutes: float) -> str:
+        return "unknown" if not np.isfinite(minutes) else f"{int(minutes) // 60:02d}:{int(minutes) % 60:02d}"
+
+    lines = [f"# Breakfast I:C proposal ({as_of.date()})", ""]
+    if proposal.status == "proposed":
+        lines += [
+            f"**Proposed: change the pump segment starting {hhmm(proposal.segment_start_minutes)} from {proposal.current_value:.1f} to "
+            f"{proposal.proposed_value:.1f} g/U ({proposal.direction}).** {proposal.reason}.",
+            "",
+            f"Affected hours (segment plus {AFTER_MEAL_HOURS} h): {proposal.affected_hours}. Evidence: {proposal.breakfasts} breakfasts at the current setting.",
+            "",
+            "Enter it on the pump yourself, then hold it for at least 14 days before the next change. Discuss it with your endocrinologist.",
+        ]
+    else:
+        lines += [f"**No change proposed.** {proposal.reason[:1].upper()}{proposal.reason[1:]}.", ""]
+        if np.isfinite(proposal.segment_start_minutes):
+            lines.append(f"Segment checked: starting {hhmm(proposal.segment_start_minutes)}, current {proposal.current_value:.1f} g/U.")
+    if proposal.checks:
+        lines += ["", "## Checks", ""] + [f"- {name}: {result}" for name, result in proposal.checks.items()]
+    if proposal.safety:
+        lines += ["", "## Low limits over the affected hours, last 90 days", ""] + [f"- {name}: {value:.2f}" for name, value in proposal.safety.items()]
+    lines += ["", "## How it will be judged", "", proposal.evaluation, ""]
+    return "\n".join(lines)
