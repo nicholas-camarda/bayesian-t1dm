@@ -3253,8 +3253,9 @@ def _resolve_meal_settings(rows: list[Any], segment: str, settings: LatentMealTh
        (``acquisition._calculator_carb_ratio``). A t:slim also records the correction factor.
     2. The Mobi records the correction factor and target as 0. The calculator's correction is
        (glucose - target) / CF - insulin on board, so within a run of meals on one pump with one I:C,
-       correction + insulin on board is a straight line in glucose with slope 1 / CF. A Theil-Sen fit over
-       meals with a correction of at least 0.3 U gives the run's CF and target; a meal whose own
+       correction + insulin on board is a straight line in glucose with slope 1 / CF. Over meals with a
+       correction of at least 0.3 U, a Theil-Sen fit finds the majority setting and a least-squares refit of
+       the meals within 5% of it gives the run's CF and target; a meal whose own
        (glucose - target) / (correction + insulin on board) is more than 5% from the run's CF keeps its own
        value (a setting changed inside the run).
     3. A meal with no usable record takes the value of the nearest earlier meal on the same pump, or the
@@ -3285,11 +3286,18 @@ def _resolve_meal_settings(rows: list[Any], segment: str, settings: LatentMealTh
         usable = run.loc[run["correction"].ge(RECOVERED_CF_MIN_CORRECTION_UNITS) & run["glucose"].notna() & run["iob"].notna()]
         if len(usable) < RECOVERED_CF_MIN_MEALS or usable["glucose"].nunique() < 2:
             continue
-        slope, intercept, _, _ = theilslopes(usable["correction"] + usable["iob"], usable["glucose"])
+        units = usable["correction"] + usable["iob"]
+        slope, intercept, _, _ = theilslopes(units, usable["glucose"])
         if not slope > 0:
             continue
+        # The robust fit finds the majority setting; refitting only the breakfasts close to it removes the pull of
+        # a minority with another CF, and least squares is exact for a calculator that rounds to 0.01 U.
+        own_cf = (usable["glucose"] + intercept / slope) / units
+        core = (own_cf / own_cf.median() - 1.0).abs() <= 0.05
+        if core.sum() >= RECOVERED_CF_MIN_MEALS and usable.loc[core, "glucose"].nunique() >= 2:
+            slope, intercept = np.polyfit(usable.loc[core, "glucose"], units[core], 1)
         run_cf, target = 1.0 / slope, -intercept / slope
-        own_cf = (usable["glucose"] - target) / (usable["correction"] + usable["iob"])
+        own_cf = (usable["glucose"] - target) / units
         frame.loc[usable.index, "cf_recovered"] = np.where((own_cf / run_cf - 1.0).abs() <= 0.05, round(run_cf), own_cf.round())
     cf_known = cf_recorded | frame["cf_recovered"].notna()
     frame["cf"] = frame["cf"].fillna(frame["cf_recovered"])

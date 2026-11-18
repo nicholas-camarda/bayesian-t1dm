@@ -654,7 +654,7 @@ def write_latent_meal_review_html(
         last = estimated.iloc[-1]
         status, label = "info", "Too early to judge your current setting"
         headline = (
-            f"<b>Your current morning I:C of {float(current['programmed_icr']):.1f} g/U has {int(current['n_meals'])} usable breakfasts so far</b>; "
+            f"<b>Your current morning I:C of {float(current['programmed_icr']):.1f} g/U has {int(current['n_meals'])} usable breakfast{'' if int(current['n_meals']) == 1 else 's'} so far</b>; "
             "at least 5 are needed."
         )
         explanation = (

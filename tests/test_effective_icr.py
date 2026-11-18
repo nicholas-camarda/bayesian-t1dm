@@ -409,3 +409,17 @@ def test_meal_settings_are_recovered_per_pump_and_unrecorded_meals_do_not_split_
         "bolus calculator", "carried from nearby meals", "carried from nearby meals",
         *["recovered from the bolus calculator"] * 4, "carried from nearby meals",
     ]
+
+
+def test_a_few_breakfasts_with_another_correction_factor_do_not_pull_the_rest():
+    from types import SimpleNamespace
+
+    from bayesian_t1dm.therapy_research import _resolve_meal_settings
+
+    def mobi(glucose, cf, iob=0.0):
+        return SimpleNamespace(pump_serial="1453346", carb_ratio_g_per_unit=7.0, isf_mgdl_per_unit=None, calculator_glucose_mgdl=glucose,
+                               calculator_iob_units=iob, correction_bolus_units=round((glucose - 110) / cf - iob, 2))
+
+    rows = [mobi(143, 55), mobi(198, 55, iob=0.96), mobi(131, 55)] + [mobi(g, 65) for g in (131, 136, 142, 150, 158, 165, 174, 202, 231)]
+    cfs = [cf for _, cf, _ in _resolve_meal_settings(rows, "morning", settings=None)]
+    assert cfs == [55.0] * 3 + [65.0] * 9
