@@ -9,6 +9,7 @@ import pandas as pd
 
 from .ingest import IngestedData
 from .insulin import expand_bolus_series_to_grid, expand_bolus_to_grid
+from .pump_profiles import PROFILE_SETTING_COLUMNS
 
 
 @dataclass(frozen=True)
@@ -238,8 +239,9 @@ CALCULATOR_SETTING_COLUMNS = (
     "calculator_iob_units",
     "correction_bolus_units",
 )
-# Carried with each meal; the pump serial keeps settings from one pump from standing in for another's.
-MEAL_RECORD_COLUMNS = (*CALCULATOR_SETTING_COLUMNS, "pump_serial")
+# Carried with each meal; the pump serial keeps settings from one pump from standing in for another's, and the
+# profile columns hold the profile active at the meal and its segment in force (``pump_profiles``).
+MEAL_RECORD_COLUMNS = (*CALCULATOR_SETTING_COLUMNS, "pump_serial", *PROFILE_SETTING_COLUMNS)
 
 
 def _aggregate_carbs(data: IngestedData, grid: pd.DataFrame, *, freq: str, windows_minutes: Sequence[int]) -> pd.DataFrame:

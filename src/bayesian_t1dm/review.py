@@ -762,10 +762,11 @@ def write_latent_meal_review_html(
             "Details: I:C by settings period",
             rp.table(["settings period", "pump I:C (g/U)", "settings from", "breakfasts used", "effective I:C (90% range)", "result"], period_rows, numeric=[1, 3])
             + rp.caption(
-                "Each breakfast is compared with the I:C and correction factor in force for it. The t:slim records both. The Mobi records neither, "
-                "so they are recovered from how its calculator split the bolus: the food portion gives the I:C, and the correction portion across "
-                "a run of breakfasts gives the correction factor. A breakfast with nothing usable takes the setting of the nearest breakfast on the "
-                "same pump. A settings period is a run of breakfasts with the same I:C and correction factor."
+                "Each breakfast is compared with the I:C and correction factor in force for it. The t:slim's bolus calculator records both. "
+                "The Mobi records neither: its I:C is the carbs divided by the food portion of the bolus, and its correction factor comes from "
+                "the pump's log of profile edits and switches (replayed to the segment in force), or, where the downloaded log does not include "
+                "edits, from the correction portion across a run of breakfasts. A breakfast with nothing usable takes the setting of the nearest "
+                "breakfast on the same pump and profile. A settings period is a run of breakfasts with the same I:C and correction factor."
             ),
         )
         if period_rows

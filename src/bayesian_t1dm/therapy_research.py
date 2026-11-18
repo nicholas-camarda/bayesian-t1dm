@@ -3246,43 +3246,81 @@ def _as_float(value: Any) -> float:
         return float("nan")
 
 
+SETTINGS_SOURCES = (
+    "bolus calculator",
+    "pump profile history",
+    "recovered from the bolus calculator",
+    "carried from nearby meals",
+    "pump profile",
+)
+
+
 def _resolve_meal_settings(rows: list[Any], segment: str, settings: LatentMealTherapySettings) -> list[tuple[float, float, str]]:
     """(I:C, correction factor, source) in force for each meal of one time-of-day segment, in time order.
 
-    1. The I:C is the one the bolus calculator recorded, or recovered from the food portion of the bolus
-       (``acquisition._calculator_carb_ratio``). A t:slim also records the correction factor.
-    2. The Mobi records the correction factor and target as 0. The calculator's correction is
-       (glucose - target) / CF - insulin on board, so within a run of meals on one pump with one I:C,
-       correction + insulin on board is a straight line in glucose with slope 1 / CF. Over meals with a
-       correction of at least 0.3 U, a Theil-Sen fit finds the majority setting and a least-squares refit of
-       the meals within 5% of it gives the run's CF and target; a meal whose own
+    Each value comes from the first of these that has it; the source names the weakest one used.
+
+    1. **Bolus calculator.** The I:C the calculator recorded (t:slim), or recovered from the food portion of the
+       bolus (Mobi, ``acquisition._calculator_carb_ratio``); the correction factor the t:slim recorded.
+    2. **Pump profile history.** The segment in force in the profile active at the meal, replayed from the
+       pump's profile edits (``pump_profiles``), while the archive shows those edits.
+    3. **Recovered from the bolus calculator.** The Mobi records the correction factor and target as 0. The
+       calculator's correction is (glucose - target) / CF - insulin on board, so within a run of meals on one
+       pump and profile with one I:C, correction + insulin on board is a straight line in glucose with slope
+       1 / CF. Over meals with a correction of at least 0.3 U, a Theil-Sen fit finds the majority setting and a
+       least-squares refit of the meals within 5% of it gives the run's CF and target; a meal whose own
        (glucose - target) / (correction + insulin on board) is more than 5% from the run's CF keeps its own
        value (a setting changed inside the run).
-    3. A meal with no usable record takes the value of the nearest earlier meal on the same pump, or the
-       nearest later one, so it does not start a settings period of its own.
-    4. Only a segment with no usable record on that pump at all falls back to the programmed profile.
+    4. **Carried from nearby meals.** A meal with no value takes that of the nearest earlier meal on the same
+       pump and profile, or the nearest later one; a profile switch ends the carry, and so does the end of the
+       archive's view of profile edits.
+    5. **Pump profile.** Only a value that no meal on that pump and profile has falls back to the programmed
+       profile, and only that value: a meal's own I:C is kept when its correction factor is missing.
     """
     from scipy.stats import theilslopes
 
+    def column(name: str) -> list[float]:
+        return [_as_float(getattr(row, name, np.nan)) for row in rows]
+
     frame = pd.DataFrame(
         {
-            "pump": [_as_float(getattr(row, "pump_serial", np.nan)) for row in rows],
-            "icr": [_as_float(getattr(row, "carb_ratio_g_per_unit", np.nan)) for row in rows],
-            "cf": [_as_float(getattr(row, "isf_mgdl_per_unit", np.nan)) for row in rows],
-            "glucose": [_as_float(getattr(row, "calculator_glucose_mgdl", np.nan)) for row in rows],
-            "iob": [_as_float(getattr(row, "calculator_iob_units", np.nan)) for row in rows],
-            "correction": [_as_float(getattr(row, "correction_bolus_units", np.nan)) for row in rows],
+            "pump": column("pump_serial"),
+            "profile": column("profile_id"),
+            "visible": column("profile_edits_visible"),
+            "icr": column("carb_ratio_g_per_unit"),
+            "cf": column("isf_mgdl_per_unit"),
+            "profile_icr": column("profile_carb_ratio_g_per_unit"),
+            "profile_cf": column("profile_isf_mgdl_per_unit"),
+            "glucose": column("calculator_glucose_mgdl"),
+            "iob": column("calculator_iob_units"),
+            "correction": column("correction_bolus_units"),
         }
     )
-    frame.loc[~frame["icr"].gt(0), "icr"] = np.nan
-    frame.loc[~frame["cf"].gt(0), "cf"] = np.nan
+    for name in ("icr", "cf", "profile_icr", "profile_cf"):
+        frame.loc[~frame[name].gt(0), name] = np.nan
     frame["pump"] = frame["pump"].ffill().bfill()
-    icr_known, cf_recorded = frame["icr"].notna(), frame["cf"].notna()
-    frame["icr"] = frame.groupby("pump", dropna=False)["icr"].transform(lambda s: s.ffill().bfill())
-    frame["run"] = (frame[["pump", "icr"]].ne(frame[["pump", "icr"]].shift())).any(axis=1).cumsum()
+    frame["profile"] = frame["profile"].fillna(-1.0)  # no profile switch seen yet: one unknown profile
+    frame["visible"] = frame["visible"].fillna(-1.0)
+    rank = {source: k for k, source in enumerate(SETTINGS_SOURCES)}
+    icr_source = pd.Series(np.where(frame["icr"].notna(), rank["bolus calculator"], np.nan), index=frame.index)
+    cf_source = pd.Series(np.where(frame["cf"].notna(), rank["bolus calculator"], np.nan), index=frame.index)
+    from_history = frame["icr"].isna() & frame["profile_icr"].notna()
+    frame.loc[from_history, "icr"] = frame.loc[from_history, "profile_icr"]
+    icr_source[from_history] = rank["pump profile history"]
+    from_history = frame["cf"].isna() & frame["profile_cf"].notna()
+    frame.loc[from_history, "cf"] = frame.loc[from_history, "profile_cf"]
+    cf_source[from_history] = rank["pump profile history"]
+
+    # A value is carried only within one pump and profile, and not from a time the archive shows the profile's edits
+    # into a time it does not (the profile may have been edited unseen in between).
+    keys = ["pump", "profile", "visible"]
+    carried_icr = frame.groupby(keys, dropna=False)["icr"].transform(lambda s: s.ffill().bfill())
+    icr_source[frame["icr"].isna() & carried_icr.notna()] = rank["carried from nearby meals"]
+    frame["icr"] = carried_icr
+    frame["run"] = (frame[[*keys, "icr"]].ne(frame[[*keys, "icr"]].shift())).any(axis=1).cumsum()
 
     frame["cf_recovered"] = np.nan
-    for _, run in frame.loc[~cf_recorded].groupby("run"):
+    for _, run in frame.loc[frame["cf"].isna()].groupby("run"):
         usable = run.loc[run["correction"].ge(RECOVERED_CF_MIN_CORRECTION_UNITS) & run["glucose"].notna() & run["iob"].notna()]
         if len(usable) < RECOVERED_CF_MIN_MEALS or usable["glucose"].nunique() < 2:
             continue
@@ -3299,21 +3337,23 @@ def _resolve_meal_settings(rows: list[Any], segment: str, settings: LatentMealTh
         run_cf, target = 1.0 / slope, -intercept / slope
         own_cf = (usable["glucose"] - target) / units
         frame.loc[usable.index, "cf_recovered"] = np.where((own_cf / run_cf - 1.0).abs() <= 0.05, round(run_cf), own_cf.round())
-    cf_known = cf_recorded | frame["cf_recovered"].notna()
-    frame["cf"] = frame["cf"].fillna(frame["cf_recovered"])
-    frame["cf"] = frame.groupby("pump", dropna=False)["cf"].transform(lambda s: s.ffill().bfill())
+    recovered = frame["cf"].isna() & frame["cf_recovered"].notna()
+    frame.loc[recovered, "cf"] = frame.loc[recovered, "cf_recovered"]
+    cf_source[recovered] = rank["recovered from the bolus calculator"]
+    carried_cf = frame.groupby(keys, dropna=False)["cf"].transform(lambda s: s.ffill().bfill())
+    cf_source[frame["cf"].isna() & carried_cf.notna()] = rank["carried from nearby meals"]
+    frame["cf"] = carried_cf
 
-    resolved: list[tuple[float, float, str]] = []
-    for index, row in frame.iterrows():
-        if pd.isna(row["icr"]) or pd.isna(row["cf"]):
-            resolved.append((float(settings.icr_for_segment(segment)), float(settings.correction_factor_for_segment(segment)), "pump profile"))
-        elif not (icr_known[index] and cf_known[index]):
-            resolved.append((float(row["icr"]), float(row["cf"]), "carried from nearby meals"))
-        elif cf_recorded[index]:
-            resolved.append((float(row["icr"]), float(row["cf"]), "bolus calculator"))
-        else:
-            resolved.append((float(row["icr"]), float(row["cf"]), "recovered from the bolus calculator"))
-    return resolved
+    if frame["icr"].isna().any():
+        icr_source[frame["icr"].isna()] = rank["pump profile"]
+        frame["icr"] = frame["icr"].fillna(float(settings.icr_for_segment(segment)))
+    if frame["cf"].isna().any():
+        cf_source[frame["cf"].isna()] = rank["pump profile"]
+        frame["cf"] = frame["cf"].fillna(float(settings.correction_factor_for_segment(segment)))
+    return [
+        (float(icr), float(cf), SETTINGS_SOURCES[int(max(a, b))])
+        for icr, cf, a, b in zip(frame["icr"], frame["cf"], icr_source, cf_source)
+    ]
 
 
 def _effective_icr_evidence(
@@ -3426,7 +3466,8 @@ def _render_effective_icr_section(evidence: pd.DataFrame | None) -> list[str]:
         "## Effective I:C From Logged Meals",
         "",
         "Uses accepted windows with a logged carb count. Each meal is compared with the I:C ratio and correction factor in force "
-        "for it (recorded or recovered from the bolus calculator, or carried from the nearest meal on the same pump), then meals are pooled within each "
+        "for it (from the bolus calculator, the pump's profile history, recovered from the calculator's corrections, or carried from the nearest "
+        "meal on the same pump and profile), then meals are pooled within each "
         "settings period. It assumes that correction factor was right.",
         "",
     ]
