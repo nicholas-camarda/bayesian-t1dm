@@ -380,7 +380,9 @@ def assess_prepared_feature_plausibility(frame: pd.DataFrame) -> tuple[str, dict
     if "glucose_observed" in frame.columns:
         glucose = pd.to_numeric(frame["glucose_observed"], errors="coerce")
         observed = glucose.dropna()
-        reasons["invalid_cgm_rows"] += int((observed.lt(40.0) | observed.gt(400.0)).sum())
+        # Readings at the sensor's limits (below 40, above 400) are reported; a value no sensor could return fails.
+        reasons["impossible_cgm_rows"] += int((observed.le(0.0) | observed.gt(1000.0)).sum())
+        reasons["invalid_cgm_rows"] += int(((observed.lt(40.0) | observed.gt(400.0)) & observed.gt(0.0) & observed.le(1000.0)).sum())
 
     if "cgm_invalid" in frame.columns:
         reasons["invalid_cgm_rows"] += int(pd.to_numeric(frame["cgm_invalid"], errors="coerce").fillna(0.0).gt(0).sum())

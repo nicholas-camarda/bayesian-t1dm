@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, fields
@@ -32,16 +33,24 @@ from .health_auto_export import (
     intersect_spans,
     summarize_apple_health_span,
 )
-from .ingest import IngestedData, TandemCoverage, attach_health_auto_export, load_tandem_exports, summarize_coverage, write_export_manifest
+from .ingest import (
+    MANUAL_CARB_LOG_STEMS,
+    IngestedData,
+    TandemCoverage,
+    attach_health_auto_export,
+    discover_source_files,
+    load_tandem_exports,
+    summarize_coverage,
+    write_export_manifest,
+)
 from .paths import ProjectPaths, analysis_timezone
 from .pump_profiles import ProfileHistory, decode_profile_events
 from .quality import REPORTED_NOT_FAILED_PLAUSIBILITY_REASONS, DataQualitySummary, assess_data_quality, assess_prepared_feature_plausibility
 from .report_page import plain
 
 # Bump when merge, cleaning or feature code changes what the build produces; a version change forces a rebuild.
-DATASET_VERSION = 9
+DATASET_VERSION = 10
 HORIZON_MINUTES = 30
-CARB_LOG_NAMES = ("carbs.csv", "carb_log.csv")
 
 
 class StaleDatasetError(RuntimeError):
@@ -88,12 +97,12 @@ def raw_input_files(raw_root: Path) -> list[tuple[Path, str]]:
     if tandem_root.exists():
         found.extend((path, "tandem_raw") for path in sorted(tandem_root.glob("*/raw/*")) if path.is_file())
     found.extend((path, "apple_health_export") for path in discover_health_export_files(raw_root))
-    for name in CARB_LOG_NAMES:
-        found.extend(
-            (path, "carb_log")
-            for path in sorted(raw_root.rglob(name))
-            if "normalized" not in path.relative_to(raw_root).parts
-        )
+    # Every table the ingest reads from the raw folder (hand-kept logs in any supported format included).
+    seen = {path for path, _ in found}
+    for path in discover_source_files(raw_root):
+        if "normalized" in path.relative_to(raw_root).parts or path in seen:
+            continue
+        found.append((path, "carb_log" if path.stem.lower() in MANUAL_CARB_LOG_STEMS else "table"))
     return found
 
 
@@ -137,7 +146,7 @@ def _input_diff(old: list[dict[str, Any]], new: list[InputFile]) -> dict[str, li
 
 def _changed_tandem_windows(diff: dict[str, list[str]]) -> list[str]:
     windows = set()
-    for path in diff["added"] + diff["changed"]:
+    for path in diff["added"] + diff["changed"] + diff["removed"]:
         parts = Path(path).parts
         if len(parts) >= 3 and parts[0] == "tconnectsync" and parts[2] == "raw":
             windows.add(parts[1])
@@ -211,11 +220,14 @@ def _normalize_windows(paths: ProjectPaths, tandem_root: Path, diff: dict[str, l
     if not tandem_root.exists():
         return []
     archived = sorted(p.parent.name for p in tandem_root.glob("*/raw"))
+    for window in _changed_tandem_windows({"added": [], "changed": [], "removed": diff["removed"]}):
+        if window not in archived and (tandem_root / window / "normalized").exists():
+            shutil.rmtree(tandem_root / window / "normalized")  # its raw files were removed; the derived tables would be read as data
     if rebuild_all:
         windows = archived
     else:
         missing = {w for w in archived if not (tandem_root / w / "normalized").exists()}
-        windows = sorted(set(_changed_tandem_windows(diff)) | missing)
+        windows = sorted((set(_changed_tandem_windows(diff)) | missing) & set(archived))
     if not windows:
         return []
     workers = min(len(windows), os.cpu_count() or 1)
@@ -233,7 +245,9 @@ def build_merged_dataset(paths: ProjectPaths, *, raw_root: str | Path | None = N
     previous = _read_manifest(out_dir)
     inputs = fingerprint_inputs(raw_root, known=previous["inputs"] if previous else None)
     diff = _input_diff(previous["inputs"] if previous else [], inputs)
-    unchanged = previous is not None and previous.get("dataset_version") == DATASET_VERSION and not any(diff.values())
+    timezone_name = str(analysis_timezone())
+    same_build = previous is not None and previous.get("dataset_version") == DATASET_VERSION and previous.get("timezone") == timezone_name
+    unchanged = same_build and not any(diff.values())
     if unchanged and not force:
         log(f"Merged dataset is up to date ({len(inputs)} raw files unchanged); nothing to do.")
         return load_merged_dataset(raw_root, inputs=inputs), False
@@ -243,13 +257,15 @@ def build_merged_dataset(paths: ProjectPaths, *, raw_root: str | Path | None = N
     else:
         log(f"Inputs changed: {len(diff['added'])} added, {len(diff['changed'])} changed, {len(diff['removed'])} removed.")
 
-    rebuild_all = force or previous is None or previous.get("dataset_version") != DATASET_VERSION
+    rebuild_all = force or previous is None or not same_build
     if previous is None:
         rebuild_reason = "first build"
     elif force:
         rebuild_reason = "rebuild requested with --force"
     elif previous.get("dataset_version") != DATASET_VERSION:
         rebuild_reason = f"the code's dataset version changed from {previous.get('dataset_version')} to {DATASET_VERSION}"
+    elif previous.get("timezone") != timezone_name:
+        rebuild_reason = f"the analysis timezone changed from {previous.get('timezone')} to {timezone_name}"
     else:
         rebuild_reason = "raw files changed"
     normalized_windows = _normalize_windows(paths, raw_root / "tconnectsync", diff, rebuild_all=rebuild_all, log=log)
@@ -295,6 +311,7 @@ def build_merged_dataset(paths: ProjectPaths, *, raw_root: str | Path | None = N
         "built_at": pd.Timestamp.now().isoformat(timespec="seconds"),
         "code_commit": _git_commit(paths.root),
         "horizon_minutes": HORIZON_MINUTES,
+        "timezone": timezone_name,
         "inputs": [asdict(item) for item in inputs],
         "input_changes": diff,
         "rebuild_reason": rebuild_reason,

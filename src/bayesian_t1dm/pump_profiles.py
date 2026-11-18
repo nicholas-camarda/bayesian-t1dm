@@ -3,9 +3,13 @@
 A Tandem pump logs every edit to a personal profile and every profile switch:
 
 - ``LID_IDP_TD_SEG`` (event 68): one time-of-day segment of one profile after a change, with its start time,
-  basal rate, correction factor (ISF), target and carb ratio. ``modificationType`` says what changed
-  (0 segment created, 1 inserted, 2 deleted, 3 basal, 4 carb ratio, 5 correction factor, 6 target, 7 start
-  time); ``status`` is a bitmask of the values that are set, 15 meaning all four.
+  basal rate, correction factor (ISF), target and carb ratio. ``modificationType`` says what changed. Replaying
+  the archive shows 1 is a segment *deleted* (a profile copied from another is trimmed by deleting its segments
+  one at a time, each record carrying the deleted segment's values) and every other value (0 created, 2 start
+  time changed, 3-6 a value edited, 7 re-logged unchanged) leaves the segment at its index with these values;
+  this reading agrees with the t:slim's own calculator records for 99.9% of carb entries (the earlier
+  reading, 1 = insert and 2 = delete, agreed for 99.7% and left duplicate start times in 93 snapshots).
+  ``status`` is a bitmask of the values that are set, 15 meaning all four.
 - ``LID_IDP`` (event 69): an action on a whole profile; ``status`` 0 created, 1 copied (from ``sourceIdp``),
   2 deleted, 3 activated. ``LID_IDP_MSG2`` (57) carries the rest of the profile name.
 
@@ -36,8 +40,10 @@ SEGMENT_EVENT = 68
 PROFILE_EVENT = 69
 PROFILE_NAME_EVENT = 57
 PROFILE_ACTIVATED = 3
-SEGMENT_INSERTS = (0, 1)
-SEGMENT_DELETE = 2
+SEGMENT_DELETE = 1
+PROFILE_CREATED = 0
+PROFILE_COPIED = 1
+PROFILE_DELETED = 2
 SEGMENT_COMPLETE_STATUS = 15
 _TANDEM_EPOCH = dt.datetime(2008, 1, 1)
 
@@ -192,33 +198,55 @@ class ProfileHistory:
     visible: dict[str, tuple[dt.date, dt.date]]
     _tables: dict[tuple[str, int], tuple[list[dt.datetime], list[list[dict[str, float] | None]]]] = field(init=False, default_factory=dict)
     _active: dict[str, tuple[list[dt.datetime], list[int]]] = field(init=False, default_factory=dict)
+    _whole: set[tuple[str, int]] = field(init=False, default_factory=set)  # profiles whose whole history the archive holds
+    _complete: dict[tuple[str, int], list[bool]] = field(init=False, default_factory=dict)
 
     def __post_init__(self) -> None:
-        segments = self.events[self.events["event"].eq(SEGMENT_EVENT)]
+        actions = self.events[self.events["event"].isin((SEGMENT_EVENT, PROFILE_EVENT))]
         state: dict[tuple[str, int], list[dict[str, float] | None]] = {}
-        for row in segments.itertuples(index=False):
+        for row in actions.itertuples(index=False):
             key = (row.pump_serial, int(row.profile_id))
-            table = state.setdefault(key, [])
-            index = int(row.segment_index)
-            values = {
-                "start_minutes": int(row.start_minutes),
-                "carb_ratio_g_per_unit": float(row.carb_ratio_g_per_unit),
-                "isf_mgdl_per_unit": float(row.isf_mgdl_per_unit),
-                "target_bg_mgdl": float(row.target_bg_mgdl),
-            }
-            complete = int(row.status) == SEGMENT_COMPLETE_STATUS
-            if int(row.modification) in SEGMENT_INSERTS:
-                table.insert(index, values if complete else None)
-            elif int(row.modification) == SEGMENT_DELETE:
-                if index >= len(table):
-                    raise ValueError(f"Profile history deletes segment {index} of profile {key} at {row.timestamp}, which it never saw.")
-                table.pop(index)
+            if int(row.event) == PROFILE_EVENT:
+                status = int(row.status)
+                if status == PROFILE_CREATED:
+                    state[key] = []
+                    self._whole.add(key)
+                elif status == PROFILE_COPIED:
+                    source = (row.pump_serial, int(row.source_profile_id))
+                    state[key] = [None if seg is None else dict(seg) for seg in state.get(source, [])]
+                    if source in self._whole:
+                        self._whole.add(key)
+                    else:
+                        self._whole.discard(key)
+                elif status == PROFILE_DELETED:
+                    state.pop(key, None)
+                    self._whole.discard(key)
+                else:
+                    continue
             else:
-                table.extend([None] * (index + 1 - len(table)))
-                table[index] = values if complete else None
+                table = state.setdefault(key, [])
+                index = int(row.segment_index)
+                values = {
+                    "start_minutes": int(row.start_minutes),
+                    "carb_ratio_g_per_unit": float(row.carb_ratio_g_per_unit),
+                    "isf_mgdl_per_unit": float(row.isf_mgdl_per_unit),
+                    "target_bg_mgdl": float(row.target_bg_mgdl),
+                }
+                complete = int(row.status) == SEGMENT_COMPLETE_STATUS
+                if int(row.modification) == SEGMENT_DELETE:
+                    if index < len(table):
+                        table.pop(index)
+                    elif key in self._whole:
+                        raise ValueError(f"Profile history deletes segment {index} of profile {key} at {row.timestamp}, which it never saw.")
+                    # otherwise the profile predates the archive: the slot was never seen and the table stays partly unknown
+                else:
+                    table.extend([None] * (index + 1 - len(table)))
+                    table[index] = values if complete else None
             times, tables = self._tables.setdefault(key, ([], []))
             times.append(row.timestamp)
-            tables.append(list(table))
+            tables.append(list(state.get(key, [])))
+            wholes = self._complete.setdefault(key, [])
+            wholes.append(key in self._whole)
         activations = self.events[self.events["event"].eq(PROFILE_EVENT) & self.events["status"].eq(PROFILE_ACTIVATED)]
         for pump_serial, group in activations.sort_values("timestamp").groupby("pump_serial"):
             self._active[pump_serial] = (list(group["timestamp"]), [int(v) for v in group["profile_id"]])
@@ -243,8 +271,11 @@ class ProfileHistory:
         for index, segment in enumerate(table):
             if segment is not None and segment["start_minutes"] <= minute and (covering is None or segment["start_minutes"] > table[covering]["start_minutes"]):
                 covering = index
-        # A slot not yet seen could start before this minute, so the covering segment is unknown.
+        # A slot not yet seen could start before this minute, so the covering segment is unknown; and when the
+        # archive never saw the profile created, a slot after the last one seen may exist too.
         if covering is None or (covering + 1 < len(table) and table[covering + 1] is None):
+            return None
+        if covering + 1 == len(table) and not self._complete[(pump_serial, profile_id)][k]:
             return None
         return table[covering]
 

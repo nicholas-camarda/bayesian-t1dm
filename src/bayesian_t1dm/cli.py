@@ -524,9 +524,9 @@ def _dispatch_command(
         return 0
 
     if args.command == "research-therapy-settings":
-        if _path_matches(args.report_dir, paths.output_therapy):
-            _prepare_runtime_output(paths, paths.output_therapy)
         preparation, result, _ = _run_therapy_analysis(args=args, merged=_load_dataset(args, session), session=session, include_validation=False)
+        if _path_matches(args.report_dir, paths.output_therapy):
+            _prepare_runtime_output(paths, paths.output_therapy)  # only after the analysis succeeded: a failure leaves the last output
         with session.stage("therapy.write_artifacts", report_dir=args.report_dir):
             write_therapy_research_artifacts(
                 result,
@@ -537,9 +537,9 @@ def _dispatch_command(
         return 0
 
     if args.command == "research-latent-meal-icr":
+        _, result = _run_latent_meal_analysis(args=args, paths=paths, session=session)
         if _path_matches(args.report_dir, paths.output_latent_meal):
             _prepare_runtime_output(paths, paths.output_latent_meal)
-        _, result = _run_latent_meal_analysis(args=args, paths=paths, session=session)
         with session.stage("latent_meal.write_artifacts", report_dir=args.report_dir, review_html=args.review_html):
             write_latent_meal_research_artifacts(result, args.report_dir, cache_dir=paths.cache_latent_meal)
             write_latent_meal_review_html(
@@ -590,9 +590,9 @@ def _dispatch_command(
         report_path = Path(args.report)
         report_dir = report_path.parent
         publish_latest = _path_matches(report_path, paths.output_therapy / "therapy_review.html")
+        preparation, research_result, validation_result = _run_therapy_analysis(args=args, merged=_load_dataset(args, session), session=session)
         if publish_latest:
             _prepare_runtime_output(paths, paths.output_therapy)
-        preparation, research_result, validation_result = _run_therapy_analysis(args=args, merged=_load_dataset(args, session), session=session)
         with session.stage("therapy.write_review", report_path=args.report):
             _write_therapy_outputs(
                 preparation=preparation,
@@ -614,8 +614,6 @@ def _dispatch_command(
         return 0
 
     if args.command == "status":
-        with session.stage("status.initialize", output_root=str(paths.reports)):
-            _prepare_runtime_output(paths, paths.output_therapy, paths.output_forecast)
         merged = _load_dataset(args, session)
         preparation, research_result, validation_result = _run_therapy_analysis(
             args=args,
@@ -624,6 +622,10 @@ def _dispatch_command(
             research_stage="status.therapy_research",
             validation_stage="status.therapy_validation",
         )
+        with session.stage("status.forecast_validation", forecast_root=str(paths.output_forecast)):
+            forecast_summary = _build_forecast_summary(args=args, merged=merged, session=session, skip_recommendations=True)
+        with session.stage("status.initialize", output_root=str(paths.reports)):
+            _prepare_runtime_output(paths, paths.output_therapy, paths.output_forecast)  # only after both analyses succeeded
         with session.stage("status.write_therapy_bundle", therapy_root=str(paths.output_therapy)):
             _write_therapy_outputs(
                 preparation=preparation,
@@ -641,8 +643,6 @@ def _dispatch_command(
                 artifact_root=paths.output_therapy,
                 artifact_href_prefix="therapy/",
             )
-        with session.stage("status.forecast_validation", forecast_root=str(paths.output_forecast)):
-            forecast_summary = _build_forecast_summary(args=args, merged=merged, session=session, skip_recommendations=True)
         with session.stage("status.write_forecast_bundle", forecast_root=str(paths.output_forecast)):
             forecast_report_path = paths.output_forecast / "run_summary.md"
             forecast_review_path = paths.output_forecast / "forecast_review.html"
@@ -700,14 +700,15 @@ def _dispatch_command(
 
     if args.command == "run":
         publish_latest = _path_matches(args.report, paths.output_forecast / "run_summary.md")
-        if publish_latest:
-            _prepare_runtime_output(paths, paths.output_forecast)
         summary = _build_forecast_summary(
             args=args,
             merged=_load_dataset(args, session),
             session=session,
             skip_recommendations=bool(args.skip_recommendations),
         )
+        if publish_latest:
+            # Clear the previous run's output only once the new fit has succeeded, so a failed run leaves it in place.
+            _prepare_runtime_output(paths, paths.output_forecast)
         review_path = str(Path(args.report).with_name("forecast_review.html"))
         with session.stage("run.reporting", report_path=args.report, review_path=review_path):
             write_markdown_report({**summary, "review_artifacts": {"forecast_review_html": review_path}}, args.report)

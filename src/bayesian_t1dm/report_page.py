@@ -90,6 +90,7 @@ PLAIN_LABELS = {
     "out_of_window_rows_rejected": "rows outside the requested dates (dropped)",
     "cgm_gap_ge_120m_rows": "a CGM gap of 2 hours or more",
     "invalid_cgm_rows": "a CGM value outside 40 to 400 mg/dL",
+    "impossible_cgm_rows": "a CGM value of 0 or below, or above 1000 mg/dL",
     "negative_bolus_rows": "a negative bolus",
     "implausible_5min_bolus_rows": "more than 25 U of bolus in 5 minutes",
     "implausible_daily_bolus_days": "more than 150 U of bolus in a day (days)",

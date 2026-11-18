@@ -2862,12 +2862,34 @@ def _settings_for_estimation(settings: LatentMealTherapySettings | None) -> Late
     return settings if settings is not None else LatentMealTherapySettings.default()
 
 
+def _attach_resolved_settings(window_metrics: pd.DataFrame, settings: LatentMealTherapySettings) -> pd.DataFrame:
+    """Add each meal's own I:C and correction factor (``resolved_icr``, ``resolved_cf``).
+
+    The values come from ``_resolve_meal_settings`` (bolus calculator, then pump profile history), so a meal is
+    judged against the settings its pump held at the time and not against the latest profile snapshot.
+    """
+    frame = window_metrics.copy()
+    frame["resolved_icr"] = np.nan
+    frame["resolved_cf"] = np.nan
+    if frame.empty or "segment" not in frame:
+        return frame
+    for segment, group in frame.groupby(frame["segment"].astype(str), sort=True):
+        ordered = group.sort_values("timestamp")
+        resolved = _resolve_meal_settings(list(ordered.itertuples(index=False)), str(segment), settings)
+        frame.loc[ordered.index, "resolved_icr"] = [icr for icr, _, _ in resolved]
+        frame.loc[ordered.index, "resolved_cf"] = [cf for _, cf, _ in resolved]
+    return frame
+
+
 def _settings_series(
     window_metrics: pd.DataFrame,
     settings: LatentMealTherapySettings,
     *,
     field: str,
 ) -> pd.Series:
+    resolved_column = {"icr": "resolved_icr", "correction_factor": "resolved_cf"}.get(field)
+    if resolved_column is not None and resolved_column in window_metrics:
+        return pd.to_numeric(window_metrics[resolved_column], errors="raise").astype(float)
     segments = window_metrics.get("segment", pd.Series("default", index=window_metrics.index, dtype=str)).astype(str)
     if field == "icr":
         values = [settings.icr_for_segment(segment) for segment in segments]
@@ -3314,7 +3336,10 @@ def _resolve_meal_settings(rows: list[Any], segment: str, settings: LatentMealTh
     # A value is carried only within one pump and profile, and not from a time the archive shows the profile's edits
     # into a time it does not (the profile may have been edited unseen in between).
     keys = ["pump", "profile", "visible"]
-    carried_icr = frame.groupby(keys, dropna=False)["icr"].transform(lambda s: s.ffill().bfill())
+    # A carry stays inside one unbroken stretch of meals on the same pump, profile and edit visibility: a switch
+    # to another profile and back starts a new stretch, so values never cross it.
+    stretch = frame[keys].ne(frame[keys].shift()).any(axis=1).cumsum()
+    carried_icr = frame.groupby(stretch)["icr"].transform(lambda s: s.ffill().bfill())
     icr_source[frame["icr"].isna() & carried_icr.notna()] = rank["carried from nearby meals"]
     frame["icr"] = carried_icr
     frame["run"] = (frame[[*keys, "icr"]].ne(frame[[*keys, "icr"]].shift())).any(axis=1).cumsum()
@@ -3340,7 +3365,7 @@ def _resolve_meal_settings(rows: list[Any], segment: str, settings: LatentMealTh
     recovered = frame["cf"].isna() & frame["cf_recovered"].notna()
     frame.loc[recovered, "cf"] = frame.loc[recovered, "cf_recovered"]
     cf_source[recovered] = rank["recovered from the bolus calculator"]
-    carried_cf = frame.groupby(keys, dropna=False)["cf"].transform(lambda s: s.ffill().bfill())
+    carried_cf = frame.groupby(stretch)["cf"].transform(lambda s: s.ffill().bfill())
     cf_source[frame["cf"].isna() & carried_cf.notna()] = rank["carried from nearby meals"]
     frame["cf"] = carried_cf
 
@@ -3705,8 +3730,12 @@ def _latent_carb_posterior_for_window(
     trajectory: MealWindowTrajectory | None = None,
 ) -> tuple[dict[str, float | str | bool], pd.DataFrame]:
     segment = str(row.get("segment") or "default")
-    icr = settings.icr_for_segment(segment)
-    correction_factor = settings.correction_factor_for_segment(segment)
+    if "resolved_icr" in row.index:  # the meal's own settings, resolved by ``_attach_resolved_settings``
+        icr = float(row["resolved_icr"])
+        correction_factor = float(row["resolved_cf"])
+    else:  # a caller with no per-meal history (synthetic validation) uses the programmed segment
+        icr = settings.icr_for_segment(segment)
+        correction_factor = settings.correction_factor_for_segment(segment)
     bolus_units = _positive_float(max(float(pd.to_numeric(pd.Series([row.get("bolus_units")]), errors="coerce").fillna(0.0).iloc[0]), 1e-6), "bolus_units")
     premeal_iob = float(pd.to_numeric(pd.Series([row.get("premeal_iob")]), errors="coerce").fillna(0.0).iloc[0])
     observed_peak_delta = float(pd.to_numeric(pd.Series([row.get("observed_peak_delta")]), errors="coerce").fillna(np.nan).iloc[0])
@@ -4572,6 +4601,7 @@ def run_latent_meal_icr_research(
     tier_summary_markdown = _render_latent_meal_tier_summary(tier_summary)
     window_metrics = _accepted_first_meal_window_metrics(research_frame, meal_event_registry, meal_windows)
     settings = _settings_for_estimation(therapy_settings)
+    window_metrics = _attach_resolved_settings(window_metrics, settings)
     model_comparison, selected_model, params = _latent_meal_model_comparison(window_metrics, therapy_settings=settings)
     trajectories = _first_meal_window_trajectories(research_frame, window_metrics)
     posterior_meals = _build_latent_meal_posterior_meals(
