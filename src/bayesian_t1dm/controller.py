@@ -26,7 +26,7 @@ BASAL_EVENT = 279
 MODE_EVENT = 229
 MODE_NAMES = {0: "standard", 1: "sleep", 2: "exercise"}
 MAX_INTERVAL_MINUTES = 10  # delivery records come every ~5 minutes; longer gaps are not bridged
-AFTER_MEAL_HOURS = 4
+AFTER_MEAL_HOURS = 4          # the strict rule: this long after any carbohydrate or bolus of 0.5 U or more
 AFTER_EXERCISE_HOURS = 1
 MIN_MEAL_BOLUS = 0.5
 TARGET_LOW, TARGET_HIGH = 70.0, 180.0
@@ -80,6 +80,45 @@ def _near_after(times: pd.Series, anchors: np.ndarray, hours: float) -> np.ndarr
     return (position >= 0) & ((values - last) <= np.timedelta64(int(hours * 60), "m"))
 
 
+MIN_MEAL_CARBS = 15.0         # smaller entries (snacks, low treatments) do not set a meal window
+MIN_MEAL_UNITS = 1.0          # smaller boluses are mostly Control-IQ's own corrections, the behaviour being measured
+
+
+def meal_windows(bolus: pd.DataFrame, carbs: pd.DataFrame, *, strict: bool = False) -> pd.DataFrame:
+    """When a meal still explains the controller's behaviour: each meal's time and how many hours after it to set aside.
+
+    The default scales the window with the meal: carbohydrate of 15 g or more sets 2 hours below 20 g, 3 hours below 40 g
+    and 4 hours above; a bolus of 1 U or more (with no carbohydrate entered) sets 2 hours below 2 U, 3 below 4 U and 4
+    above. Smaller carbohydrate entries and the pump's automatic corrections do not set a window. ``strict`` is the
+    earlier rule, kept as a sensitivity: any carbohydrate or a bolus of 0.5 U or more, 4 hours each.
+    """
+    carb_rows = carbs[pd.to_numeric(carbs["carb_grams"], errors="coerce") > 0][["timestamp", "carb_grams"]].copy()
+    bolus_rows = bolus[pd.to_numeric(bolus["bolus_units"], errors="coerce") >= (MIN_MEAL_BOLUS if strict else MIN_MEAL_UNITS)][["timestamp", "bolus_units"]].copy()
+    if strict:
+        out = pd.concat([pd.DataFrame({"timestamp": pd.to_datetime(carb_rows["timestamp"]), "window_hours": float(AFTER_MEAL_HOURS)}),
+                         pd.DataFrame({"timestamp": pd.to_datetime(bolus_rows["timestamp"]), "window_hours": float(AFTER_MEAL_HOURS)})], ignore_index=True)
+        return out.sort_values("timestamp").reset_index(drop=True)
+    carb_rows = carb_rows[carb_rows["carb_grams"] >= MIN_MEAL_CARBS]
+    by_carbs = np.where(carb_rows["carb_grams"] < 20, 2.0, np.where(carb_rows["carb_grams"] < 40, 3.0, 4.0))
+    by_units = np.where(bolus_rows["bolus_units"] < 2, 2.0, np.where(bolus_rows["bolus_units"] < 4, 3.0, 4.0))
+    out = pd.concat([pd.DataFrame({"timestamp": pd.to_datetime(carb_rows["timestamp"]), "window_hours": by_carbs}),
+                     pd.DataFrame({"timestamp": pd.to_datetime(bolus_rows["timestamp"]), "window_hours": by_units})], ignore_index=True)
+    return out.sort_values("timestamp").reset_index(drop=True)
+
+
+def _inside_windows(times: pd.Series, meals: pd.DataFrame) -> np.ndarray:
+    """True for each time that falls inside any meal's window (a long window is not cut short by a later short one)."""
+    if meals.empty:
+        return np.zeros(len(times), dtype=bool)
+    order = meals.sort_values("timestamp")
+    starts = order["timestamp"].to_numpy(dtype="datetime64[ns]")
+    ends = starts + (order["window_hours"].to_numpy() * 60).astype("timedelta64[m]")
+    latest_end = np.maximum.accumulate(ends)
+    values = times.to_numpy(dtype="datetime64[ns]")
+    position = np.searchsorted(starts, values, side="right") - 1
+    return (position >= 0) & (latest_end[np.maximum(position, 0)] >= values)
+
+
 def delivery_intervals(rates: pd.DataFrame) -> pd.DataFrame:
     """Each rate record held until the next, with the extra insulin (commanded minus profile) over that interval."""
     frame = rates.sort_values("timestamp").reset_index(drop=True).copy()
@@ -95,7 +134,7 @@ def daily_controller_pattern(
     rates: pd.DataFrame,
     modes: pd.DataFrame,
     cgm: pd.DataFrame,
-    meal_times: np.ndarray,
+    meals: pd.DataFrame,
     parts: list[DayPart],
     *,
     unlogged: pd.DataFrame | None = None,
@@ -115,7 +154,7 @@ def daily_controller_pattern(
     mode = _mode_at(stamp, modes)
     # "within an hour after exercise mode began or ended": any mode change away from exercise counts as an end.
     exercise_ends = modes.loc[modes["mode"].shift(1).eq(2) & modes["mode"].ne(2), "timestamp"].to_numpy(dtype="datetime64[ns]") if not modes.empty else np.array([], dtype="datetime64[ns]")
-    keep = ~_near_after(stamp, meal_times, AFTER_MEAL_HOURS)
+    keep = ~_inside_windows(stamp, meals)
     keep &= mode != 2
     keep &= ~_near_after(stamp, exercise_ends, AFTER_EXERCISE_HOURS)
     if unlogged is not None and not unlogged.empty:
@@ -250,7 +289,7 @@ def basal_signal(daily: pd.DataFrame, *, windows: tuple[int, ...] = SIGNAL_WINDO
     return pd.DataFrame(rows)
 
 
-def controller_inputs(merged, raw_root: str | Path, parts: list[DayPart], *, excluded_days=()) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def controller_inputs(merged, raw_root: str | Path, parts: list[DayPart], *, excluded_days=(), strict: bool = False) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """The daily controller pattern for a merged dataset, with its meal, unlogged-food and exercise exclusions.
 
     Returns the daily table, the rate records it was built from (empty when the archive holds no rate records) and the
@@ -262,14 +301,9 @@ def controller_inputs(merged, raw_root: str | Path, parts: list[DayPart], *, exc
     if rates.empty:
         return pd.DataFrame(), rates, pd.DataFrame()
     cgm, bolus, carbs = merged.tandem_data.cgm, merged.tandem_data.bolus, merged.tandem_data.carbs
-    meal_times = np.sort(
-        np.concatenate(
-            [pd.to_datetime(bolus.loc[bolus["bolus_units"] >= MIN_MEAL_BOLUS, "timestamp"]).to_numpy(), pd.to_datetime(carbs.loc[carbs["carb_grams"] > 0, "timestamp"]).to_numpy()]
-        ).astype("datetime64[ns]")
-    )
     frame = pd.DataFrame({"timestamp": pd.to_datetime(cgm["timestamp"]), "glucose": cgm["glucose"]}).drop_duplicates("timestamp").sort_values("timestamp")
     frame["explicit_carb_grams"] = frame["timestamp"].map(carbs.groupby(pd.to_datetime(carbs["timestamp"]))["carb_grams"].sum()).fillna(0.0)
     frame["bolus_units"] = frame["timestamp"].map(bolus.groupby(pd.to_datetime(bolus["timestamp"]))["bolus_units"].sum()).fillna(0.0)
     unlogged = meal_flags.unlogged_intervals(frame, merged.data.nutrition)
-    daily = daily_controller_pattern(rates, modes, cgm, meal_times, parts, unlogged=unlogged, excluded_days=excluded_days, min_clean_fraction=None, min_clean_hours=MIN_CLEAN_HOURS)
+    daily = daily_controller_pattern(rates, modes, cgm, meal_windows(bolus, carbs, strict=strict), parts, unlogged=unlogged, excluded_days=excluded_days, min_clean_fraction=None, min_clean_hours=MIN_CLEAN_HOURS)
     return daily, rates, unlogged

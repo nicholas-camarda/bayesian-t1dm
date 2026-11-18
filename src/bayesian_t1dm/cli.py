@@ -587,15 +587,18 @@ def _dispatch_command(
             pd.DataFrame([{"as_of": as_of.date(), **proposal.to_row()}]).to_csv(out / "breakfast_proposal.csv", index=False)
             excluded_days = [day for period in load_excluded_periods(args.raw) for day in pd.date_range(period.start, period.end, freq="D")]
             controller_daily, rates, unlogged = controller_inputs(merged, args.raw, parts, excluded_days=excluded_days)
+            strict_daily, _, _ = controller_inputs(merged, args.raw, parts, excluded_days=excluded_days, strict=True)
             site_events = load_site_events(Path(args.raw) / "tconnectsync")
             episode_data, classified_episodes = episodes_payload(cgm, merged.preparation.dataset.frame, parts, site_events, rates, unlogged, merged.data.workouts, as_of=as_of)
             classified_episodes.drop(columns=["site_change"]).assign(site_change=classified_episodes["site_change"]).to_csv(out / "episodes.csv", index=False)
             if not controller_daily.empty:
                 controller_daily.to_csv(out / "controller_daily.csv", index=False)
                 basal_signal(controller_daily).to_csv(out / "basal_signal.csv", index=False)
+                if not strict_daily.empty:
+                    basal_signal(strict_daily).to_csv(out / "basal_signal_strict.csv", index=False)
             page = build_dashboard_data(
                 cgm=cgm, parts=parts, settings_now=now_settings, segments=table, evidence=result.effective_icr_evidence, proposal_row=proposal.to_row(),
-                records=load_records(paths.cloud_root / "data" / "records" / "setting_proposals.csv"), controller_daily=controller_daily, as_of=as_of,
+                records=load_records(paths.cloud_root / "data" / "records" / "setting_proposals.csv"), controller_daily=controller_daily, controller_daily_strict=strict_daily, as_of=as_of,
                 run={"run_id": f"{pd.Timestamp.now():%Y-%m-%d}_{current_commit(paths.root)[:8]}", "commit": current_commit(paths.root), "built": f"{pd.Timestamp.now():%Y-%m-%d %H:%M}"},
                 pump_serial=proposal.pump_serial, profile_id=proposal.profile_id, episodes=episode_data,
             )
