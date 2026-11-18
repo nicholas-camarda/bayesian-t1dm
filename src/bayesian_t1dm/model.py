@@ -15,6 +15,9 @@ from .features import FeatureFrame
 os.environ.setdefault("PYTENSOR_FLAGS", f"compiledir={tempfile.gettempdir()}/bayesian_t1dm_pytensor")
 
 
+OBSERVATION_DF = 5.0
+
+
 @dataclass(frozen=True)
 class ModelFit:
     posterior: object
@@ -195,7 +198,7 @@ class BayesianGlucoseModel:
             beta = pm.Normal("beta", mu=0.0, sigma=1.0, shape=X.shape[1])
             sigma_obs = pm.Exponential("sigma_obs", 1.0)
             mu = intercept + pm.math.dot(X_data, beta)
-            pm.StudentT("obs", nu=5.0, mu=mu, sigma=sigma_obs, observed=y_data)
+            pm.StudentT("obs", nu=OBSERVATION_DF, mu=mu, sigma=sigma_obs, observed=y_data)
             sample_started = time.perf_counter()
             posterior = pm.sample(
                 draws=self.draws,
@@ -269,7 +272,7 @@ class BayesianGlucoseModel:
         central = np.mean(mean, axis=0)
         # Add observation noise to each posterior draw before computing quantiles,
         # so that predictive intervals reflect full posterior predictive uncertainty.
-        predictive = rng.normal(0.0, sigma_obs[:, np.newaxis] * fit.target_scale, size=mean.shape)
+        predictive = rng.standard_t(OBSERVATION_DF, size=mean.shape) * (sigma_obs[:, np.newaxis] * fit.target_scale)
         predictive += mean
         lower_q, upper_q = self.target_quantiles
         lower, upper = np.quantile(predictive, [lower_q, upper_q], axis=0)

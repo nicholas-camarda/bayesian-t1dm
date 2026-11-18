@@ -47,6 +47,12 @@ The **analysis grid** (`analysis_grid_5min.parquet`) holds every 5-minute slot w
 
 ## Breakfast I:C proposals (goal B)
 
+1. Identify an eligible logged meal and the pump segment and settings in force.
+2. Compare its glucose trace with traces predicted across carbohydrate amounts and absorption times, accounting for insulin action and within-meal correlation.
+3. Divide the meal's estimated carbohydrate equivalent by its entered grams and pool log ratios within the same settings period. The per-meal grid yields a posterior. The pooled effective I:C has a 90% Hartung–Knapp confidence interval.
+4. Read the estimate alongside sensitivity checks, observed low-glucose limits and the change record before interpreting proposal eligibility.
+
+
 `bayesian-t1dm propose-breakfast-icr` writes `runtime/output/proposals/breakfast_proposal.md` and `.csv`.
 
 **What the page leads with.** A table with one row per pump segment of the profile now running (segments are never merged: each has its own I:C, CF and basal). For each: the settings it holds now, glucose over its own hours (time in range, below 70, below 54, above 180) for the last 90 days with the last 14 in brackets, a one-line reading (meeting the 70% target; below it with lows within limits; or lows over a limit, so no added insulin), how many breakfasts have been eaten at the current I:C (of the 5 needed), and what breakfasts at the earlier I:C say. A setting changed recently has few breakfasts at the new value; the table then shows the earlier setting's evidence beside it and says whether it supports the change.
@@ -320,50 +326,9 @@ Default horizon:
 
 ## Bayesian Model
 
-The active model is a Bayesian dynamic regression with a latent autoregressive residual process.
+The model predicts glucose 30 minutes ahead from current and lagged measurements. Each training fold supplies its own feature and target means and standard deviations. On those standardized scales the conditional mean is a linear regression. The intercept and each coefficient have independent standard normal priors. Observation errors follow a Student-t distribution with five degrees of freedom and an exponential prior with rate one on the scale.
 
-Let:
-
-- $z_t$ = feature vector at time $t$
-- $y_t$ = observed CGM glucose
-- $\alpha$ = intercept
-- $\beta$ = regression coefficients
-- $x_t$ = latent residual state
-- $\rho$ = autoregressive persistence
-- $\sigma_{\text{state}}$ = latent state noise scale
-- $\sigma_{\text{obs}}$ = observation noise scale
-
-State equation:
-
-$$
-x_t = \rho x_{t-1} + \epsilon_t, \qquad \epsilon_t \sim \mathcal{N}(0, \sigma_{\text{state}}^2)
-$$
-
-Observation equation:
-
-$$
-y_t \sim \text{StudentT}(\nu, \mu_t, \sigma_{\text{obs}})
-$$
-
-with:
-
-$$
-\mu_t = \alpha + \beta^\top z_t + x_t
-$$
-
-The Student-t likelihood is used because CGM and pump-derived features can have outliers, short gaps, and occasional sensor noise.
-
-### Prior Choices
-
-The implementation uses shrinkage priors:
-
-- $\alpha \sim \mathcal{N}(0, 1)$ on the standardized scale
-- $\beta_j \sim \mathcal{N}(0, 0.5)$
-- $\rho \sim \text{Beta}(2, 2)$
-- $\sigma_{\text{state}} \sim \text{Exponential}(1)$
-- $\sigma_{\text{obs}} \sim \text{Exponential}(1)$
-
-These are intentionally conservative because the personal dataset can be sparse and unevenly distributed across meals, days, and activity states.
+The point forecast averages posterior conditional means in mg/dL. For a predictive interval, each draw adds a Student-t observation error at that draw's scale before taking quantiles. Held-out coverage counts future glucose measurements inside the interval. Width is reported in mg/dL alongside error and the persistence forecast.
 
 ## Recommendation Scoring
 
