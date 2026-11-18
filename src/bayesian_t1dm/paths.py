@@ -37,6 +37,7 @@ class ProjectPaths:
     output_latent_meal: Path
     output_outcomes: Path
     output_proposals: Path
+    output_refresh: Path
     output_fixture: Path
     output_source: Path
     output_prepare: Path
@@ -94,6 +95,7 @@ class ProjectPaths:
             output_latent_meal=runtime_path / "output" / "latent_meal",
             output_outcomes=runtime_path / "output" / "outcomes",
             output_proposals=runtime_path / "output" / "proposals",
+            output_refresh=runtime_path / "output" / "refresh",
             output_fixture=runtime_path / "output" / "fixture",
             output_source=runtime_path / "output" / "source",
             output_prepare=runtime_path / "output" / "prepare",
@@ -124,6 +126,7 @@ class ProjectPaths:
             self.output_latent_meal,
             self.output_outcomes,
             self.output_proposals,
+            self.output_refresh,
             self.output_fixture,
             self.output_source,
             self.output_prepare,

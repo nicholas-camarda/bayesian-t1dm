@@ -49,6 +49,18 @@ def current_day_parts(merged: MergedDataset, raw_root: str | Path) -> tuple[list
     return day_parts_from_starts(starts), source
 
 
+def active_profile_now(merged: MergedDataset, raw_root: str | Path) -> tuple[str, int]:
+    """The latest pump and the profile it runs as of the last day its edits are visible."""
+    events = pd.read_parquet(merged_dir(raw_root) / "tables" / "pump_profile_events.parquet")
+    visible = {
+        pump: (dt.date.fromisoformat(item["edits_visible"][0][:10]), dt.date.fromisoformat(item["edits_visible"][1][:10]))
+        for pump, item in merged.manifest["pump_profile_history"].items()
+    }
+    pump = str(int(merged.tandem_data.cgm.sort_values("timestamp")["pump_serial"].dropna().iloc[-1]))
+    profile = ProfileHistory(events, visible).active_profile(pump, dt.datetime.combine(visible[pump][1], dt.time(23, 59)))
+    return pump, int(profile)
+
+
 def current_segment_settings(merged: MergedDataset, raw_root: str | Path) -> dict[float, dict[str, float]]:
     """The I:C and CF each pump segment holds now, from the latest profile edits, keyed by the segment's start minute."""
     events = pd.read_parquet(merged_dir(raw_root) / "tables" / "pump_profile_events.parquet")
