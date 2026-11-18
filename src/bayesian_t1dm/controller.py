@@ -119,13 +119,48 @@ def _inside_windows(times: pd.Series, meals: pd.DataFrame) -> np.ndarray:
     return (position >= 0) & (latest_end[np.maximum(position, 0)] >= values)
 
 
+def profile_rate_at(history, pump_serials: pd.Series, times: pd.Series, *, slot_minutes: int = 15) -> np.ndarray:
+    """The programmed basal rate (U/h) of the segment in force at each time, from the pump's profile history (NaN when the
+    archive cannot show it). Looked up once per pump and ``slot_minutes`` slot."""
+    slots = pd.to_datetime(times).dt.floor(f"{slot_minutes}min")
+    pumps = pump_serials.astype(str).str.removesuffix(".0")
+    cache: dict[tuple[str, pd.Timestamp], float] = {}
+    out = np.full(len(slots), np.nan)
+    for position, (pump, slot) in enumerate(zip(pumps, slots)):
+        key = (pump, slot)
+        if key not in cache:
+            moment = slot.to_pydatetime()
+            profile = history.active_profile(pump, moment)
+            segment = history.segment_in_force(pump, profile, moment) if profile is not None else None
+            cache[key] = float(segment["basal_units_per_hour"]) if segment is not None else float("nan")
+        out[position] = cache[key]
+    return out
+
+
+def basal_records(merged, history) -> pd.DataFrame:
+    """The controller's commanded rate for the whole record, with the programmed rate of the segment in force.
+
+    The commanded rate is the pump's basal delivery log (every ~5 minutes; the merged ``basal`` table holds it for the
+    binary archive and the newer downloads alike: it equals event 279's ``commandedRate`` exactly where both exist).
+    The programmed rate comes from the profile history, which covers the same years.
+    """
+    basal = merged.tandem_data.basal
+    frame = pd.DataFrame(
+        {"pump_serial": basal["pump_serial"].astype(str).str.removesuffix(".0"), "timestamp": pd.to_datetime(basal["start_timestamp"]).astype("datetime64[ns]"),
+         "commanded_u_per_h": pd.to_numeric(basal["basal_units_per_hour"], errors="coerce")}
+    ).dropna().sort_values("timestamp").reset_index(drop=True)
+    frame["profile_u_per_h"] = profile_rate_at(history, frame["pump_serial"], frame["timestamp"])
+    return frame
+
+
 def delivery_intervals(rates: pd.DataFrame) -> pd.DataFrame:
     """Each rate record held until the next, with the extra insulin (commanded minus profile) over that interval."""
     frame = rates.sort_values("timestamp").reset_index(drop=True).copy()
-    gap = frame["timestamp"].shift(-1) - frame["timestamp"]
+    gap = frame.groupby("pump_serial")["timestamp"].shift(-1) - frame["timestamp"]
     frame["hours"] = gap.dt.total_seconds() / 3600.0
     frame = frame[(frame["hours"] > 0) & (frame["hours"] <= MAX_INTERVAL_MINUTES / 60.0)].copy()
-    frame["excess_units"] = (frame["commanded_u_per_h"] - frame["profile_u_per_h"]) * frame["hours"]
+    frame["commanded_units"] = frame["commanded_u_per_h"] * frame["hours"]
+    frame["excess_units"] = (frame["commanded_u_per_h"] - frame["profile_u_per_h"]) * frame["hours"]  # NaN where the programmed rate is unknown
     frame["profile_units"] = frame["profile_u_per_h"] * frame["hours"]
     return frame
 
@@ -141,6 +176,7 @@ def daily_controller_pattern(
     excluded_days=(),
     min_clean_fraction: float | None = MIN_DAY_COVERAGE,
     min_clean_hours: float = 0.0,
+    workouts: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """One row per day and pump segment: extra insulin as a share of the profile's, and mean glucose, over the clean time.
 
@@ -157,6 +193,12 @@ def daily_controller_pattern(
     keep = ~_inside_windows(stamp, meals)
     keep &= mode != 2
     keep &= ~_near_after(stamp, exercise_ends, AFTER_EXERCISE_HOURS)
+    if workouts is not None and not workouts.empty:
+        # Workouts of 30 minutes or more from Apple Health, which cover the years before exercise mode was logged:
+        # from the start of the workout to an hour after its end.
+        long = workouts[pd.to_numeric(workouts["duration_seconds"], errors="coerce") >= 30 * 60]
+        spans = pd.DataFrame({"timestamp": pd.to_datetime(long["start_timestamp"]), "window_hours": (pd.to_datetime(long["end_timestamp"]) - pd.to_datetime(long["start_timestamp"])).dt.total_seconds() / 3600 + AFTER_EXERCISE_HOURS})
+        keep &= ~_inside_windows(stamp, spans)
     if unlogged is not None and not unlogged.empty:
         flagged = np.zeros(len(stamp), dtype=bool)
         for row in unlogged.itertuples(index=False):
@@ -183,9 +225,9 @@ def daily_controller_pattern(
             clean = window[window["timestamp"].dt.floor("5min").isin(group["timestamp"].dt.floor("5min"))]["glucose"]
             rows.append(
                 {
-                    "date": date, "part": part.name, "clean_hours": hours, "profile_units": profile_units,
-                    "profile_rate": round(float((group["profile_u_per_h"] * group["hours"]).sum() / hours), 3),
-                    "excess_units": float(group["excess_units"].sum()), "excess_fraction": float(group["excess_units"].sum() / profile_units),
+                    "date": date, "part": part.name, "clean_hours": hours, "commanded_units": float(group["commanded_units"].sum()),
+                    "profile_units": profile_units, "profile_rate": round(float(group["profile_units"].sum() / group.loc[group["profile_units"].notna(), "hours"].sum()), 3) if profile_units > 0 else np.nan,
+                    "excess_units": float(group["excess_units"].sum()), "excess_fraction": float(group["excess_units"].sum() / profile_units) if profile_units > 0 else np.nan,
                     "mean_glucose": float(clean.mean()) if len(clean) else np.nan, "time_in_range_pct": float(100 * ((clean >= TARGET_LOW) & (clean <= TARGET_HIGH)).mean()) if len(clean) else np.nan,
                     "below_70_pct": float(100 * (clean < TARGET_LOW).mean()) if len(clean) else np.nan,
                     "below_54_pct": float(100 * (clean < 54.0).mean()) if len(clean) else np.nan,
@@ -224,7 +266,7 @@ BOOTSTRAP_DRAWS = 2000
 BOOTSTRAP_SEED = 20261118
 
 
-def basal_signal(daily: pd.DataFrame, *, windows: tuple[int, ...] = SIGNAL_WINDOWS, draws: int = BOOTSTRAP_DRAWS) -> pd.DataFrame:
+def basal_signal(daily: pd.DataFrame, current_rates: dict[str, float] | None = None, *, windows: tuple[int, ...] = SIGNAL_WINDOWS, draws: int = BOOTSTRAP_DRAWS) -> pd.DataFrame:
     """Per pump segment: does the controller consistently work against the programmed basal at its current rate?
 
     Pooled by hours, over the last 28 calendar days (or the shortest of ``windows`` that holds enough clean time, reported
@@ -247,7 +289,10 @@ def basal_signal(daily: pd.DataFrame, *, windows: tuple[int, ...] = SIGNAL_WINDO
     rows = []
     for part, group in daily.groupby("part", sort=False):
         group = group.sort_values("date")
-        rate = round(float(group["profile_rate"].iloc[-1]), 3)
+        rate = round(float((current_rates or {}).get(part, group["profile_rate"].dropna().iloc[-1] if group["profile_rate"].notna().any() else np.nan)), 3)
+        if not np.isfinite(rate) or rate <= 0:
+            rows.append({"part": part, "signal": "the programmed rate for this segment is not known"})
+            continue
         for window in windows:
             recent = group[group["date"] > group["date"].max() - pd.Timedelta(days=window)]
             n, hours = len(recent), float(recent["clean_hours"].sum())
@@ -259,7 +304,7 @@ def basal_signal(daily: pd.DataFrame, *, windows: tuple[int, ...] = SIGNAL_WINDO
             rows.append(row)
             continue
         w = recent["clean_hours"].to_numpy()
-        commanded = (recent["profile_units"] + recent["excess_units"]).to_numpy()
+        commanded = recent["commanded_units"].to_numpy()
         frac = commanded / (rate * w) - 1.0  # each day's commanded rate against the current programmed rate
         over = float(w[frac > SIGNAL_EXTRA_FRACTION].sum() / w.sum())
         under = float(w[frac < -SIGNAL_EXTRA_FRACTION].sum() / w.sum())
@@ -289,7 +334,7 @@ def basal_signal(daily: pd.DataFrame, *, windows: tuple[int, ...] = SIGNAL_WINDO
     return pd.DataFrame(rows)
 
 
-def controller_inputs(merged, raw_root: str | Path, parts: list[DayPart], *, excluded_days=(), strict: bool = False) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def controller_inputs(merged, raw_root: str | Path, parts: list[DayPart], history, *, excluded_days=(), strict: bool = False) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """The daily controller pattern for a merged dataset, with its meal, unlogged-food and exercise exclusions.
 
     Returns the daily table, the rate records it was built from (empty when the archive holds no rate records) and the
@@ -297,7 +342,8 @@ def controller_inputs(merged, raw_root: str | Path, parts: list[DayPart], *, exc
     """
     from . import meal_flags
 
-    rates, modes = load_basal_delivery(Path(raw_root) / "tconnectsync")
+    _, modes = load_basal_delivery(Path(raw_root) / "tconnectsync")
+    rates = basal_records(merged, history)
     if rates.empty:
         return pd.DataFrame(), rates, pd.DataFrame()
     cgm, bolus, carbs = merged.tandem_data.cgm, merged.tandem_data.bolus, merged.tandem_data.carbs
@@ -305,5 +351,5 @@ def controller_inputs(merged, raw_root: str | Path, parts: list[DayPart], *, exc
     frame["explicit_carb_grams"] = frame["timestamp"].map(carbs.groupby(pd.to_datetime(carbs["timestamp"]))["carb_grams"].sum()).fillna(0.0)
     frame["bolus_units"] = frame["timestamp"].map(bolus.groupby(pd.to_datetime(bolus["timestamp"]))["bolus_units"].sum()).fillna(0.0)
     unlogged = meal_flags.unlogged_intervals(frame, merged.data.nutrition)
-    daily = daily_controller_pattern(rates, modes, cgm, meal_windows(bolus, carbs, strict=strict), parts, unlogged=unlogged, excluded_days=excluded_days, min_clean_fraction=None, min_clean_hours=MIN_CLEAN_HOURS)
+    daily = daily_controller_pattern(rates, modes, cgm, meal_windows(bolus, carbs, strict=strict), parts, unlogged=unlogged, excluded_days=excluded_days, min_clean_fraction=None, min_clean_hours=MIN_CLEAN_HOURS, workouts=merged.data.workouts)
     return daily, rates, unlogged

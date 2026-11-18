@@ -70,7 +70,7 @@ def _days(fractions, hours=5.0, rate=0.7, glucose=150.0, below_70=0.5, part="00:
     fractions = np.asarray(fractions, dtype=float)
     hours = np.broadcast_to(np.asarray(hours, dtype=float), fractions.shape)
     units = rate * hours
-    return pd.DataFrame({"date": pd.date_range(start, periods=len(fractions)), "part": part, "clean_hours": hours, "profile_units": units, "excess_units": fractions * units,
+    return pd.DataFrame({"date": pd.date_range(start, periods=len(fractions)), "part": part, "clean_hours": hours, "commanded_units": units + fractions * units, "profile_units": units, "excess_units": fractions * units,
                          "excess_fraction": fractions, "profile_rate": rate, "mean_glucose": glucose, "below_70_pct": below_70, "below_54_pct": 0.0})
 
 
