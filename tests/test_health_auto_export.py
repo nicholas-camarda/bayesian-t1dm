@@ -344,7 +344,10 @@ def test_build_health_analysis_ready_command_writes_tandem_aligned_dataset(tmp_p
 
     first_row = analysis_ready.loc[analysis_ready["timestamp"] == "2025-05-24 00:00:00"].iloc[0]
     assert float(first_row["health_activity_value"]) == 100.0
-    assert float(first_row["prior_night_total_sleep_hours"]) == 8.2
+    # The night ends at 07:00; at 00:00 its total is not yet known, so it is not carried and is flagged as unknown.
+    assert float(first_row["prior_night_total_sleep_hours"]) == 0.0 and int(first_row["prior_night_sleep_known"]) == 0
+    after_wake = analysis_ready.loc[analysis_ready["timestamp"] >= "2025-05-24 07:00:00"]
+    assert after_wake.empty or (after_wake["prior_night_total_sleep_hours"].iloc[0] == 8.2 and int(after_wake["prior_night_sleep_known"].iloc[0]) == 1)
     assert int(first_row["in_sleep"]) == 1
     assert float(first_row["hrv_latest"]) == 55.0
 

@@ -716,18 +716,11 @@ def build_health_context_frame(base_frame: pd.DataFrame, data: IngestedData, *, 
         sleep["projection_date"] = sleep["sleep_end"].dt.normalize()
         sleep["projection_date"] = sleep["projection_date"].where(sleep["projection_date"].notna(), sleep["date"])
         out["date"] = out["timestamp"].dt.normalize()
-        sleep_daily = sleep.loc[:, [
-            "projection_date",
-            "total_sleep_hours",
-            "in_bed_hours",
-            "core_hours",
-            "deep_hours",
-            "rem_hours",
-            "awake_hours",
-        ]].drop_duplicates(subset=["projection_date"], keep="last")
-        sleep_daily = sleep_daily.rename(
+        # A night's totals are known only once it ends: each row carries the most recent night whose recorded end is at or before
+        # the row's time, and nothing (NaN) when no night has ended in the last 36 hours, so a missing record is not zero sleep.
+        night = sleep.dropna(subset=["sleep_end"]).loc[:, ["sleep_end", "total_sleep_hours", "in_bed_hours", "core_hours", "deep_hours", "rem_hours", "awake_hours"]]
+        night = night.drop_duplicates(subset=["sleep_end"], keep="last").sort_values("sleep_end").rename(
             columns={
-                "projection_date": "date",
                 "total_sleep_hours": "prior_night_total_sleep_hours",
                 "in_bed_hours": "prior_night_in_bed_hours",
                 "core_hours": "prior_night_core_hours",
@@ -736,7 +729,9 @@ def build_health_context_frame(base_frame: pd.DataFrame, data: IngestedData, *, 
                 "awake_hours": "prior_night_awake_hours",
             }
         )
-        out = out.merge(sleep_daily, on="date", how="left")
+        out = out.sort_values("timestamp").reset_index(drop=True)
+        out = pd.merge_asof(out, night, left_on="timestamp", right_on="sleep_end", direction="backward", tolerance=pd.Timedelta(hours=36)).drop(columns=["sleep_end"])
+        out["prior_night_sleep_known"] = out["prior_night_total_sleep_hours"].notna().astype(int)  # the zero fill later must not read as no sleep
         intervals = sleep.loc[:, ["sleep_start", "sleep_end"]].copy()
         out["in_sleep"] = 0
         for row in intervals.dropna(subset=["sleep_start", "sleep_end"]).itertuples(index=False):
@@ -745,6 +740,7 @@ def build_health_context_frame(base_frame: pd.DataFrame, data: IngestedData, *, 
         feature_columns.extend(
             [
                 "in_sleep",
+                "prior_night_sleep_known",
                 "prior_night_total_sleep_hours",
                 "prior_night_in_bed_hours",
                 "prior_night_core_hours",
