@@ -728,3 +728,17 @@ def test_missing_timezone_is_an_error_not_utc(monkeypatch):
     monkeypatch.setenv("TIMEZONE_NAME", "Eastern")
     with pytest.raises(ValueError, match="not a valid IANA timezone"):
         analysis_timezone()
+
+
+def test_renormalizing_an_archived_window_never_rewrites_its_raw_folder(tmp_path):
+    workspace = _workspace(tmp_path)
+    raw_dir = workspace.cloud_raw / "tconnectsync" / "2024-05-01__2024-05-03" / "raw"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "cgm.json").write_text('[{"eventDateTime": "2024-05-01T00:00:00", "egv_estimatedGlucoseValue": 110}]', encoding="utf-8")
+    (raw_dir / "bolus.json").write_text("[]", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in raw_dir.iterdir()}
+
+    acquisition.normalize_tconnectsync_archive(workspace, raw_root=workspace.cloud_raw / "tconnectsync", force=True)
+
+    assert {path.name: path.read_bytes() for path in raw_dir.iterdir()} == before
+    assert (raw_dir.parent / "normalized" / "cgm.csv").exists()

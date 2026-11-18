@@ -1082,7 +1082,13 @@ def _write_tconnectsync_window_artifacts(
     pump_serial: str | None = None,
     extra_raw_artifacts: Sequence[RawApiArtifact] = (),
     payload_hash_source: Mapping[str, Any] | None = None,
+    write_raw: bool = True,
 ) -> NormalizedWindowResult:
+    """Write a window's normalized tables (and, at collection time only, its raw payloads).
+
+    Re-normalizing an archived window passes ``write_raw=False``: the raw folder is the record of what
+    Tandem returned and is never rewritten by processing.
+    """
     archive_root = workspace.cloud_raw / 'tconnectsync' / window.window_id
     raw_root = archive_root / 'raw'
     normalized_root = archive_root / 'normalized'
@@ -1103,7 +1109,8 @@ def _write_tconnectsync_window_artifacts(
     for family, payload in payloads.items():
         body_path = raw_root / f'{family}.json'
         metadata_path = raw_root / f'{family}.meta.json'
-        body_path.write_text(_stable_json_dumps(payload) + '\n', encoding='utf-8')
+        if write_raw:
+            body_path.write_text(_stable_json_dumps(payload) + '\n', encoding='utf-8')
         metadata = {
             'window_id': window.window_id,
             'requested_start': window.start_date.isoformat(),
@@ -1116,7 +1123,8 @@ def _write_tconnectsync_window_artifacts(
             'created_at': datetime.now(UTC).isoformat(timespec='seconds').replace('+00:00', 'Z'),
             'path': str(body_path),
         }
-        _write_json(metadata_path, metadata)
+        if write_raw:
+            _write_json(metadata_path, metadata)
         raw_artifacts.append(RawApiArtifact(endpoint_family=family, path=body_path, metadata_path=metadata_path, metadata=metadata))
         raw_metadata_rows.append({
             'window_id': window.window_id,
@@ -2044,6 +2052,7 @@ def normalize_tconnectsync_archive(
             timezone=selected_timezone,
             pump_serial=pump_serial,
             payload_hash_source=payloads,
+            write_raw=False,
         )
         results.append(result)
         report_lines.append(

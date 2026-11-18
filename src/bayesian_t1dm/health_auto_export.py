@@ -374,7 +374,7 @@ def _normalize_health_payload(payload: dict[str, Any], *, source_file: str) -> t
             continue
         if metric_name in NUTRITION_METRICS:
             nutrition_rows.extend(
-                {"timestamp": row.get("date"), "nutrient": NUTRITION_METRICS[metric_name], "grams": row.get("qty"), "source_device": str(row.get("source") or "")}
+                {"timestamp": _parse_timestamp(row.get("date")), "nutrient": NUTRITION_METRICS[metric_name], "grams": row.get("qty"), "source_device": str(row.get("source") or "")}
                 for row in rows
                 if isinstance(row, dict)
             )
@@ -397,7 +397,7 @@ def _normalize_health_payload(payload: dict[str, Any], *, source_file: str) -> t
 
     if nutrition_rows:
         long = pd.DataFrame(nutrition_rows)
-        long["timestamp"] = _parse_series(long["timestamp"])
+        long["timestamp"] = pd.to_datetime(long["timestamp"], errors="coerce")
         long["grams"] = pd.to_numeric(long["grams"], errors="coerce")
         long = long.dropna(subset=["timestamp", "grams"])
         if not long.empty:

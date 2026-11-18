@@ -607,7 +607,8 @@ def test_logged_food_entries_become_one_nutrition_row_per_entry(tmp_path):
 
     payload = _build_health_auto_export_payload()
     payload["data"]["metrics"] += [
-        {"name": "carbohydrates", "units": "g", "data": [{"date": "2026-04-04 08:17:00 -0400", "qty": 49.2, "source": ""}]},
+        # Entries either side of the November DST change carry different offsets.
+        {"name": "carbohydrates", "units": "g", "data": [{"date": "2026-04-04 08:17:00 -0400", "qty": 49.2, "source": ""}, {"date": "2026-11-05 07:40:00 -0500", "qty": 30.0, "source": ""}]},
         {"name": "protein", "units": "g", "data": [{"date": "2026-04-04 08:17:00 -0400", "qty": 18.0, "source": ""}]},
         {"name": "total_fat", "units": "g", "data": [{"date": "2026-04-04 08:17:00 -0400", "qty": 22.5, "source": ""}]},
     ]
@@ -615,7 +616,8 @@ def test_logged_food_entries_become_one_nutrition_row_per_entry(tmp_path):
 
     nutrition = load_unified_health_auto_export_tables(tmp_path / "raw")["nutrition"]
 
-    assert len(nutrition) == 1
+    assert len(nutrition) == 2
+    assert pd.Timestamp(nutrition["timestamp"].iloc[1]) == pd.Timestamp("2026-11-05 07:40:00")
     row = nutrition.iloc[0]
     assert pd.Timestamp(row["timestamp"]) == pd.Timestamp("2026-04-04 08:17:00")  # local wall-clock time
     assert (row["carb_grams"], row["protein_grams"], row["fat_grams"]) == (49.2, 18.0, 22.5)
