@@ -2089,6 +2089,7 @@ def build_first_meal_clean_window_registry(
     premeal_minutes: int = 30,
     postmeal_minutes: int = 180,
     unlogged: pd.DataFrame | None = None,
+    meal_segments: tuple[str, ...] = ("morning",),
 ) -> pd.DataFrame:
     columns = [
         "candidate_id",
@@ -2126,13 +2127,14 @@ def build_first_meal_clean_window_registry(
     step_seconds = ordered["timestamp"].diff().dt.total_seconds().dropna()
     step_minutes = float(step_seconds[step_seconds > 0].median() / 60.0) if (step_seconds > 0).any() else 5.0
     morning_candidates = ordered.loc[
-        ordered["therapy_segment"].astype(str).eq("morning")
+        ordered["therapy_segment"].astype(str).isin(meal_segments)
         & pd.to_numeric(_column_or_default(ordered, "bolus_units"), errors="coerce").fillna(0.0).ge(1.5)
     ].copy()
     if morning_candidates.empty:
         return pd.DataFrame(columns=columns)
 
-    candidate_rows = morning_candidates.groupby("date", as_index=False).head(1).copy().reset_index(drop=True)
+    # The first bolus of 1.5 U or more in each meal segment of each day.
+    candidate_rows = morning_candidates.groupby(["date", morning_candidates["therapy_segment"].astype(str)], as_index=False).head(1).copy().reset_index(drop=True)
     rows: list[dict[str, Any]] = []
     for candidate_index, candidate in enumerate(candidate_rows.itertuples(index=False), start=1):
         timestamp = pd.Timestamp(candidate.timestamp)
@@ -3402,6 +3404,15 @@ AGREEMENT_CHECKS: tuple[tuple[str, Any], ...] = (
 )
 
 
+def _pool_label(window_metrics: pd.DataFrame) -> pd.Series:
+    """The group a meal's evidence is pooled in: the pump segment covering it (a setting governs every meal in its
+    segment, whichever meal of the day it is), or the therapy segment when the archive does not show the pump's."""
+    start = pd.to_numeric(window_metrics.get("profile_segment_start_minutes", pd.Series(np.nan, index=window_metrics.index)), errors="coerce")
+    therapy = window_metrics["segment"].astype(str)
+    label = start.map(lambda minute: "" if not np.isfinite(minute) else f"{int(minute) // 60:02d}:{int(minute) % 60:02d} segment")
+    return label.where(label.ne(""), therapy)
+
+
 def _unknown_as(value: float, unknown: float = -1.0) -> float:
     """A group key for a value the archive does not show (NaN never equals itself, so it cannot be a key)."""
     return unknown if not np.isfinite(value) else float(value)
@@ -3448,9 +3459,9 @@ def _effective_icr_evidence(
 
     rows: list[dict[str, Any]] = []
     for analysis, include, carbs_for in analyses:
-        for segment, group in window_metrics.groupby(window_metrics["segment"].astype(str), sort=True):
+        for segment, group in window_metrics.groupby(_pool_label(window_metrics), sort=True):
             ordered_rows = list(group.sort_values("timestamp").itertuples(index=False))
-            in_force = _resolve_meal_settings(ordered_rows, segment, settings)
+            in_force = _resolve_meal_settings(ordered_rows, str(group["segment"].astype(str).mode().iloc[0]), settings)
             meals: list[dict[str, Any]] = []
             for metric_row, (icr, cf, source) in zip(ordered_rows, in_force):
                 stated = carbs_for(metric_row)
@@ -4606,6 +4617,7 @@ def run_latent_meal_icr_research(
     therapy_settings: LatentMealTherapySettings | None = None,
     excluded_periods: tuple[ExcludedPeriod, ...] = (),
     nutrition: pd.DataFrame | None = None,
+    meal_segments: tuple[str, ...] = ("morning",),
 ) -> LatentMealResearchResult:
     if research_scope not in {"foundation", "full"}:
         raise ValueError(f"Unsupported research_scope: {research_scope}")
@@ -4613,7 +4625,7 @@ def run_latent_meal_icr_research(
     research_frame = build_therapy_research_frame(dataset, segments=segments, meal_proxy_mode=meal_proxy_mode, excluded_periods=excluded_periods)
     meal_event_registry = build_meal_event_registry(research_frame)
     unlogged = meal_flags.unlogged_intervals(research_frame, nutrition)
-    clean_meal_windows = build_first_meal_clean_window_registry(research_frame, unlogged=unlogged)
+    clean_meal_windows = build_first_meal_clean_window_registry(research_frame, unlogged=unlogged, meal_segments=meal_segments)
     first_meal_exclusion_summary = build_first_meal_exclusion_summary(clean_meal_windows)
     if research_scope == "foundation":
         gate, gate_markdown = _latent_meal_gate(dataset, clean_meal_windows, research_scope=research_scope)
