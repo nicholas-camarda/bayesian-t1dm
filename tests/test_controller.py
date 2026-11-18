@@ -60,3 +60,24 @@ def test_summary_reports_the_spread_across_days():
     daily = pd.DataFrame({"part": "00:00-05:00", "excess_fraction": [0.0, 0.2, 0.4, 0.6], "mean_glucose": 140.0, "time_in_range_pct": 80.0, "sleep_share": 1.0})
     summary = controller.controller_summary(daily).iloc[0]
     assert summary["days"] == 4 and summary["median_excess_fraction"] == pytest.approx(0.3) and summary["sd_between_days"] > 0
+
+
+def _days(fractions, glucose=150.0, below_70=0.5, part="00:00-05:00"):
+    return pd.DataFrame({"date": pd.date_range("2026-06-01", periods=len(fractions)), "part": part, "excess_fraction": fractions, "mean_glucose": glucose,
+                         "below_70_pct": below_70, "below_54_pct": 0.0})
+
+
+def test_basal_signal_needs_extra_insulin_on_half_the_nights_glucose_still_high_and_lows_within_limits():
+    signal = lambda frame: controller.basal_signal(frame).iloc[0]["signal"]  # noqa: E731
+    assert signal(_days([0.4] * 20)) == "basal likely too low"
+    assert signal(_days([0.4] * 10 + [0.0] * 10)) == "basal likely too low"  # exactly half the nights
+    assert signal(_days([0.4] * 9 + [0.0] * 11)) == "no consistent pattern"
+    assert signal(_days([0.4] * 20, below_70=5.0)).startswith("controller adds insulin but lows are over a limit")
+    assert signal(_days([0.4] * 20, glucose=110.0)).startswith("controller adds insulin and glucose is within the target")
+    assert signal(_days([-0.4] * 20)) == "basal likely too high"
+    assert signal(_days([0.4] * 10)).startswith("not enough clean days")
+
+
+def test_basal_signal_looks_only_at_the_most_recent_nights():
+    frame = _days([0.0] * 30 + [0.5] * 28)  # the first 30 nights are quiet; the last 28 are not
+    assert controller.basal_signal(frame).iloc[0]["signal"] == "basal likely too low"

@@ -140,6 +140,8 @@ def daily_controller_pattern(
                     "date": date, "part": part.name, "clean_hours": hours, "profile_units": profile_units,
                     "excess_units": float(group["excess_units"].sum()), "excess_fraction": float(group["excess_units"].sum() / profile_units),
                     "mean_glucose": float(clean.mean()) if len(clean) else np.nan, "time_in_range_pct": float(100 * ((clean >= TARGET_LOW) & (clean <= TARGET_HIGH)).mean()) if len(clean) else np.nan,
+                    "below_70_pct": float(100 * (clean < TARGET_LOW).mean()) if len(clean) else np.nan,
+                    "below_54_pct": float(100 * (clean < 54.0).mean()) if len(clean) else np.nan,
                     "sleep_share": float((group["mode"] == 1).mean()),
                 }
             )
@@ -158,5 +160,51 @@ def controller_summary(daily: pd.DataFrame) -> pd.DataFrame:
                 "mean_glucose": float(group["mean_glucose"].mean()), "time_in_range_pct": float(group["time_in_range_pct"].mean()),
                 "sleep_share": float(group["sleep_share"].mean()),
             }
+        )
+    return pd.DataFrame(rows)
+
+
+# The written rule for turning the pattern into a basal signal (chosen with the person, 2026-11-18).
+SIGNAL_EXTRA_FRACTION = 0.25  # X: the controller runs this far above (or below) the profile
+SIGNAL_SHARE_OF_DAYS = 0.50   # Y: on at least this share of the recent clean days
+SIGNAL_RECENT_DAYS = 28
+SIGNAL_MIN_DAYS = 14
+HIGH_GLUCOSE_MGDL = 120.0     # the top of the sleep-mode target: glucose still above it despite the extra insulin
+
+
+def basal_signal(daily: pd.DataFrame, *, recent_days: int = SIGNAL_RECENT_DAYS) -> pd.DataFrame:
+    """Per pump segment, over its most recent clean days: does the controller consistently work against the programmed basal?
+
+    "Basal likely too low": the controller delivers more than ``SIGNAL_EXTRA_FRACTION`` above the profile on at least
+    ``SIGNAL_SHARE_OF_DAYS`` of the days, mean glucose over those days is still above ``HIGH_GLUCOSE_MGDL``, and time
+    below 70 and below 54 stay within their limits. "Basal likely too high": it withholds more than that on at least
+    that share of days. Fewer than ``SIGNAL_MIN_DAYS`` clean days gives no signal.
+    """
+    from .outcomes import LOW_LIMIT_PERCENT, VERY_LOW_LIMIT_PERCENT
+
+    rows = []
+    for part, group in daily.groupby("part", sort=False):
+        recent = group.sort_values("date").tail(recent_days)
+        n = len(recent)
+        over = float((recent["excess_fraction"] > SIGNAL_EXTRA_FRACTION).mean()) if n else np.nan
+        under = float((recent["excess_fraction"] < -SIGNAL_EXTRA_FRACTION).mean()) if n else np.nan
+        glucose = float(recent["mean_glucose"].mean()) if n else np.nan
+        below_70, below_54 = (float(recent["below_70_pct"].mean()), float(recent["below_54_pct"].mean())) if n else (np.nan, np.nan)
+        lows_ok = below_70 < LOW_LIMIT_PERCENT and below_54 < VERY_LOW_LIMIT_PERCENT
+        if n < SIGNAL_MIN_DAYS:
+            signal = f"not enough clean days ({n} of {SIGNAL_MIN_DAYS})"
+        elif over >= SIGNAL_SHARE_OF_DAYS and glucose > HIGH_GLUCOSE_MGDL and lows_ok:
+            signal = "basal likely too low"
+        elif over >= SIGNAL_SHARE_OF_DAYS and not lows_ok:
+            signal = "controller adds insulin but lows are over a limit: no added basal"
+        elif over >= SIGNAL_SHARE_OF_DAYS:
+            signal = "controller adds insulin and glucose is within the target: basal is being covered by the controller"
+        elif under >= SIGNAL_SHARE_OF_DAYS:
+            signal = "basal likely too high"
+        else:
+            signal = "no consistent pattern"
+        rows.append(
+            {"part": part, "days": n, "share_over_x": over, "share_under_minus_x": under, "mean_glucose": glucose, "below_70_pct": below_70,
+             "below_54_pct": below_54, "median_excess_fraction": float(recent["excess_fraction"].median()) if n else np.nan, "signal": signal}
         )
     return pd.DataFrame(rows)
