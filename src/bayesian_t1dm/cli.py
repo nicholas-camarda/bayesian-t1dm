@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import shutil
+import json
 import os
 from contextlib import nullcontext
 from datetime import date, timedelta
@@ -36,8 +38,11 @@ from .dataset import MergedDataset, build_merged_dataset, load_merged_dataset, m
 from .ingest import summarize_tandem_raw_dir
 from .model import BayesianGlucoseModel
 from .observability import LoggingSession, setup_run_logging
-from .outcomes_report import current_day_parts, current_segment_settings, write_outcomes
+from .outcomes_report import active_profile_now, current_day_parts, current_segment_settings, write_outcomes
+from .changes import SETTING_FIELDS, detect_setting_changes
 from .outcomes import day_part_table
+from .publish import current_commit, publish_run, working_tree_is_clean
+from .records import evaluate_open, load_records, register_proposal, save_records, sync_with_pump
 from .proposals import propose_breakfast_icr, proposal_markdown, segment_ends_from_parts, segment_markdown, segment_summary
 from .paths import ProjectPaths
 from .recommend import RecommendationPolicy, recommend_setting_changes
@@ -108,6 +113,12 @@ def build_parser() -> argparse.ArgumentParser:
     propose.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
     propose.add_argument("--research-scope", choices=["foundation", "full"], default="full")
     propose.add_argument("--therapy-settings", default=None)
+    propose.add_argument("--record", action=argparse.BooleanOptionalAction, default=False, help="Update the durable change record in the Project Vault (proposals, entered changes, evaluations)")
+
+    refresh = add_command("refresh", "Run the whole pipeline by hand: collect, build, outcomes, proposal, change record, then publish to the Vault")
+    refresh.add_argument("--env-file", default=None, help="Optional .env file with Tandem credentials")
+    refresh.add_argument("--collect", action=argparse.BooleanOptionalAction, default=True, help="Fetch the latest 30 days from Tandem Source first")
+    refresh.add_argument("--publish", action=argparse.BooleanOptionalAction, default=True)
 
     screen_health = add_command("screen-health-features", "Screen imported Apple Health context features against Tandem glucose targets")
     screen_health.add_argument("--raw", default=None)
@@ -537,6 +548,9 @@ def _dispatch_command(
             )
         return 0
 
+    if args.command == "refresh":
+        return _run_refresh(args, paths, parser)
+
     if args.command == "propose-breakfast-icr":
         preparation, result = _run_latent_meal_analysis(args=args, paths=paths, session=session)
         merged = _load_dataset(args, session)
@@ -557,7 +571,11 @@ def _dispatch_command(
                 result.effective_icr_evidence, pump_serial=proposal.pump_serial, profile_id=proposal.profile_id,
             )
             table.to_csv(out / "segment_summary.csv", index=False)
-            (out / "breakfast_proposal.md").write_text(segment_markdown(table) + "\n" + proposal_markdown(proposal, as_of=as_of), encoding="utf-8")
+            change_log = ""
+            if args.record:
+                change_log = _update_change_record(args, paths, merged, proposal, parts, as_of)
+                (out / "change_log.md").write_text(change_log, encoding="utf-8")
+            (out / "breakfast_proposal.md").write_text(segment_markdown(table) + "\n" + proposal_markdown(proposal, as_of=as_of) + ("\n" + change_log if change_log else ""), encoding="utf-8")
         print((out / "breakfast_proposal.md").read_text(encoding="utf-8"))
         return 0
 
@@ -880,6 +898,67 @@ def _dispatch_command(
 
     parser.error(f"Unknown command: {args.command}")
     return 2
+
+
+def _update_change_record(args, paths: ProjectPaths, merged: MergedDataset, proposal, parts, as_of: pd.Timestamp) -> str:
+    """Sync the durable record with the pump, register the proposal, run due evaluations, and return the change log."""
+    record_path = paths.cloud_root / "data" / "records" / "setting_proposals.csv"
+    records = load_records(record_path)
+    events = pd.read_parquet(merged_dir(args.raw) / "tables" / "pump_profile_events.parquet")
+    pump, profile = active_profile_now(merged, args.raw)
+    changes = detect_setting_changes(events)
+    # Only the profile now running: edits to a profile that is not in use do not change the person's glucose.
+    changes = changes[changes["pump_serial"].eq(pump) & changes["profile_id"].eq(profile)]
+    parts_by_start = {float(part.start_minutes): part for part in parts}
+    # Changes are looked at from 30 days back so a new record also picks up edits made since the last refresh.
+    records = sync_with_pump(records, changes, parts_by_start, since=as_of - pd.Timedelta(days=30))
+    records, note = register_proposal(records, proposal, as_of=as_of)
+    excluded = [day for period in load_excluded_periods(args.raw) for day in pd.date_range(period.start, period.end, freq="D")]
+    records = evaluate_open(records, merged.tandem_data.cgm, parts_by_start, now=as_of, excluded_days=excluded)
+    save_records(records, record_path)
+    lines = ["## Change log", "", f"Record: `{record_path}` ({note}).", ""]
+    if records.empty:
+        lines.append("No setting changes recorded yet.")
+    else:
+        lines += ["| made | setting | segment | change | origin | other changes within 24 h | status | result |", "| --- | --- | --- | --- | --- | ---: | --- | --- |"]
+        for row in records.sort_values("entered_on", na_position="last").itertuples(index=False):
+            made = row.entered_on if pd.notna(row.entered_on) else f"proposed {row.proposed_on}"
+            segment = f"{int(row.segment_start_minutes) // 60:02d}:{int(row.segment_start_minutes) % 60:02d}"
+            lines.append(f"| {made} | {SETTING_FIELDS.get(row.setting, row.setting)} | {segment} | {row.old_value:g} -> {row.new_value:g} | {row.origin} | {int(row.concurrent_changes) if pd.notna(row.concurrent_changes) else 0} | {row.status} | {row.result if pd.notna(row.result) else ''} |")
+    return "\n".join(lines) + "\n"
+
+
+def _run_refresh(args, paths: ProjectPaths, parser) -> int:
+    """Collect, build, report, propose, record and publish; the run record says whether every step completed."""
+    run_id = f"{pd.Timestamp.now():%Y-%m-%d}_{current_commit(paths.root)[:8]}"
+    run_dir = paths.output_refresh / run_id
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
+    run_dir.mkdir(parents=True)
+    record = {"run_id": run_id, "commit": current_commit(paths.root), "working_tree_clean": working_tree_is_clean(paths.root), "started": f"{pd.Timestamp.now():%Y-%m-%dT%H:%M:%S}", "steps": {}, "status": "running"}
+    base = ["--root", str(args.root)]
+    steps = []
+    if args.collect:
+        steps.append(("collect", ["collect", *(["--env-file", args.env_file] if args.env_file else [])]))
+    steps += [("build-dataset", ["build-dataset"]), ("report-outcomes", ["report-outcomes"]), ("propose-breakfast-icr", ["propose-breakfast-icr", "--record"])]
+    for name, argv in steps:
+        code = main([*base, *argv])
+        record["steps"][name] = code
+        if code != 0:
+            record["status"] = f"failed at {name}"
+            (run_dir / "run_record.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+            print(f"Refresh stopped: {name} exited with {code}. Nothing was published.")
+            return code or 1
+    for name in ("outcomes", "proposals"):
+        shutil.copytree(paths.reports / name, run_dir / name)
+    record["status"] = "complete"
+    record["finished"] = f"{pd.Timestamp.now():%Y-%m-%dT%H:%M:%S}"
+    (run_dir / "run_record.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+    print(f"Run {run_id} complete: {run_dir}")
+    if args.publish:
+        destination = publish_run(run_dir, paths.cloud_output / f"{pd.Timestamp.now():%Y-%m-%d}", repo_root=paths.root)
+        print(f"Published to {destination}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

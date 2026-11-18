@@ -23,6 +23,7 @@ TOP_LEVEL_ENTRYPOINTS = {
     "latent_meal",
     "outcomes",
     "proposals",
+    "refresh",
     "fixture",
     "source",
     "prepare",
