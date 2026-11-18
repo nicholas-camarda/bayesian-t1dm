@@ -39,10 +39,11 @@ from .dataset import MergedDataset, build_merged_dataset, load_merged_dataset, m
 from .ingest import summarize_tandem_raw_dir
 from .model import BayesianGlucoseModel
 from .observability import LoggingSession, setup_run_logging
-from .outcomes_report import profile_history, active_profile_now, current_day_parts, current_segment_settings, write_outcomes
+from .analysis_data import AnalysisData, load_analysis_data
+from .context_rules import exercise_intervals
+from .outcomes_report import write_outcomes
 from .controller import basal_signal, controller_inputs
 from .dashboard import build_dashboard_data, episodes_payload
-from .episodes import load_site_events
 from .dashboard_page import render_dashboard
 from .changes import EVALUATION_DAYS, SETTING_FIELDS, detect_setting_changes
 from .outcomes import day_part_table
@@ -563,17 +564,18 @@ def _dispatch_command(
     if args.command == "propose-breakfast-icr":
         preparation, result = _run_latent_meal_analysis(args=args, paths=paths, session=session)
         merged = _load_dataset(args, session)
+        analysis = load_analysis_data(args.raw, merged)
         with session.stage("proposals.breakfast_icr", report_dir=args.report_dir):
-            parts, _ = current_day_parts(merged, args.raw)
-            as_of = pd.Timestamp(merged.tandem_data.cgm["timestamp"].max()).normalize()
+            parts, _ = analysis.day_parts()
+            now_settings = analysis.segment_settings()
+            cgm = analysis.cgm
+            as_of = pd.Timestamp(cgm["timestamp"].max()).normalize()
             proposal = propose_breakfast_icr(
-                result.effective_icr_evidence, merged.tandem_data.cgm, segment_ends_from_parts(parts), as_of=as_of,
-                current_icr={start: item["icr"] for start, item in current_segment_settings(merged, args.raw).items()},
+                result.effective_icr_evidence, cgm, segment_ends_from_parts(parts), as_of=as_of,
+                current_icr={start: item["icr"] for start, item in now_settings.items()},
             )
             out = Path(args.report_dir)
             out.mkdir(parents=True, exist_ok=True)
-            cgm = merged.tandem_data.cgm
-            now_settings = current_segment_settings(merged, args.raw)
             table = segment_summary(
                 parts, now_settings, day_part_table(cgm, parts, as_of=as_of, days=90), day_part_table(cgm, parts, as_of=as_of, days=14),
                 result.effective_icr_evidence, pump_serial=proposal.pump_serial, profile_id=proposal.profile_id,
@@ -582,16 +584,16 @@ def _dispatch_command(
             result.effective_icr_evidence.to_csv(out / "effective_icr_evidence.csv", index=False)
             change_log = ""
             if args.record:
-                change_log, proposal = _update_change_record(args, paths, merged, proposal, parts, as_of)
+                change_log, proposal = _update_change_record(args, paths, analysis, proposal, parts, as_of)
                 (out / "change_log.md").write_text(change_log, encoding="utf-8")
             pd.DataFrame([{"as_of": as_of.date(), **proposal.to_row()}]).to_csv(out / "breakfast_proposal.csv", index=False)
-            excluded_days = [day for period in load_excluded_periods(args.raw) for day in pd.date_range(period.start, period.end, freq="D")]
-            history = profile_history(merged, args.raw)
             current_rates = {part.name: now_settings[float(part.start_minutes)]["basal"] for part in parts if float(part.start_minutes) in now_settings}
-            controller_daily, rates, unlogged = controller_inputs(merged, args.raw, parts, history, excluded_days=excluded_days)
-            strict_daily, _, _ = controller_inputs(merged, args.raw, parts, history, excluded_days=excluded_days, strict=True)
-            site_events = load_site_events(Path(args.raw) / "tconnectsync")
-            episode_data, classified_episodes = episodes_payload(cgm, merged.preparation.dataset.frame, parts, site_events, rates, unlogged, merged.data.workouts, as_of=as_of)
+            controller_daily, rates, unlogged = controller_inputs(analysis, parts)
+            strict_daily, _, _ = controller_inputs(analysis, parts, strict=True)
+            exercise = exercise_intervals(merged.data.workouts, analysis.mode_events)
+            episode_data, classified_episodes = episodes_payload(
+                cgm, merged.preparation.dataset.frame, parts, analysis.site_events, rates, unlogged, exercise, merged.data.workouts, site_observed_from=analysis.site_observed_from(), as_of=as_of,
+            )
             classified_episodes.drop(columns=["site_change"]).assign(site_change=classified_episodes["site_change"]).to_csv(out / "episodes.csv", index=False)
             if not controller_daily.empty:
                 controller_daily.to_csv(out / "controller_daily.csv", index=False)
@@ -612,7 +614,7 @@ def _dispatch_command(
     if args.command == "report-outcomes":
         merged = _load_dataset(args, session)
         with session.stage("outcomes.write", report_dir=args.report_dir):
-            written = write_outcomes(merged, args.raw, args.report_dir)
+            written = write_outcomes(load_analysis_data(args.raw, merged), args.report_dir)
         print(f"Outcomes report: {written['page']}")
         return 0
 
@@ -930,14 +932,13 @@ def _dispatch_command(
     return 2
 
 
-def _update_change_record(args, paths: ProjectPaths, merged: MergedDataset, proposal, parts, as_of: pd.Timestamp):
+def _update_change_record(args, paths: ProjectPaths, analysis: AnalysisData, proposal, parts, as_of: pd.Timestamp):
     """Sync the durable record with the pump, register the proposal, run due evaluations, and return the change log
     with the proposal (held, with the reason, when earlier changes are still being evaluated)."""
     record_path = paths.cloud_root / "data" / "records" / "setting_proposals.csv"
     records = load_records(record_path)
-    events = pd.read_parquet(merged_dir(args.raw) / "tables" / "pump_profile_events.parquet")
-    pump, profile = active_profile_now(merged, args.raw)
-    changes = detect_setting_changes(events)
+    pump, profile = analysis.pump, analysis.profile_id
+    changes = detect_setting_changes(analysis.merged.profile_events)
     # Only the profile now running: edits to a profile that is not in use do not change the person's glucose.
     changes = changes[changes["pump_serial"].eq(pump) & changes["profile_id"].eq(profile)]
     parts_by_start = {float(part.start_minutes): part for part in parts}
@@ -951,8 +952,7 @@ def _update_change_record(args, paths: ProjectPaths, merged: MergedDataset, prop
             reason=f"waiting: earlier changes are still being evaluated (the first can be judged on {first_due}). The evidence would otherwise support {proposal.current_value:.1f} to {proposal.proposed_value:.1f} g/U "
                    f"for the segment starting {int(proposal.segment_start_minutes) // 60:02d}:{int(proposal.segment_start_minutes) % 60:02d}",
         )
-    excluded = [day for period in load_excluded_periods(args.raw) for day in pd.date_range(period.start, period.end, freq="D")]
-    records = evaluate_open(records, merged.tandem_data.cgm, parts_by_start, now=as_of, excluded_days=excluded)
+    records = evaluate_open(records, analysis.cgm, parts_by_start, now=as_of, excluded_days=analysis.excluded_days)
     save_records(records, record_path)
     lines = ["## Change log", "", f"Record: `{record_path}` ({note}).", ""]
     if records.empty:

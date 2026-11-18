@@ -9,11 +9,10 @@ the same time of day it points at the setting that governs that time (an I:C for
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
+
+from .context_rules import EXERCISE_AFTER_HOURS, inside_intervals
 
 HIGH_MGDL = 250.0
 HIGH_MINUTES = 90
@@ -28,13 +27,10 @@ MIN_SITE_EPISODE_HOURS = 1.5
 LATE_DROP_MGDL = 120.0
 LATE_DROP_MINUTES = 90
 STACKED_IOB_UNITS = 2.0
-EXERCISE_WINDOW_MINUTES = 12 * 60
-MIN_WORKOUT_MINUTES = 10      # a workout counts as exercise from this length, walks included
 BOLUS_LOOKBACK_MINUTES = 240
 CORRECTION_LOOKBACK_MINUTES = 180
 REPEAT_MIN_EPISODES = 4
 REPEAT_MIN_SHARE = 0.5
-SITE_EVENT_CODES = {33: "cartridge filled", 61: "cannula filled", 63: "tubing filled"}
 
 HIGH_PATTERNS = {
     "site_or_insulin": "Possible infusion-site or insulin problem",
@@ -66,35 +62,6 @@ PLAYBOOK = {
     "overnight": ("basal for the overnight hours", "A low with no bolus before it points at basal or an earlier evening dose."),
     "unexplained": ("nothing specific", "No pattern in the recorded data."),
 }
-
-
-def load_site_events(tandem_root: str | Path) -> pd.DataFrame:
-    """Cartridge, cannula and tubing fills from the archived pump-logs JSON (available from the 3.x downloads on)."""
-    rows = []
-    for path in sorted(Path(tandem_root).glob("*/raw/pump_logs_*.json")):
-        if path.name.endswith(".meta.json"):
-            continue
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        for chunk in payload["chunks"]:
-            for event in chunk["response"].get("events") or []:
-                if event["eventCode"] in SITE_EVENT_CODES:
-                    rows.append({"timestamp": pd.Timestamp(event["pumpDateTime"]), "kind": SITE_EVENT_CODES[event["eventCode"]]})
-    frame = pd.DataFrame(rows, columns=["timestamp", "kind"]).drop_duplicates().sort_values("timestamp").reset_index(drop=True)
-    return frame
-
-
-def minutes_since_workout(times: pd.Series, workouts: pd.DataFrame | None, *, minimum_minutes: int = MIN_WORKOUT_MINUTES) -> np.ndarray:
-    """Minutes from the end of the last qualifying workout to each time (NaN when none came before)."""
-    if workouts is None or workouts.empty:
-        return np.full(len(times), np.nan)
-    kept = workouts[pd.to_numeric(workouts["duration_seconds"], errors="coerce") >= minimum_minutes * 60]
-    ends = np.sort(pd.to_datetime(kept["end_timestamp"]).to_numpy(dtype="datetime64[ns]"))
-    if len(ends) == 0:
-        return np.full(len(times), np.nan)
-    values = pd.to_datetime(times).to_numpy(dtype="datetime64[ns]")
-    position = np.searchsorted(ends, values, side="right") - 1
-    gap = (values - ends[np.maximum(position, 0)]) / np.timedelta64(1, "m")
-    return np.where(position >= 0, gap, np.nan)
 
 
 def _runs(glucose: pd.Series, mask: pd.Series, minutes: int) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
@@ -131,14 +98,14 @@ def describe_episodes(
     site_events: pd.DataFrame,
     unlogged: pd.DataFrame | None = None,
     delivery: pd.DataFrame | None = None,
-    workouts: pd.DataFrame | None = None,
+    exercise: pd.DataFrame | None = None,
     site_coverage_from: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
     """Add what surrounded each episode. ``site_coverage_from`` is when site-change events begin to be recorded
     (episodes before it are not judged on sites); by default the first event.
 
     ``grid`` is the 5-minute dataset (``timestamp``, ``glucose``, ``iob_units``, ``bolus_units``, ``carb_grams``,
-    ``carb_ratio_g_per_unit``, ``minutes_since_last_workout``). ``delivery`` is the controller's delivery intervals
+    ``carb_ratio_g_per_unit``, ``exercise`` is the shared exercise intervals (``start``, ``end``; see ``context_rules.exercise_intervals``). ``delivery`` is the controller's delivery intervals
     (``timestamp``, ``excess_units``) for the extra insulin it added during a high.
     """
     grid = grid.copy()
@@ -175,7 +142,7 @@ def describe_episodes(
             starts_gap = (sites - np.datetime64(s)) / np.timedelta64(1, "m")
             hit = (starts_gap >= SITE_WINDOW_BEFORE_MINUTES) & (gaps <= SITE_WINDOW_AFTER_MINUTES)
             near_site = pd.Timestamp(sites[hit][0]) if hit.any() else None
-        since = minutes_since_workout(pd.Series([s]), workouts)[0] if workouts is not None else float("nan")
+        in_exercise = bool(exercise is not None and inside_intervals(pd.Series([s]), exercise)[0])
         prior = grid[(grid["timestamp"] >= s - pd.Timedelta(minutes=BOLUS_LOOKBACK_MINUTES)) & (grid["timestamp"] < s)]
         prior_bolus = pd.to_numeric(prior["bolus_units"], errors="coerce").fillna(0.0)
         prior_carbs = pd.to_numeric(prior["carb_grams"], errors="coerce").fillna(0.0)
@@ -189,7 +156,7 @@ def describe_episodes(
                 "meal_carbs": meal_carbs, "meal_units": meal_units, "icr": icr, "dose_ratio": dose_ratio, "correction_units": correction_units,
                 "corrections": int((corrections > 0).sum()), "extra_basal_units": extra_basal, "drop_after": drop,
                 "iob_at_end": float(iob_end.dropna().iloc[-1]) if iob_end.notna().any() else float("nan"),
-                "site_change": near_site, "minutes_since_workout": float(since),
+                "site_change": near_site, "in_exercise": in_exercise,
                 "bolus_prior_4h": float(prior_bolus.sum()), "carbs_prior_4h": float(prior_carbs.sum()), "corrections_no_carbs_3h": corrections_no_carbs,
                 "unlogged_flag": flagged,
             }
@@ -216,9 +183,8 @@ def classify(row: pd.Series) -> tuple[str, str]:
             return "persistent", f"high for {row['hours']:.1f} h with no meal in the 2 hours before it" + (
                 f"; the controller added {row['extra_basal_units']:.1f} U above the profile and {row['correction_units']:.1f} U of corrections were given" if pd.notna(row["extra_basal_units"]) else f"; {row['correction_units']:.1f} U of corrections were given")
         return "unexplained", "nothing in the record before it explains it"
-    recent_workout = pd.notna(row["minutes_since_workout"]) and row["minutes_since_workout"] <= EXERCISE_WINDOW_MINUTES
-    if recent_workout and row["bolus_prior_4h"] > 0:
-        return "after_exercise", f"a workout ended {row['minutes_since_workout'] / 60:.1f} h earlier and {row['bolus_prior_4h']:.1f} U was given in the 4 hours before"
+    if row["in_exercise"] and row["bolus_prior_4h"] > 0:
+        return "after_exercise", f"it began during exercise or within {EXERCISE_AFTER_HOURS:.0f} hours after it, and {row['bolus_prior_4h']:.1f} U was given in the 4 hours before"
     if row["corrections_no_carbs_3h"] >= 1.0:
         return "over_correction", f"{row['corrections_no_carbs_3h']:.1f} U was given as corrections, with no carbohydrate, in the 3 hours before"
     if row["carbs_prior_4h"] > 0 and pd.notna(row["icr"]) and row["icr"] > 0 and row["bolus_prior_4h"] > 0 and (row["carbs_prior_4h"] / row["icr"]) / row["bolus_prior_4h"] <= OVER_DOSE_RATIO:
@@ -271,23 +237,23 @@ def wilson(successes: int, n: int, z: float = 1.645) -> tuple[float, float]:
     return float(max(0.0, centre - half)), float(min(1.0, centre + half))
 
 
-def exercise_effect(grid: pd.DataFrame, workouts: pd.DataFrame, *, min_bolus: float = 1.5) -> dict:
-    """How often a meal bolus is followed by a low within 4 hours, for meals within 12 hours after a workout of at least
-    10 minutes and for the others."""
+def exercise_effect(grid: pd.DataFrame, exercise: pd.DataFrame, *, min_bolus: float = 1.5) -> dict:
+    """How often a meal bolus is followed by a low within 4 hours, for meals during exercise or within the hours after it
+    (the shared exercise rule) and for the others."""
     frame = grid.copy()
     frame["timestamp"] = pd.to_datetime(frame["timestamp"])
     frame = frame.sort_values("timestamp").reset_index(drop=True)
     meals = frame[(pd.to_numeric(frame["bolus_units"], errors="coerce").fillna(0) >= min_bolus) & (pd.to_numeric(frame["carb_grams"], errors="coerce").fillna(0) > 0)]
     if meals.empty:
         return {}
-    since = minutes_since_workout(meals["timestamp"], workouts)
+    during = inside_intervals(meals["timestamp"], exercise)
     glucose = frame.set_index("timestamp")["glucose"]
     after_workout, other = [0, 0], [0, 0]  # [meals followed by a low, meals]
-    for time, gap in zip(meals["timestamp"], since):
+    for time, in_exercise in zip(meals["timestamp"], during):
         window = glucose[time : time + pd.Timedelta(hours=4)]
         if len(window.dropna()) < 36:  # under 3 of 4 hours of readings
             continue
-        group = after_workout if np.isfinite(gap) and gap <= EXERCISE_WINDOW_MINUTES else other
+        group = after_workout if in_exercise else other
         group[0] += int((window < LOW_MGDL).any())
         group[1] += 1
     return {

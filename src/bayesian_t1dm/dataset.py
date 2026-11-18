@@ -16,7 +16,7 @@ import os
 import shutil
 import subprocess
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -44,12 +44,13 @@ from .ingest import (
     write_export_manifest,
 )
 from .paths import ProjectPaths, analysis_timezone
+from .device_events import decode_device_events
 from .pump_profiles import ProfileHistory, decode_profile_events, pump_key
 from .quality import REPORTED_NOT_FAILED_PLAUSIBILITY_REASONS, DataQualitySummary, assess_data_quality, assess_prepared_feature_plausibility
 from .report_page import plain
 
 # Bump when merge, cleaning or feature code changes what the build produces; a version change forces a rebuild.
-DATASET_VERSION = 12
+DATASET_VERSION = 13
 HORIZON_MINUTES = 30
 
 
@@ -75,6 +76,9 @@ class MergedDataset:
     data_quality: DataQualitySummary
     quality_rows: pd.DataFrame
     manifest: dict[str, Any]
+    profile_events: pd.DataFrame = field(default_factory=pd.DataFrame)  # pump profile edits and switches, whole archive
+    mode_events: pd.DataFrame = field(default_factory=pd.DataFrame)  # Control-IQ mode changes: pump_serial, sequence, timestamp, mode (0 standard, 1 sleep, 2 exercise)
+    site_events: pd.DataFrame = field(default_factory=pd.DataFrame)  # cartridge, cannula and tubing fills
 
 
 def merged_dir(raw_root: str | Path) -> Path:
@@ -275,6 +279,8 @@ def build_merged_dataset(paths: ProjectPaths, *, raw_root: str | Path | None = N
     log("Replaying pump profile history...")
     profile_events, profile_edits_visible = decode_profile_events(raw_root / "tconnectsync")
     profile_settings = ProfileHistory(profile_events, profile_edits_visible).settings_for(tandem.carbs)
+    log("Decoding Control-IQ modes and site changes...")
+    mode_events, site_events, device_event_span = decode_device_events(raw_root / "tconnectsync")
     tandem.carbs = pd.concat([tandem.carbs.drop(columns=list(profile_settings.columns), errors="ignore"), profile_settings], axis=1)
     log("Adding Apple Health...")
     merged = attach_health_auto_export(tandem, raw_root)
@@ -305,6 +311,8 @@ def build_merged_dataset(paths: ProjectPaths, *, raw_root: str | Path | None = N
     _to_parquet(dataset.frame, out_dir / "prepared_model_data_5min.parquet")
     _to_parquet(quality_rows, out_dir / "window_quality.parquet")
     _to_parquet(profile_events, out_dir / "tables" / "pump_profile_events.parquet")
+    _to_parquet(mode_events, out_dir / "tables" / "pump_mode_events.parquet")
+    _to_parquet(site_events, out_dir / "tables" / "site_events.parquet")
 
     manifest = {
         "dataset_version": DATASET_VERSION,
@@ -316,6 +324,7 @@ def build_merged_dataset(paths: ProjectPaths, *, raw_root: str | Path | None = N
         "input_changes": diff,
         "rebuild_reason": rebuild_reason,
         "normalized_windows": normalized_windows,
+        "device_event_span": {pump: [str(start), str(end)] for pump, (start, end) in device_event_span.items()},
         "pump_profile_history": {
             pump: {
                 "edits_visible": [str(start), str(end)],
@@ -432,6 +441,9 @@ def load_merged_dataset(raw_root: str | Path, *, inputs: list[InputFile] | None 
         data_quality=DataQualitySummary(**manifest["data_quality"]),
         quality_rows=pd.read_parquet(out_dir / "window_quality.parquet"),
         manifest=manifest,
+        profile_events=pd.read_parquet(out_dir / "tables" / "pump_profile_events.parquet"),
+        mode_events=pd.read_parquet(out_dir / "tables" / "pump_mode_events.parquet"),
+        site_events=pd.read_parquet(out_dir / "tables" / "site_events.parquet"),
     )
 
 

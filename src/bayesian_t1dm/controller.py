@@ -7,60 +7,25 @@ range, is telling us the programmed basal is too low there (and the reverse for 
 
 Per day and pump segment this module measures the net insulin the controller delivered above or below the profile,
 as a fraction of the profile's own insulin, over the time that is not explained by something else: not the 4 hours
-after a bolus or logged carbohydrate, not exercise mode or the hour after it, not near unlogged food, and not on a
+after a bolus or logged carbohydrate, not exercise (a workout of 10 minutes or more, or exercise mode) or the hours after it, not near unlogged food, and not on a
 day listed in ``context_events.csv``. Sleep mode is kept: it governs the overnight hours this analysis is mostly about,
 and the sleep-mode glucose target (higher than the daytime target) is reported as its own mode column.
 """
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 
+from .context_rules import exercise_intervals, inside_intervals
 from .outcomes import MIN_DAY_COVERAGE, DayPart
 from .pump_profiles import pump_key
 
-BASAL_EVENT = 279
-MODE_EVENT = 229
 MODE_NAMES = {0: "standard", 1: "sleep", 2: "exercise"}
 MAX_INTERVAL_MINUTES = 10  # delivery records come every ~5 minutes; longer gaps are not bridged
 AFTER_MEAL_HOURS = 4          # the strict rule: this long after any carbohydrate or bolus of 0.5 U or more
-AFTER_EXERCISE_HOURS = 1
-EXERCISE_MIN_MINUTES = 10  # Apple Health workouts count from this length, walks included
 MIN_MEAL_BOLUS = 0.5
 TARGET_LOW, TARGET_HIGH = 70.0, 180.0
-
-
-def load_basal_delivery(tandem_root: str | Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Commanded and profile basal rates (U/h) and user-mode changes from the archived pump-logs JSON.
-
-    Each rate record is kept to the second; the same record in overlapping windows is kept once.
-    """
-    rates: list[dict] = []
-    modes: list[dict] = []
-    for path in sorted(Path(tandem_root).glob("*/raw/pump_logs_*.json")):
-        if path.name.endswith(".meta.json"):
-            continue
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        pump = pump_key(payload["pump_serial"])
-        for chunk in payload["chunks"]:
-            for event in chunk["response"].get("events") or []:
-                props = event["eventProperties"]
-                if event["eventCode"] == BASAL_EVENT:
-                    rates.append(
-                        {"pump_serial": pump, "sequence": int(event["sequenceNumber"]), "timestamp": pd.Timestamp(event["pumpDateTime"]),
-                         "commanded_u_per_h": props["commandedRate"] / 1000.0, "profile_u_per_h": props["profileBasalRate"] / 1000.0}
-                    )
-                elif event["eventCode"] == MODE_EVENT:
-                    modes.append({"pump_serial": pump, "sequence": int(event["sequenceNumber"]), "timestamp": pd.Timestamp(event["pumpDateTime"]), "mode": int(props["currentUserMode"])})
-    rate_frame = pd.DataFrame(rates, columns=["pump_serial", "sequence", "timestamp", "commanded_u_per_h", "profile_u_per_h"])
-    mode_frame = pd.DataFrame(modes, columns=["pump_serial", "sequence", "timestamp", "mode"])
-    rate_frame = rate_frame.drop_duplicates(["pump_serial", "sequence"]).sort_values("timestamp").reset_index(drop=True)
-    mode_frame = mode_frame.drop_duplicates(["pump_serial", "sequence"]).sort_values("timestamp").reset_index(drop=True)
-    return rate_frame, mode_frame
 
 
 def _mode_at(times: pd.Series, modes: pd.DataFrame) -> np.ndarray:
@@ -69,17 +34,6 @@ def _mode_at(times: pd.Series, modes: pd.DataFrame) -> np.ndarray:
     position = np.searchsorted(modes["timestamp"].to_numpy(dtype="datetime64[ns]"), times.to_numpy(dtype="datetime64[ns]"), side="right") - 1
     values = modes["mode"].to_numpy()
     return np.where(position >= 0, values[np.maximum(position, 0)], 0)
-
-
-def _near_after(times: pd.Series, anchors: np.ndarray, hours: float) -> np.ndarray:
-    """True when an anchor lies within ``hours`` before the time."""
-    if len(anchors) == 0:
-        return np.zeros(len(times), dtype=bool)
-    anchors = np.sort(anchors)
-    values = times.to_numpy(dtype="datetime64[ns]")
-    position = np.searchsorted(anchors, values, side="right") - 1
-    last = anchors[np.maximum(position, 0)]
-    return (position >= 0) & ((values - last) <= np.timedelta64(int(hours * 60), "m"))
 
 
 MIN_MEAL_CARBS = 15.0         # smaller entries (snacks, low treatments) do not set a meal window
@@ -190,22 +144,10 @@ def daily_controller_pattern(
         return pd.DataFrame()
     stamp = intervals["timestamp"]
     mode = _mode_at(stamp, modes)
-    # "within an hour after exercise mode began or ended": any mode change away from exercise counts as an end.
-    exercise_ends = modes.loc[modes["mode"].shift(1).eq(2) & modes["mode"].ne(2), "timestamp"].to_numpy(dtype="datetime64[ns]") if not modes.empty else np.array([], dtype="datetime64[ns]")
     keep = ~_inside_windows(stamp, meals)
-    keep &= mode != 2
-    keep &= ~_near_after(stamp, exercise_ends, AFTER_EXERCISE_HOURS)
-    if workouts is not None and not workouts.empty:
-        # Workouts of 10 minutes or more (walks included) from Apple Health, which cover the years before exercise mode was logged:
-        # from the start of the workout to an hour after its end.
-        long = workouts[pd.to_numeric(workouts["duration_seconds"], errors="coerce") >= EXERCISE_MIN_MINUTES * 60]
-        spans = pd.DataFrame({"timestamp": pd.to_datetime(long["start_timestamp"]), "window_hours": (pd.to_datetime(long["end_timestamp"]) - pd.to_datetime(long["start_timestamp"])).dt.total_seconds() / 3600 + AFTER_EXERCISE_HOURS})
-        keep &= ~_inside_windows(stamp, spans)
+    keep &= ~inside_intervals(stamp, exercise_intervals(workouts, modes))  # the shared exercise rule: workouts and exercise mode, plus the hours after
     if unlogged is not None and not unlogged.empty:
-        flagged = np.zeros(len(stamp), dtype=bool)
-        for row in unlogged.itertuples(index=False):
-            flagged |= ((stamp >= row.start) & (stamp <= row.end)).to_numpy()
-        keep &= ~flagged
+        keep &= ~inside_intervals(stamp, unlogged[["start", "end"]])
     excluded = {pd.Timestamp(day).normalize() for day in excluded_days}
     intervals = intervals.assign(mode=mode)[keep].copy()
     intervals["minute"] = intervals["timestamp"].dt.hour * 60 + intervals["timestamp"].dt.minute
@@ -340,22 +282,23 @@ def basal_signal(daily: pd.DataFrame, current_rates: dict[str, float] | None = N
     return pd.DataFrame(rows)
 
 
-def controller_inputs(merged, raw_root: str | Path, parts: list[DayPart], history, *, excluded_days=(), strict: bool = False) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """The daily controller pattern for a merged dataset, with its meal, unlogged-food and exercise exclusions.
+def controller_inputs(analysis, parts: list[DayPart], *, strict: bool = False) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """The daily controller pattern with its meal, unlogged-food and exercise exclusions, from the shared ``AnalysisData``.
 
     Returns the daily table, the rate records it was built from (empty when the archive holds no rate records) and the
     unlogged-food intervals found along the way.
     """
     from . import meal_flags
 
-    _, modes = load_basal_delivery(Path(raw_root) / "tconnectsync")
-    rates = basal_records(merged, history)
+    merged = analysis.merged
+    rates = basal_records(merged, analysis.history)
     if rates.empty:
         return pd.DataFrame(), rates, pd.DataFrame()
-    cgm, bolus, carbs = merged.tandem_data.cgm, merged.tandem_data.bolus, merged.tandem_data.carbs
+    cgm, bolus, carbs = analysis.cgm, merged.tandem_data.bolus, merged.tandem_data.carbs
     frame = pd.DataFrame({"timestamp": pd.to_datetime(cgm["timestamp"]), "glucose": cgm["glucose"]}).drop_duplicates("timestamp").sort_values("timestamp")
     frame["explicit_carb_grams"] = frame["timestamp"].map(carbs.groupby(pd.to_datetime(carbs["timestamp"]))["carb_grams"].sum()).fillna(0.0)
     frame["bolus_units"] = frame["timestamp"].map(bolus.groupby(pd.to_datetime(bolus["timestamp"]))["bolus_units"].sum()).fillna(0.0)
     unlogged = meal_flags.unlogged_intervals(frame, merged.data.nutrition)
-    daily = daily_controller_pattern(rates, modes, cgm, meal_windows(bolus, carbs, strict=strict), parts, unlogged=unlogged, excluded_days=excluded_days, min_clean_fraction=None, min_clean_hours=MIN_CLEAN_HOURS, workouts=merged.data.workouts)
+    daily = daily_controller_pattern(rates, analysis.mode_events, cgm, meal_windows(bolus, carbs, strict=strict), parts, unlogged=unlogged, excluded_days=analysis.excluded_days,
+                                     min_clean_fraction=None, min_clean_hours=MIN_CLEAN_HOURS, workouts=merged.data.workouts)
     return daily, rates, unlogged

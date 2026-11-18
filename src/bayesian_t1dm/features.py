@@ -7,6 +7,7 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 
+from .context_rules import CGM_MAX_MGDL, CGM_MIN_MGDL
 from .ingest import IngestedData
 from .insulin import expand_bolus_series_to_grid, expand_bolus_to_grid
 from .pump_profiles import PROFILE_SETTING_COLUMNS
@@ -110,7 +111,7 @@ def _aggregate_cgm(
     cgm = data.cgm.copy()
     cgm["timestamp"] = pd.to_datetime(cgm["timestamp"]).dt.floor(freq)
     cgm["glucose"] = pd.to_numeric(cgm["glucose"], errors="coerce")
-    cgm["cgm_invalid"] = cgm["glucose"].isna() | cgm["glucose"].le(0.0) | cgm["glucose"].lt(40.0) | cgm["glucose"].gt(400.0)
+    cgm["cgm_invalid"] = ~cgm["glucose"].between(CGM_MIN_MGDL, CGM_MAX_MGDL)
     invalid = cgm.groupby("timestamp", as_index=False).agg(cgm_invalid=("cgm_invalid", "sum"))
     cgm = cgm.loc[~cgm["cgm_invalid"]].copy()
     cgm = cgm.groupby("timestamp", as_index=False).agg(glucose_observed=("glucose", "mean"))
