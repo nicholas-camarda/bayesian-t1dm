@@ -206,3 +206,15 @@ def test_scenario_forecasts_omit_draw_losses_without_target():
     (forecast,) = model.scenario_forecasts(_slope_uncertain_fit(), [("current", frame)])
 
     assert forecast.target_loss_draws is None
+
+
+def test_predictive_quantiles_match_fitted_student_likelihood():
+    from scipy.stats import t
+
+    model = BayesianGlucoseModel(target_quantiles=(0.05, 0.95))
+    n = 100_000
+    fit = _make_minimal_fit(sigma_obs=1.0)
+    summary = model._summarize_draws(fit, np.full((n, 1), 110.0), np.ones(n), np.random.default_rng(14), [0])
+    expected = 110 + fit.target_scale * t.ppf([0.05, 0.95], df=5)
+    np.testing.assert_allclose(summary.loc[0, ["lower", "upper"]], expected, atol=0.4)
+    assert summary.loc[0, "mean"] == 110
