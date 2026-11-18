@@ -590,7 +590,7 @@ def _dispatch_command(
             pd.DataFrame([{"as_of": as_of.date(), **proposal.to_row()}]).to_csv(out / "breakfast_proposal.csv", index=False)
             current_rates = {part.name: now_settings[float(part.start_minutes)]["basal"] for part in parts if float(part.start_minutes) in now_settings}
             controller_daily, rates, unlogged = controller_inputs(analysis, parts)
-            strict_daily, _, _ = controller_inputs(analysis, parts, strict=True)
+            strict_daily, _, _ = controller_inputs(analysis, parts, strict=True, rates=rates)
             episode_data, classified_episodes = episodes_payload(
                 cgm, analysis.grid, parts, analysis.site_events, rates, unlogged, analysis.exercise, merged.data.workouts, site_observed_from=analysis.site_observed_from(), as_of=as_of,
             )

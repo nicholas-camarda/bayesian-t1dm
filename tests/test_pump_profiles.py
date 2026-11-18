@@ -228,3 +228,18 @@ def test_a_meal_is_judged_by_the_profile_at_the_moment_recorded_not_its_grid_slo
         }
     )
     assert history.settings_for(carbs)["profile_carb_ratio_g_per_unit"].tolist() == [7.0, 6.5]
+
+
+def test_basal_rates_use_exact_edit_time_and_pump(tmp_path):
+    day = dt.datetime(2025, 9, 1)
+    edit = day.replace(hour=9, minute=7)
+    events, visible = decode_profile_events(_archive(tmp_path, {"2025-09-01__2025-09-30": [
+        _profile_action(day, 1, profile=0, status=0),
+        _segment(day, 2, profile=0, index=0, modification=0, start=0, icr=7, isf=65, basal=0.8),
+        _activate(day, 3, profile=0, name="Main"),
+        _segment(edit, 4, profile=0, index=0, modification=4, start=0, icr=7, isf=65, basal=0.9),
+    ]}, serial="10001"))
+    history = ProfileHistory(events, visible)
+    stamps = pd.Series([edit - dt.timedelta(seconds=1), edit, edit.replace(minute=10), edit, day - dt.timedelta(days=1)])
+    rates = history.basal_rates(pd.Series(["10001"] * 3 + ["another", "10001"]), stamps)
+    np.testing.assert_allclose(rates, [0.8, 0.9, 0.9, np.nan, np.nan])

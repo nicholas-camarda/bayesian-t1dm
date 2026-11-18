@@ -75,22 +75,9 @@ def _inside_windows(times: pd.Series, meals: pd.DataFrame) -> np.ndarray:
     return (position >= 0) & (latest_end[np.maximum(position, 0)] >= values)
 
 
-def profile_rate_at(history, pump_serials: pd.Series, times: pd.Series, *, slot_minutes: int = 15) -> np.ndarray:
-    """The programmed basal rate (U/h) of the segment in force at each time, from the pump's profile history (NaN when the
-    archive cannot show it). Looked up once per pump and ``slot_minutes`` slot."""
-    slots = pd.to_datetime(times).dt.floor(f"{slot_minutes}min")
-    pumps = pump_serials.map(pump_key)
-    cache: dict[tuple[str, pd.Timestamp], float] = {}
-    out = np.full(len(slots), np.nan)
-    for position, (pump, slot) in enumerate(zip(pumps, slots)):
-        key = (pump, slot)
-        if key not in cache:
-            moment = slot.to_pydatetime()
-            profile = history.active_profile(pump, moment)
-            segment = history.segment_in_force(pump, profile, moment) if profile is not None else None
-            cache[key] = float(segment["basal_units_per_hour"]) if segment is not None else float("nan")
-        out[position] = cache[key]
-    return out
+def profile_rate_at(history, pump_serials: pd.Series, times: pd.Series) -> np.ndarray:
+    """Programmed basal in U/h at the exact moment of each pump record."""
+    return history.basal_rates(pump_serials, times)
 
 
 def basal_records(merged, history) -> pd.DataFrame:
@@ -139,7 +126,7 @@ def daily_controller_pattern(
     A day-segment counts when its clean time is at least ``min_clean_fraction`` of the segment's hours (None for no
     fraction rule) and at least ``min_clean_hours``. ``clean_hours`` lets a later pooling weight each day by its clean time.
     """
-    intervals = delivery_intervals(rates)
+    intervals = delivery_intervals(rates).dropna(subset=["profile_units", "commanded_units"])
     if intervals.empty:
         return pd.DataFrame()
     stamp = intervals["timestamp"]
@@ -170,7 +157,7 @@ def daily_controller_pattern(
             rows.append(
                 {
                     "date": date, "part": part.name, "clean_hours": hours, "commanded_units": float(group["commanded_units"].sum()),
-                    "profile_units": profile_units, "profile_rate": round(float(group["profile_units"].sum() / group.loc[group["profile_units"].notna(), "hours"].sum()), 3) if profile_units > 0 else np.nan,
+                    "profile_units": profile_units, "profile_rate": round(float(profile_units / hours), 3) if profile_units > 0 else np.nan,
                     "excess_units": float(group["excess_units"].sum()), "excess_fraction": float(group["excess_units"].sum() / profile_units) if profile_units > 0 else np.nan,
                     "mean_glucose": float(clean.mean()) if len(clean) else np.nan, "time_in_range_pct": float(100 * ((clean >= TARGET_LOW) & (clean <= TARGET_HIGH)).mean()) if len(clean) else np.nan,
                     "below_70_pct": float(100 * (clean < TARGET_LOW).mean()) if len(clean) else np.nan,
@@ -282,14 +269,15 @@ def basal_signal(daily: pd.DataFrame, current_rates: dict[str, float] | None = N
     return pd.DataFrame(rows)
 
 
-def controller_inputs(analysis, parts: list[DayPart], *, strict: bool = False) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def controller_inputs(analysis, parts: list[DayPart], *, strict: bool = False, rates: pd.DataFrame | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """The daily controller pattern with its meal, unlogged-food and exercise exclusions, from the shared ``AnalysisData``.
 
     Returns the daily table, the rate records it was built from (empty when the archive holds no rate records) and the
     unlogged-food intervals found along the way.
     """
     merged = analysis.merged
-    rates = basal_records(merged, analysis.history)
+    if rates is None:
+        rates = basal_records(merged, analysis.history)
     if rates.empty:
         return pd.DataFrame(), rates, pd.DataFrame()
     cgm, bolus, carbs = analysis.cgm, merged.tandem_data.bolus, merged.tandem_data.carbs

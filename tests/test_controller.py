@@ -167,3 +167,13 @@ def test_a_window_that_wraps_midnight_belongs_to_the_day_it_started():
     stamps = pd.Series(pd.to_datetime(["2026-06-05 22:00", "2026-06-06 01:00", "2026-06-06 23:00"]))  # readings inside the bin
     assert wrap.analysis_date(stamps).tolist() == [pd.Timestamp("2026-06-05")] * 2 + [pd.Timestamp("2026-06-06")]
     assert DayPart("05:00-09:00", 300, 540).analysis_date(stamps).tolist() == list(stamps.dt.normalize())
+
+
+def test_daily_units_and_hours_use_identical_known_pairs():
+    rates = _rates(days=1).iloc[:4].copy()
+    rates.loc[1, "profile_u_per_h"] = np.nan
+    daily = controller.daily_controller_pattern(rates, NO_MODES, _cgm(), NO_MEALS, [NIGHT], min_clean_fraction=None)
+    row = daily.iloc[0]
+    assert row.clean_hours == pytest.approx(10 / 60)
+    assert row.commanded_units == pytest.approx(1.5 * row.clean_hours)
+    assert row.excess_units == pytest.approx(row.commanded_units - row.profile_units)
