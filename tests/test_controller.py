@@ -177,3 +177,12 @@ def test_daily_units_and_hours_use_identical_known_pairs():
     assert row.clean_hours == pytest.approx(10 / 60)
     assert row.commanded_units == pytest.approx(1.5 * row.clean_hours)
     assert row.excess_units == pytest.approx(row.commanded_units - row.profile_units)
+
+
+def test_controller_exclusion_counts_reconcile_with_daily_rows():
+    flow = []
+    daily = controller.daily_controller_pattern(_rates(), NO_MODES, _cgm(), NO_MEALS, [NIGHT],
+                                                excluded_days=["2026-06-02"], flow=flow)
+    assert flow[0]["days"] == 3
+    assert flow[-1]["days"] == len(daily) == 2
+    assert flow[-1]["hours"] == pytest.approx(daily.clean_hours.sum())
