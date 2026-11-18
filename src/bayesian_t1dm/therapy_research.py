@@ -3105,6 +3105,7 @@ def _first_meal_window_trajectories(
     research_frame: pd.DataFrame,
     window_metrics: pd.DataFrame,
     *,
+    programmed_units: pd.Series | None = None,
     postmeal_minutes: int = 180,
     basal_reference_minutes: int = 180,
     insulin_action_minutes: int = 300,
@@ -3129,6 +3130,8 @@ def _first_meal_window_trajectories(
     ordered["timestamp"] = pd.to_datetime(ordered["timestamp"], errors="coerce")
     ordered = ordered.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
     scheduled_basal = _scheduled_basal_units_per_row(ordered) if "basal_units_delivered" in ordered.columns else None
+    if programmed_units is not None:
+        scheduled_basal = ordered["timestamp"].map(programmed_units)
     for row in window_metrics.itertuples(index=False):
         anchor_time = pd.Timestamp(row.timestamp)
         post = ordered.loc[
@@ -3148,6 +3151,8 @@ def _first_meal_window_trajectories(
         if scheduled_basal is not None:
             delivered = pd.to_numeric(post["basal_units_delivered"], errors="coerce")
             reference = scheduled_basal.loc[post.index]
+            if programmed_units is not None and (reference.isna().any() or delivered.isna().any()):
+                continue
             if reference.isna().any():
                 # Too few comparable days to infer the schedule: fall back to the pre-meal rate.
                 premeal = pd.to_numeric(
