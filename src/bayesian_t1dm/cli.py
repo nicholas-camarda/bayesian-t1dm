@@ -40,8 +40,12 @@ from .ingest import summarize_tandem_raw_dir
 from .model import BayesianGlucoseModel
 from .observability import LoggingSession, setup_run_logging
 from .outcomes_report import active_profile_now, current_day_parts, current_segment_settings, write_outcomes
+from .controller import basal_signal, controller_inputs
+from .dashboard import build_dashboard_data
+from .dashboard_page import render_dashboard
 from .changes import EVALUATION_DAYS, SETTING_FIELDS, detect_setting_changes
 from .outcomes import day_part_table
+from .layout import activate_current, assemble_run
 from .publish import current_commit, publish_run, working_tree_is_clean
 from .records import evaluate_open, load_records, register_proposal, save_records, sync_with_pump
 from .proposals import propose_breakfast_icr, proposal_markdown, segment_ends_from_parts, segment_markdown, segment_summary
@@ -574,11 +578,24 @@ def _dispatch_command(
                 result.effective_icr_evidence, pump_serial=proposal.pump_serial, profile_id=proposal.profile_id,
             )
             table.to_csv(out / "segment_summary.csv", index=False)
+            result.effective_icr_evidence.to_csv(out / "effective_icr_evidence.csv", index=False)
             change_log = ""
             if args.record:
                 change_log, proposal = _update_change_record(args, paths, merged, proposal, parts, as_of)
                 (out / "change_log.md").write_text(change_log, encoding="utf-8")
             pd.DataFrame([{"as_of": as_of.date(), **proposal.to_row()}]).to_csv(out / "breakfast_proposal.csv", index=False)
+            excluded_days = [day for period in load_excluded_periods(args.raw) for day in pd.date_range(period.start, period.end, freq="D")]
+            controller_daily, _ = controller_inputs(merged, args.raw, parts, excluded_days=excluded_days)
+            if not controller_daily.empty:
+                controller_daily.to_csv(out / "controller_daily.csv", index=False)
+                basal_signal(controller_daily).to_csv(out / "basal_signal.csv", index=False)
+            page = build_dashboard_data(
+                cgm=cgm, parts=parts, settings_now=now_settings, segments=table, evidence=result.effective_icr_evidence, proposal_row=proposal.to_row(),
+                records=load_records(paths.cloud_root / "data" / "records" / "setting_proposals.csv"), controller_daily=controller_daily, as_of=as_of,
+                run={"run_id": f"{pd.Timestamp.now():%Y-%m-%d}_{current_commit(paths.root)[:8]}", "commit": current_commit(paths.root), "built": f"{pd.Timestamp.now():%Y-%m-%d %H:%M}"},
+                pump_serial=proposal.pump_serial, profile_id=proposal.profile_id,
+            )
+            (out / "dashboard.html").write_text(render_dashboard(page), encoding="utf-8")
             (out / "breakfast_proposal.md").write_text(segment_markdown(table) + "\n" + proposal_markdown(proposal, as_of=as_of) + ("\n" + change_log if change_log else ""), encoding="utf-8")
         print((out / "breakfast_proposal.md").read_text(encoding="utf-8"))
         return 0
@@ -943,7 +960,7 @@ def _update_change_record(args, paths: ProjectPaths, merged: MergedDataset, prop
 def _run_refresh(args, paths: ProjectPaths, parser) -> int:
     """Collect, build, report, propose, record and publish; the run record says whether every step completed."""
     run_id = f"{pd.Timestamp.now():%Y-%m-%d}_{current_commit(paths.root)[:8]}"
-    run_dir = paths.output_refresh / run_id
+    run_dir = paths.runs / run_id
     if run_dir.exists():
         shutil.rmtree(run_dir)
     run_dir.mkdir(parents=True)
@@ -961,12 +978,12 @@ def _run_refresh(args, paths: ProjectPaths, parser) -> int:
             (run_dir / "run_record.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
             print(f"Refresh stopped: {name} exited with {code}. Nothing was published.")
             return code or 1
-    for name in ("outcomes", "proposals"):
-        shutil.copytree(paths.reports / name, run_dir / name)
+    assemble_run(paths.reports, paths.cloud_raw, run_dir, record_path=paths.cloud_root / "data" / "records" / "setting_proposals.csv")
     record["status"] = "complete"
     record["finished"] = f"{pd.Timestamp.now():%Y-%m-%dT%H:%M:%S}"
     (run_dir / "run_record.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
-    print(f"Run {run_id} complete: {run_dir}")
+    activate_current(run_dir, paths.current)
+    print(f"Run {run_id} complete. Open {paths.current / 'index.html'}")
     if args.publish:
         destination = publish_run(run_dir, paths.cloud_output / f"{pd.Timestamp.now():%Y-%m-%d}", repo_root=paths.root)
         print(f"Published to {destination}")

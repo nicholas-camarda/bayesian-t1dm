@@ -208,3 +208,26 @@ def basal_signal(daily: pd.DataFrame, *, recent_days: int = SIGNAL_RECENT_DAYS) 
              "below_54_pct": below_54, "median_excess_fraction": float(recent["excess_fraction"].median()) if n else np.nan, "signal": signal}
         )
     return pd.DataFrame(rows)
+
+
+def controller_inputs(merged, raw_root: str | Path, parts: list[DayPart], *, excluded_days=()) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """The daily controller pattern for a merged dataset, with its meal, unlogged-food and exercise exclusions.
+
+    Returns the daily table and the rate records it was built from (empty when the archive holds no rate records).
+    """
+    from . import meal_flags
+
+    rates, modes = load_basal_delivery(Path(raw_root) / "tconnectsync")
+    if rates.empty:
+        return pd.DataFrame(), rates
+    cgm, bolus, carbs = merged.tandem_data.cgm, merged.tandem_data.bolus, merged.tandem_data.carbs
+    meal_times = np.sort(
+        np.concatenate(
+            [pd.to_datetime(bolus.loc[bolus["bolus_units"] >= MIN_MEAL_BOLUS, "timestamp"]).to_numpy(), pd.to_datetime(carbs.loc[carbs["carb_grams"] > 0, "timestamp"]).to_numpy()]
+        ).astype("datetime64[ns]")
+    )
+    frame = pd.DataFrame({"timestamp": pd.to_datetime(cgm["timestamp"]), "glucose": cgm["glucose"]}).drop_duplicates("timestamp").sort_values("timestamp")
+    frame["explicit_carb_grams"] = frame["timestamp"].map(carbs.groupby(pd.to_datetime(carbs["timestamp"]))["carb_grams"].sum()).fillna(0.0)
+    frame["bolus_units"] = frame["timestamp"].map(bolus.groupby(pd.to_datetime(bolus["timestamp"]))["bolus_units"].sum()).fillna(0.0)
+    unlogged = meal_flags.unlogged_intervals(frame, merged.data.nutrition)
+    return daily_controller_pattern(rates, modes, cgm, meal_times, parts, unlogged=unlogged, excluded_days=excluded_days), rates

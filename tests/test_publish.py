@@ -34,8 +34,8 @@ def test_a_complete_clean_run_is_copied_byte_identical_with_a_manifest(tmp_path)
     run = _run(tmp_path, repo)
     destination = publish_run(run, tmp_path / "vault" / "outputs" / "2026-11-18", repo_root=repo)
     manifest = (destination / MANIFEST_NAME).read_text()
-    assert "proposals/breakfast_proposal.md" in manifest and "commit" in manifest.splitlines()[0]
-    assert (destination / "outcomes/outcomes_report.html").read_bytes() == (run / "outcomes/outcomes_report.html").read_bytes()
+    assert "B_icr/icr_proposal.md" in manifest and "commit" in manifest.splitlines()[0]
+    assert (destination / "A_outcomes/outcomes_report.html").read_bytes() == (run / "A_outcomes/outcomes_report.html").read_bytes()
 
 
 @pytest.mark.parametrize("problem", ["incomplete", "status", "dirty_record", "dirty_tree", "exists", "moved"])
