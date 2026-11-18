@@ -28,6 +28,7 @@ MODE_NAMES = {0: "standard", 1: "sleep", 2: "exercise"}
 MAX_INTERVAL_MINUTES = 10  # delivery records come every ~5 minutes; longer gaps are not bridged
 AFTER_MEAL_HOURS = 4          # the strict rule: this long after any carbohydrate or bolus of 0.5 U or more
 AFTER_EXERCISE_HOURS = 1
+EXERCISE_MIN_MINUTES = 10  # Apple Health workouts count from this length, walks included
 MIN_MEAL_BOLUS = 0.5
 TARGET_LOW, TARGET_HIGH = 70.0, 180.0
 
@@ -194,9 +195,9 @@ def daily_controller_pattern(
     keep &= mode != 2
     keep &= ~_near_after(stamp, exercise_ends, AFTER_EXERCISE_HOURS)
     if workouts is not None and not workouts.empty:
-        # Workouts of 30 minutes or more from Apple Health, which cover the years before exercise mode was logged:
+        # Workouts of 10 minutes or more (walks included) from Apple Health, which cover the years before exercise mode was logged:
         # from the start of the workout to an hour after its end.
-        long = workouts[pd.to_numeric(workouts["duration_seconds"], errors="coerce") >= 30 * 60]
+        long = workouts[pd.to_numeric(workouts["duration_seconds"], errors="coerce") >= EXERCISE_MIN_MINUTES * 60]
         spans = pd.DataFrame({"timestamp": pd.to_datetime(long["start_timestamp"]), "window_hours": (pd.to_datetime(long["end_timestamp"]) - pd.to_datetime(long["start_timestamp"])).dt.total_seconds() / 3600 + AFTER_EXERCISE_HOURS})
         keep &= ~_inside_windows(stamp, spans)
     if unlogged is not None and not unlogged.empty:
