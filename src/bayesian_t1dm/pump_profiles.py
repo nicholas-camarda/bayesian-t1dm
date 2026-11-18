@@ -327,7 +327,12 @@ class ProfileHistory:
         if carbs.empty or "pump_serial" not in carbs.columns:
             return out  # carbs from hand-kept logs belong to no pump
         serials = carbs["pump_serial"].map(lambda v: "" if pd.isna(v) else str(v).removesuffix(".0"))
-        for index, pump_serial, timestamp in zip(carbs.index, serials, pd.to_datetime(carbs["timestamp"])):
+        # The profile is read at the moment the pump recorded (``event_time``), not at its 5-minute grid slot, so an
+        # edit made inside the slot applies to the meals after it and not to those before.
+        moments = pd.to_datetime(carbs["timestamp"])
+        if "event_time" in carbs:
+            moments = pd.to_datetime(carbs["event_time"]).fillna(moments)
+        for index, pump_serial, timestamp in zip(carbs.index, serials, moments):
             if not pump_serial or pd.isna(timestamp):
                 continue
             moment = timestamp.to_pydatetime()

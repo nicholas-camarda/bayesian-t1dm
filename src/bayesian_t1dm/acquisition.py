@@ -768,15 +768,18 @@ def _normalize_carb_records(
             }
         )
     if not rows:
-        return pd.DataFrame(columns=['timestamp', 'carb_grams', 'source_file', 'source_label', *CALCULATOR_SETTING_COLUMNS])
+        return pd.DataFrame(columns=['timestamp', 'event_time', 'carb_grams', 'source_file', 'source_label', *CALCULATOR_SETTING_COLUMNS])
     frame = pd.DataFrame(rows)
     frame['timestamp'] = to_local_wall_clock(frame['timestamp'], timezone=_storage_timezone_name(timezone))
     frame = frame.loc[frame['timestamp'].notna()].reset_index(drop=True)
-    frame['timestamp'] = pd.to_datetime(frame['timestamp'], errors='coerce').dt.floor('5min')
+    # ``event_time`` keeps the moment the pump recorded; ``timestamp`` is that moment on the 5-minute grid.
+    frame['event_time'] = pd.to_datetime(frame['timestamp'], errors='coerce')
+    frame['timestamp'] = frame['event_time'].dt.floor('5min')
     frame, _ = _filter_timestamp_window(frame, window=window, timestamp_columns=['timestamp'])
     group_cols = [column for column in ['timestamp', 'source_file', 'source_label', 'pump_serial', 'tconnect_device_id'] if column in frame.columns]
     return frame.groupby(group_cols, as_index=False, dropna=False).agg(
         carb_grams=('carb_grams', 'sum'),
+        event_time=('event_time', 'min'),
         **{key: (key, 'first') for key in CALCULATOR_SETTING_COLUMNS},
     )
 

@@ -208,3 +208,23 @@ def test_asking_about_other_hours_uses_the_profile_as_it_stood_at_the_given_mome
     assert history.segment_in_force("1453346", 0, at_noon, minute_of_day=6 * 60)["carb_ratio_g_per_unit"] == 6.5
     # Asked at 07:00, before the 09:30 edit, the same hour of the day still shows the old value.
     assert history.segment_in_force("1453346", 0, dt.datetime(2025, 9, 1, 7, 0), minute_of_day=6 * 60)["carb_ratio_g_per_unit"] == 7.0
+
+
+def test_a_meal_is_judged_by_the_profile_at_the_moment_recorded_not_its_grid_slot(tmp_path):
+    day = dt.datetime(2025, 9, 1)
+    records = [
+        _profile_action(day, 1, profile=0, status=0, name="Main"),
+        _segment(day, 2, profile=0, index=0, modification=0, start=0, icr=7.0, isf=65),
+        _activate(day, 3, profile=0, name="Main"),
+        _segment(day.replace(hour=7, minute=57), 4, profile=0, index=0, modification=4, start=0, icr=6.5, isf=65),
+    ]
+    events, visible = decode_profile_events(_archive(tmp_path, {"2025-08-25__2025-09-23": records}))
+    history = ProfileHistory(events, visible)
+    carbs = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2025-09-01 07:55", "2025-09-01 07:55"]),  # both on the 07:55 grid slot
+            "event_time": pd.to_datetime(["2025-09-01 07:56:10", "2025-09-01 07:58:40"]),
+            "pump_serial": ["1453346", "1453346"],
+        }
+    )
+    assert history.settings_for(carbs)["profile_carb_ratio_g_per_unit"].tolist() == [7.0, 6.5]
