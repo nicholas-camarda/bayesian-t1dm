@@ -57,6 +57,16 @@ class DayPart:
             return (minutes >= self.start_minutes) & (minutes < self.end_minutes)
         return (minutes >= self.start_minutes) | (minutes < self.end_minutes)  # wraps midnight
 
+    def analysis_date(self, timestamps: pd.Series) -> pd.Series:
+        """The day a reading belongs to: the date the bin started. For a bin that wraps midnight, the hours after
+        midnight belong to the previous date (21:00-04:00 on the 5th includes 01:00 on the 6th)."""
+        stamps = pd.to_datetime(timestamps)
+        dates = stamps.dt.normalize()
+        if self.start_minutes < self.end_minutes:
+            return dates
+        minutes = stamps.dt.hour * 60 + stamps.dt.minute
+        return dates.where(minutes >= self.start_minutes, dates - pd.Timedelta(days=1))
+
     @property
     def hours(self) -> float:
         return ((self.end_minutes - self.start_minutes) % (24 * 60) or 24 * 60) / 60.0
@@ -134,7 +144,8 @@ def daily_metrics(cgm: pd.DataFrame, *, part: DayPart | None = None) -> pd.DataF
     frame = _prepare(cgm)
     expected = READINGS_PER_DAY if part is None else part.hours * 60 / READING_MINUTES
     if part is not None:
-        frame = frame[part.contains(frame["minute"])]
+        frame = frame[part.contains(frame["minute"])].copy()
+        frame["date"] = part.analysis_date(frame["timestamp"])
     rows = []
     for date, group in frame.groupby("date", sort=True):
         row = _summarize(group["glucose"], expected_readings=expected)
@@ -152,7 +163,8 @@ def pooled_metrics(cgm: pd.DataFrame, *, start: pd.Timestamp, end: pd.Timestamp,
     frame = frame[(frame["timestamp"] >= start) & (frame["timestamp"] < end)]
     expected = READINGS_PER_DAY if part is None else part.hours * 60 / READING_MINUTES
     if part is not None:
-        frame = frame[part.contains(frame["minute"])]
+        frame = frame[part.contains(frame["minute"])].copy()
+        frame["date"] = part.analysis_date(frame["timestamp"])
     counts = frame.groupby("date")["glucose"].count()
     counted = counts[counts / expected >= MIN_DAY_COVERAGE].index
     kept = frame[frame["date"].isin(counted)]

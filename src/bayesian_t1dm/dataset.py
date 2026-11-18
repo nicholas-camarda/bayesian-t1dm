@@ -44,7 +44,7 @@ from .ingest import (
     write_export_manifest,
 )
 from .paths import ProjectPaths, analysis_timezone
-from .pump_profiles import ProfileHistory, decode_profile_events
+from .pump_profiles import ProfileHistory, decode_profile_events, pump_key
 from .quality import REPORTED_NOT_FAILED_PLAUSIBILITY_REASONS, DataQualitySummary, assess_data_quality, assess_prepared_feature_plausibility
 from .report_page import plain
 
@@ -321,7 +321,7 @@ def build_merged_dataset(paths: ProjectPaths, *, raw_root: str | Path | None = N
                 "edits_visible": [str(start), str(end)],
                 "segment_records": int((profile_events["pump_serial"].eq(pump) & profile_events["event"].eq(68)).sum()),
                 "profile_switches": int((profile_events["pump_serial"].eq(pump) & profile_events["event"].eq(69) & profile_events["status"].eq(3)).sum()),
-                "carb_entries_with_profile_settings": int(profile_settings.loc[tandem.carbs["pump_serial"].astype(str).str.removesuffix(".0").eq(pump), "profile_carb_ratio_g_per_unit"].notna().sum()),
+                "carb_entries_with_profile_settings": int(profile_settings.loc[tandem.carbs["pump_serial"].map(pump_key).eq(pump), "profile_carb_ratio_g_per_unit"].notna().sum()),
             }
             for pump, (start, end) in sorted(profile_edits_visible.items())
         },

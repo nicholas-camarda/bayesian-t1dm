@@ -831,6 +831,7 @@ def _dedupe_canonical_events(kind: str, frame: pd.DataFrame) -> pd.DataFrame:
                 "source_event_name",
                 "pump_serial",
                 "tconnect_device_id",
+                "bolus_id",
             ]
             if column in out.columns
         ]

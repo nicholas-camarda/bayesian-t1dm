@@ -18,6 +18,7 @@ import pandas as pd
 from .changes import evaluate_change
 from .outcomes import DayPart
 from .proposals import EVALUATION, Proposal, affected_part
+from .pump_profiles import pump_key
 
 RECORD_COLUMNS = [
     "record_id", "origin", "proposed_on", "setting", "pump_serial", "profile_id", "segment_start_minutes", "affected_hours",
@@ -57,8 +58,8 @@ def register_proposal(records: pd.DataFrame, proposal: Proposal, *, as_of: pd.Ti
     if not open_rows.empty:
         return records, f"not recorded: {len(open_rows)} earlier change(s) are still open ({', '.join(open_rows['record_id'])})"
     row = {
-        "record_id": _record_id(as_of, "carb_ratio_g_per_unit", proposal.segment_start_minutes) + f"-{proposal.pump_serial}", "origin": "system",
-        "proposed_on": as_of.date(), "setting": "carb_ratio_g_per_unit", "pump_serial": proposal.pump_serial, "profile_id": proposal.profile_id,
+        "record_id": _record_id(as_of, "carb_ratio_g_per_unit", proposal.segment_start_minutes) + f"-{pump_key(proposal.pump_serial)}", "origin": "system",
+        "proposed_on": as_of.date(), "setting": "carb_ratio_g_per_unit", "pump_serial": pump_key(proposal.pump_serial), "profile_id": proposal.profile_id,
         "segment_start_minutes": proposal.segment_start_minutes, "affected_hours": proposal.affected_hours, "old_value": proposal.current_value,
         "new_value": proposal.proposed_value, "reason": proposal.reason, "evaluation_plan": EVALUATION, "status": "proposed",
     }
@@ -76,7 +77,7 @@ def sync_with_pump(records: pd.DataFrame, changes: pd.DataFrame, parts_by_start:
     used: set[int] = set()
     for index, record in records[records["status"].eq("proposed")].iterrows():
         match = changes[
-            changes["pump_serial"].eq(str(record["pump_serial"])) & changes["profile_id"].eq(int(record["profile_id"]))
+            changes["pump_serial"].map(pump_key).eq(pump_key(record["pump_serial"])) & changes["profile_id"].eq(int(record["profile_id"]))
             & changes["segment_start_minutes"].eq(float(record["segment_start_minutes"])) & changes["setting"].eq(record["setting"])
             & np.isclose(changes["new_value"], float(record["new_value"]))
             & (pd.to_datetime(changes["timestamp"]).dt.date >= pd.Timestamp(record["proposed_on"]).date())
@@ -89,7 +90,7 @@ def sync_with_pump(records: pd.DataFrame, changes: pd.DataFrame, parts_by_start:
     for index, change in changes.iterrows():
         if index in used or change["setting"] == "start_minutes":
             continue
-        rid = _record_id(change["timestamp"], change["setting"], change["segment_start_minutes"]) + f"-{change['pump_serial']}"
+        rid = _record_id(change["timestamp"], change["setting"], change["segment_start_minutes"]) + f"-{pump_key(change['pump_serial'])}"
         if rid in known:
             continue
         part = parts_by_start.get(float(change["segment_start_minutes"]))
@@ -97,7 +98,7 @@ def sync_with_pump(records: pd.DataFrame, changes: pd.DataFrame, parts_by_start:
         nearby = abs(pd.to_datetime(changes["timestamp"]) - pd.Timestamp(change["timestamp"])) <= pd.Timedelta(hours=24)
         new_rows.append(
             {
-                "record_id": rid, "origin": "person", "proposed_on": pd.NaT, "setting": change["setting"], "pump_serial": change["pump_serial"],
+                "record_id": rid, "origin": "person", "proposed_on": pd.NaT, "setting": change["setting"], "pump_serial": pump_key(change["pump_serial"]),
                 "profile_id": change["profile_id"], "segment_start_minutes": change["segment_start_minutes"], "affected_hours": hours,
                 "old_value": change["old_value"], "new_value": change["new_value"], "reason": "change made on the pump; found in the profile history",
                 "status": "entered", "entered_on": pd.Timestamp(change["timestamp"]), "concurrent_changes": int((nearby & (changes.index != index)).sum()),

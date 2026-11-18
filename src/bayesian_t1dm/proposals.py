@@ -25,6 +25,7 @@ import pandas as pd
 
 from .latent_meal_trajectory import MIN_LOGGED_MEALS_FOR_ICR
 from .outcomes import DayPart, LOW_LIMIT_PERCENT, VERY_LOW_LIMIT_PERCENT, passes_low_limits, pooled_metrics
+from .pump_profiles import pump_key
 
 MAX_STEP_FRACTION = 0.10
 STEP_ROUNDING = 0.1
@@ -134,7 +135,7 @@ def propose_breakfast_icr(
 def _assess_segment(frame: pd.DataFrame, row: pd.Series, segment: float, cgm: pd.DataFrame, segment_ends: dict[float, float], as_of: pd.Timestamp, current_icr: dict[float, float] | None) -> Proposal:
     """The rule applied to one pump segment's current-setting period."""
     identity = dict(
-        pump_serial=str(row["pump_serial"]), profile_id=float(row["profile_id"]), segment_start_minutes=segment,
+        pump_serial=pump_key(row["pump_serial"]), profile_id=float(row["profile_id"]), segment_start_minutes=segment,
         current_value=float(row["programmed_icr"]), breakfasts=int(row["n_meals"]),
         estimate=float(row["effective_icr"]), estimate_lower_90=float(row["effective_icr_lower_90"]), estimate_upper_90=float(row["effective_icr_upper_90"]),
     )

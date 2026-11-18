@@ -13,6 +13,7 @@ from .evaluate import walk_forward_splits
 from .features import MEAL_RECORD_COLUMNS, FeatureConfig, FeatureFrame, recompute_scenario_features
 from .health_auto_export import AnalysisReadyHealthDataset
 from . import meal_flags
+from .pump_profiles import pump_key
 from .latent_meal_trajectory import (
     MIN_LOGGED_MEALS_FOR_ICR,
     CarbSensitivityObservation,
@@ -3469,7 +3470,7 @@ def _effective_icr_evidence(
                     continue
                 meals.append({
                     "row": metric_row, "stated": stated, "icr": round(icr, 2), "cf": round(cf), "source": source, "timestamp": pd.Timestamp(metric_row.timestamp),
-                    "pump": str(getattr(metric_row, "pump_serial", "")), "profile": _unknown_as(_as_float(getattr(metric_row, "profile_id", np.nan))),
+                    "pump": pump_key(getattr(metric_row, "pump_serial", "")), "profile": _unknown_as(_as_float(getattr(metric_row, "profile_id", np.nan))),
                     "segment_start": _unknown_as(_as_float(getattr(metric_row, "profile_segment_start_minutes", np.nan))),
                 })
             base = {"analysis": analysis, "logged_food_scale": bevel_scale, "logged_food_pairs": bevel_pairs}

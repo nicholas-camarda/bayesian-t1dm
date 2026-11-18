@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from .outcomes import MIN_DAY_COVERAGE, DayPart
+from .pump_profiles import pump_key
 
 BASAL_EVENT = 279
 MODE_EVENT = 229
@@ -44,7 +45,7 @@ def load_basal_delivery(tandem_root: str | Path) -> tuple[pd.DataFrame, pd.DataF
         if path.name.endswith(".meta.json"):
             continue
         payload = json.loads(path.read_text(encoding="utf-8"))
-        pump = str(payload["pump_serial"])
+        pump = pump_key(payload["pump_serial"])
         for chunk in payload["chunks"]:
             for event in chunk["response"].get("events") or []:
                 props = event["eventProperties"]
@@ -124,7 +125,7 @@ def profile_rate_at(history, pump_serials: pd.Series, times: pd.Series, *, slot_
     """The programmed basal rate (U/h) of the segment in force at each time, from the pump's profile history (NaN when the
     archive cannot show it). Looked up once per pump and ``slot_minutes`` slot."""
     slots = pd.to_datetime(times).dt.floor(f"{slot_minutes}min")
-    pumps = pump_serials.astype(str).str.removesuffix(".0")
+    pumps = pump_serials.map(pump_key)
     cache: dict[tuple[str, pd.Timestamp], float] = {}
     out = np.full(len(slots), np.nan)
     for position, (pump, slot) in enumerate(zip(pumps, slots)):
@@ -147,7 +148,7 @@ def basal_records(merged, history) -> pd.DataFrame:
     """
     basal = merged.tandem_data.basal
     frame = pd.DataFrame(
-        {"pump_serial": basal["pump_serial"].astype(str).str.removesuffix(".0"), "timestamp": pd.to_datetime(basal["start_timestamp"]).astype("datetime64[ns]"),
+        {"pump_serial": basal["pump_serial"].map(pump_key), "timestamp": pd.to_datetime(basal["start_timestamp"]).astype("datetime64[ns]"),
          "commanded_u_per_h": pd.to_numeric(basal["basal_units_per_hour"], errors="coerce")}
     ).dropna().sort_values("timestamp").reset_index(drop=True)
     frame["profile_u_per_h"] = profile_rate_at(history, frame["pump_serial"], frame["timestamp"])
@@ -207,15 +208,15 @@ def daily_controller_pattern(
         keep &= ~flagged
     excluded = {pd.Timestamp(day).normalize() for day in excluded_days}
     intervals = intervals.assign(mode=mode)[keep].copy()
-    intervals["date"] = intervals["timestamp"].dt.normalize()
-    intervals = intervals[~intervals["date"].isin(excluded)]
     intervals["minute"] = intervals["timestamp"].dt.hour * 60 + intervals["timestamp"].dt.minute
     glucose = cgm[["timestamp", "glucose"]].copy()
     glucose["timestamp"] = pd.to_datetime(glucose["timestamp"])
     glucose = glucose.dropna().sort_values("timestamp")
     rows = []
     for part in parts:
-        inside = intervals[part.contains(intervals["minute"])]
+        inside = intervals[part.contains(intervals["minute"])].copy()
+        inside["date"] = part.analysis_date(inside["timestamp"])
+        inside = inside[~inside["date"].isin(excluded)]
         for date, group in inside.groupby("date"):
             hours = float(group["hours"].sum())
             profile_units = float(group["profile_units"].sum())
@@ -309,13 +310,17 @@ def basal_signal(daily: pd.DataFrame, current_rates: dict[str, float] | None = N
         frac = commanded / (rate * w) - 1.0  # each day's commanded rate against the current programmed rate
         over = float(w[frac > SIGNAL_EXTRA_FRACTION].sum() / w.sum())
         under = float(w[frac < -SIGNAL_EXTRA_FRACTION].sum() / w.sum())
-        glucose = float(np.average(recent["mean_glucose"], weights=w))
-        below_70, below_54 = float(np.average(recent["below_70_pct"], weights=w)), float(np.average(recent["below_54_pct"], weights=w))
+        measured = recent["mean_glucose"].notna().to_numpy()  # a day with no clean CGM says nothing about glucose or lows
+        glucose = float(np.average(recent["mean_glucose"].to_numpy()[measured], weights=w[measured])) if measured.any() else float("nan")
+        below_70 = float(np.average(recent["below_70_pct"].to_numpy()[measured], weights=w[measured])) if measured.any() else float("nan")
+        below_54 = float(np.average(recent["below_54_pct"].to_numpy()[measured], weights=w[measured])) if measured.any() else float("nan")
         pick = rng.integers(0, n, size=(draws, n))
         boot_over = np.array([w[i][frac[i] > SIGNAL_EXTRA_FRACTION].sum() / w[i].sum() for i in pick])
         boot_excess = np.array([commanded[i].sum() / (rate * w[i].sum()) - 1.0 for i in pick])
         lows_ok = below_70 < LOW_LIMIT_PERCENT and below_54 < VERY_LOW_LIMIT_PERCENT
-        if over >= SIGNAL_SHARE_OF_TIME and glucose > HIGH_GLUCOSE_MGDL and lows_ok:
+        if not measured.any():
+            signal = "no clean glucose in the window: glucose and lows are unknown"
+        elif over >= SIGNAL_SHARE_OF_TIME and glucose > HIGH_GLUCOSE_MGDL and lows_ok:
             signal = "basal likely too low"
         elif over >= SIGNAL_SHARE_OF_TIME and not lows_ok:
             signal = "controller adds insulin but lows are over a limit: no added basal"
@@ -329,7 +334,7 @@ def basal_signal(daily: pd.DataFrame, current_rates: dict[str, float] | None = N
             {"share_over_x": over, "share_over_lo": float(np.percentile(boot_over, 5)), "share_over_hi": float(np.percentile(boot_over, 95)), "share_under_minus_x": under,
              "prob_rule_met": float((boot_over >= SIGNAL_SHARE_OF_TIME).mean()), "pooled_excess": float(commanded.sum() / (rate * w.sum()) - 1.0),
              "excess_lo": float(np.percentile(boot_excess, 5)), "excess_hi": float(np.percentile(boot_excess, 95)), "mean_glucose": glucose,
-             "below_70_pct": below_70, "below_54_pct": below_54, "signal": signal}
+             "below_70_pct": below_70, "below_54_pct": below_54, "days_with_glucose": int(measured.sum()), "signal": signal}
         )
         rows.append(row)
     return pd.DataFrame(rows)
