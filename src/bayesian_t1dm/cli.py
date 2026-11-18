@@ -37,7 +37,8 @@ from .ingest import summarize_tandem_raw_dir
 from .model import BayesianGlucoseModel
 from .observability import LoggingSession, setup_run_logging
 from .outcomes_report import current_day_parts, current_segment_settings, write_outcomes
-from .proposals import propose_breakfast_icr, proposal_markdown, segment_ends_from_parts
+from .outcomes import day_part_table
+from .proposals import propose_breakfast_icr, proposal_markdown, segment_ends_from_parts, segment_markdown, segment_summary
 from .paths import ProjectPaths
 from .recommend import RecommendationPolicy, recommend_setting_changes
 from .report import build_run_summary, write_json_report, write_markdown_report
@@ -549,7 +550,14 @@ def _dispatch_command(
             out = Path(args.report_dir)
             out.mkdir(parents=True, exist_ok=True)
             pd.DataFrame([{"as_of": as_of.date(), **proposal.to_row()}]).to_csv(out / "breakfast_proposal.csv", index=False)
-            (out / "breakfast_proposal.md").write_text(proposal_markdown(proposal, as_of=as_of), encoding="utf-8")
+            cgm = merged.tandem_data.cgm
+            now_settings = current_segment_settings(merged, args.raw)
+            table = segment_summary(
+                parts, now_settings, day_part_table(cgm, parts, as_of=as_of, days=90), day_part_table(cgm, parts, as_of=as_of, days=14),
+                result.effective_icr_evidence, pump_serial=proposal.pump_serial, profile_id=proposal.profile_id,
+            )
+            table.to_csv(out / "segment_summary.csv", index=False)
+            (out / "breakfast_proposal.md").write_text(segment_markdown(table) + "\n" + proposal_markdown(proposal, as_of=as_of), encoding="utf-8")
         print((out / "breakfast_proposal.md").read_text(encoding="utf-8"))
         return 0
 
