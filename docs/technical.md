@@ -1,5 +1,23 @@
 # Technical Notes
 
+## Goals
+
+| Goal | Question | Subgoals | Status |
+| --- | --- | --- | --- |
+| A | Where do glucose outcomes stand, and in which hours? | A1 consensus metrics overall; A2 by pump segment; A3 baseline 14 and 90 days | `report-outcomes` |
+| B | Which breakfast I:C change does the evidence support? | B1 pooled estimate per pump setting; B2 agreement checks; B3 proposal and safety rule | breakfast evidence page; proposals next |
+| C | Did an entered change help? | C1 one-command refresh; C2 proposal record; C3 before/after evaluation | planned |
+| D | Can logged food sharpen the carb estimate? | D1 unlogged-meal flags; D2 fat and protein; D3 Bevel as a second measurement | planned |
+| E | Lunch and dinner I:C | E1 per segment evidence; E2 stricter eligibility; E3 proposals | planned |
+| F | Basal from the controller pattern | F1 commanded vs profile rate; F2 lows as a hard stop; F3 proposals | planned |
+| G | Correction factor | G1 correction-only boluses | planned |
+
+The goal throughout is more time in 70-180 mg/dL with time below 70 under 4% and below 54 under 1%. A proposal changes one setting by at most 10% and is held 14 days before the next. The system proposes and measures; the person enters the change on the pump.
+
+## Outcome metrics (goal A)
+
+`bayesian-t1dm report-outcomes` writes `runtime/output/outcomes/outcomes_report.html` and CSV tables. Metrics follow the international consensus on CGM: time in range 70-180 mg/dL; time below 70 and 54; time above 180 and 250; mean glucose; coefficient of variation; glucose management indicator (3.31 + 0.02392 x mean). A day counts only when it holds at least 70% of its readings (for a part of the day, 70% of that part's readings). Readings are one per 5-minute slot. Time-of-day bins are the segments of the profile the latest pump runs, as last visible in its profile history. How to read it: a row whose time below 70 is 4% or more, or below 54 is 1% or more, is over a low limit and is not a candidate for more insulin in those hours. How it could fail: a segment start edited after the pump's edits stopped being visible (April 2026 for the current pump) would leave the bins one edit behind.
+
 ## Data Flow
 
 The active pipeline is:

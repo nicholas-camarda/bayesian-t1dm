@@ -85,32 +85,24 @@ The priority cohort is the **first meal of the day** with a long fast beforehand
 
 ## Roadmap
 
-### Now: land the real-data pipeline
+Each phase is its own branch and pull request. A phase is done when: tests for its rules are added; its real-data run is reread against the source tables; its rendered page is checked; the docs are updated; CI on the pull request is green. The live status is kept in `PROGRESS.md` (local, not committed).
 
-1. Open a pull request for the `real-data-pipeline` branch so CI runs, then merge. Nothing on the branch has been pushed yet.
-2. Read the regenerated pages: they are the first valid real-data results. In particular, check whether the current settings period has enough breakfasts for a headline (the page says "too early to judge" below 5).
+| Phase | Goal | Content |
+| --- | --- | --- |
+| 0 | land the branch | commit, review, fix, pull request |
+| 1 | A outcome metrics | consensus metrics overall and by pump segment (`outcomes.py`, `report-outcomes`) |
+| 2 | B breakfast I:C proposals | pool by (pump, I:C, CF, segment); tier, clean-direction, no-correction checks; proposal and safety rule (`proposals.py`) |
+| 3 | C refresh, change log, evaluation | one `refresh` command; event 68 request; durable proposal record; 14-day before/after evaluation |
+| 4 | D Bevel in the carb estimator | unlogged-meal flags, fat and protein absorption, Bevel as a second measurement |
+| 5 | E lunch and dinner I:C | the breakfast machinery per segment, with stricter eligibility |
+| 6 | F basal from the controller pattern | Control-IQ's commanded vs profile rate by time of day, lows as a hard stop |
+| 7 | G correction factor | after phases 2 to 6 |
 
-### Next: make the I:C answer trustworthy
+Carried into phase 2 (from the review of the pump-history work): a settings period breaks whenever a meal's own I:C or CF differs, so most periods hold fewer than 5 breakfasts; profile lookup uses carb times rounded down to 5 minutes; the plausible-carb ceiling comes from the latest snapshot.
 
-3. **Weighed or packaged breakfasts.** Log about 20 breakfasts with weighed or packaged carbs over 2 to 3 weeks. This is the only way to separate carb-counting bias from the ratio, and it also calibrates Bevel (how far its estimates are from known carbs). Needs a way to mark those meals as weighed, for example a column in `carbs.csv`.
-4. **Keep `context_events.csv` current** (illness, steroids, travel, sensor problems). Excluded periods are the main defence against confounded mornings.
-5. **Travel and time zones.** Storage uses one `TIMEZONE_NAME`. Days spent in another time zone are stored on home time (Tandem) or phone time (Apple Health), which can disagree. Until that is handled, list travel days in `context_events.csv`.
-6. **Decide whether CGM gaps should block anything.** Any multi-year record has 2-hour gaps and a few values outside 40 to 400 mg/dL; the plausibility check currently reports these as "failed", which permanently blocks forecast recommendations. Gaps are already handled per meal window.
-7. **Measure the Control-IQ residual** on real mornings: how often the controller does the same thing most mornings, which is when the basal adjustment is wrong.
+Still open from earlier: keep `context_events.csv` current; travel and time zones; whether CGM gaps should block anything (the plausibility check no longer fails on readings at the sensor's limits, only on impossible values); the forecast lane, to be retired if it does not beat persistence by 10%; `tandem_export_manifest.csv` should have one writer.
 
-### Later
-
-8. Overnight basal evidence from the therapy lane, once the I:C lane is settled.
-9. Decide whether the forecast lane earns its keep. If the model does not beat "glucose stays the same" by the 10% bar on current data, retire it.
-10. Phase E: test whether the clean first-meal estimates transfer to less clean meals, with wider uncertainty.
-11. Housekeeping: `tandem_export_manifest.csv` is written by `collect`, `backfill`, `normalize-raw` and `build-dataset`. It should have one writer, `build-dataset`, and `normalize-raw` may then be unnecessary.
-
-### Explicitly deferred
-
-- global basal optimization as the headline
-- correction-factor inference as a primary target
-- therapy recommendations across all meal contexts
-- claiming exact carb truth for any single bolus
+Explicitly deferred: global basal optimization as the headline; claiming exact carb truth for any single bolus; weighed breakfasts (not planned, so the effective I:C keeps absorbing carb-counting bias, which is the ratio that works with how the carbs are counted).
 
 ## Decision rules for new work
 

@@ -35,6 +35,7 @@ from .dataset import MergedDataset, build_merged_dataset, load_merged_dataset, m
 from .ingest import summarize_tandem_raw_dir
 from .model import BayesianGlucoseModel
 from .observability import LoggingSession, setup_run_logging
+from .outcomes_report import write_outcomes
 from .paths import ProjectPaths
 from .recommend import RecommendationPolicy, recommend_setting_changes
 from .report import build_run_summary, write_json_report, write_markdown_report
@@ -92,6 +93,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     build_dataset.add_argument("--raw", default=None)
     build_dataset.add_argument("--force", action=argparse.BooleanOptionalAction, default=False, help="Rebuild even if no raw file changed")
+
+    outcomes = add_command("report-outcomes", "Report consensus glucose outcomes (time in range, lows, highs) overall and by pump time-of-day segment")
+    outcomes.add_argument("--raw", default=None)
+    outcomes.add_argument("--report-dir", default=None)
 
     screen_health = add_command("screen-health-features", "Screen imported Apple Health context features against Tandem glucose targets")
     screen_health.add_argument("--raw", default=None)
@@ -446,7 +451,7 @@ def _prepare_runtime_output(paths: ProjectPaths, *directories: str | Path) -> No
 
 
 def _apply_command_defaults(args: argparse.Namespace, paths: ProjectPaths) -> None:
-    if args.command in {"ingest", "run", "screen-health-features", "build-dataset", "research-therapy-settings", "research-latent-meal-icr", "review-therapy-evidence", "status"}:
+    if args.command in {"ingest", "run", "screen-health-features", "build-dataset", "research-therapy-settings", "research-latent-meal-icr", "review-therapy-evidence", "status", "report-outcomes"}:
         args.raw = args.raw or str(paths.cloud_raw)
         if args.command == "ingest":
             args.report = args.report or str(paths.output_source / "coverage.md")
@@ -459,6 +464,8 @@ def _apply_command_defaults(args: argparse.Namespace, paths: ProjectPaths) -> No
             args.review_html = args.review_html or str(Path(args.report_dir) / "latent_meal_review.html")
         elif args.command == "review-therapy-evidence":
             args.report = args.report or str(paths.output_therapy / "therapy_review.html")
+        elif args.command == "report-outcomes":
+            args.report_dir = args.report_dir or str(paths.output_outcomes)
         elif args.command in {"status", "build-dataset"}:
             pass
         else:
@@ -512,6 +519,13 @@ def _dispatch_command(
                 report_path=args.report,
                 manifest_path=args.manifest,
             )
+        return 0
+
+    if args.command == "report-outcomes":
+        merged = _load_dataset(args, session)
+        with session.stage("outcomes.write", report_dir=args.report_dir):
+            written = write_outcomes(merged, args.raw, args.report_dir)
+        print(f"Outcomes report: {written['page']}")
         return 0
 
     if args.command == "build-dataset":
