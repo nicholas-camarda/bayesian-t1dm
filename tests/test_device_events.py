@@ -4,7 +4,6 @@ import base64
 import json
 import struct
 
-import numpy as np
 import pandas as pd
 
 from bayesian_t1dm.context_rules import CGM_MAX_MGDL, CGM_MIN_MGDL, exercise_intervals, inside_intervals, valid_cgm

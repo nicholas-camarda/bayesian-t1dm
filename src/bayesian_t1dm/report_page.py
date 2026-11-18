@@ -66,7 +66,7 @@ PLAIN_LABELS = {
     "premeal_bg_out_of_range": "glucose before the meal was outside the target range",
     "recent_bolus_4h": "a bolus in the 4 hours before the meal",
     "steep_premeal_slope": "glucose was rising or falling fast before the meal",
-    "recent_workout_6h": "exercise in the 6 hours before the meal",
+    "exercise": "exercise (a workout of 10 minutes or more, or exercise mode) during or in the 4 hours before the meal",
     "context_event_excluded": "inside an excluded period (for example after a steroid injection)",
     "no_candidates": "no first meals were found",
     "accepted_without_exclusions": "accepted with no exclusions",

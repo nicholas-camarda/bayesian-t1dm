@@ -5,6 +5,8 @@
 - the valid Tandem CGM readings (``cgm``; the single validity rule is in ``context_rules``);
 - the pump's profile history, replayed once (``history``);
 - the latest pump, its active profile and the one moment (``moment``) its settings and time-of-day bins are read at;
+- the 5-minute analysis grid (``grid``): every slot of the record with observed glucose, boluses, carbohydrate and IOB;
+- the unlogged-food intervals (``unlogged``), found once from the grid by time, and the exercise intervals (``exercise``);
 - Control-IQ mode changes and site events for the whole record, and the dates they are observed over;
 - the days the person marked as context events (``excluded_days``).
 
@@ -20,7 +22,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from .context_rules import valid_cgm
+from . import meal_flags
+from .context_rules import exercise_intervals, valid_cgm
 from .dataset import MergedDataset, load_merged_dataset
 from .outcomes import DayPart, day_parts_from_starts, segment_starts_in_force
 from .pump_profiles import ProfileHistory, pump_key
@@ -37,6 +40,9 @@ class AnalysisData:
     moment: dt.datetime
     mode_events: pd.DataFrame
     site_events: pd.DataFrame
+    grid: pd.DataFrame
+    unlogged: pd.DataFrame
+    exercise: pd.DataFrame
     event_span: dict[str, tuple[dt.date, dt.date]]
     excluded_days: list[pd.Timestamp]
 
@@ -65,6 +71,17 @@ class AnalysisData:
         return pd.Timestamp(self.event_span[self.pump][0]) if self.pump in self.event_span else pd.Timestamp.max
 
 
+def unlogged_for(merged: MergedDataset) -> pd.DataFrame:
+    """Unlogged-food intervals, found once from the analysis grid (observed glucose only) by time."""
+    frame = merged.grid.rename(columns={"carb_grams": "explicit_carb_grams"})[["timestamp", "glucose", "explicit_carb_grams", "bolus_units"]]
+    return meal_flags.unlogged_intervals(frame, merged.data.nutrition)
+
+
+def exercise_for(merged: MergedDataset) -> pd.DataFrame:
+    """The shared exercise intervals from the workout log and the exercise-mode periods."""
+    return exercise_intervals(merged.data.workouts, merged.mode_events)
+
+
 def load_analysis_data(raw_root: str | Path, merged: MergedDataset | None = None) -> AnalysisData:
     merged = merged if merged is not None else load_merged_dataset(raw_root)
     visible = {
@@ -83,4 +100,4 @@ def load_analysis_data(raw_root: str | Path, merged: MergedDataset | None = None
     span = {pump_name: (dt.date.fromisoformat(a[:10]), dt.date.fromisoformat(b[:10])) for pump_name, (a, b) in merged.manifest["device_event_span"].items()}
     excluded = [pd.Timestamp(day) for period in load_excluded_periods(raw_root) for day in pd.date_range(period.start, period.end, freq="D")]
     return AnalysisData(merged=merged, cgm=cgm, history=history, pump=pump, profile_id=int(profile_id), moment=moment,
-                        mode_events=merged.mode_events, site_events=merged.site_events, event_span=span, excluded_days=excluded)
+                        mode_events=merged.mode_events, site_events=merged.site_events, grid=merged.grid, unlogged=unlogged_for(merged), exercise=exercise_for(merged), event_span=span, excluded_days=excluded)

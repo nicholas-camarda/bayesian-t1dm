@@ -10,6 +10,12 @@ import pandas as pd
 import bayesian_t1dm.cli as cli
 from bayesian_t1dm.evaluate import CalibrationSummary, WalkForwardReport
 from bayesian_t1dm.cli import main
+
+
+def _fake_merged(preparation):
+    """A merged dataset with the parts the research commands read: no food log, no workouts, no pump modes, an empty analysis grid."""
+    grid = pd.DataFrame(columns=["timestamp", "glucose", "carb_grams", "bolus_units"])
+    return SimpleNamespace(preparation=preparation, grid=grid, mode_events=pd.DataFrame(), data=SimpleNamespace(nutrition=pd.DataFrame(), workouts=pd.DataFrame()))
 from bayesian_t1dm.acquisition import ExportWindow, NormalizedWindowResult
 from bayesian_t1dm.health_auto_export import ModelDataPreparationResult
 from bayesian_t1dm.therapy_research import TherapyInfraValidationResult, TherapyResearchResult, _synthetic_base_dataset
@@ -502,7 +508,7 @@ def test_review_therapy_evidence_command_writes_report_and_supporting_artifacts(
         final_dataset_end=pd.Timestamp("2025-01-07 23:55:00"),
         final_row_count=len(dataset.frame),
     )
-    monkeypatch.setattr(cli, "_load_dataset", lambda args, session=None: SimpleNamespace(preparation=preparation, data=SimpleNamespace(nutrition=pd.DataFrame())))
+    monkeypatch.setattr(cli, "_load_dataset", lambda args, session=None: _fake_merged(preparation))
 
     report = tmp_path / "therapy_evidence_review.html"
     exit_code = main(
@@ -545,7 +551,7 @@ def test_research_latent_meal_icr_command_writes_artifacts_and_review(tmp_path, 
         final_dataset_end=pd.Timestamp("2025-01-07 23:55:00"),
         final_row_count=len(dataset.frame),
     )
-    monkeypatch.setattr(cli, "_load_dataset", lambda args, session=None: SimpleNamespace(preparation=preparation, data=SimpleNamespace(nutrition=pd.DataFrame())))
+    monkeypatch.setattr(cli, "_load_dataset", lambda args, session=None: _fake_merged(preparation))
 
     report_dir = tmp_path / "latent_meal"
     review_html = report_dir / "latent_meal_review.html"
@@ -628,7 +634,7 @@ def test_research_latent_meal_icr_full_scope_writes_outputs(tmp_path, monkeypatc
         final_dataset_end=pd.Timestamp("2025-01-07 23:55:00"),
         final_row_count=len(dataset.frame),
     )
-    monkeypatch.setattr(cli, "_load_dataset", lambda args, session=None: SimpleNamespace(preparation=preparation, data=SimpleNamespace(nutrition=pd.DataFrame())))
+    monkeypatch.setattr(cli, "_load_dataset", lambda args, session=None: _fake_merged(preparation))
 
     exit_code = main(
         [
@@ -725,7 +731,7 @@ def test_status_command_writes_curated_latest_outputs_and_cache_artifacts(tmp_pa
         final_dataset_end=pd.Timestamp("2025-01-07 23:55:00"),
         final_row_count=len(dataset.frame),
     )
-    monkeypatch.setattr(cli, "_load_dataset", lambda args, session=None: SimpleNamespace(preparation=preparation, data=SimpleNamespace(nutrition=pd.DataFrame())))
+    monkeypatch.setattr(cli, "_load_dataset", lambda args, session=None: _fake_merged(preparation))
     monkeypatch.setattr(cli, "run_therapy_research", lambda *args, **kwargs: _fake_status_research_result())
     monkeypatch.setattr(
         cli,

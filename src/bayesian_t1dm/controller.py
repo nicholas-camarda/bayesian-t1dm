@@ -288,17 +288,11 @@ def controller_inputs(analysis, parts: list[DayPart], *, strict: bool = False) -
     Returns the daily table, the rate records it was built from (empty when the archive holds no rate records) and the
     unlogged-food intervals found along the way.
     """
-    from . import meal_flags
-
     merged = analysis.merged
     rates = basal_records(merged, analysis.history)
     if rates.empty:
         return pd.DataFrame(), rates, pd.DataFrame()
     cgm, bolus, carbs = analysis.cgm, merged.tandem_data.bolus, merged.tandem_data.carbs
-    frame = pd.DataFrame({"timestamp": pd.to_datetime(cgm["timestamp"]), "glucose": cgm["glucose"]}).drop_duplicates("timestamp").sort_values("timestamp")
-    frame["explicit_carb_grams"] = frame["timestamp"].map(carbs.groupby(pd.to_datetime(carbs["timestamp"]))["carb_grams"].sum()).fillna(0.0)
-    frame["bolus_units"] = frame["timestamp"].map(bolus.groupby(pd.to_datetime(bolus["timestamp"]))["bolus_units"].sum()).fillna(0.0)
-    unlogged = meal_flags.unlogged_intervals(frame, merged.data.nutrition)
-    daily = daily_controller_pattern(rates, analysis.mode_events, cgm, meal_windows(bolus, carbs, strict=strict), parts, unlogged=unlogged, excluded_days=analysis.excluded_days,
+    daily = daily_controller_pattern(rates, analysis.mode_events, cgm, meal_windows(bolus, carbs, strict=strict), parts, unlogged=analysis.unlogged, excluded_days=analysis.excluded_days,
                                      min_clean_fraction=None, min_clean_hours=MIN_CLEAN_HOURS, workouts=merged.data.workouts)
-    return daily, rates, unlogged
+    return daily, rates, analysis.unlogged

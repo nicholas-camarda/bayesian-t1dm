@@ -24,7 +24,7 @@ from typing import Any
 import pandas as pd
 
 from .acquisition import normalize_tconnectsync_window
-from .features import FeatureConfig
+from .features import FeatureConfig, build_analysis_grid
 from .health_auto_export import (
     AnalysisReadyHealthDataset,
     ModelDataPreparationResult,
@@ -79,6 +79,7 @@ class MergedDataset:
     profile_events: pd.DataFrame = field(default_factory=pd.DataFrame)  # pump profile edits and switches, whole archive
     mode_events: pd.DataFrame = field(default_factory=pd.DataFrame)  # Control-IQ mode changes: pump_serial, sequence, timestamp, mode (0 standard, 1 sleep, 2 exercise)
     site_events: pd.DataFrame = field(default_factory=pd.DataFrame)  # cartridge, cannula and tubing fills
+    grid: pd.DataFrame = field(default_factory=pd.DataFrame)  # every 5-minute slot with glucose (observed only), bolus, carbs and IOB
 
 
 def merged_dir(raw_root: str | Path) -> Path:
@@ -287,6 +288,7 @@ def build_merged_dataset(paths: ProjectPaths, *, raw_root: str | Path | None = N
     write_export_manifest(merged.manifest, raw_root / "tandem_export_manifest.csv")
 
     log("Building the 5-minute dataset...")
+    analysis_grid = build_analysis_grid(tandem, FeatureConfig(horizon_minutes=HORIZON_MINUTES))
     dataset = build_prepared_model_dataset(tandem_data=tandem, health_data=merged, config=FeatureConfig(horizon_minutes=HORIZON_MINUTES))
     data_quality, quality_rows = assess_data_quality(raw_root, export_manifest=merged.manifest)
     plausibility_status, plausibility_reasons = assess_prepared_feature_plausibility(dataset.frame)
@@ -309,6 +311,7 @@ def build_merged_dataset(paths: ProjectPaths, *, raw_root: str | Path | None = N
     _write_tables(merged, out_dir / "tables")
     _to_parquet(tandem.cgm, out_dir / "tables" / "tandem_cgm.parquet")
     _to_parquet(dataset.frame, out_dir / "prepared_model_data_5min.parquet")
+    _to_parquet(analysis_grid, out_dir / "analysis_grid_5min.parquet")
     _to_parquet(quality_rows, out_dir / "window_quality.parquet")
     _to_parquet(profile_events, out_dir / "tables" / "pump_profile_events.parquet")
     _to_parquet(mode_events, out_dir / "tables" / "pump_mode_events.parquet")
@@ -444,6 +447,7 @@ def load_merged_dataset(raw_root: str | Path, *, inputs: list[InputFile] | None 
         profile_events=pd.read_parquet(out_dir / "tables" / "pump_profile_events.parquet"),
         mode_events=pd.read_parquet(out_dir / "tables" / "pump_mode_events.parquet"),
         site_events=pd.read_parquet(out_dir / "tables" / "site_events.parquet"),
+        grid=pd.read_parquet(out_dir / "analysis_grid_5min.parquet"),
     )
 
 

@@ -5,7 +5,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from bayesian_t1dm.features import FeatureConfig, build_feature_frame
+from bayesian_t1dm.features import FeatureConfig, build_analysis_grid, build_feature_frame
 from bayesian_t1dm.ingest import IngestedData, load_tandem_exports
 
 
@@ -203,3 +203,19 @@ def test_linear_cgm_fill_remains_available_for_retrospective_use():
 def test_unknown_cgm_fill_method_is_rejected():
     with pytest.warns(UserWarning), pytest.raises(ValueError, match="cgm_fill_method"):
         build_feature_frame(_gap_data(), _gap_config(cgm_fill_method="spline"))
+
+
+def test_the_analysis_grid_keeps_every_event_and_leaves_gaps_empty():
+    # A 40-minute CGM gap holds a bolus and a carbohydrate entry: the forecasting frame drops those slots, the analysis grid does not.
+    times = pd.date_range("2023-06-01 00:00", periods=12, freq="5min").delete(range(4, 9))
+    data = IngestedData(
+        cgm=_frame({"timestamp": times, "glucose": 100.0 + 5 * pd.RangeIndex(len(times))}),
+        bolus=_frame({"timestamp": pd.to_datetime(["2023-06-01 00:30:00"]), "bolus_units": [2.0]}),
+        carbs=_frame({"timestamp": pd.to_datetime(["2023-06-01 00:30:00"]), "carb_grams": [30.0]}),
+    )
+    config = FeatureConfig(horizon_minutes=30, cgm_lags=(5,), rolling_windows_minutes=(30,), activity_windows_minutes=(30,), carb_windows_minutes=(30,))
+    grid = build_analysis_grid(data, config)
+    assert len(grid) == 12 and grid["bolus_units"].sum() == pytest.approx(2.0) and grid["carb_grams"].sum() == pytest.approx(30.0)
+    gap = grid[grid["timestamp"].between("2023-06-01 00:20", "2023-06-01 00:40")]
+    assert gap["glucose"].isna().all() and gap["glucose_carried_forward"].all()
+    assert not build_feature_frame(data, config).frame["timestamp"].eq(pd.Timestamp("2023-06-01 00:30")).any()

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 from typing import Sequence
 
@@ -40,6 +40,7 @@ class FeatureFrame:
     target_column: str
     horizon_minutes: int
     config: FeatureConfig
+    analysis_grid: pd.DataFrame = field(default_factory=pd.DataFrame)  # every 5-minute slot, before rows without a target are dropped
 
 
 def _freq_minutes(freq: str) -> int:
@@ -427,11 +428,33 @@ def build_feature_frame(data: IngestedData, config: FeatureConfig | None = None)
     if feature_columns:
         fill_columns = [column for column in feature_columns if column != "glucose"]
         frame[fill_columns] = frame[fill_columns].fillna(0.0)
+    analysis_grid = frame.copy()
     frame = frame.dropna(subset=["glucose", "target_glucose"]).reset_index(drop=True)
     return FeatureFrame(
         frame=frame,
+        analysis_grid=analysis_grid,
         feature_columns=feature_columns,
         target_column="target_glucose",
         horizon_minutes=config.horizon_minutes,
         config=config,
     )
+
+
+ANALYSIS_GRID_COLUMNS = ["timestamp", "glucose", "glucose_carried_forward", "bolus_units", "carb_grams", "iob_units", "carb_ratio_g_per_unit"]
+
+
+def build_analysis_grid(data: IngestedData, config: FeatureConfig | None = None) -> pd.DataFrame:
+    """Every 5-minute slot of the record with what the pump logged in it, for the analyses that need events, not forecasts.
+
+    ``glucose`` is the observed reading only (NaN where there is none); ``glucose_carried_forward`` marks slots where the
+    forecasting frame holds the previous reading instead. Slots without a future glucose to forecast are kept, so every
+    bolus and carbohydrate entry in the tables is on the grid.
+    """
+    built = build_feature_frame(data, config)
+    grid = built.analysis_grid
+    if grid.empty:
+        return pd.DataFrame(columns=ANALYSIS_GRID_COLUMNS)
+    out = grid.copy()
+    out["glucose_carried_forward"] = out["glucose"].notna() & out["glucose_observed"].isna()
+    out["glucose"] = out["glucose_observed"]
+    return out[[column for column in ANALYSIS_GRID_COLUMNS if column in out.columns]].reset_index(drop=True)

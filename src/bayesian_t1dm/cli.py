@@ -39,8 +39,7 @@ from .dataset import MergedDataset, build_merged_dataset, load_merged_dataset, m
 from .ingest import summarize_tandem_raw_dir
 from .model import BayesianGlucoseModel
 from .observability import LoggingSession, setup_run_logging
-from .analysis_data import AnalysisData, load_analysis_data
-from .context_rules import exercise_intervals
+from .analysis_data import AnalysisData, exercise_for, load_analysis_data, unlogged_for
 from .outcomes_report import write_outcomes
 from .controller import basal_signal, controller_inputs
 from .dashboard import build_dashboard_data, episodes_payload
@@ -390,6 +389,8 @@ def _run_latent_meal_analysis(
             therapy_settings=therapy_settings,
             excluded_periods=load_excluded_periods(args.raw),
             nutrition=merged.data.nutrition,
+            unlogged=unlogged_for(merged),
+            exercise=exercise_for(merged),
             meal_segments=tuple(part.strip() for part in getattr(args, "meal_segments", "morning").split(",") if part.strip()),
         )
     return preparation, result
@@ -590,9 +591,8 @@ def _dispatch_command(
             current_rates = {part.name: now_settings[float(part.start_minutes)]["basal"] for part in parts if float(part.start_minutes) in now_settings}
             controller_daily, rates, unlogged = controller_inputs(analysis, parts)
             strict_daily, _, _ = controller_inputs(analysis, parts, strict=True)
-            exercise = exercise_intervals(merged.data.workouts, analysis.mode_events)
             episode_data, classified_episodes = episodes_payload(
-                cgm, merged.preparation.dataset.frame, parts, analysis.site_events, rates, unlogged, exercise, merged.data.workouts, site_observed_from=analysis.site_observed_from(), as_of=as_of,
+                cgm, analysis.grid, parts, analysis.site_events, rates, unlogged, analysis.exercise, merged.data.workouts, site_observed_from=analysis.site_observed_from(), as_of=as_of,
             )
             classified_episodes.drop(columns=["site_change"]).assign(site_change=classified_episodes["site_change"]).to_csv(out / "episodes.csv", index=False)
             if not controller_daily.empty:
