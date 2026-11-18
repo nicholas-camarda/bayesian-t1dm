@@ -158,3 +158,53 @@ def test_a_carry_never_crosses_a_profile_switch_and_back():
     resolved = _resolve_meal_settings(rows, "morning", settings=SimpleNamespace(icr_for_segment=lambda s: 6.5, correction_factor_for_segment=lambda s: 55.0))
     # The later Main meals do not borrow Main's 7.0 from before the switch: they fall back to the programmed profile.
     assert [(icr, cf) for icr, cf, _ in resolved] == [(7.0, 65.0), (8.0, 60.0), (6.5, 55.0), (6.5, 55.0)]
+
+
+def test_segment_edits_from_pump_logs_json_extend_the_visible_history(tmp_path):
+    import json
+
+    root = tmp_path / "tconnectsync"
+    raw = root / "2026-04-23__2026-05-22" / "raw"
+    raw.mkdir(parents=True)
+
+    def edit(seq, when, index, modification, start, icr, isf, basal=710):
+        return {
+            "eventCode": 68, "sequenceNumber": seq, "pumpDateTime": when,
+            "eventProperties": {"idp": 0, "status": [0, 1, 2, 3], "segmentIndex": index, "modificationType": modification,
+                                "startTime": start, "basalRate": basal, "isf": isf, "targetBg": 110, "carbRatio": int(icr * 1000)},
+        }
+
+    events = [
+        {"eventCode": 69, "sequenceNumber": 1, "pumpDateTime": "2026-04-23T08:00:00",
+         "eventProperties": {"idp": 0, "status": 0, "sourceIdp": 0, "name0": 77, "name1": 97, "name2": 105, "name3": 110, "name4": 0, "name5": 255, "name6": 255, "name7": 255}},
+        edit(2, "2026-04-23T08:00:01", 0, 0, 0, 7.0, 60),
+        edit(3, "2026-04-23T08:00:02", 1, 0, 300, 7.0, 65),
+        {"eventCode": 69, "sequenceNumber": 4, "pumpDateTime": "2026-04-23T08:01:00",
+         "eventProperties": {"idp": 0, "status": 3, "sourceIdp": 0, "name0": 77, "name1": 97, "name2": 105, "name3": 110, "name4": 0, "name5": 255, "name6": 255, "name7": 255}},
+        edit(5, "2026-05-10T09:29:43", 1, 4, 300, 6.5, 65),  # carb ratio edit
+    ]
+    (raw / "pump_logs_1453346_dev.json").write_text(json.dumps({"pump_serial": "1453346", "chunks": [{"start": "2026-04-23", "end": "2026-05-22", "response": {"events": [e for e in events if e["eventCode"] == 69]}}]}))
+    (raw / "pump_profile_edits_1453346_dev.json").write_text(json.dumps({"pump_serial": "1453346", "chunks": [{"start": "2026-04-23", "end": "2026-05-22", "response": {"events": [e for e in events if e["eventCode"] == 68]}}]}))
+    frame, visible = decode_profile_events(root)
+    assert visible == {"1453346": (dt.date(2026, 4, 23), dt.date(2026, 5, 22))}
+    history = ProfileHistory(frame, visible)
+    before = history.segment_in_force("1453346", 0, dt.datetime(2026, 5, 9, 7, 30))
+    after = history.segment_in_force("1453346", 0, dt.datetime(2026, 5, 11, 7, 30))
+    assert (before["carb_ratio_g_per_unit"], after["carb_ratio_g_per_unit"]) == (7.0, 6.5)
+
+
+def test_asking_about_other_hours_uses_the_profile_as_it_stood_at_the_given_moment(tmp_path):
+    day = dt.datetime(2025, 9, 1)
+    records = [
+        _profile_action(day, 1, profile=0, status=0, name="Main"),
+        _segment(day, 2, profile=0, index=0, modification=0, start=0, icr=7.0, isf=65),
+        _segment(day, 3, profile=0, index=1, modification=0, start=300, icr=7.0, isf=65),
+        _activate(day, 4, profile=0, name="Main"),
+        _segment(day.replace(hour=9, minute=30), 5, profile=0, index=1, modification=4, start=300, icr=6.5, isf=65),
+    ]
+    events, visible = decode_profile_events(_archive(tmp_path, {"2025-08-25__2025-09-23": records}))
+    history = ProfileHistory(events, visible)
+    at_noon = dt.datetime(2025, 9, 1, 12, 0)
+    assert history.segment_in_force("1453346", 0, at_noon, minute_of_day=6 * 60)["carb_ratio_g_per_unit"] == 6.5
+    # Asked at 07:00, before the 09:30 edit, the same hour of the day still shows the old value.
+    assert history.segment_in_force("1453346", 0, dt.datetime(2025, 9, 1, 7, 0), minute_of_day=6 * 60)["carb_ratio_g_per_unit"] == 7.0

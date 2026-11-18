@@ -15,6 +15,7 @@ from .evaluate import run_walk_forward
 from .acquisition import (
     load_local_env_file,
     ExportWindow,
+    backfill_profile_edits,
     backfill_tandem_exports,
     collect_tandem_exports,
     load_tandem_credentials,
@@ -35,7 +36,7 @@ from .dataset import MergedDataset, build_merged_dataset, load_merged_dataset, m
 from .ingest import summarize_tandem_raw_dir
 from .model import BayesianGlucoseModel
 from .observability import LoggingSession, setup_run_logging
-from .outcomes_report import current_day_parts, write_outcomes
+from .outcomes_report import current_day_parts, current_segment_settings, write_outcomes
 from .proposals import propose_breakfast_icr, proposal_markdown, segment_ends_from_parts
 from .paths import ProjectPaths
 from .recommend import RecommendationPolicy, recommend_setting_changes
@@ -203,6 +204,9 @@ def build_parser() -> argparse.ArgumentParser:
     backfill.add_argument("--env-file", default=None, help="Optional .env file with Tandem credentials")
     backfill.add_argument("--strict", action=argparse.BooleanOptionalAction, default=False)
     backfill.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+
+    edits = add_command("fetch-profile-edits", "Fetch pump profile segment edits (event 68) for archived windows that lack them")
+    edits.add_argument("--env-file", default=None, help="Optional .env file with Tandem credentials")
 
     return parser
 
@@ -538,7 +542,10 @@ def _dispatch_command(
         with session.stage("proposals.breakfast_icr", report_dir=args.report_dir):
             parts, _ = current_day_parts(merged, args.raw)
             as_of = pd.Timestamp(merged.tandem_data.cgm["timestamp"].max()).normalize()
-            proposal = propose_breakfast_icr(result.effective_icr_evidence, merged.tandem_data.cgm, segment_ends_from_parts(parts), as_of=as_of)
+            proposal = propose_breakfast_icr(
+                result.effective_icr_evidence, merged.tandem_data.cgm, segment_ends_from_parts(parts), as_of=as_of,
+                current_icr={start: item["icr"] for start, item in current_segment_settings(merged, args.raw).items()},
+            )
             out = Path(args.report_dir)
             out.mkdir(parents=True, exist_ok=True)
             pd.DataFrame([{"as_of": as_of.date(), **proposal.to_row()}]).to_csv(out / "breakfast_proposal.csv", index=False)
@@ -803,6 +810,14 @@ def _dispatch_command(
                 )
             Path(args.report).parent.mkdir(parents=True, exist_ok=True)
             Path(args.report).write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+        return 0
+
+    if args.command == "fetch-profile-edits":
+        credentials = load_tandem_credentials(args.root, args.env_file)
+        with session.stage("acquisition.profile_edits"):
+            with TConnectSyncSourceClient(paths, region=credentials.region, timezone=credentials.timezone, pump_serial=credentials.pump_serial) as client:
+                written = backfill_profile_edits(client, credentials, paths)
+        print(f"Wrote {len(written)} profile edit files; run build-dataset next.")
         return 0
 
     if args.command in {"collect", "backfill"}:
