@@ -46,6 +46,7 @@ from .dashboard import build_dashboard_data, episodes_payload
 from .dashboard_page import render_dashboard
 from .changes import EVALUATION_DAYS, SETTING_FIELDS, detect_setting_changes
 from .outcomes import day_part_table
+from .result_flow import write_result_flow
 from .layout import activate_current, assemble_run
 from .publish import current_commit, publish_run, working_tree_is_clean
 from .records import evaluate_open, load_records, register_proposal, save_records, sync_with_pump
@@ -988,6 +989,7 @@ def _run_refresh(args, paths: ProjectPaths, parser) -> int:
             print(f"Refresh stopped: {name} exited with {code}. Nothing was published.")
             return code or 1
     assemble_run(paths.reports, paths.cloud_raw, run_dir, record_path=paths.cloud_root / "data" / "records" / "setting_proposals.csv")
+    write_result_flow(run_dir, paths.cloud_raw)
     record["status"] = "complete"
     record["finished"] = f"{pd.Timestamp.now():%Y-%m-%dT%H:%M:%S}"
     (run_dir / "run_record.json").write_text(json.dumps(record, indent=2), encoding="utf-8")

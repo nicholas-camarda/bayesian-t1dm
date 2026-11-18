@@ -614,3 +614,16 @@ Known failure modes:
 - Coverage completeness is defined on the acquisition manifest, while cross-file gap checks live in the normalized ingest manifest.
 - Deprecated `archive data/` content is intentionally excluded from active Tandem ingest because it may contain legacy Apple Health exports and non-tabular ECG CSVs that are not part of the modeling contract.
 - Canonical Apple Health loading is scoped to `data/raw/health_auto_export/...`; the `apple_health_data/` directory is a source pool for import, not a direct modeling input.
+
+### Tracing dashboard results
+
+Each dated refresh writes `00_General/source_to_result.csv`. The dates describe the input to the named check or the eligible reporting window. Read the count in its stated unit. An interval for a settings period uses meals with an estimable trajectory. A basal result uses eligible hours within qualifying segment-days. A high or low contributes one classified episode. A change stays in the register while it accumulates follow-up.
+
+| Result | Source and eligibility | Dated output |
+| --- | --- | --- |
+| Prior-night duration | Apple Health sleep records with a completed end time and duration. Each grid row uses the last completed night within 36 hours. The source table counts overlapping in-bed flags separately. | Merged prepared dataset and general source-to-result table |
+| A, glucose outcomes | One valid Tandem CGM reading per five-minute slot on days meeting the coverage criterion. | A_outcomes/supporting |
+| B/E, effective I:C | First eligible meal of each meal segment, with entered carbohydrate, settings evidence and a usable glucose trajectory. D flags potential unlogged food in the window. | B_icr/supporting |
+| C, setting changes | Entered changes grouped by status. Follow-up uses the affected hours and excludes recorded context days. | C_changes |
+| F, controller activity | Paired programmed and commanded basal over eligible intervals. Compare size-scaled and strict meal exclusions. Count qualifying segment-days and clean hours. | F_basal/supporting |
+| H, prolonged glucose excursions | Eligible CGM sequences that meet episode thresholds, classified with available pump and context evidence. | H_episodes |
