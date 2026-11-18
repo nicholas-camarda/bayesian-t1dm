@@ -62,22 +62,71 @@ def test_summary_reports_the_spread_across_days():
     assert summary["days"] == 4 and summary["median_excess_fraction"] == pytest.approx(0.3) and summary["sd_between_days"] > 0
 
 
-def _days(fractions, glucose=150.0, below_70=0.5, part="00:00-05:00"):
-    return pd.DataFrame({"date": pd.date_range("2026-06-01", periods=len(fractions)), "part": part, "excess_fraction": fractions, "mean_glucose": glucose,
-                         "below_70_pct": below_70, "below_54_pct": 0.0})
+def _days(fractions, hours=5.0, rate=0.7, glucose=150.0, below_70=0.5, part="00:00-05:00", start="2026-06-01"):
+    fractions = np.asarray(fractions, dtype=float)
+    hours = np.broadcast_to(np.asarray(hours, dtype=float), fractions.shape)
+    units = rate * hours
+    return pd.DataFrame({"date": pd.date_range(start, periods=len(fractions)), "part": part, "clean_hours": hours, "profile_units": units, "excess_units": fractions * units,
+                         "excess_fraction": fractions, "profile_rate": rate, "mean_glucose": glucose, "below_70_pct": below_70, "below_54_pct": 0.0})
 
 
-def test_basal_signal_needs_extra_insulin_on_half_the_nights_glucose_still_high_and_lows_within_limits():
-    signal = lambda frame: controller.basal_signal(frame).iloc[0]["signal"]  # noqa: E731
-    assert signal(_days([0.4] * 20)) == "basal likely too low"
-    assert signal(_days([0.4] * 10 + [0.0] * 10)) == "basal likely too low"  # exactly half the nights
-    assert signal(_days([0.4] * 9 + [0.0] * 11)) == "no consistent pattern"
-    assert signal(_days([0.4] * 20, below_70=5.0)).startswith("controller adds insulin but lows are over a limit")
-    assert signal(_days([0.4] * 20, glucose=110.0)).startswith("controller adds insulin and glucose is within the target")
-    assert signal(_days([-0.4] * 20)) == "basal likely too high"
-    assert signal(_days([0.4] * 10)).startswith("not enough clean days")
+def _signal(frame):
+    return controller.basal_signal(frame).iloc[0]
 
 
-def test_basal_signal_looks_only_at_the_most_recent_nights():
-    frame = _days([0.0] * 30 + [0.5] * 28)  # the first 30 nights are quiet; the last 28 are not
-    assert controller.basal_signal(frame).iloc[0]["signal"] == "basal likely too low"
+def test_basal_signal_needs_extra_insulin_for_half_the_clean_time_glucose_still_high_and_lows_within_limits():
+    assert _signal(_days([0.4] * 20))["signal"] == "basal likely too low"
+    assert _signal(_days([0.4] * 10 + [0.0] * 10))["signal"] == "basal likely too low"  # exactly half the clean time
+    assert _signal(_days([0.4] * 9 + [0.0] * 11))["signal"] == "no consistent pattern"
+    assert _signal(_days([0.4] * 20, below_70=5.0))["signal"].startswith("controller adds insulin but lows are over a limit")
+    assert _signal(_days([0.4] * 20, glucose=110.0))["signal"].startswith("controller adds insulin and glucose is within the target")
+    assert _signal(_days([-0.4] * 20))["signal"] == "basal likely too high"
+
+
+def test_basal_signal_gives_a_range_and_the_chance_the_rule_is_met():
+    row = _signal(_days([0.4] * 20))
+    assert row["share_over_x"] == pytest.approx(1.0) and row["prob_rule_met"] == pytest.approx(1.0) and row["pooled_excess"] == pytest.approx(0.4)
+    mixed = _signal(_days([0.4] * 10 + [0.0] * 10))
+    assert 0.2 < mixed["prob_rule_met"] < 0.8 and mixed["share_over_lo"] < 0.5 < mixed["share_over_hi"]
+
+
+def test_each_day_counts_in_proportion_to_its_clean_hours():
+    hours = [1.0] * 12 + [6.0] * 4  # twelve short loud days and four long quiet days
+    frame = _days([0.5] * 12 + [0.0] * 4, hours=hours)
+    row = _signal(frame)
+    assert row["share_over_x"] == pytest.approx(12 / 36) and row["signal"] == "no consistent pattern"
+
+
+def test_a_change_of_basal_rate_keeps_the_earlier_days_by_comparing_commanded_rates_with_the_current_one():
+    # Before: profile 0.6 with 0.3 extra (commanded 0.78 U/h). After: profile 0.7 with none (commanded 0.7 U/h).
+    old = _days([0.3] * 20, rate=0.6, start="2026-05-01")
+    new = _days([0.0] * 12, rate=0.7, start="2026-05-21")
+    row = _signal(pd.concat([old, new], ignore_index=True))
+    assert row["profile_rate"] == 0.7 and row["days"] == 28 and row["signal"] == "no consistent pattern"
+    # (16 old days x 5 h x 0.78 + 12 new days x 5 h x 0.7) / (28 x 5 h x 0.7) - 1
+    assert row["pooled_excess"] == pytest.approx((16 * 5 * 0.78 + 12 * 5 * 0.7) / (28 * 5 * 0.7) - 1)
+    # The same commanded rate that was only +30% over the old profile is +11% over the current one, below the 25% line.
+    assert row["share_over_x"] == 0.0
+
+
+def test_basal_signal_looks_only_at_the_most_recent_28_days_and_needs_enough_clean_time():
+    assert _signal(_days([0.0] * 30 + [0.5] * 28))["signal"] == "basal likely too low"
+    assert _signal(_days([0.4] * 8))["signal"].startswith("not enough clean time")
+    assert _signal(_days([0.4] * 12, hours=1.0))["signal"].startswith("not enough clean time")  # 12 days but only 12 clean hours
+    daytime = _signal(_days([0.4] * 14, hours=2.0, part="15:00-19:00"))  # 28 clean hours across 14 days is enough
+    assert daytime["signal"] == "basal likely too low"
+
+
+def test_loose_clean_time_rule_lets_a_partial_day_count_when_asked():
+    rates = _rates(days=1)
+    meals = np.array([np.datetime64("2026-06-01 00:00")], dtype="datetime64[ns]")  # leaves 1 of 5 hours: under 70%
+    strict = controller.daily_controller_pattern(rates, NO_MODES, _cgm(days=1), meals, [NIGHT])
+    loose = controller.daily_controller_pattern(rates, NO_MODES, _cgm(days=1), meals, [NIGHT], min_clean_fraction=None, min_clean_hours=0.5)
+    assert strict.empty and len(loose) == 1 and loose.loc[0, "clean_hours"] == pytest.approx(1.0, abs=0.1) and loose.loc[0, "profile_rate"] == 1.0
+
+
+def test_a_segment_short_of_clean_time_widens_its_window_and_says_so():
+    dates = pd.date_range("2026-04-01", periods=60, freq="4D")  # one clean day every 4 days: 7 fall in 28 days, 14 in 56
+    frame = _days([0.4] * 60).assign(date=dates)
+    row = _signal(frame)
+    assert row["window_days"] == 56 and row["days"] >= 10 and row["signal"] == "basal likely too low"

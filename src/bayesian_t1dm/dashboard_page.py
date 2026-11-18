@@ -248,12 +248,16 @@ function renderMeals(){
   $('#only').onclick=()=>{showAll=false;renderMeals();}; $('#all').onclick=()=>{showAll=true;renderMeals();};
   let rows = D.evidence.filter(r=>r.n>=5); if(!showAll){ const latest={}; rows.forEach(r=>{ if(!latest[r.segment]||r.end>latest[r.segment].end) latest[r.segment]=r; }); rows=Object.values(latest); }
   rows.sort((a,b)=>a.segment.localeCompare(b.segment)||a.start.localeCompare(b.start));
-  const m={l:158,r:16,t:8,b:44}, rh=28; const mon = d => new Date(d).toLocaleString('en',{month:'short',year:'2-digit'});
+  const mon = d => new Date(d).toLocaleString('en',{month:'short',year:'2-digit'});
+  const labelOf = r => `${r.segment} · ${mon(r.start)} to ${mon(r.end)} · ${r.n}`;
+  const labelW = Math.max(...rows.map(r => labelOf(r).length)) * 6.6 + 16;
+  const stacked = $('#forest').clientWidth < labelW + 260;
+  const m={l: stacked ? 14 : Math.ceil(labelW), r:16, t:8, b:44}, rh = stacked ? 50 : 28;
   chart($('#forest'), Math.max(80,rows.length*rh+m.t+m.b), (svg,w,h)=>{
     const lo=Math.min(4,...rows.map(r=>r.lower))-.3, hi=Math.max(9,...rows.map(r=>r.upper))+.3, xs=scale(lo,hi,m.l,w-m.r);
     for(let v=Math.ceil(lo);v<=hi;v++){ el('line',{x1:xs(v),x2:xs(v),y1:m.t,y2:h-m.b,stroke:css('--grid')},svg); txt(svg,xs(v),h-m.b+16,v,{'text-anchor':'middle'}); }
     txt(svg,(m.l+w-m.r)/2,h-3,'I:C, grams of carbohydrate per unit of insulin',{'text-anchor':'middle'});
-    rows.forEach((r,i)=>{ const y=m.t+i*rh+rh/2; txt(svg,m.l-8,y+4,`${r.segment} · ${mon(r.start)} to ${mon(r.end)} · ${r.n}`,{'text-anchor':'end'}); const thin = r.n < 10 ? .4 : 1;
+    rows.forEach((r,i)=>{ const y=m.t+i*rh+(stacked?rh*0.7:rh/2); if (stacked) txt(svg,m.l,y-14,labelOf(r),{'text-anchor':'start'}); else txt(svg,m.l-8,y+4,labelOf(r),{'text-anchor':'end'}); const thin = r.n < 10 ? .4 : 1;
       const ln=el('line',{x1:xs(r.lower),x2:xs(r.upper),y1:y,y2:y,stroke:css('--blue'),'stroke-width':3,'stroke-linecap':'round',opacity:thin},svg); el('circle',{cx:xs(r.effective),cy:y,r:5,fill:css('--blue'),stroke:css('--card'),'stroke-width':2,opacity:thin},svg);
       el('rect',{x:xs(r.programmed)-1.5,y:y-9,width:3,height:18,fill:css('--ink'),rx:1},svg);
       if (r.now!=null && Math.abs(r.now-r.programmed)>=0.05 && r.latest) el('circle',{cx:xs(r.now),cy:y,r:8,fill:'none',stroke:css('--orange'),'stroke-width':2.5},svg);
@@ -267,10 +271,11 @@ function renderMeals(){
 function renderBasal(){
   const t=$('#t-basal'), s=D.controller.signals;
   t.innerHTML = `<h2>What Control-IQ does against your programmed basal</h2><p class="lead">Your pump records the rate it delivered and the rate your profile calls for. If it adds a lot of insulin on most nights and glucose is still high, the programmed basal is probably too low there. Time after meals, boluses, exercise and unlogged food is left out.</p>
-  <div class="card"><div class="scroll"><table id="sig"></table></div><p class="note">Rule: the controller runs 25% or more above the profile on at least half of the last 28 clean days, mean glucose is still above 120 mg/dL, and lows are within limits. Fewer than 14 clean days gives no signal. Daytime segments have few clean days because meals take most of the day.</p></div>
+  <div class="card"><div class="scroll"><table id="sig"></table></div><p class="note">Rule: over the last 28 days at the segment's current basal rate, the controller runs 25% or more above the profile for at least half of the clean time, mean glucose is still above 120 mg/dL, and lows are within limits. Each day counts in proportion to its clean hours, so daytime segments, where meals leave little clean time, can still be assessed. Ranges come from resampling days; \"chance the rule is met\" is the share of those resamples in which the controller ran 25% or more above the profile for at least half of the clean time. Under 10 days or 14 clean hours gives no signal.</p></div>
   <h2>Overnight, night by night</h2><p class="lead">Extra insulin delivered above the profile, as a share of the profile's insulin (${D.controller.nightly.length} clean nights). The dashed line is 25%.</p><div class="card"><div class="legend"><span><i style="background:var(--orange)"></i>25% or more above the profile</span><span><i style="background:var(--blue)"></i>under 25%</span></div><div id="nightly"></div></div>
   <h2>Overnight glucose, night by night</h2><p class="lead">Mean glucose over the same clean hours. The shaded band is the sleep-mode target, 112-120 mg/dL.</p><div class="card"><div id="nightglu"></div></div>`;
-  $('#sig').innerHTML = `<tr><th class="l">Segment</th><th>Clean days</th><th>Median extra</th><th>Days at 25%+</th><th>Mean glucose</th><th>Below 70</th><th class="l">Signal</th></tr>` + s.map(r=>`<tr><td class="l">${r.part}</td><td>${r.days}</td><td>${r.median_excess_fraction==null?'n/a':(r.median_excess_fraction*100>=0?'+':'')+(r.median_excess_fraction*100).toFixed(0)+'%'}</td><td>${r.share_over_x==null?'n/a':(r.share_over_x*100).toFixed(0)+'%'}</td><td>${f0(r.mean_glucose)}</td><td>${r.below_70_pct==null?'n/a':r.below_70_pct.toFixed(2)+'%'}</td><td class="l">${esc(r.signal)}</td></tr>`).join('');
+  const pc = v => v==null ? 'n/a' : (v*100).toFixed(0)+'%', sg = v => v==null ? 'n/a' : (v>=0?'+':'')+(v*100).toFixed(0)+'%';
+  $('#sig').innerHTML = `<tr><th class="l">Segment</th><th>Basal U/h</th><th>Days · clean hours (window)</th><th>Extra insulin (90% range)</th><th>Clean time at 25%+ (90% range)</th><th>Chance the rule is met</th><th>Mean glucose</th><th>Below 70</th><th class="l">Signal</th></tr>` + s.map(r=>`<tr><td class="l">${r.part}</td><td>${r.profile_rate==null?'n/a':r.profile_rate.toFixed(2)}</td><td>${r.days} · ${f0(r.clean_hours)} (${r.window_days} d)</td><td>${r.pooled_excess==null?'n/a':sg(r.pooled_excess)+' ('+sg(r.excess_lo)+' to '+sg(r.excess_hi)+')'}</td><td>${r.share_over_x==null?'n/a':pc(r.share_over_x)+' ('+pc(r.share_over_lo)+' to '+pc(r.share_over_hi)+')'}</td><td>${pc(r.prob_rule_met)}</td><td>${f0(r.mean_glucose)}</td><td>${r.below_70_pct==null?'n/a':r.below_70_pct.toFixed(2)+'%'}</td><td class="l">${esc(r.signal)}</td></tr>`).join('');
   nightChart($('#nightly'),'excess'); nightChart($('#nightglu'),'glucose');
 }
 function nightChart(host,kind){

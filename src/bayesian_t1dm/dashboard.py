@@ -133,7 +133,7 @@ def find_problem_areas(
     for row in signals.itertuples(index=False):
         if row.signal in ("basal likely too low", "basal likely too high"):
             areas.append({"level": "act", "tab": "basal", "title": f"{row.signal.capitalize()}, {row.part}",
-                          "summary": f"Over the last {row.days} clean days the controller ran above the profile by 25% or more on {row.share_over_x:.0%} of days (median {row.median_excess_fraction:+.0%}); mean glucose {row.mean_glucose:.0f} mg/dL."})
+                          "summary": f"In the last {row.window_days} days ({row.days} days, {row.clean_hours:.0f} clean hours, any basal rate) the controller commanded 25% or more above the current programmed rate for {row.share_over_x:.0%} of the clean time (90% range {row.share_over_lo:.0%} to {row.share_over_hi:.0%}); pooled extra insulin {row.pooled_excess:+.0%}; mean glucose {row.mean_glucose:.0f} mg/dL."})
     for row in segments.itertuples(index=False):
         if row.below_70_90d < LOW_LIMIT_PERCENT and row.tir_90d < TIME_IN_RANGE_TARGET:
             worse = row.tir_14d < row.tir_90d - 10
@@ -195,7 +195,7 @@ def build_dashboard_data(
                      "upper": float(row.effective_icr_upper_90), "n": int(row.n_meals), "start": str(pd.Timestamp(row.period_start).date()), "end": str(pd.Timestamp(row.period_end).date()),
                      "current": chosen is row, "now": now, "latest": chosen is None and row is latest}
                 )
-    signals = basal_signal(controller_daily) if not controller_daily.empty else pd.DataFrame(columns=["part", "days", "share_over_x", "share_under_minus_x", "mean_glucose", "below_70_pct", "below_54_pct", "median_excess_fraction", "signal"])
+    signals = basal_signal(controller_daily) if not controller_daily.empty else pd.DataFrame(columns=["part", "profile_rate", "window_days", "days", "clean_hours", "share_over_x", "share_over_lo", "share_over_hi", "prob_rule_met", "pooled_excess", "excess_lo", "excess_hi", "mean_glucose", "below_70_pct", "below_54_pct", "signal"])
     summary = controller_summary(controller_daily) if not controller_daily.empty else pd.DataFrame()
     night = controller_daily[controller_daily["part"].eq(controller_daily["part"].iloc[0])] if not controller_daily.empty else pd.DataFrame()
     nightly = [{"date": str(pd.Timestamp(r.date).date()), "excess": r.excess_fraction, "glucose": r.mean_glucose} for r in night.sort_values("date").itertuples(index=False)] if not night.empty else []
