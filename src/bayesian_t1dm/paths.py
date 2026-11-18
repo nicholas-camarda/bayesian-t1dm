@@ -35,6 +35,7 @@ class ProjectPaths:
     output_forecast: Path
     output_therapy: Path
     output_latent_meal: Path
+    output_outcomes: Path
     output_fixture: Path
     output_source: Path
     output_prepare: Path
@@ -90,6 +91,7 @@ class ProjectPaths:
             output_forecast=runtime_path / "output" / "forecast",
             output_therapy=runtime_path / "output" / "therapy",
             output_latent_meal=runtime_path / "output" / "latent_meal",
+            output_outcomes=runtime_path / "output" / "outcomes",
             output_fixture=runtime_path / "output" / "fixture",
             output_source=runtime_path / "output" / "source",
             output_prepare=runtime_path / "output" / "prepare",
@@ -118,6 +120,7 @@ class ProjectPaths:
             self.output_forecast,
             self.output_therapy,
             self.output_latent_meal,
+            self.output_outcomes,
             self.output_fixture,
             self.output_source,
             self.output_prepare,
