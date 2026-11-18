@@ -9,7 +9,7 @@ Per day and pump segment this module measures the net insulin the controller del
 as a fraction of the profile's own insulin, over the time that is not explained by something else: not the 4 hours
 after a bolus or logged carbohydrate, not exercise (a workout of 10 minutes or more, or exercise mode) or the hours after it, not near unlogged food, and not on a
 day listed in ``context_events.csv``. Sleep mode is kept: it governs the overnight hours this analysis is mostly about,
-and the sleep-mode glucose target (higher than the daytime target) is reported as its own mode column.
+and sleep mode (Tandem's treatment range 112.5-120 mg/dL, against 112.5-160 without Sleep or Exercise, and no automatic correction boluses) is reported as its own mode column.
 """
 
 from __future__ import annotations

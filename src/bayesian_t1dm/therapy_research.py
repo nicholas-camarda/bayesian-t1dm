@@ -800,7 +800,8 @@ def build_therapy_research_frame(
         & glucose.ge(140.0)
     ).astype(int)
     frame["sleep_deficit_flag"] = (
-        pd.to_numeric(_column_or_default(frame, "prior_night_total_sleep_hours"), errors="coerce").fillna(0.0).lt(7.0)
+        pd.to_numeric(_column_or_default(frame, "prior_night_total_sleep_hours"), errors="coerce").lt(7.0)
+        & pd.to_numeric(_column_or_default(frame, "prior_night_sleep_known"), errors="coerce").eq(1)  # unknown sleep is not short sleep
     ).astype(int)
     frame["post_workout_meal_context"] = frame["meal_context"] * frame["recent_exercise_context"]
     if "hrv_latest" in frame.columns:
