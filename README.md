@@ -10,6 +10,7 @@ It is research and decision support, not a medical device; nothing here changes 
 | --- | --- | --- |
 | Is my morning I:C ratio right? | `research-latent-meal-icr --research-scope full` | `output/latent_meal/latent_meal_review.html` |
 | Which breakfast I:C change does the evidence support? | `propose-breakfast-icr` | `output/proposals/breakfast_proposal.md` |
+| Where do I stand and what needs a look? | `refresh --no-collect --no-publish` | `runtime/current/index.html` (open this) |
 | Run everything by hand and publish it to the Vault | `refresh` | `outputs/<date>/` in the Project Vault |
 | Where do time in range, lows and highs stand? | `report-outcomes` | `output/outcomes/outcomes_report.html` |
 | Is there enough clean overnight data to judge basal? | `review-therapy-evidence` | `output/therapy/therapy_review.html` |

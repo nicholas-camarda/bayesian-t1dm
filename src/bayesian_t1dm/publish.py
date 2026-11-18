@@ -8,7 +8,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-REQUIRED_RUN_FILES = ("run_record.json", "outcomes/outcomes_report.html", "proposals/breakfast_proposal.md", "proposals/segment_summary.csv")
+REQUIRED_RUN_FILES = ("run_record.json", "index.html", "A_outcomes/outcomes_report.html", "B_icr/icr_proposal.md", "B_icr/segment_summary.csv")
 MANIFEST_NAME = "MANIFEST.sha256"
 
 
