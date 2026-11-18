@@ -23,7 +23,8 @@ All real-data results produced before November 17, 2026 are void. Until then the
 
 ## What the data contain
 
-- **Pump-entered carbs exist.** Carbs typed into the bolus calculator are on the pump's `LID_BOLUS_REQUESTED_MSG1` event, together with the carb ratio the calculator used; `LID_BOLUS_REQUESTED_MSG2` holds the correction factor and target. Each breakfast is judged against the setting in force for it, and the effective I:C is reported per settings period, with the current period as the headline. These carbs are the user's estimates, not weighed truth.
+- **Pump-entered carbs exist.** Carbs typed into the bolus calculator are on the pump's `LID_BOLUS_REQUESTED_MSG1` event. The t:slim also records the carb ratio there and the correction factor and target on `LID_BOLUS_REQUESTED_MSG2`. The Mobi, bolusing from the phone app, records all three as 0; they are recovered from how its calculator split the bolus (method in [technical.md](technical.md#bolus-calculator-settings)). Each breakfast is judged against the setting in force for it, and the effective I:C is reported per settings period, with the current period as the headline. These carbs are the user's estimates, not weighed truth.
+- **Profiles were switched.** Recovered settings and the profile basal rate show Main mornings at 7.0 g/U (CF 65) until May 2026, Medium at 7.5 g/U (CF 60) from June 2026 and Main again from November 16, 2026. Today's pump snapshot alone (Main, 6.5) is not the setting most breakfasts were dosed with.
 - **Logged food from Apple Health** (mostly Bevel; entries that carry protein and fat with the carbs) is matched to breakfasts within 30 minutes. It is supplementary only: the headline stays on pump entries, and two labelled sensitivity analyses (without high fat or protein breakfasts; pump and logged-food carbs combined after rescaling) show whether conclusions move. Whether an entry came from a barcode scan or a photo estimate is not in the export.
 - **CGM** comes only from sensor-reading events, timed by the sensor's measurement clock (`egvTimeStamp`). Readings backfilled after a signal dropout used to pile into one 5-minute slot.
 - **Excluded periods** are listed in `data/raw/context_events.csv` (for example the 14 days after the October 22, 2026 C-spine steroid injection). Breakfasts and overnight periods inside them are a hard exclusion in every analysis.
@@ -54,6 +55,7 @@ Each of these changed results; anything computed before the fix should be regene
 9. **CGM readings took the pump's receipt time**, so backfilled readings collided. They now use sensor time, kept as pump wall-clock time so a daylight-saving change between measurement and receipt cannot move them an hour.
 10. **Pump settings were dated by the window they were archived with.** Every window collected on the same day holds the same current snapshot, so ordering is now by the snapshot's upload time.
 11. **Unreadable timestamps were dropped silently**; they now stop the build.
+12. **Every Mobi breakfast was compared with today's profile.** The Mobi records its calculator settings as 0, so all breakfasts since August 2025 were compared with the snapshot uploaded on the day of the pull (Main, 6.5), while they were dosed at 7.0 and then 7.5 g/U. Settings are now recovered per breakfast, and a breakfast without a usable record takes the setting of the nearest breakfast on the same pump instead of today's profile.
 
 ## Structural limits that no code change removes
 

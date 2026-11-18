@@ -34,11 +34,11 @@ from .health_auto_export import (
 )
 from .ingest import IngestedData, TandemCoverage, attach_health_auto_export, load_tandem_exports, summarize_coverage, write_export_manifest
 from .paths import ProjectPaths, analysis_timezone
-from .quality import DataQualitySummary, assess_data_quality, assess_prepared_feature_plausibility
+from .quality import REPORTED_NOT_FAILED_PLAUSIBILITY_REASONS, DataQualitySummary, assess_data_quality, assess_prepared_feature_plausibility
 from .report_page import plain
 
 # Bump when merge, cleaning or feature code changes what the build produces; a version change forces a rebuild.
-DATASET_VERSION = 6
+DATASET_VERSION = 7
 HORIZON_MINUTES = 30
 CARB_LOG_NAMES = ("carbs.csv", "carb_log.csv")
 
@@ -467,7 +467,8 @@ def _validation_report(manifest: dict[str, Any]) -> str:
         )
     for reason, count in sorted((quality.get("reason_counts") or {}).items(), key=lambda kv: -kv[1]):
         lines.append(f"| windows where {plain(reason)} | {count} |")
-    flagged = f"{_count_text(len(plausibility), 'check')} flagged, listed below" if plausibility else "no checks flagged"
+    failing = [reason for reason in plausibility if reason not in REPORTED_NOT_FAILED_PLAUSIBILITY_REASONS]
+    flagged = f"{_count_text(len(failing), 'impossible-value check')} failed, listed below" if failing else "no impossible values; counts below are for information"
     lines.append(f"| 5-minute data plausible | {plain(quality.get('normalized_plausibility_status'))}; {flagged} |")
     for reason, count in sorted(plausibility.items(), key=lambda kv: -kv[1]):
         lines.append(f"| rows with {plain(reason)} | {count:,} |")

@@ -26,3 +26,15 @@ def test_fingerprint_reuses_recorded_hashes_and_rehashes_edited_files(tmp_path, 
     edited = dataset.fingerprint_inputs(tmp_path, known=[asdict(item) for item in first])
     assert hashed == ["carbs.csv"]
     assert dataset._input_diff([asdict(item) for item in first], edited)["changed"] == ["carbs.csv"]
+
+
+def test_cgm_gaps_are_reported_but_only_impossible_values_fail_plausibility():
+    import pandas as pd
+
+    from bayesian_t1dm.quality import assess_prepared_feature_plausibility
+
+    frame = pd.DataFrame({"glucose_observed": [120.0, 39.0, 150.0], "minutes_since_last_cgm": [5.0, 150.0, 5.0], "bolus_units": [0.0, 1.0, 0.0]})
+    assert assess_prepared_feature_plausibility(frame) == ("good", {"cgm_gap_ge_120m_rows": 1, "invalid_cgm_rows": 1})
+    frame.loc[0, "bolus_units"] = -1.0
+    status, reasons = assess_prepared_feature_plausibility(frame)
+    assert status == "failed" and reasons["negative_bolus_rows"] == 1

@@ -382,3 +382,30 @@ def test_logged_food_sensitivity_analyses_leave_the_primary_result_alone():
     assert by_analysis.loc["without high fat or protein breakfasts", "n_meals"] < by_analysis.loc["primary", "n_meals"]
     # Rescaled to the pump entries, the combined count stays at the primary level.
     assert by_analysis.loc["pump and logged-food carbs combined", "effective_icr"] == pytest.approx(by_analysis.loc["primary", "effective_icr"], rel=0.08)
+
+
+def test_meal_settings_are_recovered_per_pump_and_unrecorded_meals_do_not_split_periods():
+    from types import SimpleNamespace
+
+    from bayesian_t1dm.therapy_research import _resolve_meal_settings
+
+    def meal(pump, icr=None, cf=None, glucose=None, iob=0.0, correction=None):
+        return SimpleNamespace(pump_serial=pump, carb_ratio_g_per_unit=icr, isf_mgdl_per_unit=cf,
+                               calculator_glucose_mgdl=glucose, calculator_iob_units=iob, correction_bolus_units=correction)
+
+    def mobi(glucose, iob=0.0):  # Mobi records CF 0; its correction follows (glucose - 110) / 60 - IOB, rounded to 0.01 U
+        return meal("1453346", icr=7.5, glucose=glucose, iob=iob, correction=round((glucose - 110) / 60 - iob, 2))
+
+    rows = [
+        meal("90723647", icr=7.0, cf=65.0),       # t:slim records both
+        meal("90723647"),                          # no record: carried from the t:slim meal before it
+        meal("1453346"),                           # first Mobi meal, no record: takes the Mobi's own later value
+        mobi(180), mobi(150, iob=0.2), mobi(210, iob=0.5), mobi(130),
+        meal("1453346", icr=7.5, glucose=100, correction=0.0),  # below target, no correction: CF carried
+    ]
+    resolved = _resolve_meal_settings(rows, "morning", settings=None)
+    assert [(icr, cf) for icr, cf, _ in resolved] == [(7.0, 65.0), (7.0, 65.0)] + [(7.5, 60.0)] * 6
+    assert [source for *_, source in resolved] == [
+        "bolus calculator", "carried from nearby meals", "carried from nearby meals",
+        *["recovered from the bolus calculator"] * 4, "carried from nearby meals",
+    ]

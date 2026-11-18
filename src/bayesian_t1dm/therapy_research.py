@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 from .evaluate import walk_forward_splits
-from .features import CALCULATOR_SETTING_COLUMNS, FeatureConfig, FeatureFrame, recompute_scenario_features
+from .features import MEAL_RECORD_COLUMNS, FeatureConfig, FeatureFrame, recompute_scenario_features
 from .health_auto_export import AnalysisReadyHealthDataset
 from .latent_meal_trajectory import (
     MIN_LOGGED_MEALS_FOR_ICR,
@@ -2100,7 +2100,7 @@ def build_first_meal_clean_window_registry(
         "explicit_carb_source_available",
         "meal_truth_status",
         "stated_carbs",
-        *CALCULATOR_SETTING_COLUMNS,
+        *MEAL_RECORD_COLUMNS,
         "bolus_units",
         "premeal_glucose",
         "premeal_delta_30m",
@@ -2219,8 +2219,8 @@ def build_first_meal_clean_window_registry(
             if not nearby_carbs.empty:
                 stated_carbs = float(nearby_carbs.sum())
         # Settings the bolus calculator used for the largest logged entry in that range, if recorded.
-        recorded_settings = {column: float("nan") for column in CALCULATOR_SETTING_COLUMNS}
-        if np.isfinite(stated_carbs) and all(column in ordered.columns for column in CALCULATOR_SETTING_COLUMNS):
+        recorded_settings = {column: float("nan") for column in MEAL_RECORD_COLUMNS}
+        if np.isfinite(stated_carbs) and "explicit_carb_grams" in ordered.columns:
             nearby = ordered.loc[
                 ordered["timestamp"].ge(timestamp - pd.Timedelta(minutes=20))
                 & ordered["timestamp"].le(timestamp + pd.Timedelta(minutes=30))
@@ -2228,7 +2228,7 @@ def build_first_meal_clean_window_registry(
             ]
             if not nearby.empty:
                 largest = nearby.loc[pd.to_numeric(nearby["explicit_carb_grams"], errors="coerce").idxmax()]
-                recorded_settings = {column: float(pd.to_numeric(pd.Series([largest.get(column)]), errors="coerce").iloc[0]) for column in CALCULATOR_SETTING_COLUMNS}
+                recorded_settings = {column: _as_float(largest.get(column)) for column in MEAL_RECORD_COLUMNS}
         rows.append(
             {
                 "candidate_id": f"first_meal_{candidate_index:04d}",
@@ -2907,7 +2907,7 @@ def _accepted_first_meal_window_metrics(
         "explicit_carb_source_available",
         "meal_truth_status",
         "stated_carbs",
-        *CALCULATOR_SETTING_COLUMNS,
+        *MEAL_RECORD_COLUMNS,
         "bolus_units",
         "meal_proxy_confidence",
         "premeal_glucose",
@@ -3008,7 +3008,7 @@ def _accepted_first_meal_window_metrics(
                 "explicit_carb_source_available": int(row.explicit_carb_source_available),
                 "meal_truth_status": str(row.meal_truth_status),
                 "stated_carbs": None if pd.isna(row.stated_carbs) else float(row.stated_carbs),
-                **{column: float(pd.to_numeric(pd.Series([getattr(row, column, float("nan"))]), errors="coerce").iloc[0]) for column in CALCULATOR_SETTING_COLUMNS},
+                **{column: float(pd.to_numeric(pd.Series([getattr(row, column, float("nan"))]), errors="coerce").iloc[0]) for column in MEAL_RECORD_COLUMNS},
                 "bolus_units": float(row.bolus_units),
                 "meal_proxy_confidence": float(pd.to_numeric(pd.Series([anchor_row.get("meal_proxy_confidence")]), errors="coerce").fillna(0.0).iloc[0]),
                 "premeal_glucose": baseline_glucose,
@@ -3234,17 +3234,78 @@ def _logged_food_scale(research_frame: pd.DataFrame, nutrition: pd.DataFrame | N
     return float(np.exp(np.median(np.log(ratios)))), len(ratios)
 
 
-def _settings_in_force(metric_row: Any, segment: str, settings: LatentMealTherapySettings) -> tuple[float, float, str]:
-    """(I:C, correction factor, source) in force for one meal.
+# A calculator correction smaller than this is too coarsely rounded (0.01 U) to recover the correction factor from.
+RECOVERED_CF_MIN_CORRECTION_UNITS = 0.3
+RECOVERED_CF_MIN_MEALS = 3
 
-    Meals logged on the pump carry the values the bolus calculator used for that bolus. A meal from a
-    hand-kept carb log has no calculator record, so the programmed profile for that time of day applies.
+
+def _as_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _resolve_meal_settings(rows: list[Any], segment: str, settings: LatentMealTherapySettings) -> list[tuple[float, float, str]]:
+    """(I:C, correction factor, source) in force for each meal of one time-of-day segment, in time order.
+
+    1. The I:C is the one the bolus calculator recorded, or recovered from the food portion of the bolus
+       (``acquisition._calculator_carb_ratio``). A t:slim also records the correction factor.
+    2. The Mobi records the correction factor and target as 0. The calculator's correction is
+       (glucose - target) / CF - insulin on board, so within a run of meals on one pump with one I:C,
+       correction + insulin on board is a straight line in glucose with slope 1 / CF. A Theil-Sen fit over
+       meals with a correction of at least 0.3 U gives the run's CF and target; a meal whose own
+       (glucose - target) / (correction + insulin on board) is more than 5% from the run's CF keeps its own
+       value (a setting changed inside the run).
+    3. A meal with no usable record takes the value of the nearest earlier meal on the same pump, or the
+       nearest later one, so it does not start a settings period of its own.
+    4. Only a segment with no usable record on that pump at all falls back to the programmed profile.
     """
-    icr = float(pd.to_numeric(pd.Series([getattr(metric_row, "carb_ratio_g_per_unit", np.nan)]), errors="coerce").iloc[0])
-    cf = float(pd.to_numeric(pd.Series([getattr(metric_row, "isf_mgdl_per_unit", np.nan)]), errors="coerce").iloc[0])
-    if np.isfinite(icr) and icr > 0 and np.isfinite(cf) and cf > 0:
-        return icr, cf, "bolus calculator"
-    return float(settings.icr_for_segment(segment)), float(settings.correction_factor_for_segment(segment)), "pump profile"
+    from scipy.stats import theilslopes
+
+    frame = pd.DataFrame(
+        {
+            "pump": [_as_float(getattr(row, "pump_serial", np.nan)) for row in rows],
+            "icr": [_as_float(getattr(row, "carb_ratio_g_per_unit", np.nan)) for row in rows],
+            "cf": [_as_float(getattr(row, "isf_mgdl_per_unit", np.nan)) for row in rows],
+            "glucose": [_as_float(getattr(row, "calculator_glucose_mgdl", np.nan)) for row in rows],
+            "iob": [_as_float(getattr(row, "calculator_iob_units", np.nan)) for row in rows],
+            "correction": [_as_float(getattr(row, "correction_bolus_units", np.nan)) for row in rows],
+        }
+    )
+    frame.loc[~frame["icr"].gt(0), "icr"] = np.nan
+    frame.loc[~frame["cf"].gt(0), "cf"] = np.nan
+    frame["pump"] = frame["pump"].ffill().bfill()
+    icr_known, cf_recorded = frame["icr"].notna(), frame["cf"].notna()
+    frame["icr"] = frame.groupby("pump", dropna=False)["icr"].transform(lambda s: s.ffill().bfill())
+    frame["run"] = (frame[["pump", "icr"]].ne(frame[["pump", "icr"]].shift())).any(axis=1).cumsum()
+
+    frame["cf_recovered"] = np.nan
+    for _, run in frame.loc[~cf_recorded].groupby("run"):
+        usable = run.loc[run["correction"].ge(RECOVERED_CF_MIN_CORRECTION_UNITS) & run["glucose"].notna() & run["iob"].notna()]
+        if len(usable) < RECOVERED_CF_MIN_MEALS or usable["glucose"].nunique() < 2:
+            continue
+        slope, intercept, _, _ = theilslopes(usable["correction"] + usable["iob"], usable["glucose"])
+        if not slope > 0:
+            continue
+        run_cf, target = 1.0 / slope, -intercept / slope
+        own_cf = (usable["glucose"] - target) / (usable["correction"] + usable["iob"])
+        frame.loc[usable.index, "cf_recovered"] = np.where((own_cf / run_cf - 1.0).abs() <= 0.05, round(run_cf), own_cf.round())
+    cf_known = cf_recorded | frame["cf_recovered"].notna()
+    frame["cf"] = frame["cf"].fillna(frame["cf_recovered"])
+    frame["cf"] = frame.groupby("pump", dropna=False)["cf"].transform(lambda s: s.ffill().bfill())
+
+    resolved: list[tuple[float, float, str]] = []
+    for index, row in frame.iterrows():
+        if pd.isna(row["icr"]) or pd.isna(row["cf"]):
+            resolved.append((float(settings.icr_for_segment(segment)), float(settings.correction_factor_for_segment(segment)), "pump profile"))
+        elif not (icr_known[index] and cf_known[index]):
+            resolved.append((float(row["icr"]), float(row["cf"]), "carried from nearby meals"))
+        elif cf_recorded[index]:
+            resolved.append((float(row["icr"]), float(row["cf"]), "bolus calculator"))
+        else:
+            resolved.append((float(row["icr"]), float(row["cf"]), "recovered from the bolus calculator"))
+    return resolved
 
 
 def _effective_icr_evidence(
@@ -3289,12 +3350,13 @@ def _effective_icr_evidence(
     rows: list[dict[str, Any]] = []
     for analysis, include, carbs_for in analyses:
         for segment, group in window_metrics.groupby(window_metrics["segment"].astype(str), sort=True):
+            ordered_rows = list(group.sort_values("timestamp").itertuples(index=False))
+            in_force = _resolve_meal_settings(ordered_rows, segment, settings)
             meals: list[dict[str, Any]] = []
-            for metric_row in group.sort_values("timestamp").itertuples(index=False):
+            for metric_row, (icr, cf, source) in zip(ordered_rows, in_force):
                 stated = carbs_for(metric_row)
                 if not np.isfinite(stated) or stated <= 0 or not include(metric_row):
                     continue
-                icr, cf, source = _settings_in_force(metric_row, segment, settings)
                 meals.append({"row": metric_row, "stated": stated, "icr": round(icr, 2), "cf": cf, "source": source, "timestamp": pd.Timestamp(metric_row.timestamp)})
             base = {"analysis": analysis, "logged_food_scale": bevel_scale, "logged_food_pairs": bevel_pairs}
             if not meals:
@@ -3304,7 +3366,7 @@ def _effective_icr_evidence(
                 continue
             periods: list[list[dict[str, Any]]] = []
             for meal in meals:
-                if periods and periods[-1][-1]["icr"] == meal["icr"]:
+                if periods and (periods[-1][-1]["icr"], periods[-1][-1]["cf"]) == (meal["icr"], meal["cf"]):
                     periods[-1].append(meal)
                 else:
                     periods.append([meal])
@@ -3356,7 +3418,7 @@ def _render_effective_icr_section(evidence: pd.DataFrame | None) -> list[str]:
         "## Effective I:C From Logged Meals",
         "",
         "Uses accepted windows with a logged carb count. Each meal is compared with the I:C ratio and correction factor in force "
-        "for it (as recorded by the bolus calculator, or the pump profile for hand-logged meals), then meals are pooled within each "
+        "for it (recorded or recovered from the bolus calculator, or carried from the nearest meal on the same pump), then meals are pooled within each "
         "settings period. It assumes that correction factor was right.",
         "",
     ]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import binascii
 import hashlib
 import json
+import math
 import os
 import shutil
 from dataclasses import asdict, dataclass, field
@@ -12,6 +13,7 @@ from typing import Any, Iterable, Mapping, Protocol, Sequence
 
 import pandas as pd
 
+from .features import CALCULATOR_SETTING_COLUMNS
 from .io import read_table
 from .ingest import IngestedData, build_export_manifest, load_tandem_exports, summarize_export_manifest, to_local_wall_clock
 from .observability import sanitize_fields
@@ -722,7 +724,6 @@ def _normalize_bolus_records(
 
 
 # Bolus-calculator settings in force for each logged meal (carb ratio, correction factor, target).
-CALCULATOR_SETTING_COLUMNS = ('carb_ratio_g_per_unit', 'isf_mgdl_per_unit', 'target_bg_mgdl')
 
 
 def _normalize_carb_records(
@@ -1307,6 +1308,8 @@ def _tconnectsync_event_payloads(
     # The bolus calculator records the settings it used: carb ratio on MSG1, correction factor and
     # target on MSG2 (same bolus id). Those are the settings in force for that meal.
     calculator_settings: dict[str, dict[str, float]] = {}
+    # MSG3 holds the calculator's food and correction portions; see _calculator_carb_ratio.
+    bolus_portions: dict[str, dict[str, float]] = {}
     delivered_bolus_ids: set[str] = set()
     for event in events:
         record = event.todict() if hasattr(event, 'todict') else {}
@@ -1355,6 +1358,8 @@ def _tconnectsync_event_payloads(
                     'carbs': float(carb_amount),
                     # Tandem stores the carb ratio in milli-grams per unit (7000 = 7.0 g/U).
                     'carb_ratio_g_per_unit': None if pd.isna(carb_ratio) or float(carb_ratio) <= 0 else float(carb_ratio) / 1000.0,
+                    'calculator_glucose_mgdl': _to_float(record.get('bg')),
+                    'calculator_iob_units': _to_float(record.get('iob')),
                     'bolus_id': bolus_id,
                     'source_event_id': record.get('id'),
                     'source_event_name': name,
@@ -1369,6 +1374,13 @@ def _tconnectsync_event_payloads(
                 calculator_settings[str(bolus_id)] = {
                     'isf_mgdl_per_unit': None if pd.isna(isf) or float(isf) <= 0 else float(isf),
                     'target_bg_mgdl': None if pd.isna(target) or float(target) <= 0 else float(target),
+                }
+        elif name == 'LID_BOLUS_REQUESTED_MSG3':
+            bolus_id = record.get('bolusId')
+            if bolus_id is not None:
+                bolus_portions[str(bolus_id)] = {
+                    'food': _to_float(record.get('foodBolusSize')),
+                    'correction': _to_float(record.get('correctionBolusSize')),
                 }
         elif name == 'LID_BOLUS_DELIVERY':
             delivered_total = _to_float(record.get('deliveredTotal'))
@@ -1401,12 +1413,40 @@ def _tconnectsync_event_payloads(
                 }
             )
     payloads['activity'] = []
-    payloads['carbs'] = [
-        {**request, **calculator_settings.get(bolus_id, {'isf_mgdl_per_unit': None, 'target_bg_mgdl': None})}
-        for bolus_id, request in carb_requests.items()
-        if bolus_id in delivered_bolus_ids
-    ]
+    payloads['carbs'] = []
+    for bolus_id, request in carb_requests.items():
+        if bolus_id not in delivered_bolus_ids:
+            continue
+        settings = calculator_settings.get(bolus_id, {'isf_mgdl_per_unit': None, 'target_bg_mgdl': None})
+        portions = bolus_portions.get(bolus_id, {})
+        carb_row = dict(request)
+        carb_row['carb_ratio_g_per_unit'] = _calculator_carb_ratio(request, settings, portions)
+        carb_row['correction_bolus_units'] = portions.get('correction', float('nan'))
+        payloads['carbs'].append({**carb_row, **settings})
     return payloads
+
+
+def _calculator_carb_ratio(request: Mapping[str, Any], settings: Mapping[str, Any], portions: Mapping[str, float]) -> float | None:
+    """The carb ratio the bolus calculator used for one meal, in g/U, or None when it cannot be known.
+
+    The t:slim records it on MSG1. The Mobi, bolusing from the phone app, records 0 there (and 0 for the
+    correction factor and target on MSG2), but MSG3 records the food portion of the bolus, which is
+    carbs / ratio. That holds only while the calculator has not folded a below-target correction or
+    insulin on board into the food portion: when the bolus includes a positive correction, or when glucose
+    was at or above a recorded target. On 1,405 t:slim meals with a recorded ratio, carbs / food portion
+    matched it in all 1,082 meals meeting that condition. Pump ratios are set in 0.1 g/U steps.
+    """
+    recorded = request.get('carb_ratio_g_per_unit')
+    if recorded is not None:
+        return recorded
+    food = portions.get('food', float('nan'))
+    correction = portions.get('correction', float('nan'))
+    if not math.isfinite(food) or food <= 0:
+        return None
+    target = settings.get('target_bg_mgdl')
+    glucose = request.get('calculator_glucose_mgdl', float('nan'))
+    food_unreduced = (math.isfinite(correction) and correction > 0) or (target is not None and math.isfinite(glucose) and glucose >= target)
+    return round(float(request['carbs']) / food, 1) if food_unreduced else None
 
 
 EVENT_DERIVED_FAMILIES = ('cgm', 'bolus', 'basal', 'carbs')

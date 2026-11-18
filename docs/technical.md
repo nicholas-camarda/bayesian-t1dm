@@ -82,6 +82,23 @@ Normalized CSV contract:
 - a CGM reading's time is the sensor's measurement time on the pump clock, stored without an offset. Example: a reading measured at 01:58 on the day clocks jump forward and received at 03:01 is stored at 01:58. Attaching the receipt's offset (EDT) to the measurement (EST) would have moved it an hour
 - Apple Health times keep the wall-clock time the phone recorded and drop its offset
 
+## Bolus calculator settings
+
+Each breakfast is compared with the I:C ratio and correction factor (CF) the bolus calculator used for it.
+
+- **t:slim** records the ratio on `LID_BOLUS_REQUESTED_MSG1` (in milligrams per unit) and the CF and target on `LID_BOLUS_REQUESTED_MSG2`.
+- **Mobi** (boluses from the phone app) records all three as 0. `LID_BOLUS_REQUESTED_MSG3` records the food and correction portions of the bolus, which are enough to recover them.
+
+**I:C.** The food portion is carbs / I:C, so I:C = carbs / food portion, rounded to the pump's 0.1 g/U steps. That holds only while the calculator has not folded a below-target correction or insulin on board into the food portion, which is the case when the bolus includes a positive correction or glucose was at or above the recorded target. On 1,405 t:slim meals that record the ratio, the recovered value matched in all 1,082 meals meeting that condition; in the other 323 the food portion was reduced and no ratio is recovered.
+
+Example: 35 g with a food portion of 4.67 U and a 0.38 U correction gives 35 / 4.67 = 7.49, so 7.5 g/U. The same 35 g at glucose 95 with no correction may have had 0.3 U taken off the food portion (glucose below a 110 target with CF 50), which would read as 8.0 g/U; that meal gets no recovered ratio.
+
+**CF and target.** The calculator's correction is (glucose - target) / CF - insulin on board. Within a run of breakfasts on one pump with one I:C, correction + insulin on board is therefore a straight line in glucose with slope 1 / CF and intercept -target / CF. A Theil-Sen fit over breakfasts with a correction of at least 0.3 U (smaller ones are too coarsely rounded) gives the run's CF and target. A breakfast whose own (glucose - target) / (correction + insulin on board) is more than 5% from the run's CF keeps its own value, because a setting changed within the run. On t:slim groups with a recorded CF and target, the fit recovers both to within 0.1 mg/dL/U and 0.1 mg/dL.
+
+Example: on the Mobi from June 2026, 41 morning corrections fit CF 60.0 and target 110.1 with no residual above 0.01 U.
+
+**Breakfasts with nothing usable** (no correction and glucose below target, or a hand-logged meal) take the setting of the nearest earlier breakfast on the same pump, or the nearest later one, so they do not start a settings period of their own. A settings period is a run of breakfasts with the same I:C and CF. How it could fail: a setting changed and changed back between two usable breakfasts would be missed; with breakfasts most days, that window is about a day.
+
 Per-window manifest fields now include:
 
 - `requested_start`, `requested_end`

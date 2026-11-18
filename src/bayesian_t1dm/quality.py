@@ -348,8 +348,17 @@ def assess_data_quality(
     )
 
 
+# Counted and reported, but not a failure: any long CGM record has gaps and readings at the sensor's limits,
+# and the meal and overnight analyses exclude gaps window by window.
+REPORTED_NOT_FAILED_PLAUSIBILITY_REASONS = frozenset({"cgm_gap_ge_120m_rows", "invalid_cgm_rows"})
+
+
 def assess_prepared_feature_plausibility(frame: pd.DataFrame) -> tuple[str, dict[str, int]]:
-    """Assess model-ready feature values for physiologically impossible inputs."""
+    """Count implausible or notable values in the model-ready frame.
+
+    Returns ("failed" when any physiologically impossible value is present, else "good", counts by reason).
+    CGM gaps and readings outside 40 to 400 mg/dL are counted but do not fail the check.
+    """
     reasons: Counter[str] = Counter()
     if frame.empty:
         reasons["prepared_frame_empty"] += 1
@@ -381,4 +390,5 @@ def assess_prepared_feature_plausibility(frame: pd.DataFrame) -> tuple[str, dict
         reasons["cgm_gap_ge_120m_rows"] += int(gaps.ge(120.0).sum())
 
     clean_reasons = {key: int(value) for key, value in sorted(reasons.items()) if int(value) > 0}
-    return ("good" if not clean_reasons else "failed"), clean_reasons
+    failed = any(reason not in REPORTED_NOT_FAILED_PLAUSIBILITY_REASONS for reason in clean_reasons)
+    return ("failed" if failed else "good"), clean_reasons

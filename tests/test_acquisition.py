@@ -724,6 +724,32 @@ def test_cgm_sensor_time_keeps_its_wall_clock_across_a_dst_change(monkeypatch):
     assert pd.to_datetime(ingested.cgm["timestamp"]).dt.strftime("%H:%M").tolist() == ["01:55"]
 
 
+def test_mobi_carb_ratio_is_derived_from_the_food_portion_when_it_is_not_recorded():
+    """The Mobi records carbRatio 0 for app boluses; carbs / food portion recovers it when nothing was folded in."""
+    from tconnectsync.eventparser.generic import Events
+
+    from bayesian_t1dm.acquisition import _tconnectsync_event_payloads
+
+    def meal(bolus_id: int, minute: int, *, carbs: int, bg: int, food: float, correction: float, target: int = 0) -> list[dict]:
+        when = f"2026-10-20T08:{minute:02d}:00"
+        return [
+            _pump_log_event(64, when, bolus_id * 10 + 1, "uuid", bg=bg, bolusId=bolus_id, bolusType=3, carbAmount=carbs, carbRatio=0, correctionBolusIncluded=int(correction > 0), iob=0),
+            _pump_log_event(65, when, bolus_id * 10 + 2, "uuid", bolusId=bolus_id, declinedCorrection=0, duration=0, isf=0, options=4, selectedIob=1, spareB6=0, standardPercent=100, targetBg=target, userOverride=0),
+            _pump_log_event(66, when, bolus_id * 10 + 3, "uuid", bolusId=bolus_id, correctionBolusSize=correction, foodBolusSize=food, queued=0, spareA3=0, totalBolusSize=food + correction),
+            _bolus_delivery_event(when, bolus_id * 10 + 4, "uuid", bolus_id=bolus_id, milliunits=int((food + correction) * 1000)),
+        ]
+
+    events = [
+        *meal(1, 0, carbs=35, bg=133, food=4.67, correction=0.38),  # positive correction: food portion is carbs / 7.5
+        *meal(2, 10, carbs=30, bg=95, food=3.72, correction=0.0),  # below an unknown target: portion may be reduced
+        *meal(3, 20, carbs=30, bg=140, food=4.0, correction=0.0, target=110),  # at or above a recorded target
+    ]
+    carbs = _tconnectsync_event_payloads(list(Events(events)))["carbs"]
+    assert [row["carb_ratio_g_per_unit"] for row in carbs] == [7.5, None, 7.5]
+    assert [row["correction_bolus_units"] for row in carbs] == [0.38, 0.0, 0.0]
+    assert [row["calculator_glucose_mgdl"] for row in carbs] == [133, 95, 140]
+
+
 def test_pump_times_are_stored_in_local_time_not_utc(monkeypatch):
     """An 08:00 Eastern bolus must be stored as 08:00, the same clock Apple Health uses."""
     monkeypatch.setenv("TIMEZONE_NAME", "America/New_York")
