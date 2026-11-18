@@ -12,6 +12,7 @@ import pandas as pd
 from .evaluate import walk_forward_splits
 from .features import MEAL_RECORD_COLUMNS, FeatureConfig, FeatureFrame, recompute_scenario_features
 from .health_auto_export import AnalysisReadyHealthDataset
+from . import meal_flags
 from .latent_meal_trajectory import (
     MIN_LOGGED_MEALS_FOR_ICR,
     CarbSensitivityObservation,
@@ -2087,6 +2088,7 @@ def build_first_meal_clean_window_registry(
     *,
     premeal_minutes: int = 30,
     postmeal_minutes: int = 180,
+    unlogged: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     columns = [
         "candidate_id",
@@ -2202,6 +2204,8 @@ def build_first_meal_clean_window_registry(
             exclusion_reasons.append("missing_cgm_first_90m")
         if int(pd.to_numeric(pd.Series([getattr(candidate, "context_event_excluded", 0)]), errors="coerce").fillna(0).iloc[0]):
             exclusion_reasons.append("context_event_excluded")
+        if unlogged is not None and meal_flags.overlaps(unlogged, timestamp - pd.Timedelta(minutes=premeal_minutes), timestamp + pd.Timedelta(minutes=postmeal_minutes)):
+            exclusion_reasons.append("unlogged_food_in_window")
 
         # A carb entry rarely lands in the same 5-minute bin as the bolus, so take every
         # explicit entry from 20 minutes before to 30 minutes after the bolus.
@@ -4608,7 +4612,8 @@ def run_latent_meal_icr_research(
     segments = segments or parse_therapy_segments()
     research_frame = build_therapy_research_frame(dataset, segments=segments, meal_proxy_mode=meal_proxy_mode, excluded_periods=excluded_periods)
     meal_event_registry = build_meal_event_registry(research_frame)
-    clean_meal_windows = build_first_meal_clean_window_registry(research_frame)
+    unlogged = meal_flags.unlogged_intervals(research_frame, nutrition)
+    clean_meal_windows = build_first_meal_clean_window_registry(research_frame, unlogged=unlogged)
     first_meal_exclusion_summary = build_first_meal_exclusion_summary(clean_meal_windows)
     if research_scope == "foundation":
         gate, gate_markdown = _latent_meal_gate(dataset, clean_meal_windows, research_scope=research_scope)
