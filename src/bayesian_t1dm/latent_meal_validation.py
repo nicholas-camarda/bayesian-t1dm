@@ -52,12 +52,17 @@ class MealSimulationScenario:
     # Simulate an automated insulin delivery controller that raises basal when glucose
     # runs high and suspends it when glucose runs low.
     closed_loop_basal: bool = False
+    # Meals with fat and protein: each meal draws fat-protein units (FPU, 100 kcal from fat at 9 kcal/g and protein
+    # at 4 kcal/g) uniformly from 0 to this value; part of its carbohydrate then absorbs over the Warsaw duration
+    # (about 3, 4, 5 and 8 hours for 1, 2, 3 and 4 FPU).
+    fpu_max: float = 0.0
 
 
 DEFAULT_SCENARIOS: tuple[MealSimulationScenario, ...] = (
     MealSimulationScenario("matched_assumptions", "Symmetric absorption, exact settings, no drift. Easiest case."),
     MealSimulationScenario("long_tail_absorption", "Front-loaded absorption with a long tail.", absorption="gamma"),
     MealSimulationScenario("biphasic_absorption", "60% fast, 40% slow and delayed; some carbohydrate lands after the window.", absorption="biphasic"),
+    MealSimulationScenario("fat_protein_meals", "0 to 4 FPU of fat and protein hold back part of the carbohydrate (Warsaw durations).", absorption="fat_protein", fpu_max=4.0),
     MealSimulationScenario("prebolus_timing", "Meal starts 0-20 minutes after the bolus.", prebolus_max_minutes=20.0),
     MealSimulationScenario("wrong_settings", "True I:C and correction factor each differ from programmed by ~15%.", settings_error_log_sd=0.15),
     MealSimulationScenario("baseline_drift", "Unmodelled linear drift, SD 10 mg/dL per hour.", drift_sd_mgdl_per_hour=10.0),
@@ -83,7 +88,14 @@ def _s_curve(minutes: np.ndarray, duration: float) -> np.ndarray:
     return np.where(x < 0.5, 2.0 * x**2, 1.0 - 2.0 * (1.0 - x) ** 2)
 
 
-def _true_absorbed_fraction(minutes: np.ndarray, *, kind: str, duration: float) -> np.ndarray:
+def _warsaw_duration_minutes(fpu: float) -> float:
+    return float(np.interp(fpu, [0.0, 1.0, 2.0, 3.0, 4.0], [150.0, 180.0, 240.0, 300.0, 480.0]))
+
+
+def _true_absorbed_fraction(minutes: np.ndarray, *, kind: str, duration: float, fpu: float = 0.0) -> np.ndarray:
+    if kind == "fat_protein":
+        slow = min(0.5, 0.12 * fpu)  # the share of carbohydrate held back grows with FPU
+        return (1.0 - slow) * _s_curve(minutes, 0.6 * duration) + slow * _s_curve(np.asarray(minutes, dtype=float) - 30.0, _warsaw_duration_minutes(fpu))
     if kind == "s_curve":
         return _s_curve(minutes, duration)
     if kind == "gamma":
@@ -132,6 +144,7 @@ def simulate_meal(
     # The person boluses for what they *think* they are eating.
     bolus_units = true_carbs * float(rng.lognormal(0.0, scenario.carb_count_error_log_sd)) / programmed_icr
     duration = float(rng.uniform(120.0, 240.0))
+    fpu = float(rng.uniform(0.0, scenario.fpu_max)) if scenario.fpu_max > 0 else 0.0
     delay = float(rng.uniform(0.0, scenario.prebolus_max_minutes)) if scenario.prebolus_max_minutes > 0 else 0.0
     drift = float(rng.normal(0.0, scenario.drift_sd_mgdl_per_hour)) if scenario.drift_sd_mgdl_per_hour > 0 else 0.0
 
@@ -142,7 +155,7 @@ def simulate_meal(
 
     insulin_fraction = _insulin_absorbed_fraction(minutes)
     bolus_absorbed = bolus_units * insulin_fraction
-    carb_effect = (true_cf / true_icr) * true_carbs * _true_absorbed_fraction(minutes - delay, kind=scenario.absorption, duration=duration)
+    carb_effect = (true_cf / true_icr) * true_carbs * _true_absorbed_fraction(minutes - delay, kind=scenario.absorption, duration=duration, fpu=fpu)
     passive = premeal_glucose + carb_effect - true_cf * bolus_absorbed + drift * minutes / 60.0 + noise
     basal_absorbed = np.zeros(minutes.size)
     if scenario.closed_loop_basal:
