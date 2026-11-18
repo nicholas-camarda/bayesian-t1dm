@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pandas as pd
 
@@ -9,7 +8,7 @@ from bayesian_t1dm.features import FeatureConfig
 from bayesian_t1dm.health_auto_export import AnalysisReadyHealthDataset, ModelDataPreparationResult
 from bayesian_t1dm.paths import ProjectPaths
 from bayesian_t1dm.status import cleanup_legacy_top_level_output, derive_current_status, finalize_status_logs, publish_html_entrypoint, reset_output_directory, write_status_json
-from bayesian_t1dm.therapy_research import TherapyInfraValidationResult, TherapyResearchResult
+from bayesian_t1dm.therapy_research import TherapyResearchResult
 
 
 def _dataset(*, apple: bool = True) -> AnalysisReadyHealthDataset:

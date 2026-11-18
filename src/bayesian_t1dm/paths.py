@@ -8,6 +8,24 @@ import os
 PROJECT_SLUG = "bayesian-t1dm"
 
 
+def analysis_timezone() -> str:
+    """The timezone all timestamps are stored in (local wall-clock time), from TIMEZONE_NAME.
+
+    Tandem pump times and Apple Health times are both local; storing one of them in UTC shifts it by
+    four or five hours against the other. There is deliberately no default.
+    """
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    name = os.getenv("TIMEZONE_NAME", "").strip()
+    if not name:
+        raise ValueError("Set TIMEZONE_NAME (for example America/New_York) in .env or the environment; timestamps are stored in that local time.")
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"TIMEZONE_NAME={name!r} is not a valid IANA timezone name.") from exc
+    return name
+
+
 @dataclass(frozen=True)
 class ProjectPaths:
     root: Path

@@ -1,341 +1,124 @@
 # Technical Lab Notebook: Bayesian T1DM
 
-**Updated**: April 3, 2026  
-**Branch**: `main`  
-**Project**: Bayesian T1DM (`bayesian-t1dm`)  
-**Purpose**: Technical status notebook for the checked-in `main` branch
+**Updated**: November 17, 2026
+**Purpose**: Scientific status, open problems and roadmap. Commands are in the [README](../README.md); implementation detail is in [technical.md](technical.md). Real-data numbers live in the generated reports, which trace to a run, not in this file.
 
-## Scope Note
+## Contents
 
-This notebook describes what the repository is actually trying to do right now and what the current branch really implements.
+- [Summary](#summary)
+- [What the data contain](#what-the-data-contain)
+- [What has been verified](#what-has-been-verified)
+- [Problems found and fixed](#problems-found-and-fixed)
+- [Structural limits that no code change removes](#structural-limits-that-no-code-change-removes)
+- [Lane status](#lane-status)
+- [Scientific frame and priority cohort](#scientific-frame-and-priority-cohort)
+- [Roadmap](#roadmap)
+- [Decision rules for new work](#decision-rules-for-new-work)
 
-It is not a product roadmap, and it is not a promise that every checked-in workflow is equally important.
+## Summary
 
-The point of this file is to reduce scatter by separating:
+The repository is a personal diabetes research workbench, not a therapy-recommendation product. Its main question is whether the morning insulin-to-carb (I:C) ratio fits how glucose actually responds to logged breakfasts.
 
-- active scientific priorities
-- useful but secondary infrastructure
-- experimental side tracks
-- deferred ideas that should not drive day-to-day work yet
+All real-data results produced before November 17, 2026 are void. Until then the Tandem data were stored in UTC because `TIMEZONE_NAME` was unset and the code fell back to UTC silently, while Apple Health was in local time. Time-of-day segments covered the wrong hours, Apple glucose filled CGM gaps at the wrong times and pump settings were looked up at the wrong hour. `TIMEZONE_NAME` is now required.
 
-## Executive Summary
+## What the data contain
 
-The repository is best understood as a **personal diabetes research workbench**, not a finished therapy-recommendation product.
+- **Pump-entered carbs exist.** Carbs typed into the bolus calculator are on the pump's `LID_BOLUS_REQUESTED_MSG1` event. The t:slim also records the carb ratio there and the correction factor and target on `LID_BOLUS_REQUESTED_MSG2`. The Mobi, bolusing from the phone app, records all three as 0; they are recovered from how its calculator split the bolus (method in [technical.md](technical.md#bolus-calculator-settings)). Each breakfast is judged against the setting in force for it, and the effective I:C is reported per settings period, with the current period as the headline. These carbs are the user's estimates, not weighed truth.
+- **The pump logs its profile history.** Every profile edit (event 68, one segment's start, basal, CF, target and I:C) and every profile switch (event 69) is in the archived raw events, decoded by `pump_profiles.py` (see [technical.md](technical.md#bolus-calculator-settings)). Edits are visible only while the binary archive covers the pump (t:slim January 2024 to September 2025; Mobi August 2025 to April 22, 2026); the tconnectsync 3.x downloads after that carry profile switches but not edits. The history shows frequent switching between Main, Low and Medium on the Mobi in August to September 2025, Main from mid-September 2025 to June 2026, Medium (edited unseen from 8.0 to 7.5 g/U) from June 2026 with a Main interlude on July 26 to 29, and Main again from November 16, 2026.
+- **Logged food from Apple Health** (mostly Bevel; entries that carry protein and fat with the carbs) is matched to breakfasts within 30 minutes. It is supplementary only: the headline stays on pump entries, and two labelled sensitivity analyses (without high fat or protein breakfasts; pump and logged-food carbs combined after rescaling) show whether conclusions move. Whether an entry came from a barcode scan or a photo estimate is not in the export.
+- **CGM** comes only from sensor-reading events, timed by the sensor's measurement clock (`egvTimeStamp`). Readings backfilled after a signal dropout used to pile into one 5-minute slot.
+- **Excluded periods** are listed in `data/raw/context_events.csv` (for example the 14 days after the October 22, 2026 C-spine steroid injection). Breakfasts and overnight periods inside them are a hard exclusion in every analysis.
+- Counts, spans and checks for the current dataset are in `data/merged/validation_report.md`.
 
-The strongest current conclusion is not a therapy setting recommendation. It is a data-truth conclusion:
+## What has been verified
 
-- the current `tconnectsync` Tandem raw archive does **not** appear to contain explicit carbohydrate records
-- the canonical Tandem feature table therefore has `carb_grams == 0` and `meal_event == 0` everywhere unless meal information is supplied from some other source
-- this makes direct recovery of basal, I/C, and sensitivity from observed glucose much harder than the repo originally hoped
+These results come from tests and simulation, not from the personal data.
 
-That does **not** mean the project is blocked completely.
+- The test suite runs without clinical data in CI on Python 3.11 and 3.13.
+- The trajectory-based latent carb estimator recovers simulated carbohydrate. Against meals bolused for a mis-counted amount, bolus x I:C is off by about 17 g on average; the trajectory estimator is off by 2.5 to 9 g in seven of eight scenarios, with 90% intervals that cover truth at least 90% of the time. Reproduce with `bayesian-t1dm validate-latent-meal`.
+- With 20 logged meals, the effective I:C estimator recovers a true ratio of 8 or 12.5 against a programmed 10 to within about 3%.
+- The full command chain runs end to end on a simulated raw tree laid out like the Tandem archive (an automated test).
+- Data-pipeline rewrites for speed were checked to produce identical Tandem tables, Apple Health tables and basal features on the real data.
 
-The current best scientific path is:
+## Problems found and fixed
 
-1. stop pretending meal truth is directly observed
-2. treat meal response as a partially observed latent-signal problem
-3. start with **strict, low-confounding first-meal windows**
-4. estimate **latent meal exposure** and **carb-entry error** before trying to make broad therapy claims
+Each of these changed results; anything computed before the fix should be regenerated, not reused.
 
-## Current North Star
+1. **Timezone.** Tandem times were stored in UTC (see Summary).
+2. **Look-ahead leak in forecast features.** CGM gaps were filled by linear interpolation from the reading at the far end of the gap. The fill is now last-observation-carried-forward.
+3. **Original latent carb estimator was miscalibrated** (about +12 g bias, 55 to 72% interval coverage). It is now only a fallback.
+4. **"Posterior probability better" was not a probability.** It is now the share of paired posterior draws in which a scenario wins.
+5. **Meal-window CGM coverage was overstated**; it is now measured against the rows a complete window should have.
+6. **Pump-entered carbs were thrown away**; they are now read from `LID_BOLUS_REQUESTED_MSG1` and kept only for delivered boluses.
+7. **Tandem Source retired the tconnectsync 2.x endpoints** in mid-2026 (HTTP 403). Collection uses 3.x; windows collected with 2.x keep their event files, which 3.x still decodes.
+8. **The forecast sampler never converged** (R-hat about 2.9). The forecast model is now a regression of glucose 30 minutes ahead on current features with Student-t errors.
+9. **CGM readings took the pump's receipt time**, so backfilled readings collided. They now use sensor time, kept as pump wall-clock time so a daylight-saving change between measurement and receipt cannot move them an hour.
+10. **Pump settings were dated by the window they were archived with.** Every window collected on the same day holds the same current snapshot, so ordering is now by the snapshot's upload time.
+11. **Unreadable timestamps were dropped silently**; they now stop the build.
+12. **Every Mobi breakfast was compared with today's profile.** The Mobi records its calculator settings as 0, so all breakfasts since August 2025 were compared with the snapshot uploaded on the day of the pull (Main, 6.5), while they were dosed at 7.0 and then 7.5 g/U. Settings are now recovered per breakfast, and a breakfast without a usable record takes the setting of the nearest breakfast on the same pump instead of today's profile.
+14. **Review of 94fecbd..HEAD (Opus 5.5, high), fixed:** the profile replay read modification 1 as an insert (it is a delete) and ignored copies and deletes of whole profiles (93 snapshots had duplicate start times; none now, and agreement with the calculator is 99.9%); the carry grouped non-adjacent meals, so a Main to Medium to Main sequence carried Main's values across the switch (now stretches of adjacent meals); per-meal carb estimates used the latest profile's I:C (6.5 for all 693 breakfasts, now each meal's own 5.0 to 8.0); removed raw files and timezone changes did not trigger a rebuild; the fingerprint missed tables the ingest reads; a CGM value of 0 or below, or above 1000, passed plausibility; commands that clear an output folder did so before the analysis. **Open, decided in phase 2:** a settings period breaks whenever a meal's own I:C or CF differs, so 149 of 173 periods have fewer than 5 breakfasts and the current-setting row has one; profile lookup uses carb times rounded down to 5 minutes (9 of about 3,680 entries cross an edit); the largest I:C still sets the plausible-carb ceiling from the latest snapshot.
+13. **Carried settings crossed profile switches.** A breakfast without a usable record took the setting of the nearest breakfast on the same pump, even across a switch to another profile. Checked against the pump's profile history, 36 of 115 carried Mobi correction factors were wrong, and the "7.0 g/U, CF 55, September to October 2025" period was an artifact of one carried value. The profile history now supplies settings where it shows them, and carrying stays within one pump and profile and does not cross the end of visible edits.
 
-The near-term scientific question is:
+## Structural limits that no code change removes
 
-**Can we identify useful meal-response information from the data we actually have, even when explicit carb truth is absent?**
+- **Carbs and I:C are not separately identifiable from glucose.** A post-meal trace identifies `carbs x CF / ICR`. With pump-entered carbs, "my counts run low" and "my I:C is too weak" produce the same trace, so the effective I:C absorbs any systematic carb-counting bias. That is useful clinically (it is the ratio that works with how you count), but it is not the physiological ratio. Weighed or packaged meals break the tie.
+- **Late absorption is invisible.** Carbohydrate that lands after the 180-minute window biases estimates low (about -18 g in a biphasic simulation). This is why high fat or protein breakfasts get a sensitivity analysis.
+- **Closed-loop basal is only approximately accounted for.** Control-IQ changes basal during the post-meal window. The estimator counts delivery above or below a schedule inferred from the median delivery at that time of day, which is right when modulation varies from day to day and wrong when the controller does the same thing most mornings. The residual error on real data is unknown.
+- **Retrospective personal data** support associations, not causal claims about a setting change.
 
-More concretely:
+## Lane status
 
-- can we identify a subset of meals where latent carb exposure is estimable with useful uncertainty bounds?
-- can we score whether an entered or implied carb amount was probably undercalled, overcalled, or roughly consistent with the observed response?
-- can we learn a context-specific effective I/C signal for those high-quality windows only?
+| lane | status |
+| --- | --- |
+| Acquisition and normalization (Tandem, Apple Health) | Runs on real data. A full rebuild takes under a minute and an unchanged check about a second |
+| Merged 5-minute dataset | Runs on real data; validated in `validation_report.md` |
+| Latent meal: breakfast effective I:C | Primary lane. Runs on real data with pump-entered carbs; validated in simulation. Real-data result is in `output/latent_meal/latent_meal_review.html` |
+| Therapy research (overnight basal identifiability) | Runs on real data. Its synthetic "truth recovery" uses frames without meal or insulin dynamics, so it is weaker evidence than the name suggests |
+| Forecast validation | Runs on real data. Kept only as a check on model quality; the answer is on `output/forecast/forecast_review.html` |
+| Forecast-based recommendations | Always suppressed. The scenario math is a sensitivity analysis of a predictive regression, not a causal estimate |
 
-This is a better near-term target than trying to infer all therapy settings globally from all rows.
+## Scientific frame and priority cohort
 
-## Current Branch Reality
+Observed glucose is a response to meals, insulin, basal and closed-loop behaviour, exercise, sleep, stress and measurement gaps. The project does not try to read true carbs off the data. It estimates meal response under uncertainty and suppresses results where a window is too confounded.
 
-The checked-in branch has several real subsystems:
+The priority cohort is the **first meal of the day** with a long fast beforehand, premeal glucose near target, low insulin on board, no recent correction or workout, and enough CGM through the post-meal horizon. It is the least confounded setting in the data and can later calibrate messier meals.
 
-1. **Acquisition and normalization**
-   - `tconnectsync` Tandem Source pulls
-   - raw payload archival
-   - normalized CGM / bolus / basal / activity tables
-   - Apple Health import and overlap-aware dedupe
+## Roadmap
 
-2. **Prepared analysis dataset**
-   - Tandem-aligned 5-minute grid
-   - insulin action and IOB expansion
-   - Apple Health context alignment
-   - rolling, lagged, and calendar features
+### Now: land the real-data pipeline
 
-3. **Forecast validation lane**
-   - walk-forward glucose forecasting
-   - baseline comparison
-   - run summary and review artifacts
+1. Open a pull request for the `real-data-pipeline` branch so CI runs, then merge. Nothing on the branch has been pushed yet.
+2. Read the regenerated pages: they are the first valid real-data results. In particular, check whether the current settings period has enough breakfasts for a headline (the page says "too early to judge" below 5).
 
-4. **Therapy research lane**
-   - segment-level basal / I:C identifiability review
-   - source report cards
-   - model comparison and recommendation suppression
+### Next: make the I:C answer trustworthy
 
-5. **Latent meal research lane**
-   - meal event registry
-   - meal-window extraction
-   - latent carb / effective I:C approximation
-   - confidence and identifiability reporting
+3. **Weighed or packaged breakfasts.** Log about 20 breakfasts with weighed or packaged carbs over 2 to 3 weeks. This is the only way to separate carb-counting bias from the ratio, and it also calibrates Bevel (how far its estimates are from known carbs). Needs a way to mark those meals as weighed, for example a column in `carbs.csv`.
+4. **Keep `context_events.csv` current** (illness, steroids, travel, sensor problems). Excluded periods are the main defence against confounded mornings.
+5. **Travel and time zones.** Storage uses one `TIMEZONE_NAME`. Days spent in another time zone are stored on home time (Tandem) or phone time (Apple Health), which can disagree. Until that is handled, list travel days in `context_events.csv`.
+6. **Decide whether CGM gaps should block anything.** Any multi-year record has 2-hour gaps and a few values outside 40 to 400 mg/dL; the plausibility check currently reports these as "failed", which permanently blocks forecast recommendations. Gaps are already handled per meal window.
+7. **Measure the Control-IQ residual** on real mornings: how often the controller does the same thing most mornings, which is when the basal adjustment is wrong.
 
-These are all real code paths, but they should not all be treated as equal strategic priorities.
+### Later
 
-## What We Know Right Now
+8. Overnight basal evidence from the therapy lane, once the I:C lane is settled.
+9. Decide whether the forecast lane earns its keep. If the model does not beat "glucose stays the same" by the 10% bar on current data, retire it.
+10. Phase E: test whether the clean first-meal estimates transfer to less clean meals, with wider uncertainty.
+11. Housekeeping: `tandem_export_manifest.csv` is written by `collect`, `backfill`, `normalize-raw` and `build-dataset`. It should have one writer, `build-dataset`, and `normalize-raw` may then be unnecessary.
 
-### 1. The Tandem raw archive is not giving us explicit carb truth
+### Explicitly deferred
 
-Current archived `tconnectsync` raw payload families are:
+- global basal optimization as the headline
+- correction-factor inference as a primary target
+- therapy recommendations across all meal contexts
+- claiming exact carb truth for any single bolus
 
-- `activity`
-- `basal`
-- `bolus`
-- `cgm`
-- `pump_event_metadata`
+## Decision rules for new work
 
-The sampled `bolus.json` records currently expose only insulin amount, timestamp, and source-event metadata, not explicit carbohydrate values.
+Ask first: **does this help the clean first-meal I:C program, or is it a side quest?**
 
-Operational implication:
+- Work that improves source truth, missingness semantics or meal-window quality is high priority.
+- Work that improves identifiability of the morning I:C is high priority.
+- Work that only makes dashboards prettier is low priority.
+- Work that assumes recommendations are already trustworthy is premature.
 
-- explicit Tandem carb truth is currently unavailable in the canonical raw source
-
-### 2. The prepared Tandem feature table reflects that absence
-
-In the current runtime outputs, the Tandem source report card shows:
-
-- `carb_grams` all zero
-- `meal_event` all zero
-- `minutes_since_last_meal` all zero
-
-Operational implication:
-
-- the base feature frame should not be interpreted as containing observed meal truth
-
-### 3. Some Health-derived context features were malformed and needed repair
-
-Known fixes already landed:
-
-- workout recency/count windows were repaired
-- plausibility guards were added for workout summaries
-- sparse physiology such as HRV and resting heart rate now carries freshness metadata instead of only silent zero-fill semantics
-
-Operational implication:
-
-- Apple context is still useful, but it must be handled as partially missing and quality-gated
-
-### 4. The repo has been mixing several goals at once
-
-The codebase currently mixes:
-
-- forecasting
-- therapy recommendation support
-- feature engineering diagnostics
-- source auditing
-- latent meal inference
-
-Operational implication:
-
-- without a lab-notebook-style priority structure, the project feels more advanced than it actually is
-
-## Working Scientific Frame
-
-The most useful framing right now is:
-
-**Observed glucose is a mixed response signal generated by latent meal exposure, insulin delivery, basal state, closed-loop behavior, exercise/recovery, sleep, stress, and measurement gaps.**
-
-This means:
-
-- we should stop thinking in terms of “recover the true carbs directly from the table”
-- we should instead think in terms of **latent meal-response deconvolution under uncertainty**
-
-The ABSOLUTE analogy is still helpful at the level of mindset:
-
-- infer hidden contributors from indirect noisy observations
-- quantify uncertainty
-- separate what is observed from what is inferred
-
-The analogy breaks if we pretend glucose is a static mixture problem. It is a dynamic feedback-controlled system.
-
-So the active model worldview should be:
-
-- **hierarchical meal-response estimation**
-- **strict identifiability gating**
-- **honest suppression when the window is too confounded**
-
-## Active Research Priority
-
-The repo should focus on one primary research lane for now:
-
-### Priority 1: Clean First-Meal Meal-Response Windows
-
-Initial target cohort:
-
-- first meal or first meal-like bolus of the day
-- long fasting interval beforehand
-- premeal BG in or near target
-- low premeal IOB
-- little evidence of recent correction activity
-- little evidence of recent workout carryover
-- high enough CGM coverage through the post-meal horizon
-
-Primary estimands for this phase:
-
-- latent meal exposure
-- carb-entry consistency or error score
-- morning first-meal effective I/C, only when identifiable
-
-Why this comes first:
-
-- it is the least confounded setting available in the current data
-- it gives the best chance of learning whether the latent-meal program is scientifically useful
-- it can later serve as training or calibration data for messier meal windows
-
-## Explicitly Deferred For Now
-
-These are not abandoned forever, but they should not be allowed to drive the repo in the next phase:
-
-- global basal optimization as the main headline
-- sensitivity-factor inference as a primary target
-- generalized therapy recommendations across all meal contexts
-- claiming exact meal carb truth for every bolus
-- broad productization of the dashboards as if they are already decision-ready
-
-## How The Pieces Fit Together
-
-```mermaid
-flowchart TD
-    A[Raw Tandem Source via tconnectsync] --> B[Normalized CGM /
-    bolus / basal / activity]
-    H[Apple Health imports] --> C[Prepared 5-min dataset]
-    B --> C
-
-    C --> D[Forecast validation lane]
-    C --> E[Therapy research lane]
-    C --> F[Latent meal research lane]
-
-    D --> D1[Useful for model diagnostics]
-    E --> E1[Useful for identifiability
-     and blocker reports]
-    F --> F1[Current #1 scientific lane]
-
-    F1 --> G[Strict first-meal clean-window cohort]
-    G --> G1[Estimate latent meal exposure]
-    G --> G2[Score carb-entry error]
-    G --> G3[Estimate effective
-    morning I:C 
-    when identifiable]
-
-    G1 --> I[Noisier meal contexts]
-    G2 --> I
-    G3 --> I
-
-    I --> J[Broader therapy recs logic]
-```
-
-## Directional Map
-
-The practical interpretation of the diagram is:
-
-- the forecasting lane stays alive because it catches model-quality failures
-- the therapy research lane stays alive because it reports blockers honestly
-- the latent meal lane becomes the main scientific workstream
-- all broader recommendation logic is downstream of whether the clean-window latent meal program succeeds
-
-## Immediate Work Program
-
-### Phase A: Truthful data semantics
-
-Goals:
-
-- stop letting missing meal truth masquerade as observed zeros
-- mark explicit carb truth as missing or unavailable where appropriate
-- keep source-quality metadata visible in reports
-
-Definition of done:
-
-- the base dataset no longer suggests that all-zero meal features are trustworthy meal observations
-
-### Phase B: Strict first-meal cohort builder
-
-Goals:
-
-- define and materialize a very conservative morning clean-window cohort
-- record inclusion and exclusion reasons
-- quantify how many usable windows actually exist
-
-Definition of done:
-
-- one artifact that tells us exactly how many high-quality first-meal windows are available and why others were rejected
-
-### Phase C: Latent meal exposure model for clean windows
-
-Goals:
-
-- estimate latent meal exposure from bolus plus glucose response
-- use programmed I/C as a prior, not truth
-- output uncertainty and identifiability status
-
-Definition of done:
-
-- meal-level outputs are interpretable as research estimates rather than ad hoc heuristics
-
-### Phase D: Carb-entry error scoring
-
-Goals:
-
-- classify likely undercount / overcount / roughly consistent meal entries when any meal entries exist
-- produce a score that remains useful even when exact truth is unknowable
-
-Definition of done:
-
-- the repo can say something more useful than “carbs are missing” for at least a subset of meal windows
-
-### Phase E: Expansion to less clean windows
-
-Goals:
-
-- test whether a clean-window-trained or clean-window-calibrated model transfers to less ideal meals
-- preserve more aggressive uncertainty and suppression in these noisier settings
-
-Definition of done:
-
-- evidence that the clean-window program generalizes at least somewhat without pretending the noisy meals are equally identifiable
-
-## Decision Rules For New Work
-
-When adding or changing anything in this repo, the first question should be:
-
-**Does this help the clean-window latent meal program, or is it a side quest?**
-
-If it is a side quest, it should usually wait.
-
-Concrete triage rules:
-
-- work that improves source truth, missingness semantics, or meal-window quality is high priority
-- work that improves latent meal identifiability is high priority
-- work that only makes dashboards prettier is low priority
-- work that assumes recommendations are already trustworthy is premature
-- work that broadens scope without improving identifiability should usually be deferred
-
-## Repo Orientation
-
-Use the repo like this:
-
-- `README.md` for onboarding and command entrypoints
-- `docs/technical.md` for lower-level implementation and data-flow notes
-- `docs/TECHNICAL_LAB_NOTEBOOK.md` for scientific direction, branch truth, and active priorities
-
-This notebook should be updated whenever one of these changes:
-
-- the active scientific question
-- the highest-confidence data-truth conclusion
-- the primary research lane
-- the set of explicitly deferred goals
-
-## Current One-Sentence Summary
-
-This repo is currently a **research-first meal-response inference workbench** whose next serious job is to learn what can be identified from strict, low-confounding first-meal windows when explicit Tandem carb truth is absent.
+Update this notebook when the active question, the main data-truth conclusion, the primary lane or the deferred list changes.

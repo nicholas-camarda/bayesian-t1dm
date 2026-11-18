@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
-import shutil
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
@@ -13,8 +13,6 @@ import pandas as pd
 from .evaluate import walk_forward_splits
 from .features import FeatureConfig, build_feature_frame
 from .ingest import IngestedData
-from .io import read_table
-from .paths import ProjectPaths
 
 
 SUPPORTED_POINT_METRICS = {
@@ -27,7 +25,8 @@ SUPPORTED_POINT_METRICS = {
 SUPPORTED_INTERVAL_METRICS = {"sleep_analysis"}
 SUPPORTED_METRICS = SUPPORTED_POINT_METRICS | SUPPORTED_INTERVAL_METRICS | {"heart_rate"}
 SUPPORTED_GLUCOSE_METRICS = {"blood_glucose"}
-EXPORT_ID_PATTERN = re.compile(r"HealthAutoExport_(\d{14})$")
+# Logged food entries (for example from Bevel): one row per entry time with these nutrients in grams.
+NUTRITION_METRICS = {"carbohydrates": "carb_grams", "protein": "protein_grams", "total_fat": "fat_grams"}
 EXPORT_JSON_PATTERN = re.compile(r"HealthAutoExport-(\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2})\.json$")
 
 
@@ -37,22 +36,6 @@ class HealthAutoExportBundle:
     input_dir: Path
     json_path: Path
     gpx_paths: tuple[Path, ...]
-    bundle_timestamp: pd.Timestamp | None
-    source_json_filename: str
-    covered_start_date: pd.Timestamp | None
-    covered_end_date: pd.Timestamp | None
-
-
-@dataclass(frozen=True)
-class HealthAutoExportImportResult:
-    export_id: str
-    raw_json_path: Path
-    raw_gpx_paths: tuple[Path, ...]
-    normalized_paths: dict[str, str]
-    row_counts: dict[str, int]
-    ignored_metrics: tuple[str, ...]
-    glucose_present: bool
-    manifest_path: Path
     bundle_timestamp: pd.Timestamp | None
     source_json_filename: str
     covered_start_date: pd.Timestamp | None
@@ -109,11 +92,22 @@ class HealthFeatureScreeningResult:
     message: str = ""
 
 
-def _parse_timestamp(value: Any) -> pd.Timestamp:
-    parsed = pd.to_datetime(value, errors="coerce")
-    if isinstance(parsed, pd.Timestamp) and parsed.tzinfo is not None:
-        parsed = parsed.tz_localize(None)
-    return parsed
+_UTC_OFFSET_SUFFIX = re.compile(r"\s*(?:Z|[+-]\d{2}:?\d{2})$")
+
+
+def _wall_clock(values: pd.Series) -> pd.Series:
+    """Parse Health Auto Export timestamps such as ``2026-05-01 08:00:00 -0400`` to naive wall-clock time.
+
+    The UTC offset is dropped, keeping the time the phone showed. Missing values become NaT; a value that is
+    present but is not an ISO 8601 timestamp raises ``ValueError``.
+    """
+    text = values.astype("string").str.strip()
+    text = text.mask(text.eq(""))
+    parsed = pd.to_datetime(text.str.replace(_UTC_OFFSET_SUFFIX, "", regex=True), format="ISO8601", errors="coerce")
+    unparsed = text.notna() & parsed.isna()
+    if unparsed.any():
+        raise ValueError(f"{int(unparsed.sum())} Health Auto Export timestamp(s) could not be read, for example {text[unparsed].iloc[0]!r}.")
+    return parsed.astype("datetime64[ns]")
 
 
 def _parse_series(series: pd.Series, *, floor: str | None = None) -> pd.Series:
@@ -125,21 +119,25 @@ def _parse_series(series: pd.Series, *, floor: str | None = None) -> pd.Series:
     return parsed
 
 
-def _safe_float(value: Any) -> float | None:
-    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
-    if pd.isna(numeric):
-        return None
-    return float(numeric)
+def _rows_frame(rows: Iterable[Any], columns: list[str]) -> pd.DataFrame:
+    """The export's list of row objects as a frame with (at least) ``columns``."""
+    return pd.DataFrame([row for row in rows if isinstance(row, dict)]).reindex(columns=columns)
 
 
-def _infer_bundle_timestamp(export_id: str) -> pd.Timestamp | None:
-    match = EXPORT_ID_PATTERN.fullmatch(export_id)
-    if not match:
-        return None
-    parsed = pd.to_datetime(match.group(1), format="%Y%m%d%H%M%S", errors="coerce")
-    if pd.isna(parsed):
-        return None
-    return pd.Timestamp(parsed)
+def _numeric(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce").astype(float)
+
+
+def _source_device(series: pd.Series) -> pd.Series:
+    return series.where(series.notna() & series.astype(bool), "").astype(str)
+
+
+def _nested_qty(series: pd.Series) -> pd.Series:
+    return _numeric(series.map(lambda value: value.get("qty") if isinstance(value, dict) else None))
+
+
+def _nested_units(series: pd.Series) -> pd.Series:
+    return series.map(lambda value: value.get("units") if isinstance(value, dict) else None)
 
 
 def _infer_covered_range(source_json_filename: str) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
@@ -153,157 +151,78 @@ def _infer_covered_range(source_json_filename: str) -> tuple[pd.Timestamp | None
     return start_value, end_value
 
 
-def _discover_bundle_dirs(path: str | Path) -> list[Path]:
-    input_path = Path(path).expanduser().resolve()
-    if input_path.is_file():
-        input_path = input_path.parent
-    if not input_path.exists() or not input_path.is_dir():
-        raise ValueError(f"Health Auto Export input directory does not exist: {input_path}")
-
-    direct_json_paths = sorted(input_path.glob("HealthAutoExport-*.json"))
-    if direct_json_paths:
-        return [input_path]
-
-    child_dirs = sorted(
-        child
-        for child in input_path.iterdir()
-        if child.is_dir() and child.name.startswith("HealthAutoExport_") and any(child.glob("HealthAutoExport-*.json"))
-    )
-    if child_dirs:
-        return child_dirs
-    raise ValueError(f"No HealthAutoExport bundle directories were found under {input_path}")
-
-
-def discover_health_auto_export_bundle(path: str | Path) -> HealthAutoExportBundle:
-    bundle_dirs = _discover_bundle_dirs(path)
-    if len(bundle_dirs) != 1:
-        raise ValueError(f"Expected exactly one Health Auto Export bundle directory, found {len(bundle_dirs)} under {path}")
-
-    input_dir = bundle_dirs[0]
-    json_paths = sorted(input_dir.glob("HealthAutoExport-*.json"))
-    if len(json_paths) != 1:
-        raise ValueError(f"Expected exactly one HealthAutoExport-*.json file in {input_dir}, found {len(json_paths)}")
-
-    gpx_paths = tuple(sorted(input_dir.glob("*.gpx")))
-    source_json_filename = json_paths[0].name
-    covered_start_date, covered_end_date = _infer_covered_range(source_json_filename)
-    return HealthAutoExportBundle(
-        export_id=input_dir.name,
-        input_dir=input_dir,
-        json_path=json_paths[0],
-        gpx_paths=gpx_paths,
-        bundle_timestamp=_infer_bundle_timestamp(input_dir.name),
-        source_json_filename=source_json_filename,
-        covered_start_date=covered_start_date,
-        covered_end_date=covered_end_date,
-    )
-
-
-def discover_health_auto_export_bundles(path: str | Path) -> tuple[HealthAutoExportBundle, ...]:
-    return tuple(discover_health_auto_export_bundle(bundle_dir) for bundle_dir in _discover_bundle_dirs(path))
-
-
-def _copy_artifact(source: Path, destination: Path) -> Path:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if source.resolve() != destination.resolve():
-        shutil.copy2(source, destination)
-    return destination
-
-
 def _normalize_point_metric(metric_name: str, units: str | None, rows: Iterable[dict[str, Any]], *, source_file: str) -> pd.DataFrame:
-    records: list[dict[str, Any]] = []
-    for row in rows:
-        timestamp = _parse_timestamp(row.get("date"))
-        value = _safe_float(row.get("qty"))
-        if pd.isna(timestamp) or value is None:
-            continue
-        records.append(
-            {
-                "timestamp": timestamp,
-                "metric": metric_name,
-                "stat": "value",
-                "value": value,
-                "unit": units,
-                "source_file": source_file,
-                "source_device": str(row.get("source") or ""),
-            }
-        )
-    return pd.DataFrame(records)
+    frame = _rows_frame(rows, ["date", "qty", "source"])
+    out = pd.DataFrame(
+        {
+            "timestamp": _wall_clock(frame["date"]),
+            "metric": metric_name,
+            "stat": "value",
+            "value": _numeric(frame["qty"]),
+            "unit": units,
+            "source_file": source_file,
+            "source_device": _source_device(frame["source"]),
+        }
+    )
+    return out.dropna(subset=["timestamp", "value"]).reset_index(drop=True)
 
 
 def _normalize_glucose_metric(rows: Iterable[dict[str, Any]], *, source_file: str) -> pd.DataFrame:
-    records: list[dict[str, Any]] = []
-    for row in rows:
-        timestamp = _parse_timestamp(row.get("date"))
-        glucose = _safe_float(row.get("qty"))
-        if pd.isna(timestamp) or glucose is None:
-            continue
-        timestamp = timestamp.floor("5min")
-        records.append(
-            {
-                "timestamp": timestamp,
-                "glucose": glucose,
-                "source_file": source_file,
-                "source_label": "apple_health",
-                "glucose_source": "apple_health_blood_glucose",
-                "source_device": str(row.get("source") or ""),
-            }
-        )
-    return pd.DataFrame(records)
+    frame = _rows_frame(rows, ["date", "qty", "source"])
+    out = pd.DataFrame(
+        {
+            "timestamp": _wall_clock(frame["date"]).dt.floor("5min"),
+            "glucose": _numeric(frame["qty"]),
+            "source_file": source_file,
+            "source_label": "apple_health",
+            "glucose_source": "apple_health_blood_glucose",
+            "source_device": _source_device(frame["source"]),
+        }
+    )
+    return out.dropna(subset=["timestamp", "glucose"]).reset_index(drop=True)
 
 
 def _normalize_heart_rate_metric(rows: Iterable[dict[str, Any]], *, units: str | None, source_file: str) -> pd.DataFrame:
-    records: list[dict[str, Any]] = []
-    for row in rows:
-        timestamp = _parse_timestamp(row.get("date"))
-        if pd.isna(timestamp):
-            continue
-        for input_key, stat in [("Avg", "avg"), ("Min", "min"), ("Max", "max")]:
-            value = _safe_float(row.get(input_key))
-            if value is None:
-                continue
-            records.append(
-                {
-                    "timestamp": timestamp,
-                    "metric": "heart_rate",
-                    "stat": stat,
-                    "value": value,
-                    "unit": units,
-                    "source_file": source_file,
-                    "source_device": str(row.get("source") or ""),
-                }
-            )
-    return pd.DataFrame(records)
+    frame = _rows_frame(rows, ["date", "Avg", "Min", "Max", "source"])
+    timestamp = _wall_clock(frame["date"])
+    device = _source_device(frame["source"])
+    parts = [
+        pd.DataFrame(
+            {
+                "_row": range(len(frame)),
+                "_order": order,
+                "timestamp": timestamp,
+                "metric": "heart_rate",
+                "stat": stat,
+                "value": _numeric(frame[input_key]),
+                "unit": units,
+                "source_file": source_file,
+                "source_device": device,
+            }
+        )
+        for order, (input_key, stat) in enumerate([("Avg", "avg"), ("Min", "min"), ("Max", "max")])
+    ]
+    out = pd.concat(parts, ignore_index=True).sort_values(["_row", "_order"], kind="stable")
+    out = out.dropna(subset=["timestamp", "value"]).drop(columns=["_row", "_order"])
+    return out.reset_index(drop=True)
 
 
 def _normalize_sleep_metric(rows: Iterable[dict[str, Any]], *, source_file: str) -> pd.DataFrame:
-    records: list[dict[str, Any]] = []
-    for row in rows:
-        date = _parse_timestamp(row.get("date"))
-        sleep_start = _parse_timestamp(row.get("sleepStart"))
-        sleep_end = _parse_timestamp(row.get("sleepEnd"))
-        in_bed_start = _parse_timestamp(row.get("inBedStart"))
-        in_bed_end = _parse_timestamp(row.get("inBedEnd"))
-        if pd.isna(date):
-            continue
-        records.append(
-            {
-                "date": date.normalize(),
-                "sleep_start": sleep_start,
-                "sleep_end": sleep_end,
-                "in_bed_start": in_bed_start,
-                "in_bed_end": in_bed_end,
-                "total_sleep_hours": _safe_float(row.get("totalSleep")),
-                "in_bed_hours": _safe_float(row.get("inBed")),
-                "core_hours": _safe_float(row.get("core")),
-                "deep_hours": _safe_float(row.get("deep")),
-                "rem_hours": _safe_float(row.get("rem")),
-                "awake_hours": _safe_float(row.get("awake")),
-                "source_file": source_file,
-                "source_device": str(row.get("source") or ""),
-            }
-        )
-    return pd.DataFrame(records)
+    hour_columns = {"total_sleep_hours": "totalSleep", "in_bed_hours": "inBed", "core_hours": "core", "deep_hours": "deep", "rem_hours": "rem", "awake_hours": "awake"}
+    frame = _rows_frame(rows, ["date", "sleepStart", "sleepEnd", "inBedStart", "inBedEnd", *hour_columns.values(), "source"])
+    out = pd.DataFrame(
+        {
+            "date": _wall_clock(frame["date"]).dt.normalize(),
+            "sleep_start": _wall_clock(frame["sleepStart"]),
+            "sleep_end": _wall_clock(frame["sleepEnd"]),
+            "in_bed_start": _wall_clock(frame["inBedStart"]),
+            "in_bed_end": _wall_clock(frame["inBedEnd"]),
+            **{name: _numeric(frame[key]) for name, key in hour_columns.items()},
+            "source_file": source_file,
+            "source_device": _source_device(frame["source"]),
+        }
+    )
+    return out.dropna(subset=["date"]).reset_index(drop=True)
 
 
 def _normalize_activity_from_measurements(measurements: pd.DataFrame, *, source_file: str) -> pd.DataFrame:
@@ -323,33 +242,24 @@ def _normalize_activity_from_measurements(measurements: pd.DataFrame, *, source_
 
 
 def _normalize_workouts(rows: Iterable[dict[str, Any]], *, source_file: str) -> pd.DataFrame:
-    records: list[dict[str, Any]] = []
-    for row in rows:
-        distance = row.get("distance") if isinstance(row.get("distance"), dict) else {}
-        energy = row.get("activeEnergyBurned") if isinstance(row.get("activeEnergyBurned"), dict) else {}
-        avg_hr = row.get("avgHeartRate") if isinstance(row.get("avgHeartRate"), dict) else {}
-        max_hr = row.get("maxHeartRate") if isinstance(row.get("maxHeartRate"), dict) else {}
-        start = _parse_timestamp(row.get("start"))
-        end = _parse_timestamp(row.get("end"))
-        if pd.isna(start) or pd.isna(end):
-            continue
-        records.append(
-            {
-                "workout_id": str(row.get("id") or ""),
-                "workout_type": str(row.get("name") or ""),
-                "start_timestamp": start,
-                "end_timestamp": end,
-                "duration_seconds": _safe_float(row.get("duration")),
-                "distance_value": _safe_float(distance.get("qty")),
-                "distance_unit": distance.get("units"),
-                "active_energy_value": _safe_float(energy.get("qty")),
-                "active_energy_unit": energy.get("units"),
-                "avg_heart_rate": _safe_float(avg_hr.get("qty")),
-                "max_heart_rate": _safe_float(max_hr.get("qty")),
-                "source_file": source_file,
-            }
-        )
-    return pd.DataFrame(records)
+    frame = _rows_frame(rows, ["id", "name", "start", "end", "duration", "distance", "activeEnergyBurned", "avgHeartRate", "maxHeartRate"])
+    out = pd.DataFrame(
+        {
+            "workout_id": _source_device(frame["id"]),
+            "workout_type": _source_device(frame["name"]),
+            "start_timestamp": _wall_clock(frame["start"]),
+            "end_timestamp": _wall_clock(frame["end"]),
+            "duration_seconds": _numeric(frame["duration"]),
+            "distance_value": _nested_qty(frame["distance"]),
+            "distance_unit": _nested_units(frame["distance"]),
+            "active_energy_value": _nested_qty(frame["activeEnergyBurned"]),
+            "active_energy_unit": _nested_units(frame["activeEnergyBurned"]),
+            "avg_heart_rate": _nested_qty(frame["avgHeartRate"]),
+            "max_heart_rate": _nested_qty(frame["maxHeartRate"]),
+            "source_file": source_file,
+        }
+    )
+    return out.dropna(subset=["start_timestamp", "end_timestamp"]).reset_index(drop=True)
 
 
 def _bundle_metadata_columns() -> list[str]:
@@ -367,6 +277,7 @@ def _empty_health_tables() -> dict[str, pd.DataFrame]:
     return {
         "cgm": pd.DataFrame(columns=["timestamp", "glucose", "source_file", "source_label", "glucose_source", "source_device", *metadata_columns]),
         "health_activity": pd.DataFrame(columns=["timestamp", "activity_value", "source_file", "source_device", *metadata_columns]),
+        "nutrition": pd.DataFrame(columns=["timestamp", *NUTRITION_METRICS.values(), "source_file", "source_device", *metadata_columns]),
         "health_measurements": pd.DataFrame(
             columns=["timestamp", "metric", "stat", "value", "unit", "source_file", "source_device", *metadata_columns]
         ),
@@ -438,6 +349,7 @@ def _normalize_health_payload(payload: dict[str, Any], *, source_file: str) -> t
     cgm_frames: list[pd.DataFrame] = []
     measurement_frames: list[pd.DataFrame] = []
     sleep_frames: list[pd.DataFrame] = []
+    nutrition_frames: list[pd.DataFrame] = []
     ignored_metrics: list[str] = []
     glucose_present = False
 
@@ -454,6 +366,19 @@ def _normalize_health_payload(payload: dict[str, Any], *, source_file: str) -> t
             glucose_present = True
             cgm_frames.append(_normalize_glucose_metric(rows, source_file=source_file))
             continue
+        if metric_name in NUTRITION_METRICS:
+            frame = _rows_frame(rows, ["date", "qty", "source"])
+            nutrition_frames.append(
+                pd.DataFrame(
+                    {
+                        "timestamp": _wall_clock(frame["date"]),
+                        "nutrient": NUTRITION_METRICS[metric_name],
+                        "grams": _numeric(frame["qty"]),
+                        "source_device": _source_device(frame["source"]),
+                    }
+                )
+            )
+            continue
         if metric_name in SUPPORTED_POINT_METRICS:
             measurement_frames.append(_normalize_point_metric(metric_name, units, rows, source_file=source_file))
         elif metric_name == "heart_rate":
@@ -469,6 +394,19 @@ def _normalize_health_payload(payload: dict[str, Any], *, source_file: str) -> t
         cgm["glucose"] = pd.to_numeric(cgm["glucose"], errors="coerce")
         cgm = cgm.dropna(subset=["timestamp", "glucose"]).reset_index(drop=True)
         tables["cgm"] = cgm
+
+    if nutrition_frames:
+        long = pd.concat(nutrition_frames, ignore_index=True)
+        long = long.dropna(subset=["timestamp", "grams"])
+        if not long.empty:
+            wide = long.pivot_table(index="timestamp", columns="nutrient", values="grams", aggfunc="sum").reset_index()
+            for column in NUTRITION_METRICS.values():
+                if column not in wide.columns:
+                    wide[column] = np.nan
+            sources = long.groupby("timestamp")["source_device"].first()
+            wide["source_device"] = wide["timestamp"].map(sources)
+            wide["source_file"] = source_file
+            tables["nutrition"] = wide[["timestamp", *NUTRITION_METRICS.values(), "source_file", "source_device"]]
 
     if measurement_frames:
         measurements = pd.concat(measurement_frames, ignore_index=True, sort=False)
@@ -489,130 +427,6 @@ def _normalize_health_payload(payload: dict[str, Any], *, source_file: str) -> t
         tables["workouts"] = _normalize_workouts(workouts, source_file=source_file).reset_index(drop=True)
 
     return tables, tuple(sorted(set(metric for metric in ignored_metrics if metric))), glucose_present
-
-
-def import_health_auto_export(path: str | Path, workspace: ProjectPaths) -> HealthAutoExportImportResult:
-    bundle = discover_health_auto_export_bundle(path)
-    archive_root = workspace.cloud_raw / "health_auto_export" / bundle.export_id
-    raw_root = archive_root / "raw"
-    normalized_root = archive_root / "normalized"
-    raw_root.mkdir(parents=True, exist_ok=True)
-    normalized_root.mkdir(parents=True, exist_ok=True)
-
-    raw_json_path = _copy_artifact(bundle.json_path, raw_root / bundle.json_path.name)
-    raw_gpx_paths = tuple(_copy_artifact(gpx_path, raw_root / gpx_path.name) for gpx_path in bundle.gpx_paths)
-
-    payload = _load_payload(bundle.json_path)
-    tables, ignored_metrics, glucose_present = _normalize_health_payload(payload, source_file=bundle.json_path.name)
-    tables = {kind: _attach_bundle_metadata(frame, bundle) for kind, frame in tables.items()}
-
-    normalized_paths: dict[str, str] = {}
-    row_counts: dict[str, int] = {}
-    for kind, frame in tables.items():
-        if frame.empty:
-            continue
-        filename = "activity.csv" if kind == "health_activity" else f"{kind}.csv"
-        output_path = normalized_root / filename
-        frame.to_csv(output_path, index=False)
-        normalized_paths[kind] = str(output_path)
-        row_counts[kind] = int(len(frame))
-
-    manifest_rows: list[dict[str, Any]] = [
-        {
-            "export_id": bundle.export_id,
-            "kind": "raw_json",
-            "raw_path": str(raw_json_path),
-            "normalized_path": "",
-            "row_count": 0,
-            "ignored_metrics": json.dumps(list(ignored_metrics)),
-            "glucose_present": glucose_present,
-            "bundle_timestamp": bundle.bundle_timestamp,
-            "source_json_filename": bundle.source_json_filename,
-            "covered_start_date": bundle.covered_start_date,
-            "covered_end_date": bundle.covered_end_date,
-        }
-    ]
-    manifest_rows.extend(
-        {
-            "export_id": bundle.export_id,
-            "kind": "raw_gpx",
-            "raw_path": str(path),
-            "normalized_path": "",
-            "row_count": 0,
-            "ignored_metrics": json.dumps(list(ignored_metrics)),
-            "glucose_present": glucose_present,
-            "bundle_timestamp": bundle.bundle_timestamp,
-            "source_json_filename": bundle.source_json_filename,
-            "covered_start_date": bundle.covered_start_date,
-            "covered_end_date": bundle.covered_end_date,
-        }
-        for path in raw_gpx_paths
-    )
-    manifest_rows.extend(
-        {
-            "export_id": bundle.export_id,
-            "kind": kind,
-            "raw_path": str(raw_json_path),
-            "normalized_path": normalized_path,
-            "row_count": row_counts[kind],
-            "ignored_metrics": json.dumps(list(ignored_metrics)),
-            "glucose_present": glucose_present,
-            "bundle_timestamp": bundle.bundle_timestamp,
-            "source_json_filename": bundle.source_json_filename,
-            "covered_start_date": bundle.covered_start_date,
-            "covered_end_date": bundle.covered_end_date,
-        }
-        for kind, normalized_path in normalized_paths.items()
-    )
-    manifest_path = archive_root / "health_auto_export_manifest.csv"
-    pd.DataFrame(manifest_rows).to_csv(manifest_path, index=False)
-
-    return HealthAutoExportImportResult(
-        export_id=bundle.export_id,
-        raw_json_path=raw_json_path,
-        raw_gpx_paths=raw_gpx_paths,
-        normalized_paths=normalized_paths,
-        row_counts=row_counts,
-        ignored_metrics=ignored_metrics,
-        glucose_present=glucose_present,
-        manifest_path=manifest_path,
-        bundle_timestamp=bundle.bundle_timestamp,
-        source_json_filename=bundle.source_json_filename,
-        covered_start_date=bundle.covered_start_date,
-        covered_end_date=bundle.covered_end_date,
-    )
-
-
-def import_health_auto_export_batch(path: str | Path, workspace: ProjectPaths) -> tuple[HealthAutoExportImportResult, ...]:
-    return tuple(import_health_auto_export(bundle.input_dir, workspace) for bundle in discover_health_auto_export_bundles(path))
-
-
-def _coerce_manifest_timestamp(value: Any) -> pd.Timestamp | None:
-    parsed = pd.to_datetime(value, errors="coerce")
-    if pd.isna(parsed):
-        return None
-    if isinstance(parsed, pd.Timestamp) and parsed.tzinfo is not None:
-        parsed = parsed.tz_localize(None)
-    return pd.Timestamp(parsed)
-
-
-def _attach_manifest_metadata(frame: pd.DataFrame, row: dict[str, Any]) -> pd.DataFrame:
-    if frame.empty:
-        return frame
-    out = frame.copy()
-    metadata_defaults = {
-        "export_id": str(row.get("export_id") or ""),
-        "export_timestamp": _coerce_manifest_timestamp(row.get("bundle_timestamp")),
-        "source_json_filename": str(row.get("source_json_filename") or ""),
-        "covered_start_date": _coerce_manifest_timestamp(row.get("covered_start_date")),
-        "covered_end_date": _coerce_manifest_timestamp(row.get("covered_end_date")),
-    }
-    for column, value in metadata_defaults.items():
-        if column not in out.columns:
-            out[column] = value
-        else:
-            out[column] = out[column].where(out[column].notna(), value)
-    return out
 
 
 def _canonicalize_health_table_types(kind: str, frame: pd.DataFrame) -> pd.DataFrame:
@@ -679,6 +493,8 @@ def _dedupe_canonical_health_table(kind: str, frame: pd.DataFrame) -> pd.DataFra
     if kind == "health_activity":
         subset = ["timestamp", "source_device"]
         return out.drop_duplicates(subset=subset, keep="last").reset_index(drop=True)
+    if kind == "nutrition":
+        return out.drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
     if kind == "sleep":
         subset = ["date", "source_device"]
         return out.drop_duplicates(subset=subset, keep="last").reset_index(drop=True)
@@ -687,30 +503,52 @@ def _dedupe_canonical_health_table(kind: str, frame: pd.DataFrame) -> pd.DataFra
     return out.reset_index(drop=True)
 
 
-def load_unified_health_auto_export_tables(raw_dir: str | Path) -> dict[str, pd.DataFrame]:
-    raw_path = Path(raw_dir)
-    tables = _empty_health_tables()
-    if not raw_path.exists():
-        return tables
+def discover_health_export_files(raw_dir: str | Path) -> list[Path]:
+    """Every Health Auto Export JSON under ``<raw>/health_auto_export/``, wherever it was dropped."""
+    root = Path(raw_dir) / "health_auto_export"
+    if not root.exists():
+        return []
+    return sorted(root.rglob("HealthAutoExport-*.json"))
 
-    manifest_files = sorted(raw_path.rglob("health_auto_export_manifest.csv"))
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def load_unified_health_auto_export_tables(raw_dir: str | Path) -> dict[str, pd.DataFrame]:
+    """Read every Apple Health export JSON once and merge them.
+
+    The raw JSON is the source of truth; nothing is copied. Byte-identical files are read once.
+    Where exports overlap, the export covering the later end date wins for each timestamp and device.
+    """
+    tables = _empty_health_tables()
     collected: dict[str, list[pd.DataFrame]] = {key: [] for key in tables}
-    for manifest_path in manifest_files:
-        manifest = pd.read_csv(manifest_path)
-        if "normalized_path" not in manifest.columns or "kind" not in manifest.columns:
+    seen: set[str] = set()
+    for json_path in discover_health_export_files(raw_dir):
+        digest = _file_sha256(json_path)
+        if digest in seen:
             continue
-        for row in manifest.to_dict(orient="records"):
-            kind = str(row.get("kind") or "")
-            normalized_path = str(row.get("normalized_path") or "").strip()
-            if kind not in tables or not normalized_path:
+        seen.add(digest)
+        covered_start, covered_end = _infer_covered_range(json_path.name)
+        bundle = HealthAutoExportBundle(
+            export_id=json_path.stem,
+            input_dir=json_path.parent,
+            json_path=json_path,
+            gpx_paths=(),
+            bundle_timestamp=covered_end,
+            source_json_filename=json_path.name,
+            covered_start_date=covered_start,
+            covered_end_date=covered_end,
+        )
+        normalized, _, _ = _normalize_health_payload(_load_payload(json_path), source_file=json_path.name)
+        for kind, frame in normalized.items():
+            if kind not in collected or frame.empty:
                 continue
-            candidate = Path(normalized_path).expanduser()
-            if not candidate.exists():
-                continue
-            frame = read_table(candidate)
-            frame = _attach_manifest_metadata(frame, row)
-            frame = _canonicalize_health_table_types(kind, frame)
-            collected[kind].append(frame)
+            collected[kind].append(_canonicalize_health_table_types(kind, _attach_bundle_metadata(frame, bundle)))
 
     for kind, frames in collected.items():
         if not frames:

@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import replace, dataclass, field
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 import pandas as pd
 
+from .paths import analysis_timezone
 from .io import coalesce_columns, read_table
 
 
@@ -58,6 +59,8 @@ class IngestedData:
     health_measurements: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
     sleep: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
     workouts: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
+    # Logged food entries from Apple Health (carbs, protein, fat); supplementary, not pump carb truth.
+    nutrition: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
     manifest: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
     source_files: list[Path] = field(default_factory=list)
 
@@ -103,76 +106,42 @@ def discover_source_files(raw_dir: str | Path) -> list[Path]:
     return sorted(discovered)
 
 
-def _parse_datetime(series: pd.Series) -> pd.Series:
-    import os
-    import re
-    import warnings
+_TZ_OFFSET = re.compile(r"(?:Z|[+-]\d{2}:?\d{2})$", re.IGNORECASE)
+
+
+def to_local_wall_clock(series: pd.Series, *, timezone: str | None = None) -> pd.Series:
+    """Parse timestamps to naive wall-clock time in ``timezone`` (default ``TIMEZONE_NAME``).
+
+    Values that carry a UTC offset are converted to that timezone; values without one are already local time.
+    A value that is present but is not an ISO 8601 timestamp raises ``ValueError``.
+    """
     from zoneinfo import ZoneInfo
 
-    raw_values = series.tolist()
-    tz_offset_re = re.compile(r"(Z|[+-]\d{2}:?\d{2})$", re.IGNORECASE)
-    has_tz_hint = False
-    has_naive_hint = False
-    parsed_values: list[pd.Timestamp | pd.NaT] = []
-    for value in raw_values:
-        if value is None or (isinstance(value, float) and np.isnan(value)) or pd.isna(value):
-            parsed_values.append(pd.NaT)
-            continue
-        try:
-            ts = pd.to_datetime(value, errors="coerce", utc=False)
-        except Exception:
-            ts = pd.NaT
-        if pd.isna(ts):
-            parsed_values.append(pd.NaT)
-            continue
-        stamp = pd.Timestamp(ts)
-        if isinstance(value, str):
-            if tz_offset_re.search(value.strip()):
-                has_tz_hint = True
-            else:
-                has_naive_hint = True
-        elif stamp.tzinfo is None:
-            has_naive_hint = True
-        else:
-            has_tz_hint = True
-        parsed_values.append(stamp)
+    target_tz = ZoneInfo(timezone or analysis_timezone())
+    if isinstance(series.dtype, pd.DatetimeTZDtype):
+        return series.dt.tz_convert(target_tz).dt.tz_localize(None).astype("datetime64[ns]")
+    if pd.api.types.is_datetime64_dtype(series):
+        return series.astype("datetime64[ns]")
 
-    timezone_name = os.getenv("TIMEZONE_NAME") or "UTC"
-    try:
-        target_tz = ZoneInfo(timezone_name)
-    except Exception:  # pragma: no cover - defensive guard
-        warnings.warn(
-            f"Invalid TIMEZONE_NAME='{timezone_name}'. Falling back to UTC.",
-            UserWarning,
-            stacklevel=2,
+    text = series.astype("string").str.strip()
+    text = text.mask(text.eq(""))
+    present = text.notna()
+    has_offset = present & text.str.contains(_TZ_OFFSET).fillna(False).astype(bool)
+    local = present & ~has_offset
+    out = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    if local.any():
+        out[local] = pd.to_datetime(text[local], format="ISO8601", errors="coerce")
+    if has_offset.any():
+        converted = pd.to_datetime(text[has_offset], format="ISO8601", utc=True, errors="coerce")
+        out[has_offset] = converted.dt.tz_convert(target_tz).dt.tz_localize(None)
+    unparsed = present & out.isna()
+    if unparsed.any():
+        raise ValueError(
+            f"{int(unparsed.sum())} value(s) in column {series.name!r} are not ISO 8601 timestamps, "
+            f"for example {text[unparsed].iloc[0]!r}."
         )
-        target_tz = ZoneInfo("UTC")
-        timezone_name = "UTC"
+    return out
 
-    if has_tz_hint:
-        if has_naive_hint:
-            warnings.warn(
-                "Mixed timezone-aware and timezone-naive timestamps detected. "
-                f"Assuming naive timestamps are in TIMEZONE_NAME='{timezone_name}' and converting all timestamps "
-                "to that timezone before dropping timezone info.",
-                UserWarning,
-                stacklevel=2,
-            )
-        normalized: list[pd.Timestamp] = []
-        for stamp in parsed_values:
-            if stamp is pd.NaT or pd.isna(stamp):
-                normalized.append(pd.NaT)
-                continue
-            if stamp.tzinfo is None:
-                stamp = stamp.tz_localize(target_tz)
-            else:
-                stamp = stamp.tz_convert(target_tz)
-            normalized.append(stamp.tz_localize(None))
-        return pd.Series(normalized, index=series.index, dtype="datetime64[ns]")
-
-    parsed = pd.Series(parsed_values, index=series.index)
-    naive = pd.to_datetime(parsed, errors="coerce")
-    return pd.Series(naive.to_numpy(dtype="datetime64[ns]"), index=series.index)
 
 def _match_column(columns: Iterable[str], candidate: str) -> str | None:
     normalized = {str(col).strip().lower(): col for col in columns}
@@ -227,6 +196,10 @@ def _coerce_glucose_columns(columns: Iterable[str], *, allow_generic_value: bool
     return selected
 
 
+# A CGM gap this long is reported per window as a data-quality note.
+CGM_LONG_GAP_MINUTES = 120.0
+
+
 def _build_manifest_row(kind: str, frame: pd.DataFrame, source_order: int, source_file: str, source_sheet: str | None = None) -> dict[str, object]:
     timestamps = _infer_timestamp_series(kind, frame).dropna().sort_values()
     unique_timestamps = timestamps.drop_duplicates()
@@ -235,12 +208,16 @@ def _build_manifest_row(kind: str, frame: pd.DataFrame, source_order: int, sourc
     deltas = unique_timestamps.diff().dropna().dt.total_seconds().div(60.0) if len(unique_timestamps) > 1 else pd.Series(dtype=float)
     median_step_minutes = float(deltas.median()) if not deltas.empty else np.nan
     max_step_minutes = float(deltas.max()) if not deltas.empty else np.nan
-    has_duplicates = bool(len(timestamps) != len(unique_timestamps))
-    if kind == "cgm":
-        has_internal_gap = bool(np.isfinite(max_step_minutes) and max_step_minutes > 7.5)
-    else:
-        has_internal_gap = False
-    is_complete_window = bool(pd.notna(first_timestamp) and pd.notna(last_timestamp) and not has_internal_gap)
+    # Identical records; two readings that share a 5-minute timestamp are not duplicates.
+    has_duplicates = bool(frame.duplicated().any())
+    cgm_slot_coverage = np.nan
+    cgm_gaps_ge_2h = 0
+    if kind == "cgm" and pd.notna(first_timestamp) and pd.notna(last_timestamp):
+        slots = int((last_timestamp - first_timestamp) / pd.Timedelta(minutes=5)) + 1
+        cgm_slot_coverage = float(unique_timestamps.dt.floor("5min").nunique() / slots)
+        cgm_gaps_ge_2h = int((deltas >= CGM_LONG_GAP_MINUTES).sum())
+    has_internal_gap = bool(cgm_gaps_ge_2h)
+    is_complete_window = bool(pd.notna(first_timestamp) and pd.notna(last_timestamp))
     return {
         "kind": kind,
         "source_order": int(source_order),
@@ -254,6 +231,8 @@ def _build_manifest_row(kind: str, frame: pd.DataFrame, source_order: int, sourc
         "max_step_minutes": max_step_minutes,
         "has_internal_gap": has_internal_gap,
         "has_duplicates": has_duplicates,
+        "cgm_slot_coverage": cgm_slot_coverage,
+        "cgm_gaps_ge_2h": cgm_gaps_ge_2h,
         "is_complete_window": is_complete_window,
     }
 
@@ -331,6 +310,8 @@ def build_export_manifest(data: IngestedData) -> pd.DataFrame:
                 "max_step_minutes",
                 "has_internal_gap",
                 "has_duplicates",
+                "cgm_slot_coverage",
+                "cgm_gaps_ge_2h",
                 "is_complete_window",
             ]
         )
@@ -477,7 +458,7 @@ def _standardize_cgm(df: pd.DataFrame, source: Path, sheet: str | None = None, *
         rename_map[column] = canonical
     out = df.loc[:, selected_cols].copy()
     out = out.rename(columns=rename_map)
-    out["timestamp"] = _parse_datetime(out["timestamp"])
+    out["timestamp"] = to_local_wall_clock(out["timestamp"])
     for _, column in glucose_cols:
         out[column] = pd.to_numeric(out[column], errors="coerce")
     out["glucose"] = out[[column for _, column in glucose_cols]].bfill(axis=1).iloc[:, 0]
@@ -623,7 +604,7 @@ def _standardize_bolus(df: pd.DataFrame, source: Path, sheet: str | None = None)
     if carb_col is not None:
         rename_map[carb_col] = "carb_grams"
     out = out.rename(columns=rename_map)
-    out["timestamp"] = _parse_datetime(out["timestamp"])
+    out["timestamp"] = to_local_wall_clock(out["timestamp"])
     out["bolus_units"] = pd.to_numeric(out["bolus_units"], errors="coerce")
     if "carb_grams" in out.columns:
         out["carb_grams"] = pd.to_numeric(out["carb_grams"], errors="coerce")
@@ -660,7 +641,7 @@ def _standardize_carbs(df: pd.DataFrame, source: Path, sheet: str | None = None,
         return pd.DataFrame()
     out = df.loc[:, [ts_col, carb_col]].copy()
     out = out.rename(columns={ts_col: "timestamp", carb_col: "carb_grams"})
-    out["timestamp"] = _parse_datetime(out["timestamp"])
+    out["timestamp"] = to_local_wall_clock(out["timestamp"])
     out["carb_grams"] = pd.to_numeric(out["carb_grams"], errors="coerce")
     out = out.dropna(subset=["timestamp", "carb_grams"])
     out["timestamp"] = out["timestamp"].dt.floor("5min")
@@ -703,9 +684,9 @@ def _standardize_basal(df: pd.DataFrame, source: Path, sheet: str | None = None)
         rename_map[end_col] = "end_timestamp"
     out = out.rename(columns=rename_map)
     if "start_timestamp" in out.columns:
-        out["start_timestamp"] = _parse_datetime(out["start_timestamp"])
+        out["start_timestamp"] = to_local_wall_clock(out["start_timestamp"])
     if "end_timestamp" in out.columns:
-        out["end_timestamp"] = _parse_datetime(out["end_timestamp"])
+        out["end_timestamp"] = to_local_wall_clock(out["end_timestamp"])
     out["basal_units_per_hour"] = pd.to_numeric(out["basal_units_per_hour"], errors="coerce")
     out = out.dropna(subset=["basal_units_per_hour"])
     out["source_file"] = source.name
@@ -721,7 +702,7 @@ def _standardize_activity(df: pd.DataFrame, source: Path, sheet: str | None = No
         return pd.DataFrame()
     out = df.loc[:, [ts_col, value_col]].copy()
     out.columns = ["timestamp", "activity_value"]
-    out["timestamp"] = _parse_datetime(out["timestamp"])
+    out["timestamp"] = to_local_wall_clock(out["timestamp"])
     out["activity_value"] = pd.to_numeric(out["activity_value"], errors="coerce")
     out = out.dropna(subset=["timestamp", "activity_value"])
     out["timestamp"] = out["timestamp"].dt.floor("5min")
@@ -742,24 +723,36 @@ def _load_frames(path: Path) -> list[tuple[pd.DataFrame, str | None]]:
     return []
 
 
+MANUAL_CARB_LOG_STEMS = frozenset({"carbs", "carb_log"})
+
+
 def _load_canonical_normalized_table(path: Path) -> tuple[str, pd.DataFrame] | None:
-    if path.parent.name != "normalized":
-        return None
     stem = path.stem.lower()
+    # Pipeline-written tables live in a ``normalized`` directory. A hand-kept carb log
+    # (``carbs.csv`` or ``carb_log.csv`` with timestamp,carb_grams) is accepted from any
+    # directory so that logging meals does not require knowing the archive layout.
+    is_manual_carb_log = stem in MANUAL_CARB_LOG_STEMS
+    if path.parent.name != "normalized" and not is_manual_carb_log:
+        return None
     frame = read_table(path)
     if frame.empty:
         return None
+    if is_manual_carb_log:
+        frame = frame.rename(columns={column: str(column).strip().lower() for column in frame.columns})
+        if not {"timestamp", "carb_grams"} <= set(frame.columns):
+            return None
+        stem = "carbs"
 
     if stem == "cgm" and {"timestamp", "glucose"} <= set(frame.columns):
         out = frame.copy()
-        out["timestamp"] = _parse_datetime(out["timestamp"])
+        out["timestamp"] = to_local_wall_clock(out["timestamp"])
         out["glucose"] = pd.to_numeric(out["glucose"], errors="coerce")
         out = out.dropna(subset=["timestamp", "glucose"]).reset_index(drop=True)
         return "cgm", out
 
     if stem == "bolus" and {"timestamp", "bolus_units"} <= set(frame.columns):
         out = frame.copy()
-        out["timestamp"] = _parse_datetime(out["timestamp"])
+        out["timestamp"] = to_local_wall_clock(out["timestamp"])
         out["bolus_units"] = pd.to_numeric(out["bolus_units"], errors="coerce")
         if "raw_bolus_units" in out.columns:
             out["raw_bolus_units"] = pd.to_numeric(out["raw_bolus_units"], errors="coerce")
@@ -770,22 +763,22 @@ def _load_canonical_normalized_table(path: Path) -> tuple[str, pd.DataFrame] | N
 
     if stem == "basal" and {"start_timestamp", "end_timestamp", "basal_units_per_hour"} <= set(frame.columns):
         out = frame.copy()
-        out["start_timestamp"] = _parse_datetime(out["start_timestamp"])
-        out["end_timestamp"] = _parse_datetime(out["end_timestamp"])
+        out["start_timestamp"] = to_local_wall_clock(out["start_timestamp"])
+        out["end_timestamp"] = to_local_wall_clock(out["end_timestamp"])
         out["basal_units_per_hour"] = pd.to_numeric(out["basal_units_per_hour"], errors="coerce")
         out = out.dropna(subset=["start_timestamp", "end_timestamp", "basal_units_per_hour"]).reset_index(drop=True)
         return "basal", out
 
     if stem == "activity" and {"timestamp", "activity_value"} <= set(frame.columns):
         out = frame.copy()
-        out["timestamp"] = _parse_datetime(out["timestamp"])
+        out["timestamp"] = to_local_wall_clock(out["timestamp"])
         out["activity_value"] = pd.to_numeric(out["activity_value"], errors="coerce")
         out = out.dropna(subset=["timestamp", "activity_value"]).reset_index(drop=True)
         return "activity", out
 
     if stem == "carbs" and {"timestamp", "carb_grams"} <= set(frame.columns):
         out = frame.copy()
-        out["timestamp"] = _parse_datetime(out["timestamp"])
+        out["timestamp"] = to_local_wall_clock(out["timestamp"])
         out["carb_grams"] = pd.to_numeric(out["carb_grams"], errors="coerce")
         out = out.dropna(subset=["timestamp", "carb_grams"]).reset_index(drop=True)
         return "carbs", out
@@ -1023,18 +1016,27 @@ def load_tandem_exports(raw_dir: str | Path, *, include_health_auto_export: bool
             carbs = carbs.drop_duplicates(subset=dedupe_subset, keep="first")
         carbs = carbs.drop(columns=[column for column in ["_carb_source_priority"] if column in carbs.columns])
         ingested.carbs = _dedupe_canonical_events("carbs", carbs.reset_index(drop=True))
-    if include_health_auto_export:
-        from .health_auto_export import load_health_auto_export_tables
-
-        health_tables = load_health_auto_export_tables(raw_path)
-        if not health_tables["cgm"].empty:
-            ingested.cgm = _dedupe_canonical_events("cgm", pd.concat([ingested.cgm, health_tables["cgm"]], ignore_index=True, sort=False))
-        ingested.health_activity = health_tables["health_activity"]
-        ingested.health_measurements = health_tables["health_measurements"]
-        ingested.sleep = health_tables["sleep"]
-        ingested.workouts = health_tables["workouts"]
     ingested.manifest = build_export_manifest(ingested)
+    if include_health_auto_export:
+        return attach_health_auto_export(ingested, raw_path)
     return ingested
+
+
+def attach_health_auto_export(tandem: IngestedData, raw_dir: str | Path) -> IngestedData:
+    """Return a copy of the Tandem data with Apple Health tables added and Apple glucose merged into CGM."""
+    from .health_auto_export import load_health_auto_export_tables
+
+    health_tables = load_health_auto_export_tables(raw_dir)
+    merged = replace(tandem)
+    if not health_tables["cgm"].empty:
+        merged.cgm = _dedupe_canonical_events("cgm", pd.concat([tandem.cgm, health_tables["cgm"]], ignore_index=True, sort=False))
+    merged.health_activity = health_tables["health_activity"]
+    merged.health_measurements = health_tables["health_measurements"]
+    merged.sleep = health_tables["sleep"]
+    merged.workouts = health_tables["workouts"]
+    merged.nutrition = health_tables["nutrition"]
+    merged.manifest = build_export_manifest(merged)
+    return merged
 
 
 def summarize_coverage(data: IngestedData) -> TandemCoverage:

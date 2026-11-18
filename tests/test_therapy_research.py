@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -401,7 +400,7 @@ def test_run_latent_meal_icr_research_builds_explicit_meal_outputs(tmp_path):
     assert not result.first_meal_exclusion_summary.empty
     assert "Latent Meal Research Gate" in result.research_gate_markdown
     assert "Meal Truth Semantics Report" in result.meal_truth_semantics_report_markdown
-    assert "First Meal Clean Window Audit" in result.meal_window_audit_markdown
+    assert "Which Breakfasts Were Used" in result.meal_window_audit_markdown
 
     paths = write_latent_meal_research_artifacts(result, tmp_path / "latent")
     assert paths["research_gate"].exists()
@@ -515,20 +514,32 @@ def test_extract_latent_meal_therapy_settings_from_tandem_pump_metadata(tmp_path
     assert settings.correction_factor_mgdl_per_unit["evening"] == pytest.approx((60.0 * 48 + 58.0 * 36) / 84)
 
 
+def _with_physical_iob(dataset: AnalysisReadyHealthDataset) -> AnalysisReadyHealthDataset:
+    """Recompute IOB from the bolus column so insulin bookkeeping is self-consistent."""
+    from bayesian_t1dm.insulin import expand_bolus_series_to_grid
+
+    frame = dataset.frame.copy()
+    exposure = expand_bolus_series_to_grid(frame[["timestamp", "bolus_units"]])
+    frame["iob_units"] = exposure["iob_units"].to_numpy()
+    frame["insulin_activity_units"] = exposure["insulin_activity_units"].to_numpy()
+    return replace(dataset, frame=frame)
+
+
 def test_latent_carb_estimator_directionality_with_insulin_and_glucose_response():
-    base = _build_clean_first_meal_dataset(apple=False, explicit_carbs=False)
+    base = _with_physical_iob(_build_clean_first_meal_dataset(apple=False, explicit_carbs=False))
     base_median = _first_latent_carb_median(base)
 
     more_insulin_frame = base.frame.copy()
     bolus_mask = pd.to_numeric(more_insulin_frame["bolus_units"], errors="coerce").fillna(0.0).gt(0)
     more_insulin_frame.loc[bolus_mask, "bolus_units"] *= 1.5
-    more_insulin_median = _first_latent_carb_median(replace(base, frame=more_insulin_frame))
+    more_insulin_median = _first_latent_carb_median(_with_physical_iob(replace(base, frame=more_insulin_frame)))
 
     larger_response_frame = base.frame.copy()
     timestamps = pd.to_datetime(larger_response_frame["timestamp"], errors="coerce")
     for meal_time in timestamps.loc[bolus_mask]:
-        response_mask = timestamps.ge(meal_time) & timestamps.le(meal_time + pd.Timedelta(minutes=180))
-        larger_response_frame.loc[response_mask, "glucose"] += 25.0
+        response_mask = timestamps.gt(meal_time) & timestamps.le(meal_time + pd.Timedelta(minutes=180))
+        minutes_after = (timestamps.loc[response_mask] - meal_time).dt.total_seconds() / 60.0
+        larger_response_frame.loc[response_mask, "glucose"] += 40.0 * np.clip(minutes_after / 90.0, 0.0, 1.0)
     larger_response_median = _first_latent_carb_median(replace(base, frame=larger_response_frame))
 
     assert more_insulin_median > base_median
@@ -693,7 +704,7 @@ def test_latent_meal_tiered_window_registry_preserves_clean_gate_and_marks_relax
 def test_research_therapy_settings_cli_writes_artifacts(tmp_path, monkeypatch):
     dataset = _build_prepared_dataset(apple=True)
     preparation = SimpleNamespace(dataset=dataset)
-    monkeypatch.setattr(cli, "_prepare_model_data", lambda args, paths, session=None: preparation)
+    monkeypatch.setattr(cli, "_load_dataset", lambda args, session=None: SimpleNamespace(preparation=preparation, data=SimpleNamespace(nutrition=pd.DataFrame())))
 
     report_dir = tmp_path / "reports"
     exit_code = main(
@@ -731,3 +742,174 @@ def test_validate_therapy_infra_reports_scenarios():
     assert not result.scenario_results.empty
     assert {"basal_direction", "explicit_icr", "proxy_only_icr", "apple_helpful", "apple_null", "corrupted", "low_identifiability"}.issubset(set(result.scenario_results["scenario"]))
     assert "Therapy Infrastructure Validation" in result.report_markdown
+
+
+def test_first_meal_window_coverage_counts_rows_missing_from_the_frame():
+    from bayesian_t1dm.therapy_research import build_first_meal_clean_window_registry, build_therapy_research_frame
+
+    dataset = _build_clean_first_meal_dataset(apple=False, explicit_carbs=False)
+    complete = build_first_meal_clean_window_registry(build_therapy_research_frame(dataset, segments=parse_therapy_segments()))
+    assert not complete.empty
+    first = complete.sort_values("timestamp").iloc[0]
+    assert first["cgm_coverage_fraction"] == pytest.approx(1.0)
+
+    # Remove 40 minutes of rows right after the first meal, as the prepared frame does when
+    # a CGM gap leaves those rows without a forecast target. No remaining row is flagged
+    # missing_cgm, so only a row count can reveal the hole.
+    timestamps = pd.to_datetime(dataset.frame["timestamp"])
+    meal_time = pd.Timestamp(first["timestamp"])
+    hole = timestamps.gt(meal_time + pd.Timedelta(minutes=20)) & timestamps.le(meal_time + pd.Timedelta(minutes=60))
+    gappy = replace(dataset, frame=dataset.frame.loc[~hole].reset_index(drop=True))
+    windows = build_first_meal_clean_window_registry(build_therapy_research_frame(gappy, segments=parse_therapy_segments()))
+    affected = windows.loc[pd.to_datetime(windows["timestamp"]).eq(meal_time)].iloc[0]
+
+    assert affected["cgm_coverage_fraction"] < 0.9
+    assert int(affected["missing_cgm_first_90m"]) == 1
+    assert {"poor_cgm_coverage", "missing_cgm_first_90m"}.issubset(set(str(affected["exclusion_reasons"]).split("|")))
+    assert int(affected["included"]) == 0
+
+
+def _basal_modulation_frame(days: int = 10) -> pd.DataFrame:
+    timestamps = pd.date_range("2025-03-01 00:00:00", periods=days * 288, freq="5min")
+    hour = timestamps.hour
+    scheduled_rate = np.where(hour < 6, 0.6, np.where(hour < 12, 0.9, 0.8))
+    frame = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "glucose": 110.0,
+            "missing_cgm": 0,
+            "bolus_units": 0.0,
+            "iob_units": 0.0,
+            "basal_units_delivered": scheduled_rate * 5.0 / 60.0,
+        }
+    )
+    return frame
+
+
+def test_scheduled_basal_is_recovered_despite_one_day_of_modulation():
+    from bayesian_t1dm.therapy_research import _scheduled_basal_units_per_row
+
+    frame = _basal_modulation_frame()
+    timestamps = frame["timestamp"]
+    truth = frame["basal_units_delivered"].copy()
+    modulated = timestamps.ge("2025-03-05 08:00") & timestamps.lt("2025-03-05 10:00")
+    frame.loc[modulated, "basal_units_delivered"] = 3.0 * 5.0 / 60.0
+
+    schedule = _scheduled_basal_units_per_row(frame)
+
+    np.testing.assert_allclose(schedule.to_numpy(), truth.to_numpy(), atol=1e-9)
+
+
+def test_scheduled_basal_is_nan_without_enough_comparable_days():
+    from bayesian_t1dm.therapy_research import _scheduled_basal_units_per_row
+
+    assert _scheduled_basal_units_per_row(_basal_modulation_frame(days=3)).isna().all()
+
+
+def test_window_trajectory_counts_bolus_decay_and_basal_above_schedule():
+    from bayesian_t1dm.insulin import expand_bolus_series_to_grid
+    from bayesian_t1dm.latent_meal_trajectory import absorbed_units_from_deliveries
+    from bayesian_t1dm.therapy_research import _first_meal_window_trajectories
+
+    frame = _basal_modulation_frame()
+    meal_time = pd.Timestamp("2025-03-05 08:00")
+    timestamps = frame["timestamp"]
+    frame.loc[timestamps.eq(meal_time), "bolus_units"] = 4.0
+    frame["iob_units"] = expand_bolus_series_to_grid(frame[["timestamp", "bolus_units"]])["iob_units"].to_numpy()
+    window_metrics = pd.DataFrame({"meal_id": ["m1"], "timestamp": [meal_time]})
+
+    bolus_only = _first_meal_window_trajectories(frame, window_metrics)["m1"]
+    assert bolus_only.insulin_absorbed_units[0] == pytest.approx(0.0, abs=1e-9)
+    assert 3.0 < bolus_only.insulin_absorbed_units[-1] < 4.0  # most, not all, of 4 U by 180 min
+
+    # The controller doubles basal for the first hour after the meal on this day only.
+    boosted = timestamps.ge(meal_time) & timestamps.lt(meal_time + pd.Timedelta(minutes=60))
+    frame.loc[boosted, "basal_units_delivered"] *= 2.0
+    with_basal = _first_meal_window_trajectories(frame, window_metrics)["m1"]
+
+    extra_units = np.full(12, 0.9 * 5.0 / 60.0)
+    expected_extra = absorbed_units_from_deliveries(np.arange(0.0, 60.0, 5.0), extra_units, with_basal.minutes)
+    np.testing.assert_allclose(with_basal.insulin_absorbed_units - bolus_only.insulin_absorbed_units, expected_extra, atol=1e-6)
+    assert expected_extra[-1] > 0.5
+
+
+def test_window_trajectory_is_skipped_when_iob_bookkeeping_is_inconsistent():
+    from bayesian_t1dm.therapy_research import _first_meal_window_trajectories
+
+    frame = _basal_modulation_frame()
+    meal_time = pd.Timestamp("2025-03-05 08:00")
+    frame.loc[frame["timestamp"].eq(meal_time), "bolus_units"] = 4.0
+    # IOB that rises with no bolus behind it: absorbed insulin would have to go negative.
+    frame.loc[frame["timestamp"].gt(meal_time), "iob_units"] = 2.0
+
+    assert _first_meal_window_trajectories(frame, pd.DataFrame({"meal_id": ["m1"], "timestamp": [meal_time]})) == {}
+
+
+def test_settings_come_from_the_newest_window_including_tconnectsync_3_pumper_json(tmp_path):
+    """Windows from tconnectsync 3.x store settings in pumper.json; the newest window wins over older 2.x snapshots."""
+    old_dir = tmp_path / "raw" / "tconnectsync" / "2026-03-02__2026-03-31" / "raw"
+    old_dir.mkdir(parents=True)
+    (old_dir / "pump_event_metadata.json").write_text(json.dumps(_pump_event_metadata_payload()), encoding="utf-8")
+    new_dir = tmp_path / "raw" / "tconnectsync" / "2026-10-19__2026-11-17" / "raw"
+    new_dir.mkdir(parents=True)
+    segments = [
+        {"startTime": 0, "basalRate": 700, "carbRatio": 7000, "targetBg": 110, "isf": 60, "status": []},
+        {"startTime": 300, "basalRate": 710, "carbRatio": 6500, "targetBg": 110, "isf": 65, "status": []},
+        {"startTime": 900, "basalRate": 710, "carbRatio": 6800, "targetBg": 110, "isf": 60, "status": []},
+    ]
+    pumper = {
+        "requested_end": "2026-11-17",
+        "selected_pump_serials": ["1453346", "90723647"],
+        "pumper": {
+            "pumps": [
+                {
+                    "serialNumber": "1453346",
+                    "settings": {
+                        "uploadedTimeStamp": "2026-11-17T14:29:57Z",
+                        "details": {
+                            "profiles": {
+                                "activeIdp": 0,
+                                "profile": [{"idp": 0, "name": "Main", "insulinDuration": 300, "maxBolus": 25000, "timeDependentSegments": segments}],
+                            },
+                            "globalMaxBolusSettings": {"maxBolus": 25000},
+                        },
+                    },
+                },
+                # A second pump used in the same window, listed later but uploaded earlier: the newest upload wins.
+                {
+                    "serialNumber": "90723647",
+                    "settings": {
+                        "uploadedTimeStamp": "2025-08-27T16:04:01.73",
+                        "details": {"profiles": {"activeIdp": 0, "profile": [{"idp": 0, "timeDependentSegments": [{"startTime": 0, "carbRatio": 9000, "isf": 80, "targetBg": 110}]}]}},
+                    },
+                },
+                # A pump not selected for this window is ignored even if it has settings.
+                {"serialNumber": "849064", "settings": {"details": {"profiles": {"activeIdp": 0, "profile": [{"idp": 0, "timeDependentSegments": [{"startTime": 0, "carbRatio": 20000, "isf": 90, "targetBg": 120}]}]}}}},
+            ]
+        },
+    }
+    (new_dir / "pumper.json").write_text(json.dumps(pumper), encoding="utf-8")
+
+    settings = extract_latent_meal_therapy_settings_from_tandem_raw(tmp_path / "raw", segments=parse_therapy_segments())
+
+    # Morning (06:00-11:00) falls in the 05:00 segment of the newest window: 6.5 g/U, not the old 7.0.
+    assert settings.icr_grams_per_unit["morning"] == pytest.approx(6.5)
+    assert settings.correction_factor_mgdl_per_unit["morning"] == pytest.approx(65.0)
+
+
+def test_rows_in_an_excluded_period_never_count_as_clean_basal_time():
+    from bayesian_t1dm.therapy_research import ExcludedPeriod, build_therapy_research_frame
+
+    dataset = _synthetic_base_dataset(apple=False, explicit_carbs=True)
+    stamps = pd.to_datetime(dataset.frame["timestamp"])
+    day = stamps.dt.normalize().iloc[len(stamps) // 2]
+    period = ExcludedPeriod(start=day, end=day + pd.Timedelta(days=1) - pd.Timedelta(seconds=1), reason="steroid injection")
+
+    without = build_therapy_research_frame(dataset)
+    with_exclusion = build_therapy_research_frame(dataset, excluded_periods=(period,))
+    inside = pd.to_datetime(with_exclusion["timestamp"]).dt.normalize().eq(day)
+
+    assert without.loc[inside, "basal_context"].sum() > 0, "the test day must have clean basal time to exclude"
+    assert with_exclusion.loc[inside, "basal_context"].sum() == 0
+    assert with_exclusion.loc[inside, "context_event_excluded"].eq(1).all()
+    pd.testing.assert_series_equal(with_exclusion.loc[~inside, "basal_context"], without.loc[~inside, "basal_context"])

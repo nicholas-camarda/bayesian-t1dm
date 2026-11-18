@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -37,8 +36,7 @@ class _PerfectFutureModel:
 def test_realistic_14d_fixture_supports_integration_pipeline(monkeypatch, tandem_realistic_fixture_dir, tmp_path):
     monkeypatch.setenv("TIMEZONE_NAME", "America/New_York")
 
-    with pytest.warns(UserWarning, match="Mixed timezone-aware"):
-        data = load_tandem_exports(tandem_realistic_fixture_dir)
+    data = load_tandem_exports(tandem_realistic_fixture_dir)
 
     coverage = summarize_coverage(data)
     assert coverage.cgm_rows > 3000

@@ -4,7 +4,7 @@ from collections import Counter
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -12,13 +12,13 @@ import pandas as pd
 
 REQUIRED_WINDOW_KINDS: tuple[str, ...] = ("cgm", "bolus", "basal")
 OPTIONAL_WINDOW_KINDS: tuple[str, ...] = ("activity", "carbs")
+# A window is incomplete only when its download misses requested days or a required data type.
+# CGM gaps, repeated timestamps, overlap with neighbouring windows and rows outside the requested
+# dates are data properties, recorded per window (cgm_slot_coverage, cgm_gaps_ge_2h) but not failures.
 QUALITY_REASON_ORDER: tuple[str, ...] = (
     "missing_kind",
     "starts_late",
     "ends_early",
-    "internal_gap",
-    "duplicates",
-    "overlap",
 )
 
 
@@ -73,9 +73,6 @@ def ordered_completeness_reasons(
     observed_last_timestamp: Any,
     row_count: int,
     required: bool,
-    has_internal_gap: bool = False,
-    has_duplicates: bool = False,
-    has_overlap: bool = False,
 ) -> list[str]:
     reasons: list[str] = []
     requested_start_date = pd.Timestamp(requested_start).date() if requested_start else None
@@ -89,12 +86,6 @@ def ordered_completeness_reasons(
         reasons.append("starts_late")
     if requested_end_date is not None and not pd.isna(observed_last) and observed_last.date() < requested_end_date:
         reasons.append("ends_early")
-    if has_internal_gap:
-        reasons.append("internal_gap")
-    if has_duplicates:
-        reasons.append("duplicates")
-    if has_overlap:
-        reasons.append("overlap")
 
     ordered: list[str] = []
     seen: set[str] = set()
@@ -150,9 +141,6 @@ def build_window_quality_row(
         observed_last_timestamp=observed_last_timestamp,
         row_count=row_count,
         required=required,
-        has_internal_gap=has_internal_gap,
-        has_duplicates=has_duplicates,
-        has_overlap=has_overlap,
     )
 
     row = {
@@ -250,7 +238,7 @@ def _read_window_quality_rows(raw_dir: str | Path) -> pd.DataFrame:
                         "provenance_manifest": "window",
                         **{
                             key: row.get(key)
-                            for key in ["timezone", "rejected_row_count"]
+                            for key in ["timezone", "rejected_row_count", "cgm_slot_coverage", "cgm_gaps_ge_2h"]
                             if key in row and not pd.isna(row.get(key))
                         },
                     },
@@ -268,14 +256,7 @@ def _fallback_quality_rows_from_export_manifest(
     rows: list[dict[str, Any]] = []
     for row in export_manifest.to_dict(orient="records"):
         source_file = str(row.get("source_file") or "raw")
-        reasons: list[str] = []
-        if _coerce_bool(row.get("has_internal_gap")):
-            reasons.append("internal_gap")
-        if _coerce_bool(row.get("has_duplicates")):
-            reasons.append("duplicates")
-        if not _coerce_bool(row.get("is_complete_window", True)):
-            if not reasons:
-                reasons.append("ends_early")
+        reasons: list[str] = [] if _coerce_bool(row.get("is_complete_window", True)) else ["ends_early"]
         quality_row = {
             "window_id": source_file,
             "requested_start": _iso_or_none(row.get("first_timestamp")),
@@ -339,10 +320,6 @@ def assess_data_quality(
         requires_timezone = "provenance_manifest" in window_rows.columns and window_rows["provenance_manifest"].astype(str).eq("window").any()
         if requires_timezone and ("timezone" not in window_rows.columns or window_rows["timezone"].isna().all()):
             window_reasons.add("missing_timezone_provenance")
-        if "rejected_row_count" in window_rows.columns:
-            rejected_rows = pd.to_numeric(window_rows["rejected_row_count"], errors="coerce").fillna(0).sum()
-            if rejected_rows > 0:
-                window_reasons.add("out_of_window_rows_rejected")
         if window_reasons:
             incomplete_windows.add(str(window_id))
             aggregated_reasons.update(window_reasons)
@@ -371,8 +348,17 @@ def assess_data_quality(
     )
 
 
+# Counted and reported, but not a failure: any long CGM record has gaps and readings at the sensor's limits,
+# and the meal and overnight analyses exclude gaps window by window.
+REPORTED_NOT_FAILED_PLAUSIBILITY_REASONS = frozenset({"cgm_gap_ge_120m_rows", "invalid_cgm_rows"})
+
+
 def assess_prepared_feature_plausibility(frame: pd.DataFrame) -> tuple[str, dict[str, int]]:
-    """Assess model-ready feature values for physiologically impossible inputs."""
+    """Count implausible or notable values in the model-ready frame.
+
+    Returns ("failed" when any physiologically impossible value is present, else "good", counts by reason).
+    CGM gaps and readings outside 40 to 400 mg/dL are counted but do not fail the check.
+    """
     reasons: Counter[str] = Counter()
     if frame.empty:
         reasons["prepared_frame_empty"] += 1
@@ -394,7 +380,9 @@ def assess_prepared_feature_plausibility(frame: pd.DataFrame) -> tuple[str, dict
     if "glucose_observed" in frame.columns:
         glucose = pd.to_numeric(frame["glucose_observed"], errors="coerce")
         observed = glucose.dropna()
-        reasons["invalid_cgm_rows"] += int((observed.lt(40.0) | observed.gt(400.0)).sum())
+        # Readings at the sensor's limits (below 40, above 400) are reported; a value no sensor could return fails.
+        reasons["impossible_cgm_rows"] += int((observed.le(0.0) | observed.gt(1000.0)).sum())
+        reasons["invalid_cgm_rows"] += int(((observed.lt(40.0) | observed.gt(400.0)) & observed.gt(0.0) & observed.le(1000.0)).sum())
 
     if "cgm_invalid" in frame.columns:
         reasons["invalid_cgm_rows"] += int(pd.to_numeric(frame["cgm_invalid"], errors="coerce").fillna(0.0).gt(0).sum())
@@ -404,4 +392,5 @@ def assess_prepared_feature_plausibility(frame: pd.DataFrame) -> tuple[str, dict
         reasons["cgm_gap_ge_120m_rows"] += int(gaps.ge(120.0).sum())
 
     clean_reasons = {key: int(value) for key, value in sorted(reasons.items()) if int(value) > 0}
-    return ("good" if not clean_reasons else "failed"), clean_reasons
+    failed = any(reason not in REPORTED_NOT_FAILED_PLAUSIBILITY_REASONS for reason in clean_reasons)
+    return ("failed" if failed else "good"), clean_reasons

@@ -43,7 +43,10 @@ def test_build_feature_frame_tracks_cgm_gaps_and_drops_imputed_targets():
     row = frame.frame.loc[frame.frame["timestamp"] == pd.Timestamp("2023-06-01 00:20:00")].iloc[0]
 
     assert pd.isna(row["glucose_observed"])
-    assert row["glucose"] == pytest.approx(120.0)
+    # Causal fill: the gap row carries the last reading (100 at 00:00) forward. Linear
+    # interpolation would give 120 here by peeking at the 00:25 reading, which is this
+    # row's own forecast target.
+    assert row["glucose"] == pytest.approx(100.0)
     assert row["missing_cgm"] == 1
     assert row["minutes_since_last_cgm"] == pytest.approx(20.0)
     assert row["cgm_gap_ge_10m"] == 1
@@ -152,3 +155,51 @@ def test_build_feature_frame_warns_when_tconnectsync_has_no_explicit_carb_record
         frame = build_feature_frame(data, FeatureConfig(horizon_minutes=5))
 
     assert not frame.frame.empty
+
+
+def _gap_data() -> IngestedData:
+    return IngestedData(
+        cgm=_frame(
+            {
+                "timestamp": pd.to_datetime(["2023-06-01 00:00:00", "2023-06-01 00:25:00", "2023-06-01 00:30:00"]),
+                "glucose": [100.0, 125.0, 130.0],
+                "source_file": ["fixture.csv"] * 3,
+            }
+        ),
+    )
+
+
+def _gap_config(**overrides) -> FeatureConfig:
+    return FeatureConfig(
+        horizon_minutes=5,
+        cgm_lags=(5,),
+        rolling_windows_minutes=(30,),
+        activity_windows_minutes=(30,),
+        carb_windows_minutes=(30,),
+        **overrides,
+    )
+
+
+def test_default_cgm_fill_never_uses_readings_after_the_row_timestamp():
+    with pytest.warns(UserWarning):
+        frame = build_feature_frame(_gap_data(), _gap_config()).frame
+
+    gap_rows = frame.loc[frame["missing_cgm"] == 1]
+    assert not gap_rows.empty
+    # Every gap row sits between the 100 reading and the 125 reading; a causal fill can
+    # only ever report the earlier one.
+    assert gap_rows["glucose"].eq(100.0).all()
+    assert gap_rows["glucose_lag_5m"].eq(100.0).all()
+
+
+def test_linear_cgm_fill_remains_available_for_retrospective_use():
+    with pytest.warns(UserWarning):
+        frame = build_feature_frame(_gap_data(), _gap_config(cgm_fill_method="linear")).frame
+
+    row = frame.loc[frame["timestamp"] == pd.Timestamp("2023-06-01 00:20:00")].iloc[0]
+    assert row["glucose"] == pytest.approx(120.0)
+
+
+def test_unknown_cgm_fill_method_is_rejected():
+    with pytest.warns(UserWarning), pytest.raises(ValueError, match="cgm_fill_method"):
+        build_feature_frame(_gap_data(), _gap_config(cgm_fill_method="spline"))

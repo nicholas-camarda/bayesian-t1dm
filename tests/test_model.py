@@ -9,7 +9,7 @@ import pytest
 arviz = pytest.importorskip("arviz")
 import xarray as xr
 
-from bayesian_t1dm.features import FeatureConfig, build_feature_frame
+from bayesian_t1dm.features import FeatureConfig, FeatureFrame, build_feature_frame
 from bayesian_t1dm.ingest import load_tandem_exports
 from bayesian_t1dm.model import BayesianGlucoseModel, ModelFit, extract_fit_diagnostics
 
@@ -27,9 +27,6 @@ def test_predict_uses_posterior_samples(tandem_fixture_dir):
             {
                 "intercept": (("chain", "draw"), np.array([[0.0, 0.2]])),
                 "beta": (("chain", "draw", "beta_dim_0"), np.array([[[0.1, -0.1], [0.2, -0.2]]])),
-                "latent": (("chain", "draw", "latent_dim_0"), np.array([[[0.0, 0.1, 0.2], [0.1, 0.0, -0.1]]])),
-                "rho": (("chain", "draw"), np.array([[0.9, 0.8]])),
-                "sigma_state": (("chain", "draw"), np.array([[0.1, 0.1]])),
                 "sigma_obs": (("chain", "draw"), np.array([[1.0, 1.0]])),
             }
         )
@@ -53,7 +50,7 @@ def test_predict_uses_posterior_samples(tandem_fixture_dir):
     assert prediction["upper"].ge(prediction["lower"]).all()
 
 
-def _make_minimal_fit(*, sigma_obs: float, sigma_state: float = 0.0) -> ModelFit:
+def _make_minimal_fit(*, sigma_obs: float) -> ModelFit:
     feature_columns = ["x"]
     feature_means = pd.Series({"x": 0.0})
     feature_scales = pd.Series({"x": 1.0})
@@ -62,9 +59,6 @@ def _make_minimal_fit(*, sigma_obs: float, sigma_state: float = 0.0) -> ModelFit
             {
                 "intercept": (("chain", "draw"), np.array([[0.0, 0.0, 0.0]])),
                 "beta": (("chain", "draw", "beta_dim_0"), np.array([[[0.0], [0.0], [0.0]]])),
-                "latent": (("chain", "draw", "latent_dim_0"), np.array([[[0.0], [0.0], [0.0]]])),
-                "rho": (("chain", "draw"), np.array([[0.0, 0.0, 0.0]])),
-                "sigma_state": (("chain", "draw"), np.array([[sigma_state, sigma_state, sigma_state]])),
                 "sigma_obs": (("chain", "draw"), np.array([[sigma_obs, sigma_obs, sigma_obs]])),
             }
         )
@@ -92,15 +86,29 @@ def test_predict_intervals_widen_with_sigma_obs():
     assert float((wide["upper"] - wide["lower"]).mean()) > 0.0
 
 
-def test_predict_intervals_widen_with_state_innovation():
-    features = pd.DataFrame({"x": np.zeros(5, dtype=float)})
-    model = BayesianGlucoseModel(draws=10, tune=10, chains=1, random_seed=123)
+def test_fit_recovers_a_known_linear_relation_on_all_cores():
+    rng = np.random.default_rng(0)
+    n = 600
+    glucose = rng.normal(140.0, 40.0, n)
+    iob = rng.gamma(2.0, 1.0, n)
+    target = 15.0 + 0.9 * glucose - 6.0 * iob + rng.normal(0.0, 5.0, n)
+    frame = FeatureFrame(
+        frame=pd.DataFrame({"glucose": glucose, "iob_units": iob, "target_glucose": target}),
+        feature_columns=["glucose", "iob_units"],
+        target_column="target_glucose",
+        horizon_minutes=30,
+        config=FeatureConfig(horizon_minutes=30),
+    )
+    model = BayesianGlucoseModel(draws=300, tune=300, chains=2, random_seed=1)
+    fit = model.fit(frame)
 
-    narrow = model.predict(_make_minimal_fit(sigma_obs=0.0, sigma_state=0.0), features)
-    wide = model.predict(_make_minimal_fit(sigma_obs=0.0, sigma_state=1.0), features)
-
-    assert float((narrow["upper"] - narrow["lower"]).mean()) == 0.0
-    assert float((wide["upper"] - wide["lower"]).mean()) > 0.0
+    assert fit.diagnostics is not None and fit.diagnostics.rhat_max < 1.01 and fit.diagnostics.divergences == 0
+    new_rows = pd.DataFrame({"glucose": [100.0, 200.0], "iob_units": [0.0, 0.0]})
+    predicted = model.predict(fit, new_rows)["mean"].to_numpy()
+    assert predicted == pytest.approx([105.0, 195.0], abs=4.0)
+    # Raising insulin on board by 1 U lowers the forecast by about 6 mg/dL.
+    lower = model.predict(fit, new_rows.assign(iob_units=1.0))["mean"].to_numpy()
+    assert (predicted - lower) == pytest.approx([6.0, 6.0], abs=1.5)
 
 
 def test_scenario_forecasts_requires_target_glucose_column():
@@ -149,3 +157,52 @@ def test_extract_fit_diagnostics_reads_sampler_health():
     assert diagnostics.divergences == 1
     assert diagnostics.max_tree_depth_observed == 10
     assert diagnostics.max_tree_depth_hits == 1
+
+
+def _slope_uncertain_fit() -> ModelFit:
+    # Four posterior draws that disagree about the sign of the effect of "x":
+    # three say raising x lowers glucose, one says it raises glucose.
+    betas = np.array([[[-1.0], [-1.0], [-1.0], [1.0]]])
+    n = betas.shape[1]
+    posterior = SimpleNamespace(
+        posterior=xr.Dataset(
+            {
+                "intercept": (("chain", "draw"), np.full((1, n), 2.0)),
+                "beta": (("chain", "draw", "beta_dim_0"), betas),
+                "sigma_obs": (("chain", "draw"), np.zeros((1, n))),
+            }
+        )
+    )
+    return ModelFit(
+        posterior=posterior,
+        feature_columns=["x"],
+        feature_means=pd.Series({"x": 0.0}),
+        feature_scales=pd.Series({"x": 1.0}),
+        target_mean=100.0,
+        target_scale=10.0,
+        horizon_minutes=30,
+        model=None,
+    )
+
+
+def test_scenario_forecasts_expose_paired_target_loss_draws():
+    model = BayesianGlucoseModel(draws=10, tune=10, chains=1, random_seed=3)
+    fit = _slope_uncertain_fit()
+    baseline = pd.DataFrame({"x": np.zeros(6), "target_glucose": np.full(6, 110.0)})
+    raised = baseline.assign(x=1.0)
+
+    current, candidate = model.scenario_forecasts(fit, [("current", baseline), ("raised", raised)], target_bg=110.0)
+
+    # Baseline predicts 120 in every draw: 10 mg/dL from target.
+    assert current.target_loss_draws == pytest.approx([10.0] * 4)
+    # Raising x gives 110 in three draws (on target) and 130 in one (worse).
+    assert candidate.target_loss_draws == pytest.approx([0.0, 0.0, 0.0, 20.0])
+
+
+def test_scenario_forecasts_omit_draw_losses_without_target():
+    model = BayesianGlucoseModel(draws=10, tune=10, chains=1)
+    frame = pd.DataFrame({"x": np.zeros(3), "target_glucose": np.full(3, 110.0)})
+
+    (forecast,) = model.scenario_forecasts(_slope_uncertain_fit(), [("current", frame)])
+
+    assert forecast.target_loss_draws is None

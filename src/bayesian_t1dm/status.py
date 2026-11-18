@@ -11,7 +11,7 @@ import pandas as pd
 from .health_auto_export import ModelDataPreparationResult
 from .paths import ProjectPaths
 from .report import _to_jsonable
-from .therapy_research import TherapyInfraValidationResult, TherapyResearchResult, summarize_overnight_basal_evidence
+from .therapy_research import TherapyResearchResult, summarize_overnight_basal_evidence
 
 
 TOP_LEVEL_ENTRYPOINTS = {

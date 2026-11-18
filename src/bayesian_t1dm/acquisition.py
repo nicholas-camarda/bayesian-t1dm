@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import binascii
 import hashlib
-from importlib import metadata as importlib_metadata
-from importlib import util as importlib_util
 import json
+import math
 import os
 import shutil
 from dataclasses import asdict, dataclass, field
@@ -13,10 +13,11 @@ from typing import Any, Iterable, Mapping, Protocol, Sequence
 
 import pandas as pd
 
+from .features import CALCULATOR_SETTING_COLUMNS
 from .io import read_table
-from .ingest import IngestedData, build_export_manifest, load_tandem_exports, summarize_export_manifest
+from .ingest import IngestedData, build_export_manifest, load_tandem_exports, summarize_export_manifest, to_local_wall_clock
 from .observability import sanitize_fields
-from .paths import ProjectPaths
+from .paths import ProjectPaths, analysis_timezone
 from .quality import REQUIRED_WINDOW_KINDS, build_window_quality_row
 
 
@@ -207,7 +208,7 @@ def load_tandem_credentials(repo_root: str | Path | None = None, env_file: str |
             f'Set TANDEM_SOURCE_EMAIL/TCONNECT_EMAIL and TANDEM_SOURCE_PASSWORD/TCONNECT_PASSWORD in {env_path} or your shell environment.',
         )
     region = os.getenv('TANDEM_SOURCE_REGION') or os.getenv('TCONNECT_REGION') or 'US'
-    timezone = os.getenv('TANDEM_SOURCE_TIMEZONE') or os.getenv('TIMEZONE_NAME') or os.getenv('TZ')
+    timezone = analysis_timezone()
     pump_serial = os.getenv('TANDEM_PUMP_SERIAL') or os.getenv('TANDEM_SOURCE_PUMP_SERIAL') or os.getenv('PUMP_SERIAL_NUMBER')
     return TandemCredentials(email=email, password=password, region=region, timezone=timezone, pump_serial=pump_serial)
 
@@ -327,61 +328,20 @@ def _hash_json_value(value: Any) -> str:
     return hashlib.sha256(_stable_json_dumps(value).encode('utf-8')).hexdigest()
 
 
-def _ensure_datetime(value: Any, *, timezone: str | None = None) -> pd.Timestamp | pd.NaT:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return pd.NaT
-    timestamp = pd.to_datetime(value, errors='coerce')
-    if pd.isna(timestamp):
-        return pd.NaT
-    if timezone:
-        try:
-            if timestamp.tzinfo is None:
-                timestamp = timestamp.tz_localize(timezone)
-            else:
-                timestamp = timestamp.tz_convert(timezone)
-        except Exception:
-            pass
-    return pd.Timestamp(timestamp)
-
-
 def _storage_timezone_name(timezone: str | None = None) -> str:
-    return timezone or os.getenv("TIMEZONE_NAME") or "UTC"
+    return timezone or analysis_timezone()
 
 
-def _canonicalize_timestamp_series_for_storage(
-    series: pd.Series,
-    *,
-    timezone: str | None,
-) -> pd.Series:
-    target_timezone = _storage_timezone_name(timezone)
-    normalized: list[pd.Timestamp] = []
-    for value in series.tolist():
-        if value is None or (isinstance(value, float) and pd.isna(value)) or pd.isna(value):
-            normalized.append(pd.NaT)
-            continue
-        timestamp = _ensure_datetime(value, timezone=target_timezone)
-        if pd.isna(timestamp):
-            normalized.append(pd.NaT)
-            continue
-        stamp = pd.Timestamp(timestamp)
-        if stamp.tzinfo is not None:
-            try:
-                stamp = stamp.tz_convert(target_timezone).tz_localize(None)
-            except Exception:
-                stamp = stamp.tz_localize(None)
-        normalized.append(stamp)
-    return pd.Series(normalized, index=series.index, dtype="datetime64[ns]")
+def _to_float(value: Any) -> float:
+    """One value as a float; NaN when it is missing or not a number."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
 
 
 def _window_bounds_for_storage(window: ExportWindow) -> tuple[pd.Timestamp, pd.Timestamp]:
     return pd.Timestamp(window.start_date), pd.Timestamp(window.end_date + timedelta(days=1))
-
-
-def _record_timestamp(value: Any, *, timezone: str | None) -> pd.Timestamp | pd.NaT:
-    timestamp = _ensure_datetime(value, timezone=timezone)
-    if pd.isna(timestamp):
-        return pd.NaT
-    return _canonicalize_timestamp_series_for_storage(pd.Series([timestamp]), timezone=timezone).iloc[0]
 
 
 def _count_records_outside_window(
@@ -393,30 +353,21 @@ def _count_records_outside_window(
     require_all_timestamps: bool = False,
 ) -> int:
     start, end = _window_bounds_for_storage(window)
-    rejected = 0
-    for record in records:
-        if require_all_timestamps:
-            keys = [key for key in timestamp_candidates if key in record]
-        else:
-            key = _first_existing_key(record, timestamp_candidates)
-            keys = [] if key is None else [key]
-        if not keys:
-            continue
-        timestamps = [_record_timestamp(record.get(key), timezone=timezone) for key in keys]
-        parsed = [timestamp for timestamp in timestamps if not pd.isna(timestamp)]
-        if not parsed:
-            continue
-        outside = False
-        for key, timestamp in zip(keys, timestamps):
-            if pd.isna(timestamp):
-                continue
-            upper_exceeded = timestamp > end if "end" in str(key).lower() or "stop" in str(key).lower() else timestamp >= end
-            if timestamp < start or upper_exceeded:
-                outside = True
-                break
-        if outside:
-            rejected += 1
-    return rejected
+    if not records:
+        return 0
+    # Each record is judged by its own keys: records from different event types need not share field names.
+    chosen = [_first_existing_key(record, timestamp_candidates) for record in records]
+    if require_all_timestamps:
+        keys = [key for key in timestamp_candidates if any(key in record for record in records)]
+    else:
+        keys = list(dict.fromkeys(key for key in chosen if key is not None))
+    outside = pd.Series(False, index=range(len(records)))
+    for key in keys:
+        values = [record.get(key) if require_all_timestamps or chosen_key == key else None for record, chosen_key in zip(records, chosen)]
+        stamps = to_local_wall_clock(pd.Series(values, dtype=object), timezone=_storage_timezone_name(timezone))
+        upper = stamps.gt(end) if ("end" in str(key).lower() or "stop" in str(key).lower()) else stamps.ge(end)
+        outside |= stamps.notna() & (stamps.lt(start) | upper)
+    return int(outside.sum())
 
 
 def _filter_timestamp_window(
@@ -443,7 +394,7 @@ def _canonicalize_frame_for_storage(frame: pd.DataFrame, *, timezone: str | None
     for column in out.columns:
         if "timestamp" not in str(column).lower():
             continue
-        out[column] = _canonicalize_timestamp_series_for_storage(out[column], timezone=timezone)
+        out[column] = to_local_wall_clock(out[column], timezone=_storage_timezone_name(timezone))
     return out
 
 
@@ -539,9 +490,9 @@ def _normalize_cgm_records(
         glucose_key = _first_existing_key(record, glucose_candidates)
         if ts_key is None or glucose_key is None:
             continue
-        timestamp = _ensure_datetime(record.get(ts_key), timezone=timezone)
-        glucose = pd.to_numeric(pd.Series([record.get(glucose_key)]), errors='coerce').iloc[0]
-        if pd.isna(timestamp) or pd.isna(glucose):
+        timestamp = record.get(ts_key)
+        glucose = _to_float(record.get(glucose_key))
+        if timestamp is None or pd.isna(glucose):
             continue
         rows.append(
             {
@@ -559,7 +510,8 @@ def _normalize_cgm_records(
     if not rows:
         return pd.DataFrame(columns=['timestamp', 'glucose', 'glucose_source', 'source_file', 'source_label'])
     frame = pd.DataFrame(rows)
-    frame['timestamp'] = _canonicalize_timestamp_series_for_storage(frame['timestamp'], timezone=timezone)
+    frame['timestamp'] = to_local_wall_clock(frame['timestamp'], timezone=_storage_timezone_name(timezone))
+    frame = frame.loc[frame['timestamp'].notna()].reset_index(drop=True)
     frame['timestamp'] = pd.to_datetime(frame['timestamp'], errors='coerce').dt.floor('5min')
     frame, _ = _filter_timestamp_window(frame, window=window, timestamp_columns=['timestamp'])
     frame = frame.sort_values(['timestamp', 'glucose_source']).reset_index(drop=True)
@@ -600,9 +552,9 @@ def _normalize_bolus_records(
         units_key = _first_existing_key(record, units_candidates)
         if ts_key is None or units_key is None:
             continue
-        timestamp = _ensure_datetime(record.get(ts_key), timezone=timezone)
-        units = pd.to_numeric(pd.Series([record.get(units_key)]), errors='coerce').iloc[0]
-        if pd.isna(timestamp) or pd.isna(units):
+        timestamp = record.get(ts_key)
+        units = _to_float(record.get(units_key))
+        if timestamp is None or pd.isna(units):
             continue
         row: dict[str, Any] = {
             'timestamp': timestamp,
@@ -624,14 +576,15 @@ def _normalize_bolus_records(
         }
         carb_key = _first_existing_key(record, carbs_candidates)
         if carb_key is not None:
-            carb_value = pd.to_numeric(pd.Series([record.get(carb_key)]), errors='coerce').iloc[0]
+            carb_value = _to_float(record.get(carb_key))
             if not pd.isna(carb_value):
                 row['carb_grams'] = float(carb_value)
         rows.append(row)
     if not rows:
         return pd.DataFrame(columns=['timestamp', 'bolus_units', 'raw_bolus_units', 'source_file', 'source_label'])
     frame = pd.DataFrame(rows)
-    frame['timestamp'] = _canonicalize_timestamp_series_for_storage(frame['timestamp'], timezone=timezone)
+    frame['timestamp'] = to_local_wall_clock(frame['timestamp'], timezone=_storage_timezone_name(timezone))
+    frame = frame.loc[frame['timestamp'].notna()].reset_index(drop=True)
     frame['timestamp'] = pd.to_datetime(frame['timestamp'], errors='coerce').dt.floor('5min')
     frame, _ = _filter_timestamp_window(frame, window=window, timestamp_columns=['timestamp'])
     if frame.empty:
@@ -770,6 +723,9 @@ def _normalize_bolus_records(
     return frame.groupby(group_cols, as_index=False, dropna=False).agg(**aggregations)
 
 
+# Bolus-calculator settings in force for each logged meal (carb ratio, correction factor, target).
+
+
 def _normalize_carb_records(
     records: Sequence[Mapping[str, Any]],
     *,
@@ -796,9 +752,9 @@ def _normalize_carb_records(
         carb_key = _first_existing_key(record, carb_candidates)
         if ts_key is None or carb_key is None:
             continue
-        timestamp = _ensure_datetime(record.get(ts_key), timezone=timezone)
-        carb_value = pd.to_numeric(pd.Series([record.get(carb_key)]), errors='coerce').iloc[0]
-        if pd.isna(timestamp) or pd.isna(carb_value):
+        timestamp = record.get(ts_key)
+        carb_value = _to_float(record.get(carb_key))
+        if timestamp is None or pd.isna(carb_value):
             continue
         rows.append(
             {
@@ -808,16 +764,21 @@ def _normalize_carb_records(
                 'source_label': endpoint_family,
                 'pump_serial': record.get('pump_serial'),
                 'tconnect_device_id': record.get('tconnect_device_id'),
+                **{key: _to_float(record.get(key)) for key in CALCULATOR_SETTING_COLUMNS},
             }
         )
     if not rows:
-        return pd.DataFrame(columns=['timestamp', 'carb_grams', 'source_file', 'source_label'])
+        return pd.DataFrame(columns=['timestamp', 'carb_grams', 'source_file', 'source_label', *CALCULATOR_SETTING_COLUMNS])
     frame = pd.DataFrame(rows)
-    frame['timestamp'] = _canonicalize_timestamp_series_for_storage(frame['timestamp'], timezone=timezone)
+    frame['timestamp'] = to_local_wall_clock(frame['timestamp'], timezone=_storage_timezone_name(timezone))
+    frame = frame.loc[frame['timestamp'].notna()].reset_index(drop=True)
     frame['timestamp'] = pd.to_datetime(frame['timestamp'], errors='coerce').dt.floor('5min')
     frame, _ = _filter_timestamp_window(frame, window=window, timestamp_columns=['timestamp'])
     group_cols = [column for column in ['timestamp', 'source_file', 'source_label', 'pump_serial', 'tconnect_device_id'] if column in frame.columns]
-    return frame.groupby(group_cols, as_index=False, dropna=False).agg(carb_grams=('carb_grams', 'sum'))
+    return frame.groupby(group_cols, as_index=False, dropna=False).agg(
+        carb_grams=('carb_grams', 'sum'),
+        **{key: (key, 'first') for key in CALCULATOR_SETTING_COLUMNS},
+    )
 
 
 def _normalize_basal_records(
@@ -836,13 +797,13 @@ def _normalize_basal_records(
         rate_key = _first_existing_key(record, rate_candidates)
         if rate_key is None:
             continue
-        rate = pd.to_numeric(pd.Series([record.get(rate_key)]), errors='coerce').iloc[0]
+        rate = _to_float(record.get(rate_key))
         if pd.isna(rate):
             continue
         start_key = _first_existing_key(record, start_candidates)
         end_key = _first_existing_key(record, end_candidates)
-        start = _ensure_datetime(record.get(start_key), timezone=timezone) if start_key is not None else pd.NaT
-        end = _ensure_datetime(record.get(end_key), timezone=timezone) if end_key is not None else pd.NaT
+        start = record.get(start_key) if start_key is not None else None
+        end = record.get(end_key) if end_key is not None else None
         rows.append(
             {
                 'start_timestamp': start,
@@ -857,8 +818,8 @@ def _normalize_basal_records(
     if not rows:
         return pd.DataFrame(columns=['start_timestamp', 'end_timestamp', 'basal_units_per_hour', 'source_file', 'source_label'])
     frame = pd.DataFrame(rows)
-    frame['start_timestamp'] = _canonicalize_timestamp_series_for_storage(frame['start_timestamp'], timezone=timezone)
-    frame['end_timestamp'] = _canonicalize_timestamp_series_for_storage(frame['end_timestamp'], timezone=timezone)
+    frame['start_timestamp'] = to_local_wall_clock(frame['start_timestamp'], timezone=_storage_timezone_name(timezone))
+    frame['end_timestamp'] = to_local_wall_clock(frame['end_timestamp'], timezone=_storage_timezone_name(timezone))
     frame = frame.sort_values(['start_timestamp', 'end_timestamp']).reset_index(drop=True)
     if frame['start_timestamp'].notna().any():
         next_starts = frame['start_timestamp'].shift(-1)
@@ -896,9 +857,9 @@ def _normalize_activity_records(
         value_key = _first_existing_key(record, value_candidates)
         if ts_key is None or value_key is None:
             continue
-        timestamp = _ensure_datetime(record.get(ts_key), timezone=timezone)
-        value = pd.to_numeric(pd.Series([record.get(value_key)]), errors='coerce').iloc[0]
-        if pd.isna(timestamp) or pd.isna(value):
+        timestamp = record.get(ts_key)
+        value = _to_float(record.get(value_key))
+        if timestamp is None or pd.isna(value):
             continue
         rows.append(
             {
@@ -913,7 +874,8 @@ def _normalize_activity_records(
     if not rows:
         return pd.DataFrame(columns=['timestamp', 'activity_value', 'source_file', 'source_label'])
     frame = pd.DataFrame(rows)
-    frame['timestamp'] = _canonicalize_timestamp_series_for_storage(frame['timestamp'], timezone=timezone)
+    frame['timestamp'] = to_local_wall_clock(frame['timestamp'], timezone=_storage_timezone_name(timezone))
+    frame = frame.loc[frame['timestamp'].notna()].reset_index(drop=True)
     frame['timestamp'] = pd.to_datetime(frame['timestamp'], errors='coerce').dt.floor('5min')
     frame, _ = _filter_timestamp_window(frame, window=window, timestamp_columns=['timestamp'])
     group_cols = [column for column in ['timestamp', 'source_file', 'source_label', 'pump_serial', 'tconnect_device_id'] if column in frame.columns]
@@ -962,7 +924,7 @@ def normalize_tconnectsync_payloads(
     carb_frames = [frame for frame in [*carb_frames, carb_from_bolus] if not frame.empty]
     if carb_frames:
         carbs = pd.concat(carb_frames, ignore_index=True, sort=False)
-        carbs['timestamp'] = _canonicalize_timestamp_series_for_storage(carbs['timestamp'], timezone=timezone)
+        carbs['timestamp'] = to_local_wall_clock(carbs['timestamp'], timezone=_storage_timezone_name(timezone))
         carbs['carb_grams'] = pd.to_numeric(carbs['carb_grams'], errors='coerce')
         sort_columns = [column for column in ['timestamp', '_carb_source_priority', 'source_file', 'source_label'] if column in carbs.columns]
         if sort_columns:
@@ -1075,7 +1037,13 @@ def _write_tconnectsync_window_artifacts(
     pump_serial: str | None = None,
     extra_raw_artifacts: Sequence[RawApiArtifact] = (),
     payload_hash_source: Mapping[str, Any] | None = None,
+    write_raw: bool = True,
 ) -> NormalizedWindowResult:
+    """Write a window's normalized tables (and, at collection time only, its raw payloads).
+
+    Re-normalizing an archived window passes ``write_raw=False``: the raw folder is the record of what
+    Tandem returned and is never rewritten by processing.
+    """
     archive_root = workspace.cloud_raw / 'tconnectsync' / window.window_id
     raw_root = archive_root / 'raw'
     normalized_root = archive_root / 'normalized'
@@ -1096,7 +1064,8 @@ def _write_tconnectsync_window_artifacts(
     for family, payload in payloads.items():
         body_path = raw_root / f'{family}.json'
         metadata_path = raw_root / f'{family}.meta.json'
-        body_path.write_text(_stable_json_dumps(payload) + '\n', encoding='utf-8')
+        if write_raw:
+            body_path.write_text(_stable_json_dumps(payload) + '\n', encoding='utf-8')
         metadata = {
             'window_id': window.window_id,
             'requested_start': window.start_date.isoformat(),
@@ -1109,7 +1078,8 @@ def _write_tconnectsync_window_artifacts(
             'created_at': datetime.now(UTC).isoformat(timespec='seconds').replace('+00:00', 'Z'),
             'path': str(body_path),
         }
-        _write_json(metadata_path, metadata)
+        if write_raw:
+            _write_json(metadata_path, metadata)
         raw_artifacts.append(RawApiArtifact(endpoint_family=family, path=body_path, metadata_path=metadata_path, metadata=metadata))
         raw_metadata_rows.append({
             'window_id': window.window_id,
@@ -1181,6 +1151,8 @@ def _write_tconnectsync_window_artifacts(
                 'activity_present': bool(summary['activity_present']),
                 'timezone': summary['timezone'],
                 'rejected_row_count': int(summary.get('rejected_counts', {}).get(kind, 0)),
+                'cgm_slot_coverage': manifest_row.get('cgm_slot_coverage'),
+                'cgm_gaps_ge_2h': manifest_row.get('cgm_gaps_ge_2h'),
             },
         )
         manifest_rows.append(quality_row)
@@ -1224,133 +1196,76 @@ def _write_tconnectsync_window_artifacts(
     )
 
 
-def _ensure_pkg_resources_module() -> None:
-    if importlib_util.find_spec('pkg_resources') is not None:
-        return
-
-    import sys
-    import types
-
-    module = types.ModuleType('pkg_resources')
-
-    class _Distribution:
-        def __init__(self, name: str) -> None:
-            self.version = importlib_metadata.version(name)
-
-    def require(name: str) -> list[_Distribution]:
-        return [_Distribution(name)]
-
-    module.require = require  # type: ignore[attr-defined]
-    sys.modules['pkg_resources'] = module
+# Tandem Source pump-logs requests are capped at about four weeks, so longer windows are paged.
+PUMP_LOGS_MAX_DAYS = 28
 
 
-def _select_tconnectsync_pump(metadata: Sequence[Mapping[str, Any]], pump_serial: str | None) -> Mapping[str, Any]:
-    if not metadata:
-        raise AcquisitionError('tconnectsync returned no pump metadata')
-    candidates = list(metadata)
-    if pump_serial:
-        serial = str(pump_serial)
-        matched = [entry for entry in candidates if str(entry.get('serialNumber') or entry.get('serial_number') or '') == serial]
-        if matched:
-            candidates = matched
-
-    def _sort_key(entry: Mapping[str, Any]) -> pd.Timestamp:
-        for key in ('maxDateWithEvents', 'lastUpload', 'minDateWithEvents'):
-            value = entry.get(key)
-            if value:
-                if isinstance(value, Mapping):
-                    value = (
-                        value.get('lastUploadedAt')
-                        or value.get('uploadedAt')
-                        or value.get('timestamp')
-                        or value.get('dateTime')
-                    )
-                ts = pd.to_datetime(value, utc=True, errors='coerce')
-                if not pd.isna(ts):
-                    return ts
-        return pd.Timestamp.min.tz_localize('UTC')
-
-    return max(candidates, key=_sort_key)
+def _pump_serial(pump: Mapping[str, Any]) -> str:
+    return str(pump.get('serialNumber') or '')
 
 
-def _metadata_timestamp(value: Any) -> pd.Timestamp | pd.NaT:
-    if isinstance(value, Mapping):
-        value = (
-            value.get('lastUploadedAt')
-            or value.get('uploadedAt')
-            or value.get('timestamp')
-            or value.get('dateTime')
-        )
+def _pump_device_id(pump: Mapping[str, Any]) -> str:
+    """The UUID ``assignmentId`` that the pump-logs endpoint takes."""
+    device_id = str(pump.get('assignmentId') or '')
+    if not device_id:
+        raise AcquisitionError(f'Tandem Source pump {_pump_serial(pump) or "?"} has no assignmentId')
+    return device_id
+
+
+def _naive_utc(value: Any) -> pd.Timestamp | pd.NaT:
     timestamp = pd.to_datetime(value, errors='coerce')
     if pd.isna(timestamp):
         return pd.NaT
     stamp = pd.Timestamp(timestamp)
-    if stamp.tzinfo is not None:
-        stamp = stamp.tz_convert('UTC').tz_localize(None)
-    return stamp
+    return stamp.tz_convert('UTC').tz_localize(None) if stamp.tzinfo is not None else stamp
 
 
 def _pump_event_span(pump: Mapping[str, Any]) -> tuple[pd.Timestamp | pd.NaT, pd.Timestamp | pd.NaT]:
-    start = _metadata_timestamp(pump.get('minDateWithEvents'))
-    end = _metadata_timestamp(pump.get('maxDateWithEvents') or pump.get('lastUpload'))
-    return start, end
+    data_range = pump.get('availableDataRange') or {}
+    return _naive_utc(data_range.get('start')), _naive_utc(data_range.get('end') or pump.get('maxDateOfEvents'))
 
 
-def _pump_sort_key(pump: Mapping[str, Any]) -> tuple[pd.Timestamp, pd.Timestamp, str, str]:
-    start, end = _pump_event_span(pump)
-    return (
-        start if pd.notna(start) else pd.Timestamp.max,
-        end if pd.notna(end) else pd.Timestamp.min,
-        str(pump.get('serialNumber') or pump.get('serial_number') or ''),
-        str(pump.get('tconnectDeviceId') or ''),
-    )
-
-
-def _select_tconnectsync_pumps_for_window(
-    metadata: Sequence[Mapping[str, Any]],
+def _select_pumps_for_window(
+    pumps: Sequence[Mapping[str, Any]],
     *,
     window: ExportWindow,
     pump_serial: str | None,
 ) -> tuple[Mapping[str, Any], ...]:
-    if not metadata:
-        raise AcquisitionError('tconnectsync returned no pump metadata')
-
+    """Pumps whose recorded data overlaps the window; a requested serial is listed first."""
+    if not pumps:
+        raise AcquisitionError('Tandem Source returned no pumps for this account')
     requested_start, requested_end = _window_bounds_for_storage(window)
-    overlapping: list[Mapping[str, Any]] = []
-    for pump in metadata:
+    overlapping = []
+    for pump in pumps:
         start, end = _pump_event_span(pump)
         if pd.isna(start) and pd.isna(end):
             continue
-        starts_before_window_end = pd.isna(start) or start < requested_end
-        ends_after_window_start = pd.isna(end) or end >= requested_start
-        if starts_before_window_end and ends_after_window_start:
+        if (pd.isna(start) or start < requested_end) and (pd.isna(end) or end >= requested_start):
             overlapping.append(pump)
-
     if not overlapping:
-        raise AcquisitionError(
-            f'tconnectsync returned no pump whose event span overlaps {window.window_id}',
-        )
+        raise AcquisitionError(f'No pump on this account has data overlapping {window.window_id}')
+    requested = str(pump_serial or '').strip()
+    return tuple(sorted(overlapping, key=lambda pump: (_pump_serial(pump) != requested, _pump_serial(pump))))
 
-    requested_serial = str(pump_serial or '').strip()
-    if requested_serial:
-        preferred = [
-            pump
-            for pump in overlapping
-            if str(pump.get('serialNumber') or pump.get('serial_number') or '') == requested_serial
-        ]
-        if preferred:
-            preferred_ids = {str(pump.get('tconnectDeviceId') or '') for pump in preferred}
-            others = [pump for pump in overlapping if str(pump.get('tconnectDeviceId') or '') not in preferred_ids]
-            overlapping = [*preferred, *others]
 
-    return tuple(sorted(overlapping, key=_pump_sort_key))
+def _pump_log_chunks(start: date, end: date) -> list[tuple[str, str]]:
+    chunks = []
+    current = start
+    while current <= end:
+        chunk_end = min(current + timedelta(days=PUMP_LOGS_MAX_DAYS - 1), end)
+        chunks.append((current.isoformat(), chunk_end.isoformat()))
+        current = chunk_end + timedelta(days=1)
+    return chunks
 
 
 def _shift_timestamp_text(value: Any, minutes: int) -> str | None:
-    timestamp = _ensure_datetime(value)
-    if pd.isna(timestamp):
+    if value is None:
         return None
-    return (timestamp + pd.Timedelta(minutes=minutes)).isoformat()
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return (parsed + timedelta(minutes=minutes)).isoformat()
 
 
 def _device_fields_for_record(*, pump_serial: str | None, tconnect_device_id: str | None) -> dict[str, str]:
@@ -1362,33 +1277,64 @@ def _device_fields_for_record(*, pump_serial: str | None, tconnect_device_id: st
     return fields
 
 
+# Tandem pump clocks count seconds from 2008-01-01 in pump-local time.
+_TANDEM_EPOCH = pd.Timestamp('2008-01-01')
+
+
+def _cgm_sensor_time(event_timestamp: Any, egv_seconds: Any) -> str | None:
+    """Sensor measurement time of a CGM reading as pump wall-clock time, without a UTC offset.
+
+    The pump counts seconds in its own wall-clock time, which is the storage convention. The receipt event's
+    offset is not attached: across a daylight-saving change the reading and its receipt can have different offsets.
+    """
+    seconds = _to_float(egv_seconds)
+    if pd.isna(seconds) or float(seconds) <= 0 or pd.isna(pd.to_datetime(event_timestamp, errors='coerce')):
+        return None
+    return (_TANDEM_EPOCH + pd.Timedelta(seconds=float(seconds))).isoformat()
+
+
 def _tconnectsync_event_payloads(
     events: Sequence[Any],
     *,
     pump_serial: str | None = None,
     tconnect_device_id: str | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
-    payloads: dict[str, list[dict[str, Any]]] = {'cgm': [], 'bolus': [], 'basal': [], 'activity': []}
+    payloads: dict[str, list[dict[str, Any]]] = {'cgm': [], 'bolus': [], 'basal': [], 'activity': [], 'carbs': []}
     device_fields = _device_fields_for_record(pump_serial=pump_serial, tconnect_device_id=tconnect_device_id)
+    # Carbs typed into the pump's bolus calculator live on LID_BOLUS_REQUESTED_MSG1, not on
+    # the delivery event. They are collected by bolus id and kept only for boluses that were
+    # actually delivered, so a cancelled request that is re-entered is not counted twice.
+    carb_requests: dict[str, dict[str, Any]] = {}
+    # The bolus calculator records the settings it used: carb ratio on MSG1, correction factor and
+    # target on MSG2 (same bolus id). Those are the settings in force for that meal.
+    calculator_settings: dict[str, dict[str, float]] = {}
+    # MSG3 holds the calculator's food and correction portions; see _calculator_carb_ratio.
+    bolus_portions: dict[str, dict[str, float]] = {}
+    delivered_bolus_ids: set[str] = set()
     for event in events:
         record = event.todict() if hasattr(event, 'todict') else {}
         name = str(record.get('name') or type(event).__name__).upper()
         event_timestamp = record.get('eventTimestamp') or getattr(event, 'eventTimestamp', None)
-        if 'CGM' in name:
-            glucose_value = record.get('currentglucosedisplayvalue')
-            if glucose_value is None and record.get('egv') is not None:
-                glucose_value = record.get('egv')
+        if name.startswith('LID_CGM_DATA'):
+            # Only sensor readings (not alerts or session events), placed at the time the sensor measured
+            # them. The event time is when the pump received the reading; after a signal dropout the pump
+            # receives a burst of backfilled readings at once, which would pile them into one 5-minute slot.
+            glucose_value = record.get('currentGlucoseDisplayValue')
+            sensor_time = _cgm_sensor_time(event_timestamp, record.get('egvTimeStamp'))
+            if glucose_value is None or sensor_time is None:
+                continue
             payloads['cgm'].append(
                 {
-                    'eventDateTime': event_timestamp,
+                    'eventDateTime': sensor_time,
                     'egv_estimatedGlucoseValue': glucose_value,
+                    'pump_received_time': event_timestamp,
                     'source_event_id': record.get('id'),
                     'source_event_name': name,
                     **device_fields,
                 }
             )
         elif name == 'LID_BASAL_DELIVERY':
-            commanded_rate = pd.to_numeric(pd.Series([record.get('commandedRate')]), errors='coerce').iloc[0]
+            commanded_rate = _to_float(record.get('commandedRate'))
             payloads['basal'].append(
                 {
                     'startDateTime': event_timestamp,
@@ -1399,8 +1345,48 @@ def _tconnectsync_event_payloads(
                     **device_fields,
                 }
             )
+        elif name == 'LID_BOLUS_REQUESTED_MSG1':
+            bolus_id = record.get('bolusid') if record.get('bolusid') is not None else record.get('bolusId')
+            carb_amount = pd.to_numeric(
+                pd.Series([record.get('carbamount') if record.get('carbamount') is not None else record.get('carbAmount')]),
+                errors='coerce',
+            ).iloc[0]
+            if bolus_id is not None and not pd.isna(carb_amount) and float(carb_amount) > 0:
+                carb_ratio = _to_float(record.get('carbRatioRaw'))
+                carb_requests[str(bolus_id)] = {
+                    'eventDateTime': event_timestamp,
+                    'carbs': float(carb_amount),
+                    # Tandem stores the carb ratio in milli-grams per unit (7000 = 7.0 g/U).
+                    'carb_ratio_g_per_unit': None if pd.isna(carb_ratio) or float(carb_ratio) <= 0 else float(carb_ratio) / 1000.0,
+                    'calculator_glucose_mgdl': _to_float(record.get('bg')),
+                    'calculator_iob_units': _to_float(record.get('iob')),
+                    'bolus_id': bolus_id,
+                    'source_event_id': record.get('id'),
+                    'source_event_name': name,
+                    'source_seq_num': record.get('seqNum'),
+                    **device_fields,
+                }
+        elif name == 'LID_BOLUS_REQUESTED_MSG2':
+            bolus_id = record.get('bolusId')
+            isf = _to_float(record.get('isf'))
+            target = _to_float(record.get('targetBg'))
+            if bolus_id is not None:
+                calculator_settings[str(bolus_id)] = {
+                    'isf_mgdl_per_unit': None if pd.isna(isf) or float(isf) <= 0 else float(isf),
+                    'target_bg_mgdl': None if pd.isna(target) or float(target) <= 0 else float(target),
+                }
+        elif name == 'LID_BOLUS_REQUESTED_MSG3':
+            bolus_id = record.get('bolusId')
+            if bolus_id is not None:
+                bolus_portions[str(bolus_id)] = {
+                    'food': _to_float(record.get('foodBolusSize')),
+                    'correction': _to_float(record.get('correctionBolusSize')),
+                }
         elif name == 'LID_BOLUS_DELIVERY':
-            delivered_total = pd.to_numeric(pd.Series([record.get('deliveredTotal')]), errors='coerce').iloc[0]
+            delivered_total = _to_float(record.get('deliveredTotal'))
+            delivered_bolus_id = record.get('bolusid') if record.get('bolusid') is not None else record.get('bolusId')
+            if delivered_bolus_id is not None and not pd.isna(delivered_total) and float(delivered_total) > 0:
+                delivered_bolus_ids.add(str(delivered_bolus_id))
             payloads['bolus'].append(
                 {
                     'completionDateTime': event_timestamp,
@@ -1415,19 +1401,107 @@ def _tconnectsync_event_payloads(
                     'bolus_source_raw': record.get('bolusSourceRaw'),
                     'requested_now_units': (
                         None
-                        if pd.isna(pd.to_numeric(pd.Series([record.get('requestedNow')]), errors='coerce').iloc[0])
-                        else float(pd.to_numeric(pd.Series([record.get('requestedNow')]), errors='coerce').iloc[0]) / 1000.0
+                        if pd.isna(_to_float(record.get('requestedNow')))
+                        else float(_to_float(record.get('requestedNow'))) / 1000.0
                     ),
                     'requested_later_units': (
                         None
-                        if pd.isna(pd.to_numeric(pd.Series([record.get('requestedLater')]), errors='coerce').iloc[0])
-                        else float(pd.to_numeric(pd.Series([record.get('requestedLater')]), errors='coerce').iloc[0]) / 1000.0
+                        if pd.isna(_to_float(record.get('requestedLater')))
+                        else float(_to_float(record.get('requestedLater'))) / 1000.0
                     ),
                     **device_fields,
                 }
             )
     payloads['activity'] = []
+    payloads['carbs'] = []
+    for bolus_id, request in carb_requests.items():
+        if bolus_id not in delivered_bolus_ids:
+            continue
+        settings = calculator_settings.get(bolus_id, {'isf_mgdl_per_unit': None, 'target_bg_mgdl': None})
+        portions = bolus_portions.get(bolus_id, {})
+        carb_row = dict(request)
+        carb_row['carb_ratio_g_per_unit'] = _calculator_carb_ratio(request, settings, portions)
+        carb_row['correction_bolus_units'] = portions.get('correction', float('nan'))
+        payloads['carbs'].append({**carb_row, **settings})
     return payloads
+
+
+def _calculator_carb_ratio(request: Mapping[str, Any], settings: Mapping[str, Any], portions: Mapping[str, float]) -> float | None:
+    """The carb ratio the bolus calculator used for one meal, in g/U, or None when it cannot be known.
+
+    The t:slim records it on MSG1. The Mobi, bolusing from the phone app, records 0 there (and 0 for the
+    correction factor and target on MSG2), but MSG3 records the food portion of the bolus, which is
+    carbs / ratio. That holds only while the calculator has not folded a below-target correction or
+    insulin on board into the food portion: when the bolus includes a positive correction, or when glucose
+    was at or above a recorded target. On 1,405 t:slim meals with a recorded ratio, carbs / food portion
+    matched it in all 1,082 meals meeting that condition. Pump ratios are set in 0.1 g/U steps.
+    """
+    recorded = request.get('carb_ratio_g_per_unit')
+    if recorded is not None:
+        return recorded
+    food = portions.get('food', float('nan'))
+    correction = portions.get('correction', float('nan'))
+    if not math.isfinite(food) or food <= 0:
+        return None
+    target = settings.get('target_bg_mgdl')
+    glucose = request.get('calculator_glucose_mgdl', float('nan'))
+    food_unreduced = (math.isfinite(correction) and correction > 0) or (target is not None and math.isfinite(glucose) and glucose >= target)
+    return round(float(request['carbs']) / food, 1) if food_unreduced else None
+
+
+EVENT_DERIVED_FAMILIES = ('cgm', 'bolus', 'basal', 'carbs')
+
+
+def _archived_pump_event_files(raw_dir: Path) -> list[Path]:
+    logs = [path for path in raw_dir.glob('pump_logs_*.json') if not path.name.endswith('.meta.json')]
+    return sorted([*raw_dir.glob('pump_events_raw_*.txt'), *logs])
+
+
+def _decode_archived_pump_events(raw_dir: Path) -> dict[str, list[dict[str, Any]]]:
+    """Rebuild CGM, bolus, basal and carb payloads from a window's raw pump events.
+
+    ``pump_logs_*.json`` holds the tconnectsync 3.x pump-logs responses; ``pump_events_raw_*.txt`` holds
+    the base64 events of windows collected with 2.x (3.x still decodes them). An unreadable file is an
+    error: silently skipping it would drop that window's data.
+    """
+    from tconnectsync.eventparser.generic import Events, decode_raw_events  # type: ignore
+    from tconnectsync.eventparser.raw_event import EVENT_LEN  # type: ignore
+
+    merged: dict[str, list[dict[str, Any]]] = {family: [] for family in EVENT_DERIVED_FAMILIES}
+
+    def add(events: list[Any], pump_serial: str | None, device_id: str | None) -> None:
+        payloads = _tconnectsync_event_payloads(events, pump_serial=pump_serial, tconnect_device_id=device_id)
+        for family in EVENT_DERIVED_FAMILIES:
+            merged[family].extend(payloads.get(family, []))
+
+    for path in _archived_pump_event_files(raw_dir):
+        if path.suffix == '.json':
+            payload = json.loads(path.read_text(encoding='utf-8'))
+            seen: set[tuple[Any, Any]] = set()
+            events = []
+            for chunk in payload['chunks']:
+                for event in chunk['response'].get('events') or []:
+                    key = (event.get('sequenceGroup'), event.get('sequenceNumber'))
+                    if key not in seen:
+                        seen.add(key)
+                        events.append(event)
+            add(list(Events(events)), payload.get('pump_serial') or None, payload.get('pump_device_id') or None)
+            continue
+        text = path.read_text(encoding='utf-8').strip()
+        if not text:
+            continue
+        device_key = path.stem.replace('pump_events_raw_', '', 1)
+        pump_serial, _, device_id = device_key.rpartition('_')
+        if text.startswith('"'):
+            # Some archives store the API's JSON string literal rather than the bare text.
+            text = json.loads(text)
+        try:
+            decoded = decode_raw_events(text)
+        except (ValueError, binascii.Error) as exc:
+            raise AcquisitionError(f'Archived pump events in {path} are not valid base64') from exc
+        usable = len(decoded) - (len(decoded) % EVENT_LEN)
+        add(list(Events(decoded[:usable])), None if pump_serial in {'', 'unknown'} else pump_serial, device_id or None)
+    return merged
 
 
 def _canonical_export_name(window: ExportWindow, source_path: Path) -> str:
@@ -1914,7 +1988,43 @@ def _load_archived_window_payloads(window_dir: Path) -> dict[str, Any]:
         payloads[path.stem] = json.loads(path.read_text(encoding="utf-8"))
     if not payloads:
         raise AcquisitionError(f"No archived JSON payloads found under {raw_dir}")
+    if _archived_pump_event_files(raw_dir):
+        # The raw pump events are the source of truth for every event-derived table; payloads extracted
+        # at collection time (possibly by older code) are replaced by what the events say.
+        for family in [family for family in payloads if str(family).lower() in EVENT_DERIVED_FAMILIES or 'carb' in str(family).lower()]:
+            del payloads[family]
+        payloads.update(_decode_archived_pump_events(raw_dir))
     return payloads
+
+
+def normalize_tconnectsync_window(
+    workspace: ProjectPaths,
+    window_dir: str | Path,
+    *,
+    timezone: str | None = None,
+    pump_serial: str | None = None,
+) -> NormalizedWindowResult:
+    """Rebuild one window's normalized tables and window manifest from its archived raw responses.
+
+    Writes only inside ``window_dir``, so windows can be normalized in parallel.
+    """
+    window_dir = Path(window_dir).expanduser().resolve()
+    window = _window_from_id(window_dir.name)
+    if not (window_dir / "raw").exists():
+        raise AcquisitionError(f"Window has no archived raw responses: {window_dir}")
+    if _window_manifest_path(workspace, window).parent.resolve() != window_dir:
+        raise AcquisitionError(f"{window_dir} is not under the project's Tandem archive {workspace.cloud_raw / 'tconnectsync'}.")
+    payloads = _load_archived_window_payloads(window_dir)
+    return _write_tconnectsync_window_artifacts(
+        workspace=workspace,
+        window=window,
+        endpoint_family="tconnectsync",
+        payloads=payloads,
+        timezone=timezone or analysis_timezone(),
+        pump_serial=pump_serial,
+        payload_hash_source=payloads,
+        write_raw=False,
+    )
 
 
 def normalize_tconnectsync_archive(
@@ -1931,7 +2041,7 @@ def normalize_tconnectsync_archive(
     root = Path(raw_root or (workspace.cloud_raw / "tconnectsync")).expanduser().resolve()
     if not root.exists():
         raise AcquisitionError(f"Raw archive root does not exist: {root}")
-    selected_timezone = timezone or os.getenv('TANDEM_SOURCE_TIMEZONE') or os.getenv('TIMEZONE_NAME') or os.getenv('TZ')
+    selected_timezone = timezone or analysis_timezone()
 
     if window_id is not None:
         window_dirs = [root / window_id]
@@ -1960,16 +2070,7 @@ def normalize_tconnectsync_archive(
             report_lines.append(f"- {window_dir.name}: skipped (existing normalized artifacts present)")
             continue
 
-        payloads = _load_archived_window_payloads(window_dir)
-        result = _write_tconnectsync_window_artifacts(
-            workspace=workspace,
-            window=_window_from_id(window_dir.name),
-            endpoint_family="tconnectsync",
-            payloads=payloads,
-            timezone=selected_timezone,
-            pump_serial=pump_serial,
-            payload_hash_source=payloads,
-        )
+        result = normalize_tconnectsync_window(workspace, window_dir, timezone=selected_timezone, pump_serial=pump_serial)
         results.append(result)
         report_lines.append(
             f"- {window_dir.name}: normalized ({'complete' if result.is_complete_window else 'incomplete'}), "
@@ -1977,13 +2078,8 @@ def normalize_tconnectsync_archive(
         )
 
     global_manifest_path = Path(manifest_path or (workspace.cloud_raw / "tandem_export_manifest.csv"))
-    try:
-        data = load_tandem_exports(workspace.cloud_raw)
-        _write_manifest_path = global_manifest_path
-        _write_manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        build_export_manifest(data).to_csv(_write_manifest_path, index=False, date_format="%Y-%m-%dT%H:%M:%S")
-    except Exception as exc:
-        report_lines.extend(["", f"- manifest_refresh_error: {exc}"])
+    global_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    build_export_manifest(load_tandem_exports(workspace.cloud_raw)).to_csv(global_manifest_path, index=False, date_format="%Y-%m-%dT%H:%M:%S")
 
     summary_path = Path(report_path or (workspace.reports / "normalize_raw_summary.md"))
     summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2036,7 +2132,6 @@ class TConnectSyncSourceClient:
                 return self._adapter
         if self._credentials is None:
             raise AcquisitionError('Credentials must be loaded before constructing the tconnectsync adapter')
-        _ensure_pkg_resources_module()
         try:
             from tconnectsync.api import TConnectApi  # type: ignore
         except Exception as exc:  # pragma: no cover - optional dependency guard
@@ -2048,53 +2143,6 @@ class TConnectSyncSourceClient:
         self._adapter = TConnectApi(self._credentials.email, self._credentials.password, region=region).tandemsource
         self.region = region
         return self._adapter
-
-    @staticmethod
-    def _call_first_method(adapter: object, method_names: Sequence[str], *args: Any, **kwargs: Any) -> Any:
-        for name in method_names:
-            method = getattr(adapter, name, None)
-            if callable(method):
-                try:
-                    return method(*args, **kwargs)
-                except TypeError:
-                    if args and isinstance(args[0], TandemCredentials):
-                        credentials = args[0]
-                        try:
-                            return method(email=credentials.email, password=credentials.password, **kwargs)
-                        except TypeError:
-                            try:
-                                return method(credentials.email, credentials.password, **kwargs)
-                            except TypeError:
-                                return method(credentials, **kwargs)
-                    if 'window' in kwargs:
-                        window = kwargs['window']
-                        try:
-                            return method(window=window, **{key: value for key, value in kwargs.items() if key != 'window'})
-                        except TypeError:
-                            try:
-                                return method(window, **{key: value for key, value in kwargs.items() if key != 'window'})
-                            except TypeError:
-                                continue
-                    continue
-        raise AcquisitionError(f"Adapter does not expose any of the expected methods: {', '.join(method_names)}")
-
-    @staticmethod
-    def _coerce_payload_mapping(result: Any) -> Mapping[str, Any]:
-        if isinstance(result, Mapping):
-            return result
-        payloads = getattr(result, 'payloads', None)
-        if isinstance(payloads, Mapping):
-            return payloads
-        values = {}
-        for key in ('cgm', 'bolus', 'basal', 'activity'):
-            value = getattr(result, key, None)
-            if value is not None:
-                values[key] = value
-        if values:
-            return values
-        if isinstance(result, Sequence) and result and isinstance(result[0], Mapping):
-            return {'cgm': list(result)}
-        raise AcquisitionError('tconnectsync adapter returned an unsupported payload shape')
 
     def login(self, credentials: TandemCredentials, step_log: StepLogger | None = None) -> None:
         self._credentials = credentials
@@ -2159,154 +2207,91 @@ class TConnectSyncSourceClient:
                 requested_end=window.end_date.isoformat(),
                 endpoint_family=self.endpoint_family,
             )
-        if hasattr(adapter, 'pump_event_metadata') and hasattr(adapter, 'pump_events_raw') and hasattr(adapter, 'pump_events'):
-            metadata = adapter.pump_event_metadata()
-            requested_start = window.start_date.isoformat()
-            requested_end = window.end_date.isoformat()
-            selected_timezone = self.timezone or (self._credentials.timezone if self._credentials else None)
-            selected_pumps = _select_tconnectsync_pumps_for_window(
-                metadata,
-                window=window,
-                pump_serial=self.pump_serial or (self._credentials.pump_serial if self._credentials else None),
-            )
-            payloads: dict[str, list[dict[str, Any]]] = {'cgm': [], 'bolus': [], 'basal': [], 'activity': []}
-            raw_events_by_device: dict[str, str] = {}
-            selected_pump_records: list[Mapping[str, Any]] = []
-            extra_raw_artifacts: list[RawApiArtifact] = []
+        from tconnectsync.eventparser.generic import Events  # type: ignore
 
-            raw_metadata_payload = {
+        requested_start = window.start_date.isoformat()
+        requested_end = window.end_date.isoformat()
+        created_at = datetime.now(UTC).isoformat(timespec='seconds').replace('+00:00', 'Z')
+        selected_timezone = self.timezone or (self._credentials.timezone if self._credentials else None)
+        requested_serial = self.pump_serial or (self._credentials.pump_serial if self._credentials else None)
+        raw_dir = self.workspace.cloud_raw / 'tconnectsync' / window.window_id / 'raw'
+
+        pumper = adapter.get_pumper()
+        selected_pumps = _select_pumps_for_window(list(pumper.get('pumps') or []), window=window, pump_serial=requested_serial)
+        pumper_payload = {
+            'window_id': window.window_id,
+            'requested_start': requested_start,
+            'requested_end': requested_end,
+            'endpoint_family': 'pumper',
+            'selected_pump_serials': [_pump_serial(pump) for pump in selected_pumps],
+            'pumper': pumper,
+            'created_at': created_at,
+        }
+        raw_files: dict[Path, Any] = {raw_dir / 'pumper.json': pumper_payload}
+        extra_raw_artifacts = [
+            RawApiArtifact(
+                endpoint_family='pumper',
+                path=raw_dir / 'pumper.json',
+                metadata_path=raw_dir / 'pumper.meta.json',
+                metadata={key: value for key, value in pumper_payload.items() if key != 'pumper'},
+            )
+        ]
+        payloads: dict[str, list[dict[str, Any]]] = {'cgm': [], 'bolus': [], 'basal': [], 'activity': [], 'carbs': []}
+        for pump in selected_pumps:
+            serial, device_id = _pump_serial(pump), _pump_device_id(pump)
+            responses = [
+                {'start': chunk_start, 'end': chunk_end, 'response': adapter.get_pump_logs(device_id, chunk_start, chunk_end, event_ids_filter=None)}
+                for chunk_start, chunk_end in _pump_log_chunks(window.start_date, window.end_date)
+            ]
+            seen: set[tuple[Any, Any]] = set()
+            events = []
+            for chunk in responses:
+                for event in chunk['response'].get('events') or []:
+                    key = (event.get('sequenceGroup'), event.get('sequenceNumber'))
+                    if key not in seen:
+                        seen.add(key)
+                        events.append(event)
+            for kind, rows in _tconnectsync_event_payloads(list(Events(events)), pump_serial=serial, tconnect_device_id=device_id).items():
+                payloads.setdefault(kind, []).extend(rows)
+            logs_path = raw_dir / f'pump_logs_{serial or "unknown"}_{device_id}.json'
+            logs_payload = {
                 'window_id': window.window_id,
                 'requested_start': requested_start,
                 'requested_end': requested_end,
-                'endpoint_family': 'pump_event_metadata',
-                'selected_pump': _select_tconnectsync_pump(metadata, self.pump_serial or (self._credentials.pump_serial if self._credentials else None)),
-                'selected_pumps': list(selected_pumps),
-                'available_pumps': list(metadata),
-                'created_at': datetime.now(UTC).isoformat(timespec='seconds').replace('+00:00', 'Z'),
+                'endpoint_family': 'pump_logs',
+                'pump_serial': serial,
+                'pump_device_id': device_id,
+                'chunks': responses,
+                'created_at': created_at,
             }
-
-            metadata_artifact = RawApiArtifact(
-                endpoint_family='pump_event_metadata',
-                path=(self.workspace.cloud_raw / 'tconnectsync' / window.window_id / 'raw' / 'pump_event_metadata.json'),
-                metadata_path=(self.workspace.cloud_raw / 'tconnectsync' / window.window_id / 'raw' / 'pump_event_metadata.meta.json'),
-                metadata={
-                    **raw_metadata_payload,
-                    'pump_serial': ','.join(str(pump.get('serialNumber') or '') for pump in selected_pumps),
-                    'pump_device_id': ','.join(str(pump.get('tconnectDeviceId') or '') for pump in selected_pumps),
-                },
+            raw_files[logs_path] = logs_payload
+            extra_raw_artifacts.append(
+                RawApiArtifact(
+                    endpoint_family='pump_logs',
+                    path=logs_path,
+                    metadata_path=logs_path.with_suffix('.meta.json'),
+                    metadata={
+                        **{key: value for key, value in logs_payload.items() if key != 'chunks'},
+                        'event_count': len(events),
+                        'payload_sha256': hashlib.sha256(_stable_json_dumps(responses).encode('utf-8')).hexdigest(),
+                    },
+                )
             )
-            extra_raw_artifacts.append(metadata_artifact)
 
-            for pump in selected_pumps:
-                device_id = pump.get('tconnectDeviceId')
-                if not device_id:
-                    raise AcquisitionError('tconnectsync pump metadata did not include a tconnectDeviceId')
-                selected_pump_serial = str(pump.get('serialNumber') or '')
-                selected_pump_records.append(pump)
-                raw_events_payload = adapter.pump_events_raw(
-                    device_id,
-                    min_date=requested_start,
-                    max_date=requested_end,
-                    event_ids_filter=None,
-                )
-                decoded_events = list(
-                    adapter.pump_events(
-                        device_id,
-                        min_date=requested_start,
-                        max_date=requested_end,
-                        fetch_all_event_types=True,
-                    )
-                )
-                device_payloads = _tconnectsync_event_payloads(
-                    decoded_events,
-                    pump_serial=selected_pump_serial,
-                    tconnect_device_id=str(device_id),
-                )
-                for kind, rows in device_payloads.items():
-                    payloads.setdefault(kind, []).extend(rows)
-                device_key = f"{selected_pump_serial or 'unknown'}_{device_id}"
-                raw_events_by_device[device_key] = raw_events_payload
-                raw_path = self.workspace.cloud_raw / 'tconnectsync' / window.window_id / 'raw' / f'pump_events_raw_{device_key}.txt'
-                extra_raw_artifacts.append(
-                    RawApiArtifact(
-                        endpoint_family='pump_events_raw',
-                        path=raw_path,
-                        metadata_path=raw_path.with_suffix('.meta.json'),
-                        metadata={
-                            'window_id': window.window_id,
-                            'requested_start': requested_start,
-                            'requested_end': requested_end,
-                            'endpoint_family': 'pump_events_raw',
-                            'pump_serial': selected_pump_serial,
-                            'pump_device_id': str(device_id),
-                            'payload_sha256': hashlib.sha256(raw_events_payload.encode('utf-8')).hexdigest(),
-                            'record_count': len(decoded_events),
-                            'created_at': datetime.now(UTC).isoformat(timespec='seconds').replace('+00:00', 'Z'),
-                        },
-                    )
-                )
-
-            result = _write_tconnectsync_window_artifacts(
-                workspace=self.workspace,
-                window=window,
-                endpoint_family=self.endpoint_family,
-                payloads=payloads,
-                timezone=selected_timezone,
-                pump_serial=','.join(str(pump.get('serialNumber') or '') for pump in selected_pumps),
-                extra_raw_artifacts=tuple(extra_raw_artifacts),
-                payload_hash_source={
-                    'pump_event_metadata': raw_metadata_payload,
-                    'pump_events_raw_by_device': raw_events_by_device,
-                },
-            )
-            for artifact in extra_raw_artifacts:
-                artifact.path.parent.mkdir(parents=True, exist_ok=True)
-                if artifact.path.suffix == '.txt':
-                    device_key = artifact.path.stem.replace('pump_events_raw_', '', 1)
-                    artifact.path.write_text(raw_events_by_device.get(device_key, '') + '\n', encoding='utf-8')
-                    if artifact.metadata_path is not None:
-                        _write_json(artifact.metadata_path, artifact.metadata)
-                else:
-                    if artifact.metadata_path is not None:
-                        _write_json(artifact.metadata_path, artifact.metadata)
-                    _write_json(artifact.path, raw_metadata_payload)
-            if step_log is not None:
-                step_log.write(
-                    'api.export.complete',
-                    window_id=window.window_id,
-                    manifest_path=str(result.manifest_path) if result.manifest_path else None,
-                    normalized_paths=_stable_json_dumps(result.normalized_paths),
-                    row_counts=_stable_json_dumps(result.row_counts),
-                    pump_serials=','.join(str(pump.get('serialNumber') or '') for pump in selected_pump_records),
-                    pump_device_ids=','.join(str(pump.get('tconnectDeviceId') or '') for pump in selected_pump_records),
-                    is_complete_window=result.is_complete_window,
-                )
-            return result
-
-        payloads = self._call_first_method(
-            adapter,
-            (
-                'fetch_window_payloads',
-                'collect_window',
-                'export_window',
-                'download_window',
-                'pull_window',
-                'get_window_payloads',
-            ),
-            window=window,
-            download_dir=download_dir,
-            timezone=self.timezone,
-            pump_serial=self.pump_serial,
-        )
-        payload_mapping = self._coerce_payload_mapping(payloads)
         result = _write_tconnectsync_window_artifacts(
             workspace=self.workspace,
             window=window,
             endpoint_family=self.endpoint_family,
-            payloads=payload_mapping,
-            timezone=self.timezone,
-            pump_serial=self.pump_serial,
+            payloads=payloads,
+            timezone=selected_timezone,
+            pump_serial=','.join(_pump_serial(pump) for pump in selected_pumps),
+            extra_raw_artifacts=tuple(extra_raw_artifacts),
+            payload_hash_source={str(path.name): payload for path, payload in raw_files.items()},
         )
+        for artifact in extra_raw_artifacts:
+            _write_json(artifact.path, raw_files[artifact.path])
+            if artifact.metadata_path is not None:
+                _write_json(artifact.metadata_path, artifact.metadata)
         if step_log is not None:
             step_log.write(
                 'api.export.complete',
@@ -2314,10 +2299,10 @@ class TConnectSyncSourceClient:
                 manifest_path=str(result.manifest_path) if result.manifest_path else None,
                 normalized_paths=_stable_json_dumps(result.normalized_paths),
                 row_counts=_stable_json_dumps(result.row_counts),
+                pump_serials=','.join(_pump_serial(pump) for pump in selected_pumps),
                 is_complete_window=result.is_complete_window,
             )
         return result
-
 
 __all__ = [
     'AcquisitionError',

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import re
 from typing import Sequence
 
@@ -9,6 +9,7 @@ import pandas as pd
 
 from .ingest import IngestedData
 from .insulin import expand_bolus_series_to_grid, expand_bolus_to_grid
+from .pump_profiles import PROFILE_SETTING_COLUMNS
 
 
 @dataclass(frozen=True)
@@ -17,6 +18,12 @@ class FeatureConfig:
     iob_duration_minutes: int = 300
     horizon_minutes: int = 30
     fill_cgm_interior_only: bool = True
+    # How the model-facing ``glucose`` column is filled across CGM gaps.
+    # "locf" carries the last observation forward and is causal: a row never sees a
+    # reading taken after its own timestamp. "linear" interpolates between the readings
+    # on either side of a gap, which is smoother for retrospective analysis but leaks
+    # future glucose into gap rows and must not be used to train or score forecasts.
+    cgm_fill_method: str = "locf"
     drop_imputed_targets: bool = True
     gap_flag_thresholds_minutes: tuple[int, ...] = (10, 20, 30)
     carb_windows_minutes: tuple[int, ...] = (30, 60, 120)
@@ -85,7 +92,10 @@ def _aggregate_cgm(
     freq: str,
     fill_interior_only: bool,
     gap_flag_thresholds_minutes: Sequence[int],
+    fill_method: str = "locf",
 ) -> pd.DataFrame:
+    if fill_method not in {"locf", "linear"}:
+        raise ValueError(f"Unknown cgm_fill_method: {fill_method!r} (expected 'locf' or 'linear')")
     out = grid.copy()
     out["glucose_observed"] = np.nan
     out["glucose"] = np.nan
@@ -111,7 +121,16 @@ def _aggregate_cgm(
     out["cgm_invalid"] = pd.to_numeric(out.get("cgm_invalid_agg", out["cgm_invalid"]), errors="coerce").fillna(0).astype(int)
     out = out.drop(columns=[column for column in ["cgm_invalid_agg"] if column in out.columns])
     out["glucose"] = out["glucose_observed"]
-    if fill_interior_only:
+    if fill_method == "locf":
+        has_later_reading = out["glucose_observed"].bfill().notna()
+        filled = out["glucose"].ffill()
+        if fill_interior_only:
+            # Match the linear path: only fill gaps that sit between two readings.
+            filled = filled.where(has_later_reading)
+        else:
+            filled = filled.bfill()
+        out["glucose"] = filled
+    elif fill_interior_only:
         out["glucose"] = out["glucose"].interpolate(method="linear", limit_area="inside")
     else:
         out["glucose"] = out["glucose"].interpolate(method="linear", limit_direction="both")
@@ -160,6 +179,8 @@ def _aggregate_basal(data: IngestedData, grid: pd.DataFrame, *, freq: str) -> pd
         return out
 
     bin_start = out["timestamp"].to_numpy(dtype="datetime64[ns]")
+    if np.any(np.diff(bin_start) <= np.timedelta64(0, "ns")):
+        raise ValueError("The 5-minute grid must be sorted with unique timestamps to place basal intervals.")
     bin_end = bin_start + np.timedelta64(step_minutes, "m")
     overlap_minutes = np.zeros(len(out), dtype=float)
     delivered_units = np.zeros(len(out), dtype=float)
@@ -177,17 +198,20 @@ def _aggregate_basal(data: IngestedData, grid: pd.DataFrame, *, freq: str) -> pd
             continue
         start64 = np.datetime64(start.to_datetime64())
         end64 = np.datetime64(end.to_datetime64())
-        overlap_start = np.maximum(bin_start, start64)
-        overlap_end = np.minimum(bin_end, end64)
-        overlap = (overlap_end - overlap_start) / np.timedelta64(1, "m")
-        mask = overlap > 0
-        if not np.any(mask):
+        # Only bins that end after the interval starts and start before it ends can overlap it.
+        first = int(np.searchsorted(bin_end, start64, side="right"))
+        last = int(np.searchsorted(bin_start, end64, side="left"))
+        overlap = (np.minimum(bin_end[first:last], end64) - np.maximum(bin_start[first:last], start64)) / np.timedelta64(1, "m")
+        positive = overlap > 0
+        if not np.any(positive):
             previous_rate = rate
             continue
-        overlap_minutes[mask] += overlap[mask]
-        delivered_units[mask] += rate * overlap[mask] / 60.0
-        rate_weighted_minutes[mask] += rate * overlap[mask]
-        overlap_count[mask] += 1
+        bins = first + np.flatnonzero(positive)
+        overlap = overlap[positive]
+        overlap_minutes[bins] += overlap
+        delivered_units[bins] += rate * overlap / 60.0
+        rate_weighted_minutes[bins] += rate * overlap
+        overlap_count[bins] += 1
         if previous_rate is not None and not np.isclose(rate, previous_rate):
             change_idx = np.searchsorted(bin_start, start64, side="right") - 1
             if 0 <= change_idx < len(schedule_change):
@@ -202,6 +226,22 @@ def _aggregate_basal(data: IngestedData, grid: pd.DataFrame, *, freq: str) -> pd
     change_ts = out["timestamp"].where(out["basal_schedule_change"].astype(bool)).ffill()
     out["minutes_since_basal_change"] = (out["timestamp"] - change_ts).dt.total_seconds().div(60.0).fillna(0.0)
     return out
+
+
+# Settings the pump's bolus calculator used for each logged meal; carried alongside carb_grams.
+# The bolus-calculator record for a meal: the settings it used and the inputs needed to recover settings
+# the pump did not record (glucose and insulin on board it saw, and the correction portion it gave).
+CALCULATOR_SETTING_COLUMNS = (
+    "carb_ratio_g_per_unit",
+    "isf_mgdl_per_unit",
+    "target_bg_mgdl",
+    "calculator_glucose_mgdl",
+    "calculator_iob_units",
+    "correction_bolus_units",
+)
+# Carried with each meal; the pump serial keeps settings from one pump from standing in for another's, and the
+# profile columns hold the profile active at the meal and its segment in force (``pump_profiles``).
+MEAL_RECORD_COLUMNS = (*CALCULATOR_SETTING_COLUMNS, "pump_serial", *PROFILE_SETTING_COLUMNS)
 
 
 def _aggregate_carbs(data: IngestedData, grid: pd.DataFrame, *, freq: str, windows_minutes: Sequence[int]) -> pd.DataFrame:
@@ -222,7 +262,12 @@ def _aggregate_carbs(data: IngestedData, grid: pd.DataFrame, *, freq: str, windo
     if carbs.empty:
         return out
 
-    carbs = carbs.groupby("timestamp", as_index=False).agg(carb_grams=("carb_grams", "sum"))
+    # Bolus-calculator settings in force for the meal travel with it (not model inputs).
+    setting_columns = [column for column in MEAL_RECORD_COLUMNS if column in carbs.columns]
+    carbs = carbs.groupby("timestamp", as_index=False).agg(
+        carb_grams=("carb_grams", "sum"),
+        **{column: (column, "first") for column in setting_columns},
+    )
     out = out.merge(carbs, on="timestamp", how="left", suffixes=("", "_agg"))
     out["carb_grams"] = out["carb_grams_agg"].combine_first(out["carb_grams"])
     out = out.drop(columns=[column for column in ["carb_grams_agg"] if column in out.columns])
@@ -324,6 +369,7 @@ def build_feature_frame(data: IngestedData, config: FeatureConfig | None = None)
         freq=config.freq,
         fill_interior_only=config.fill_cgm_interior_only,
         gap_flag_thresholds_minutes=config.gap_flag_thresholds_minutes,
+        fill_method=config.cgm_fill_method,
     )
     frame = _aggregate_activity(data, frame, freq=config.freq)
     frame = _aggregate_basal(data, frame, freq=config.freq)

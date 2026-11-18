@@ -1,699 +1,374 @@
+"""Answer-first HTML review pages.
+
+Each page opens with the question it answers and a one-sentence verdict, then the
+headline numbers, how much to trust the result and what to do next. Figures, full
+tables, companion files and a glossary sit in fold-out sections below. Internal
+status codes never appear on their own; they are translated with ``report_page.plain``.
+"""
+
 from __future__ import annotations
 
-import html
 import json
+import math
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.io import to_html
 
+from . import report_page as rp
 from .health_auto_export import ModelDataPreparationResult
-from .therapy_research import LatentMealResearchResult, TherapyInfraValidationResult, TherapyResearchResult, summarize_overnight_basal_evidence
+from .dataset import HORIZON_MINUTES
+from .therapy_research import HIGH_FAT_GRAMS, HIGH_PROTEIN_GRAMS, LOGGED_FOOD_MATCH_MINUTES, LatentMealResearchResult, TherapyInfraValidationResult, TherapyResearchResult, summarize_overnight_basal_evidence
+
+FIT_ERROR_GUIDE_MGDL = 10.0
+FORECAST_INTERVAL_PERCENT = 80
+FORECAST_COVERAGE_RANGE = (0.70, 0.90)
+TRACE_CLIP_MGDL = (20.0, 450.0)
 
 
-def _figure_div(figure: go.Figure, *, include_plotlyjs: bool) -> str:
-    return to_html(
-        figure,
-        include_plotlyjs="inline" if include_plotlyjs else False,
-        full_html=False,
-        config={"responsive": True, "displaylogo": False},
-    )
-
-
-def _page_shell(*, title: str, banner_html: str, sections: list[str]) -> str:
-    return "\n".join(
-        [
-            "<!doctype html>",
-            "<html lang='en'>",
-            "<head>",
-            "<meta charset='utf-8' />",
-            f"<title>{html.escape(title)}</title>",
-            "<meta name='viewport' content='width=device-width, initial-scale=1' />",
-            "<style>",
-            "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 24px; color: #16202a; background: #f6f8fb; }",
-            "h1, h2, h3 { color: #10233f; }",
-            ".banner { padding: 16px 18px; border-radius: 12px; margin-bottom: 20px; font-weight: 600; }",
-            ".banner.good { background: #e7f6ea; border: 1px solid #9bd0a9; }",
-            ".banner.degraded { background: #fff3db; border: 1px solid #f0c36d; }",
-            ".banner.broken { background: #fde8e8; border: 1px solid #ef9a9a; }",
-            ".card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin: 12px 0 24px; }",
-            ".card { background: white; border: 1px solid #d8e1ec; border-radius: 12px; padding: 14px 16px; box-shadow: 0 1px 2px rgba(16,35,63,0.05); }",
-            ".muted { color: #4f6177; }",
-            "table { width: 100%; border-collapse: collapse; background: white; }",
-            "th, td { padding: 10px 12px; border: 1px solid #d8e1ec; text-align: left; }",
-            "th { background: #eef3f9; }",
-            ".section { margin: 24px 0 32px; }",
-            ".empty-state { background: white; border: 1px dashed #b7c6d8; border-radius: 12px; padding: 18px; }",
-            "code { background: #eef3f9; padding: 1px 4px; border-radius: 4px; }",
-            "</style>",
-            "</head>",
-            "<body>",
-            f"<h1>{html.escape(title)}</h1>",
-            banner_html,
-            *sections,
-            "</body>",
-            "</html>",
-        ]
-    )
-
-
-def _data_quality_banner(summary: dict[str, Any], *, recommendation_policy: dict[str, Any] | None = None) -> str:
-    data_quality = summary.get("data_quality") or {}
-    status = str(data_quality.get("status") or "broken")
-    recommendation_status = None if recommendation_policy is None else recommendation_policy.get("status")
-    extra = ""
-    if recommendation_status is not None:
-        extra = f" Recommendation status: <code>{html.escape(str(recommendation_status))}</code>."
-    return (
-        f"<div class='banner {html.escape(status)}'>"
-        f"Data quality is <code>{html.escape(status)}</code>. "
-        f"Incomplete windows: <code>{html.escape(str(data_quality.get('incomplete_window_count', 0)))}</code>."
-        f"{extra}"
-        "</div>"
-    )
-
-
-def _window_timeline_figure(quality_rows: pd.DataFrame) -> go.Figure:
-    timeline_rows: list[dict[str, Any]] = []
-    grouped = quality_rows.groupby("window_id", dropna=False)
-    for window_id, window_rows in grouped:
-        first_row = window_rows.iloc[0]
-        requested_start = pd.to_datetime(first_row.get("requested_start"), errors="coerce", utc=True)
-        requested_end = pd.to_datetime(first_row.get("requested_end"), errors="coerce", utc=True)
-        if pd.notna(requested_start) and pd.notna(requested_end):
-            timeline_rows.append(
-                {
-                    "window_id": str(window_id),
-                    "series": "requested",
-                    "start": requested_start,
-                    "end": requested_end + pd.Timedelta(days=1),
-                }
-            )
-        observed_first = pd.to_datetime(window_rows["observed_first_timestamp"], errors="coerce", utc=True).dropna()
-        observed_last = pd.to_datetime(window_rows["observed_last_timestamp"], errors="coerce", utc=True).dropna()
-        if not observed_first.empty and not observed_last.empty:
-            timeline_rows.append(
-                {
-                    "window_id": str(window_id),
-                    "series": "observed",
-                    "start": observed_first.min(),
-                    "end": observed_last.max(),
-                }
-            )
-    if not timeline_rows:
-        return go.Figure()
-    frame = pd.DataFrame(timeline_rows)
-    fig = px.timeline(
-        frame,
-        x_start="start",
-        x_end="end",
-        y="window_id",
-        color="series",
-        color_discrete_map={"requested": "#9aa9bb", "observed": "#1f77b4"},
-        title="Window Timeline",
-    )
-    fig.update_yaxes(autorange="reversed", title=None)
-    fig.update_layout(margin=dict(l=20, r=20, t=50, b=20), legend_title_text="")
-    return fig
-
-
-def _row_counts_figure(quality_rows: pd.DataFrame) -> go.Figure:
-    if quality_rows.empty:
-        return go.Figure()
-    counts = (
-        quality_rows.groupby("kind", dropna=False)["row_count"]
-        .sum()
-        .reset_index()
-        .sort_values("kind")
-    )
-    fig = px.bar(counts, x="kind", y="row_count", title="Row Counts by Kind")
-    fig.update_layout(margin=dict(l=20, r=20, t=50, b=20), xaxis_title=None, yaxis_title="rows")
-    return fig
-
-
-def _reasons_table_html(quality_rows: pd.DataFrame) -> str:
-    if quality_rows.empty:
-        return "<div class='section'><h2>Completeness Reasons</h2><div class='empty-state'>No window-quality rows were available.</div></div>"
-    rows: list[str] = []
-    for window_id, window_rows in quality_rows.groupby("window_id", dropna=False):
-        reasons: list[str] = []
-        for raw in window_rows["completeness_reasons"].fillna("[]").astype(str):
-            try:
-                parsed = json.loads(raw)
-            except Exception:
-                parsed = []
-            for reason in parsed:
-                if reason not in reasons:
-                    reasons.append(str(reason))
-        rows.append(
-            "<tr>"
-            f"<td>{html.escape(str(window_id))}</td>"
-            f"<td>{html.escape(', '.join(reasons) if reasons else 'none')}</td>"
-            "</tr>"
-        )
-    return "\n".join(
-        [
-            "<div class='section'>",
-            "<h2>Completeness Reasons</h2>",
-            "<table>",
-            "<thead><tr><th>window</th><th>reasons</th></tr></thead>",
-            "<tbody>",
-            *rows,
-            "</tbody></table>",
-            "</div>",
-        ]
-    )
-
-
-def _latest_window_card_html(quality_rows: pd.DataFrame) -> str:
-    if quality_rows.empty:
-        return "<div class='section'><h2>Latest Window</h2><div class='empty-state'>No latest window could be identified.</div></div>"
-    ordered = quality_rows.copy()
-    ordered["requested_end_dt"] = pd.to_datetime(ordered["requested_end"], errors="coerce")
-    latest = ordered.sort_values(["requested_end_dt", "window_id"], na_position="last").iloc[-1]
-    coverage_fraction = float(latest.get("coverage_fraction", 0.0) or 0.0)
-    return "\n".join(
-        [
-            "<div class='section'>",
-            "<h2>Latest Window</h2>",
-            "<div class='card-grid'>",
-            "<div class='card'>",
-            f"<div><strong>window_id</strong>: <code>{html.escape(str(latest.get('window_id')))}</code></div>",
-            f"<div><strong>kind</strong>: {html.escape(str(latest.get('kind')))}</div>",
-            f"<div><strong>coverage_fraction</strong>: {html.escape(f'{coverage_fraction:.3f}')}</div>",
-            f"<div><strong>observed span</strong>: {html.escape(str(latest.get('observed_first_timestamp')))} to {html.escape(str(latest.get('observed_last_timestamp')))}</div>",
-            f"<div><strong>reasons</strong>: {html.escape(str(latest.get('completeness_reasons')))}</div>",
-            "</div>",
-            "</div>",
-            "</div>",
-        ]
-    )
-
-
-def write_coverage_review_html(summary: dict[str, Any], quality_rows: pd.DataFrame, path: str | Path) -> Path:
+def _write(path: str | Path, text: str) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    include_js = True
-    figures = []
-    for figure in [_window_timeline_figure(quality_rows), _row_counts_figure(quality_rows)]:
-        figures.append(_figure_div(figure, include_plotlyjs=include_js))
-        include_js = False
-
-    sections = [
-        "<div class='section'><h2>Window Timeline</h2>" + figures[0] + "</div>",
-        "<div class='section'><h2>Rows by Kind</h2>" + figures[1] + "</div>",
-        _reasons_table_html(quality_rows),
-        _latest_window_card_html(quality_rows),
-    ]
-    html_text = _page_shell(
-        title="Bayesian T1DM Coverage Review",
-        banner_html=_data_quality_banner(summary),
-        sections=sections,
-    )
-    path.write_text(html_text, encoding="utf-8")
+    path.write_text(text, encoding="utf-8")
     return path
 
 
-def _run_trace_figures(summary: dict[str, Any]) -> list[str]:
-    traces: list[str] = []
-    include_js = True
-    for fold in (summary.get("walk_forward") or {}).get("folds", []):
-        prediction_trace = fold.get("prediction_trace")
-        if not prediction_trace:
-            continue
-        frame = pd.DataFrame(
-            {
-                "timestamp": pd.to_datetime(prediction_trace.get("timestamps", []), errors="coerce"),
-                "actual": prediction_trace.get("actual", []),
-                "predicted": prediction_trace.get("predicted", []),
-                "lower": prediction_trace.get("lower", []),
-                "upper": prediction_trace.get("upper", []),
-            }
-        )
-        figure = go.Figure()
-        figure.add_trace(go.Scatter(x=frame["timestamp"], y=frame["actual"], name="actual", line=dict(color="#1f2937")))
-        figure.add_trace(go.Scatter(x=frame["timestamp"], y=frame["predicted"], name="predicted", line=dict(color="#2563eb")))
-        figure.add_trace(go.Scatter(x=frame["timestamp"], y=frame["upper"], name="upper", line=dict(color="#93c5fd"), opacity=0.6))
-        figure.add_trace(go.Scatter(x=frame["timestamp"], y=frame["lower"], name="lower", line=dict(color="#93c5fd"), fill="tonexty", opacity=0.2))
-        figure.update_layout(
-            title=f"Fold {fold.get('fold')} Actual vs Predicted",
-            margin=dict(l=20, r=20, t=50, b=20),
-            xaxis_title=None,
-            yaxis_title="glucose",
-        )
-        traces.append(_figure_div(figure, include_plotlyjs=include_js))
-        include_js = False
-    return traces
+def _date_span(start: Any, end: Any) -> str:
+    start_ts = pd.to_datetime(start, errors="coerce")
+    end_ts = pd.to_datetime(end, errors="coerce")
+    if pd.isna(start_ts) or pd.isna(end_ts):
+        return "date range unknown"
+    return f"{start_ts:%b %d, %Y} to {end_ts:%b %d, %Y}"
 
 
-def _fold_metric_figure(summary: dict[str, Any], metric: str, *, title: str, baseline_label: str | None = None) -> go.Figure:
+def _generated() -> str:
+    return f"Generated {pd.Timestamp.now():%Y-%m-%d %H:%M}"
+
+
+def _files(root: Path, href_prefix: str, entries: list[tuple[str, str]]) -> str:
+    return rp.file_links((f"{href_prefix}{name}", description, (root / name).exists()) for name, description in entries)
+
+
+def _reason_list(raw: Any) -> list[str]:
+    if isinstance(raw, (list, tuple)):
+        return [str(item) for item in raw]
+    text = str(raw or "").strip()
+    if not text or text in {"none", "nan"}:
+        return []
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed]
+    except (ValueError, TypeError):
+        pass
+    return [part for part in text.replace(",", "|").split("|") if part]
+
+
+# ---------------------------------------------------------------------------
+# Data coverage
+# ---------------------------------------------------------------------------
+
+
+def write_coverage_review_html(summary: dict[str, Any], quality_rows: pd.DataFrame, path: str | Path) -> Path:
+    data_quality = summary.get("data_quality") or {}
+    status_code = str(data_quality.get("status") or "broken")
+    windows = quality_rows["window_id"].nunique() if not quality_rows.empty else 0
+    incomplete = int(data_quality.get("incomplete_window_count") or 0)
+    reason_counts = data_quality.get("reason_counts") or {}
+
+    status, label = {
+        "good": ("good", "Complete"),
+        "degraded": ("warn", "Usable, with gaps"),
+    }.get(status_code, ("bad", "Incomplete"))
+    headline = (
+        f"<b>{incomplete} of {windows} download windows</b> have gaps or other problems."
+        if windows
+        else "<b>No download windows were found.</b>"
+    )
+    explanation = (
+        "Analyses can still run on incomplete windows, but recommendations are held back until the data are complete."
+        if incomplete
+        else "Every download window covers the period it was asked for."
+    )
+
+    window_rows = []
+    for window_id, group in quality_rows.groupby("window_id", dropna=False) if not quality_rows.empty else []:
+        coverage = pd.to_numeric(group.get("coverage_fraction"), errors="coerce")
+        reasons: list[str] = []
+        for raw in group.get("completeness_reasons", pd.Series(dtype=str)).fillna("[]"):
+            for reason in _reason_list(raw):
+                if reason not in reasons:
+                    reasons.append(reason)
+        cgm = group.loc[group["kind"].astype(str).eq("cgm")] if "kind" in group else group.iloc[0:0]
+        slot_coverage = pd.to_numeric(cgm["cgm_slot_coverage"], errors="coerce").dropna() if "cgm_slot_coverage" in cgm else pd.Series(dtype=float)
+        long_gaps = pd.to_numeric(cgm["cgm_gaps_ge_2h"], errors="coerce").dropna() if "cgm_gaps_ge_2h" in cgm else pd.Series(dtype=float)
+        window_rows.append(
+            (
+                rp.esc(window_id),
+                rp.fmt(coverage.min() * 100 if not coverage.dropna().empty else float("nan"), 0, suffix="%"),
+                rp.fmt(slot_coverage.iloc[0] * 100 if not slot_coverage.empty else float("nan"), 1, suffix="%"),
+                rp.fmt(long_gaps.iloc[0] if not long_gaps.empty else float("nan"), 0),
+                rp.esc("; ".join(rp.plain(r) for r in reasons) or "complete"),
+            )
+        )
+
+    kind_rows = []
+    if not quality_rows.empty and "kind" in quality_rows:
+        counts = quality_rows.groupby("kind", dropna=False)["row_count"].sum().sort_values(ascending=False)
+        kind_rows = [(rp.plain(kind), float(count)) for kind, count in counts.items()]
+
+    body = [
+        rp.verdict(status, label, headline, explanation),
+        rp.tiles(
+            [
+                (rp.fmt(windows, 0), "download windows"),
+                (rp.fmt(incomplete, 0), "with gaps or problems"),
+                (rp.fmt(sum(v for _, v in kind_rows), 0), "rows downloaded"),
+            ]
+        ),
+        rp.section(
+            "What the problems are",
+            rp.bar_list([(rp.plain(reason), float(count)) for reason, count in sorted(reason_counts.items(), key=lambda kv: -kv[1])], color=rp.PRIMARY)
+            + rp.caption("Number of download windows with each problem. One window can have several.")
+            if reason_counts
+            else "<p>No problems were recorded.</p>",
+        ),
+        rp.details(
+            "Details: every window",
+            rp.table(["window", "days covered", "CGM readings (% of 5-min slots)", "CGM gaps of 2 h or more", "download problems"], window_rows, numeric=[1, 2, 3])
+            + rp.caption(
+                "Days covered is the share of the requested dates the download spans, for the data type with the least. "
+                "CGM readings is the share of 5-minute slots with a sensor reading. A window counts as incomplete only for download problems."
+            ),
+        ),
+        rp.details("Details: rows by data type", rp.bar_list(kind_rows) if kind_rows else "<p>No rows.</p>"),
+        rp.glossary(
+            [
+                ("Download window", "One request to Tandem Source for a fixed date range (about 30 days)."),
+                ("Coverage", "Share of the requested period for which data came back."),
+            ]
+        ),
+    ]
+    return _write(path, rp.page(title="Tandem Data Coverage", question="Is the Tandem data complete?", subtitle=_generated(), body=body))
+
+
+# ---------------------------------------------------------------------------
+# Forecast validation
+# ---------------------------------------------------------------------------
+
+def _completeness_phrase(data_quality: dict[str, Any]) -> str:
+    incomplete = int(data_quality.get("incomplete_window_count") or 0)
+    status = str(data_quality.get("status") or "")
+    if status == "good":
+        return "all download windows complete"
+    return f"{incomplete} download windows have gaps or other problems"
+
+
+def _forecast_trace_figure(summary: dict[str, Any]) -> str:
     folds = (summary.get("walk_forward") or {}).get("folds", [])
+    traced = [fold for fold in folds if fold.get("prediction_trace")]
+    if not traced:
+        return ""
+    fold = traced[-1]
+    trace = fold["prediction_trace"]
     frame = pd.DataFrame(
         {
-            "fold": [fold.get("fold") for fold in folds],
-            metric: [fold.get(metric) for fold in folds],
-            "persistence_mae": [fold.get("persistence_mae") for fold in folds],
+            "timestamp": pd.to_datetime(trace.get("timestamps", []), errors="coerce"),
+            "actual": pd.to_numeric(pd.Series(trace.get("actual", [])), errors="coerce"),
+            "predicted": pd.to_numeric(pd.Series(trace.get("predicted", [])), errors="coerce"),
+            "lower": pd.to_numeric(pd.Series(trace.get("lower", [])), errors="coerce"),
+            "upper": pd.to_numeric(pd.Series(trace.get("upper", [])), errors="coerce"),
         }
+    ).dropna(subset=["timestamp"])
+    if frame.empty:
+        return ""
+    end = frame["timestamp"].max()
+    frame = frame.loc[frame["timestamp"] > end - pd.Timedelta(hours=48)].copy()
+    # Keep the axis readable: CGM reports 40 to 400 mg/dL, so clip forecasts to a little beyond that.
+    model_columns = ["predicted", "lower", "upper"]
+    out_of_range = int(((frame[model_columns] < TRACE_CLIP_MGDL[0]) | (frame[model_columns] > TRACE_CLIP_MGDL[1])).any(axis=1).sum())
+    frame[model_columns] = frame[model_columns].clip(*TRACE_CLIP_MGDL)
+    figure = rp.time_series(
+        frame["timestamp"].tolist(),
+        [
+            ("CGM", frame["actual"].tolist(), "#3B3B3B", False),
+            ("model forecast", frame["predicted"].tolist(), rp.PRIMARY, False),
+        ],
+        band=(frame["lower"].tolist(), frame["upper"].tolist(), rp.PRIMARY),
+        y_label="glucose (mg/dL)",
     )
-    figure = go.Figure()
-    figure.add_trace(go.Bar(x=frame["fold"], y=frame[metric], name=metric))
-    if baseline_label is not None:
-        figure.add_trace(go.Bar(x=frame["fold"], y=frame["persistence_mae"], name=baseline_label))
-    figure.update_layout(title=title, barmode="group", margin=dict(l=20, r=20, t=50, b=20), xaxis_title="fold")
-    return figure
-
-
-def _sampler_table(summary: dict[str, Any]) -> str:
-    folds = (summary.get("walk_forward") or {}).get("folds", [])
-    rows = [
-        "<tr><th>fold</th><th>chains</th><th>divergences</th><th>rhat_max</th><th>ess_bulk_min</th><th>ess_tail_min</th></tr>"
-    ]
-    for fold in folds:
-        diag = fold.get("fit_diagnostics") or {}
-        rows.append(
-            "<tr>"
-            f"<td>{html.escape(str(fold.get('fold')))}</td>"
-            f"<td>{html.escape(str(diag.get('chains')))}</td>"
-            f"<td>{html.escape(str(diag.get('divergences')))}</td>"
-            f"<td>{html.escape(str(diag.get('rhat_max')))}</td>"
-            f"<td>{html.escape(str(diag.get('ess_bulk_min')))}</td>"
-            f"<td>{html.escape(str(diag.get('ess_tail_min')))}</td>"
-            "</tr>"
+    return (
+        figure
+        + rp.legend([("#3B3B3B", "CGM", False), (rp.PRIMARY, f"model forecast with {FORECAST_INTERVAL_PERCENT}% range", False)])
+        + rp.caption(
+            f"Last 48 hours of validation period {rp.esc(fold.get('fold'))}. Each point is the forecast made {HORIZON_MINUTES} minutes earlier."
+            + (
+                f" At {out_of_range} of {len(frame)} time points the forecast or its range went outside {TRACE_CLIP_MGDL[0]:.0f} to {TRACE_CLIP_MGDL[1]:.0f} mg/dL and is drawn at that edge."
+                if out_of_range
+                else ""
+            )
         )
-    return "\n".join(
-        [
-            "<div class='section'>",
-            "<h2>Sampler Diagnostics</h2>",
-            "<table>",
-            "<thead>",
-            rows[0],
-            "</thead>",
-            "<tbody>",
-            *rows[1:],
-            "</tbody>",
-            "</table>",
-            "</div>",
-        ]
-    )
-
-
-def _final_fit_card(summary: dict[str, Any]) -> str:
-    diagnostics = summary.get("fit_diagnostics") or {}
-    if not diagnostics:
-        return (
-            "<div class='section'><h2>Final Fit Diagnostics</h2>"
-            "<div class='empty-state'>No final recommendation fit was run.</div></div>"
-        )
-    fields = [
-        ("chains", diagnostics.get("chains")),
-        ("draws", diagnostics.get("draws")),
-        ("tune", diagnostics.get("tune")),
-        ("divergences", diagnostics.get("divergences")),
-        ("max_tree_depth_hits", diagnostics.get("max_tree_depth_hits")),
-        ("rhat_max", diagnostics.get("rhat_max")),
-        ("ess_bulk_min", diagnostics.get("ess_bulk_min")),
-        ("ess_tail_min", diagnostics.get("ess_tail_min")),
-    ]
-    items = [f"<div><strong>{html.escape(name)}</strong>: {html.escape(str(value))}</div>" for name, value in fields]
-    return "\n".join(
-        [
-            "<div class='section'>",
-            "<h2>Final Fit Diagnostics</h2>",
-            "<div class='card-grid'>",
-            "<div class='card'>",
-            *items,
-            "</div>",
-            "</div>",
-            "</div>",
-        ]
-    )
-
-
-def _forecast_summary_html(summary: dict[str, Any]) -> str:
-    walk_forward = summary.get("walk_forward") or {}
-    aggregate = walk_forward.get("aggregate") or {}
-    policy = summary.get("recommendation_policy") or {}
-    data_quality = summary.get("data_quality") or {}
-    items = [
-        ("data_quality_status", data_quality.get("status") or "unknown"),
-        ("incomplete_windows", data_quality.get("incomplete_window_count") if data_quality else "NA"),
-        ("model_mae", "NA" if aggregate.get("mae") is None else f"{float(aggregate['mae']):.3f}"),
-        ("persistence_mae", "NA" if walk_forward.get("aggregate_persistence_mae") is None else f"{float(walk_forward['aggregate_persistence_mae']):.3f}"),
-        ("coverage", "NA" if aggregate.get("coverage") is None else f"{float(aggregate['coverage']):.3f}"),
-        ("recommendation_policy", policy.get("status") or "unknown"),
-    ]
-    return "\n".join(
-        [
-            "<div class='section'>",
-            "<h2>Decision Summary</h2>",
-            "<div class='card-grid'>",
-            "<div class='card'>",
-            *[f"<div><strong>{html.escape(name)}</strong>: {html.escape(str(value))}</div>" for name, value in items],
-            "</div>",
-            "<div class='card'>",
-            "<strong>Interpretation</strong>",
-            "<div class='muted'>This page is the forecast-validation drill-down. The key questions are whether validation beats persistence, whether source quality is acceptable, and whether model diagnostics are trustworthy enough to support downstream decisions.</div>",
-            "</div>",
-            "</div>",
-            "</div>",
-        ]
     )
 
 
 def write_run_review_html(summary: dict[str, Any], path: str | Path) -> Path:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    walk_forward = summary.get("walk_forward") or {}
+    aggregate = walk_forward.get("aggregate") or {}
+    folds = walk_forward.get("folds") or []
+    model_mae = aggregate.get("mae")
+    baseline_mae = walk_forward.get("aggregate_persistence_mae")
+    coverage = aggregate.get("coverage")
+    policy = summary.get("recommendation_policy") or {}
+    data_quality = summary.get("data_quality") or {}
 
-    include_js = True
-    figures: list[str] = []
-    coverage_figure = _fold_metric_figure(summary, "model_coverage", title="Coverage by Fold")
-    figures.append(_figure_div(coverage_figure, include_plotlyjs=include_js))
-    include_js = False
-    mae_figure = _fold_metric_figure(summary, "model_mae", title="Model vs Persistence MAE", baseline_label="persistence_mae")
-    figures.append(_figure_div(mae_figure, include_plotlyjs=include_js))
-    trace_figures = _run_trace_figures(summary)
+    def finite(value: Any) -> bool:
+        try:
+            return math.isfinite(float(value))
+        except (TypeError, ValueError):
+            return False
 
-    recommendation_policy = summary.get("recommendation_policy") or {}
-    recommendations = summary.get("recommendations") or []
-    reasons = recommendation_policy.get("reasons") or []
-    reason_text = (
-        "<div class='muted'>Reasons: " + html.escape(", ".join(str(reason) for reason in reasons)) + "</div>"
-        if reasons
-        else ""
-    )
-    if recommendations:
-        recommendation_panel = (
-            "<div class='card'><strong>Recommendations generated.</strong>"
-            + reason_text
-            + "</div>"
-        )
-    elif recommendation_policy.get("status") == "suppressed":
-        recommendation_panel = (
-            "<div class='empty-state'><strong>Recommendations were suppressed by policy.</strong>"
-            + reason_text
-            + "</div>"
-        )
-    elif recommendation_policy.get("status") == "skipped":
-        recommendation_panel = (
-            "<div class='empty-state'><strong>Recommendations were skipped by configuration.</strong>"
-            + reason_text
-            + "</div>"
-        )
-    else:
-        recommendation_panel = "<div class='empty-state'><strong>No recommendations were generated.</strong></div>"
+    fits = rp.forecast_fits(summary)
+    failed_fits = sum(1 for diag in fits if not rp.sampler_healthy(diag))
+    answer = rp.forecast_verdict(model_mae, baseline_mae, failed_fits=failed_fits, total_fits=len(fits)) if folds else rp.forecast_verdict(None, None)
+    status, label = answer.status, answer.label
+    headline, explanation = f"<b>{rp.esc(answer.headline)}</b>", rp.esc(answer.explanation)
 
-    sections = [
-        _forecast_summary_html(summary),
-        "<div class='section'><h2>Coverage by Fold</h2>" + figures[0] + "</div>",
-        "<div class='section'><h2>Model vs Persistence</h2>" + figures[1] + "</div>",
-        *[f"<div class='section'><h2>Forecast Trace</h2>{trace}</div>" for trace in trace_figures],
-        _sampler_table(summary),
-        _final_fit_card(summary),
-        "<div class='section'><h2>Recommendation Policy</h2>" + recommendation_panel + "</div>",
+    width = aggregate.get("interval_width")
+    trust = [
+        (
+            f"<b>The model fitting failed its checks in {failed_fits} of {len(fits)} fits</b> (the sampler did not settle on an answer), so none of the model's numbers can be trusted."
+            if failed_fits
+            else f"Model fitting passed its checks in all {len(fits)} fits."
+        )
+        if fits
+        else "",
+        (
+            f"The {FORECAST_INTERVAL_PERCENT}% forecast range contained the real value {rp.fmt(float(coverage) * 100, 0)}% of the time "
+            f"(target {FORECAST_COVERAGE_RANGE[0]:.0%} to {FORECAST_COVERAGE_RANGE[1]:.0%}); on average the range was {rp.fmt(width, 0)} mg/dL wide."
+        )
+        if finite(coverage)
+        else "",
+        f"Tested on {len(folds)} later periods that the model was not trained on." if folds else "",
+        (f"Data completeness: {_completeness_phrase(data_quality)}.") if data_quality else "",
     ]
-    html_text = _page_shell(
-        title="Bayesian T1DM Run Review",
-        banner_html=_data_quality_banner(summary, recommendation_policy=recommendation_policy),
-        sections=sections,
-    )
-    path.write_text(html_text, encoding="utf-8")
-    return path
 
+    policy_status = str(policy.get("status") or "")
+    reasons = [rp.plain(reason) for reason in policy.get("reasons") or []]
+    if summary.get("recommendations"):
+        next_steps = ["Settings suggestions were generated; see the run summary file."]
+    elif policy_status == "skipped":
+        next_steps = ["Settings suggestions were not requested for this run."]
+    elif policy_status == "suppressed":
+        next_steps = ["Settings suggestions were held back because: " + "; ".join(reasons) + "."]
+    else:
+        next_steps = ["No settings suggestions were produced."]
 
-def _therapy_banner(preparation: ModelDataPreparationResult, overnight_summary: dict[str, Any]) -> str:
-    status = {
-        "identifiable": "good",
-        "weakly_identifiable": "degraded",
-        "blocked": "broken",
-    }.get(str(overnight_summary.get("status")), "degraded")
-    return (
-        f"<div class='banner {html.escape(status)}'>"
-        f"Prepared mode: <code>{html.escape(preparation.dataset.mode)}</code>. "
-        f"Overnight basal status: <code>{html.escape(str(overnight_summary.get('status') or 'unknown'))}</code>. "
-        f"Clean overnight rows: <code>{html.escape(str(overnight_summary.get('clean_rows', 0)))}</code> across "
-        f"<code>{html.escape(str(overnight_summary.get('clean_nights', 0)))}</code> nights."
-        "</div>"
-    )
-
-
-def _therapy_timeline_figure(preparation: ModelDataPreparationResult) -> go.Figure:
-    rows: list[dict[str, Any]] = []
-    for label, start, end in [
-        ("tandem_before", preparation.tandem_span_before_start, preparation.tandem_span_before_end),
-        ("tandem_after", preparation.tandem_span_after_start, preparation.tandem_span_after_end),
-        ("apple", preparation.apple_span_start, preparation.apple_span_end),
-        ("final_dataset", preparation.final_dataset_start, preparation.final_dataset_end),
-    ]:
-        if start is None or end is None:
-            continue
-        rows.append(
-            {
-                "series": label,
-                "start": pd.Timestamp(start),
-                "end": pd.Timestamp(end),
-                "label": label.replace("_", " "),
-            }
+    fold_rows = [
+        (
+            f"period {fold.get('fold')}",
+            float(fold["model_mae"]) if finite(fold.get("model_mae")) else None,
+            float(fold["persistence_mae"]) if finite(fold.get("persistence_mae")) else None,
         )
-    if not rows:
-        return go.Figure()
-    frame = pd.DataFrame(rows)
-    fig = px.timeline(frame, x_start="start", x_end="end", y="label", color="series", title="Therapy Data Timeline")
-    fig.update_yaxes(autorange="reversed", title=None)
-    fig.update_layout(margin=dict(l=20, r=20, t=50, b=20), legend_title_text="")
-    return fig
+        for fold in folds
+    ]
+    plottable = all(row[1] is None or row[1] < 10 * max((row[2] or 1), 1) for row in fold_rows)
+    fold_table = rp.table(
+        ["period", "test dates", "test points", "model error (mg/dL)", "baseline error (mg/dL)", f"in {FORECAST_INTERVAL_PERCENT}% range"],
+        [
+            (
+                rp.esc(fold.get("fold")),
+                rp.esc(_date_span(fold.get("test_start_timestamp"), fold.get("test_end_timestamp"))),
+                rp.fmt(fold.get("n_test"), 0),
+                rp.fmt(fold.get("model_mae")),
+                rp.fmt(fold.get("persistence_mae")),
+                rp.fmt(float(fold["model_coverage"]) * 100 if finite(fold.get("model_coverage")) else None, 0, suffix="%"),
+            )
+            for fold in folds
+        ],
+        numeric=[2, 3, 4, 5],
+    )
+
+    sampler_rows = []
+    for name, diag in [(f"period {fold.get('fold')}", fold.get("fit_diagnostics") or {}) for fold in folds] + [("final fit", summary.get("fit_diagnostics") or {})]:
+        if not diag:
+            continue
+        sampler_rows.append(
+            (
+                rp.esc(name),
+                rp.esc(diag.get("chains")),
+                rp.esc(diag.get("divergences")),
+                rp.fmt(diag.get("rhat_max"), 3),
+                rp.fmt(diag.get("ess_bulk_min"), 0),
+                "OK" if rp.sampler_healthy(diag) else "failed",
+            )
+        )
+
+    body = [
+        rp.verdict(status, label, headline, explanation),
+        rp.tiles(
+            [
+                (rp.fmt(model_mae, suffix=" mg/dL"), "model forecast error"),
+                (rp.fmt(baseline_mae, suffix=" mg/dL"), "error if glucose stays the same"),
+                (rp.fmt(float(coverage) * 100 if finite(coverage) else None, 0, suffix="%"), f"of readings inside the {FORECAST_INTERVAL_PERCENT}% range"),
+            ]
+        ),
+        rp.section("How much should I trust this?", rp.bullets(trust)),
+        rp.section("What to do next", rp.bullets(next_steps)),
+        rp.details(
+            "Details: error in each validation period",
+            (
+                rp.paired_dots(fold_rows, first_label="model", second_label="baseline", axis_label="average forecast error (mg/dL)")
+                + rp.legend([(rp.PRIMARY, "model", False), (rp.COMPARATOR, "glucose stays the same", False)])
+                if plottable
+                else rp.caption("The model's error in at least one period is too large to plot on the same scale as the baseline; see the table.")
+            )
+            + fold_table,
+            open_=True,
+        ),
+        rp.details("Details: forecast against CGM", _forecast_trace_figure(summary) or "<p>No forecast trace was saved.</p>"),
+        rp.details(
+            "Details: model fitting checks",
+            rp.table(["fit", "chains", "divergences", "R-hat (max)", "effective samples (min)", "status"], sampler_rows, numeric=[1, 2, 3, 4])
+            + rp.caption(f"OK means R-hat under {rp.SAMPLER_RHAT_MAX}, no divergences and at least {rp.SAMPLER_ESS_PER_CHAIN} effective samples per chain. Anything else means the sampler did not settle on an answer and the fit is not reliable.")
+            if sampler_rows
+            else "<p>No fitting diagnostics were recorded.</p>",
+        ),
+        rp.glossary(
+            [
+                ("Forecast error", "Average distance in mg/dL between the 30-minute forecast and the CGM reading that followed (mean absolute error)."),
+                ("Baseline", f"Forecasting that glucose in {HORIZON_MINUTES} minutes equals glucose now. A useful model must beat it."),
+                (f"{FORECAST_INTERVAL_PERCENT}% range", f"The band the model expects to contain the real value {FORECAST_INTERVAL_PERCENT}% of the time."),
+                ("Validation period", "A later stretch of data held out from training, used to test the model as if forecasting the future."),
+            ]
+        ),
+    ]
+    return _write(path, rp.page(title="Glucose Forecast Check", question=f"Can the model forecast glucose {HORIZON_MINUTES} minutes ahead?", subtitle=_generated(), body=body))
 
 
-def _overnight_trace_figure(research_result: TherapyResearchResult) -> go.Figure:
-    frame = research_result.research_frame.loc[
-        research_result.research_frame["therapy_segment"].astype(str).eq("overnight")
-    ].copy()
+# ---------------------------------------------------------------------------
+# Therapy evidence (overnight basal)
+# ---------------------------------------------------------------------------
+
+
+def _overnight_figure(research_result: TherapyResearchResult) -> str:
+    frame = research_result.research_frame
+    if frame.empty or "therapy_segment" not in frame:
+        return ""
+    frame = frame.loc[frame["therapy_segment"].astype(str).eq("overnight")].copy()
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce")
     frame = frame.dropna(subset=["timestamp"]).tail(288)
     if frame.empty:
-        return go.Figure()
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=frame["timestamp"], y=frame["glucose"], name="glucose", line=dict(color="#1f2937")))
-    if "target_glucose" in frame.columns:
-        fig.add_trace(go.Scatter(x=frame["timestamp"], y=frame["target_glucose"], name="target_glucose", line=dict(color="#2563eb", dash="dot")))
-    if "basal_units_per_hour" in frame.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=frame["timestamp"],
-                y=frame["basal_units_per_hour"],
-                name="basal_units_per_hour",
-                line=dict(color="#dc2626"),
-                yaxis="y2",
-            )
-        )
-    fig.update_layout(
-        title="Recent Overnight Glucose and Basal",
-        margin=dict(l=20, r=20, t=50, b=20),
-        xaxis_title=None,
-        yaxis_title="glucose",
-        yaxis2=dict(title="basal u/hr", overlaying="y", side="right"),
+        return ""
+    figure = rp.time_series(
+        frame["timestamp"].tolist(),
+        [("glucose", pd.to_numeric(frame["glucose"], errors="coerce").tolist(), rp.PRIMARY, False)],
+        y_label="glucose (mg/dL)",
+        reference_lines=[(180.0, "180"), (70.0, "70")],
     )
-    return fig
-
-
-def _exclusion_figure(exclusions: pd.DataFrame) -> go.Figure:
-    if exclusions.empty:
-        return go.Figure()
-    fig = px.bar(exclusions, x="reason", y="count", title="Overnight Exclusion Reasons")
-    fig.update_layout(margin=dict(l=20, r=20, t=50, b=20), xaxis_title=None)
-    return fig
-
-
-def _workflow_table_html() -> str:
-    rows = [
-        ("normalize-raw", "normalize_raw_summary.md", "src/bayesian_t1dm/acquisition.py::normalize_tconnectsync_archive", "Rebuild normalized Tandem windows from archived raw payloads."),
-        ("prepare-model-data", "output/prepare/model_data_preparation.md + cache/prepared/prepared_model_data_5min.csv", "src/bayesian_t1dm/cli.py::_prepare_model_data and src/bayesian_t1dm/health_auto_export.py::build_prepared_model_dataset", "Create the Tandem-aligned model dataset and record source overlap."),
-        ("research-therapy-settings", "therapy_research_gate.md + therapy_feature_audit.md", "src/bayesian_t1dm/therapy_research.py::run_therapy_research", "Build therapy contexts, gate identifiability, and compare models."),
-        ("validate-therapy-infra", "therapy_infra_validation.md", "src/bayesian_t1dm/therapy_research.py::validate_therapy_infra", "Check truth-recovery and suppression behavior on synthetic scenarios."),
-        ("review-therapy-evidence", "output/therapy/therapy_review.html", "src/bayesian_t1dm/review.py::write_therapy_evidence_review_html", "Explain what the system thinks is happening and why."),
-    ]
-    html_rows = [
-        "<tr><th>step</th><th>artifact</th><th>code path</th><th>purpose</th></tr>",
-        *[
-            f"<tr><td><code>{html.escape(step)}</code></td><td>{html.escape(artifact)}</td><td><code>{html.escape(code)}</code></td><td>{html.escape(purpose)}</td></tr>"
-            for step, artifact, code, purpose in rows
-        ],
-    ]
-    return "\n".join(
-        [
-            "<div class='section'>",
-            "<h2>Workflow Crosswalk</h2>",
-            "<table>",
-            "<thead>",
-            html_rows[0],
-            "</thead>",
-            "<tbody>",
-            *html_rows[1:],
-            "</tbody></table>",
-            "</div>",
-        ]
-    )
-
-
-def _parameter_gate_html(research_result: TherapyResearchResult) -> str:
-    gate = research_result.research_gate.copy()
-    if gate.empty:
-        return "<div class='section'><h2>Parameter Gate</h2><div class='empty-state'>No research gate rows were available.</div></div>"
-    rows = [
-        "<tr><th>parameter</th><th>identifiability</th><th>gate_status</th><th>source_quality_status</th><th>confounding</th></tr>"
-    ]
-    for row in gate.itertuples(index=False):
-        rows.append(
-            "<tr>"
-            f"<td>{html.escape(str(row.parameter))}</td>"
-            f"<td><code>{html.escape(str(row.identifiability))}</code></td>"
-            f"<td><code>{html.escape(str(row.gate_status))}</code></td>"
-            f"<td><code>{html.escape(str(row.source_quality_status))}</code></td>"
-            f"<td><code>{html.escape(str(row.closed_loop_confounding_risk))}</code></td>"
-            "</tr>"
-        )
-    return "\n".join(
-        [
-            "<div class='section'>",
-            "<h2>Parameter Gate</h2>",
-            "<table>",
-            "<thead>",
-            rows[0],
-            "</thead>",
-            "<tbody>",
-            *rows[1:],
-            "</tbody></table>",
-            "</div>",
-        ]
-    )
-
-
-def _overnight_summary_html(overnight_summary: dict[str, Any]) -> str:
-    items = [
-        ("status", overnight_summary.get("status")),
-        ("reason", overnight_summary.get("reason") or "none"),
-        ("overnight_rows", overnight_summary.get("overnight_rows")),
-        ("clean_rows", overnight_summary.get("clean_rows")),
-        ("overnight_nights", overnight_summary.get("overnight_nights")),
-        ("clean_nights", overnight_summary.get("clean_nights")),
-        ("stable_epochs", overnight_summary.get("stable_epochs")),
-        ("mean_glucose", "NA" if pd.isna(overnight_summary.get("mean_glucose")) else f"{float(overnight_summary.get('mean_glucose')):.2f}"),
-        ("mean_target_delta", "NA" if pd.isna(overnight_summary.get("mean_target_delta")) else f"{float(overnight_summary.get('mean_target_delta')):.2f}"),
-        ("expected_direction", overnight_summary.get("expected_direction") or "none"),
-    ]
-    return "\n".join(
-        [
-            "<div class='section'>",
-            "<h2>Overnight Basal Proof</h2>",
-            "<div class='card-grid'>",
-            "<div class='card'>",
-            *[f"<div><strong>{html.escape(name)}</strong>: {html.escape(str(value))}</div>" for name, value in items],
-            "</div>",
-            "<div class='card'>",
-            "<strong>Interpretation</strong>",
-            "<div class='muted'>This section answers the first proof question: do we have enough clean overnight / fasting rows, across enough nights and stable epochs, to treat overnight basal as identifiable rather than just modeled?</div>",
-            "</div>",
-            "</div>",
-            "</div>",
-        ]
-    )
-
-
-def _therapy_decision_summary_html(research_result: TherapyResearchResult, overnight_summary: dict[str, Any]) -> str:
-    candidates = research_result.recommendations.loc[
-        research_result.recommendations["status"].astype(str).eq("candidate")
-    ].copy()
-    suppressed = research_result.recommendations.loc[
-        research_result.recommendations["status"].astype(str).isin(["suppressed", "exploratory"])
-    ].copy()
-    candidate_text = "No actionable therapy candidates were produced."
-    if not candidates.empty:
-        lead = candidates.iloc[0]
-        candidate_text = (
-            f"{lead['parameter']} / {lead['segment']}: "
-            f"{lead['expected_direction']} {float(lead['proposed_change_percent']):.1f}% "
-            f"({lead['confidence']} confidence)"
-        )
-    blocked_reason = overnight_summary.get("reason") or "none"
-    blocked_rows = [
-        ("overnight_status", overnight_summary.get("status") or "unknown"),
-        ("blocked_reason", blocked_reason),
-        ("candidate_count", int(len(candidates))),
-        ("suppressed_count", int(len(suppressed))),
-        ("lead_candidate", candidate_text),
-    ]
-    return "\n".join(
-        [
-            "<div class='section'>",
-            "<h2>Decision Summary</h2>",
-            "<div class='card-grid'>",
-            "<div class='card'>",
-            *[f"<div><strong>{html.escape(name)}</strong>: {html.escape(str(value))}</div>" for name, value in blocked_rows],
-            "</div>",
-            "<div class='card'>",
-            "<strong>Interpretation</strong>",
-            "<div class='muted'>This page should answer whether the current data support a therapy-setting change, support leaving settings alone, or are still blocked by identifiability or confounding.</div>",
-            "</div>",
-            "</div>",
-            "</div>",
-        ]
-    )
-
-
-def _artifact_index_html(
-    artifact_root: Path,
-    *,
-    include_validation: bool,
-    artifact_href_prefix: str = "",
-) -> str:
-    artifacts = [
-        "model_data_preparation.md",
-        "therapy_research_gate.md",
-        "meal_proxy_audit.md",
-        "therapy_feature_audit.md",
-        "therapy_feature_registry.csv",
-        "therapy_model_comparison.md",
-        "therapy_segment_evidence.csv",
-        "therapy_recommendation_research.md",
-        "tandem_source_report_card.md",
-        "apple_source_report_card.md",
-        "source_numeric_summary.csv",
-        "source_missingness_summary.csv",
-    ]
-    if include_validation:
-        artifacts.extend(
-            [
-                "therapy_infra_validation.md",
-                "therapy_synthetic_results.csv",
-                "therapy_synthetic_recommendation_audit.md",
-            ]
-        )
-    rows = []
-    for artifact in artifacts:
-        path = artifact_root / artifact
-        link_target = f"{artifact_href_prefix}{artifact}"
-        link_html = f"<a href=\"{html.escape(link_target)}\">open</a>" if path.exists() else ""
-        rows.append(
-            "<tr>"
-            f"<td>{html.escape(artifact)}</td>"
-            f"<td>{'yes' if path.exists() else 'no'}</td>"
-            f"<td>{link_html}</td>"
-            "</tr>"
-        )
-    return "\n".join(
-        [
-            "<div class='section'>",
-            "<h2>Supporting Artifacts</h2>",
-            "<table>",
-            "<thead><tr><th>artifact</th><th>exists</th><th>link</th></tr></thead>",
-            "<tbody>",
-            *rows,
-            "</tbody></table>",
-            "</div>",
-        ]
+    nights = int(frame["timestamp"].dt.normalize().nunique())
+    return figure + rp.caption(
+        f"The last {len(frame) * 5 / 60:.0f} hours of overnight CGM in the analysis, spread over {nights} nights; daytime is left out, so the line breaks between nights. "
+        "Dashed lines mark 70 and 180 mg/dL."
     )
 
 
@@ -707,347 +382,234 @@ def write_therapy_evidence_review_html(
     artifact_href_prefix: str = "",
 ) -> Path:
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    artifact_root_path = Path(artifact_root) if artifact_root is not None else path.parent
-    overnight_summary, exclusion_counts = summarize_overnight_basal_evidence(research_result)
-    include_js = True
-    figures = []
-    for figure in [
-        _therapy_timeline_figure(preparation),
-        _overnight_trace_figure(research_result),
-        _exclusion_figure(exclusion_counts),
-    ]:
-        figures.append(_figure_div(figure, include_plotlyjs=include_js))
-        include_js = False
-    validation_card = ""
+    root = Path(artifact_root) if artifact_root is not None else path.parent
+    overnight, exclusions = summarize_overnight_basal_evidence(research_result)
+    recommendations = research_result.recommendations
+    candidates = recommendations.loc[recommendations["status"].astype(str).eq("candidate")] if not recommendations.empty else recommendations
+    clean_nights = int(overnight.get("clean_nights") or 0)
+    clean_hours = int(overnight.get("clean_rows") or 0) * 5 / 60
+
+    status_code = str(overnight.get("status"))
+    if status_code == "identifiable":
+        status, label = "good", "Enough clean overnight data"
+        headline = f"<b>{clean_nights} nights</b> have enough quiet overnight time to judge basal ({rp.fmt(clean_hours, 0)} hours in all)."
+    elif status_code == "weakly_identifiable":
+        status, label = "warn", "Limited clean overnight data"
+        headline = f"<b>Only {clean_nights} nights</b> have quiet overnight time ({rp.fmt(clean_hours, 0)} hours). Any conclusion about basal is weak."
+    else:
+        status, label = "bad", "Not enough clean overnight data"
+        headline = f"<b>Overnight basal can't be judged yet:</b> {rp.esc(rp.plain(overnight.get('reason')))}."
+    if not candidates.empty:
+        lead = candidates.iloc[0]
+        explanation = (
+            f"The strongest signal: {rp.esc(lead['parameter'])} ({rp.esc(lead['segment'])}) "
+            f"{rp.esc(rp.plain(lead['expected_direction']))} by about {rp.fmt(lead['proposed_change_percent'], 0)}%, "
+            f"{rp.esc(rp.plain(lead['confidence']))} confidence. This is research evidence, not a setting change."
+        )
+    else:
+        explanation = "No setting changes are suggested."
+
+    gate_rows = []
+    if not research_result.research_gate.empty:
+        for row in research_result.research_gate.itertuples(index=False):
+            gate_rows.append((rp.esc(rp.plain(row.parameter)), rp.esc(rp.plain(row.identifiability)), rp.esc(rp.plain(row.gate_status)), rp.esc(rp.plain(row.closed_loop_confounding_risk))))
+
+    validation_line = ""
     if validation_result is not None and not validation_result.scenario_results.empty:
         passed = int(validation_result.scenario_results["passed"].sum())
         total = int(len(validation_result.scenario_results))
-        validation_card = (
-            "<div class='section'><h2>Synthetic Validation</h2>"
-            f"<div class='card'><strong>{passed}/{total}</strong> validation scenarios passed. "
-            "This tests whether the therapy workflow recovers known truth and suppresses itself when it should."
-            "</div></div>"
-        )
-    sections = [
-        _therapy_decision_summary_html(research_result, overnight_summary),
-        _parameter_gate_html(research_result),
-        _overnight_summary_html(overnight_summary),
-        validation_card,
-        "<div class='section'><h2>Data Timeline</h2>" + figures[0] + "</div>",
-        "<div class='section'><h2>Recent Overnight Evidence</h2>" + figures[1] + "</div>",
-        "<div class='section'><h2>Overnight Exclusion Summary</h2>" + figures[2] + "</div>",
-        _artifact_index_html(
-            artifact_root_path,
-            include_validation=validation_result is not None,
-            artifact_href_prefix=artifact_href_prefix,
-        ),
-        _workflow_table_html(),
-    ]
-    html_text = _page_shell(
-        title="Bayesian T1DM Therapy Evidence Review",
-        banner_html=_therapy_banner(preparation, overnight_summary),
-        sections=[section for section in sections if section],
-    )
-    path.write_text(html_text, encoding="utf-8")
-    return path
+        validation_line = f"On simulated data with known answers, the method behaved correctly in {passed} of {total} scenarios."
 
-
-def _latent_meal_banner(result: LatentMealResearchResult) -> str:
-    if result.research_gate.empty:
-        status = "broken"
-        headline = "Latent meal foundation status unavailable."
-    else:
-        if str(getattr(result, "research_scope", "foundation")) == "foundation":
-            gate_row = result.research_gate.iloc[0]
-            accepted_windows = int(gate_row.get("accepted_windows") or 0)
-            evaluated_candidates = int(gate_row.get("evaluated_candidates") or 0)
-            explicit_available = bool(gate_row.get("explicit_carb_source_available"))
-            status = "good" if accepted_windows > 0 else "degraded" if evaluated_candidates > 0 else "broken"
-            headline = (
-                f"Foundation scope: <code>{html.escape(str(gate_row.get('research_scope') or 'foundation'))}</code>. "
-                f"Accepted first-meal windows: <code>{accepted_windows}</code> / <code>{evaluated_candidates}</code>. "
-                f"Explicit carb source available: <code>{str(explicit_available).lower()}</code>."
-            )
-        else:
-            explicit_available = bool(getattr(result.prepared_dataset, "explicit_carb_source_available", False))
-            reportable_ic = int(result.posterior_meals["ic_posterior_mean"].notna().sum()) if not result.posterior_meals.empty else 0
-            accepted_windows = int(pd.to_numeric(result.meal_windows.get("included"), errors="coerce").fillna(0.0).sum()) if not result.meal_windows.empty else 0
-            selected_model_rows = result.model_comparison.loc[result.model_comparison["selected"].astype(bool)] if not result.model_comparison.empty else pd.DataFrame()
-            selected_model = str(selected_model_rows.iloc[0]["model"]) if not selected_model_rows.empty else "unknown"
-            status = "good" if reportable_ic > 0 else "degraded" if accepted_windows > 0 else "broken"
-            headline = (
-                f"Full latent-meal scope on <code>{accepted_windows}</code> accepted first-meal windows. "
-                f"Selected model: <code>{html.escape(selected_model)}</code>. "
-                f"Reportable morning I/C windows: <code>{reportable_ic}</code>. "
-                f"Explicit carb source available: <code>{str(explicit_available).lower()}</code>."
-            )
-    return (
-        f"<div class='banner {html.escape(status)}'>"
-        f"{headline}"
-        "</div>"
-    )
-
-
-def _latent_meal_gate_html(result: LatentMealResearchResult) -> str:
-    if result.research_gate.empty:
-        return "<div class='section'><h2>Research Gate</h2><div class='empty-state'>No latent meal gate was available.</div></div>"
-    if str(getattr(result, "research_scope", "foundation")) == "foundation":
-        row = result.research_gate.iloc[0]
-        return "\n".join(
+    body = [
+        rp.verdict(status, label, headline, explanation),
+        rp.tiles(
             [
-                "<div class='section'>",
-                "<h2>Research Gate</h2>",
-                "<table>",
-                "<thead><tr><th>research_scope</th><th>explicit_carb_source_available</th><th>latent_fit_status</th><th>evaluated_candidates</th><th>accepted_windows</th><th>source_quality</th><th>cohort_status</th></tr></thead>",
-                "<tbody>",
-                "<tr>"
-                f"<td><code>{html.escape(str(row.research_scope))}</code></td>"
-                f"<td><code>{html.escape(str(bool(row.explicit_carb_source_available)).lower())}</code></td>"
-                f"<td><code>{html.escape(str(row.latent_fit_status))}</code></td>"
-                f"<td>{int(row.evaluated_candidates)}</td>"
-                f"<td>{int(row.accepted_windows)}</td>"
-                f"<td><code>{html.escape(str(row.source_quality_status))}</code></td>"
-                f"<td><code>{html.escape(str(row.cohort_status))}</code></td>"
-                "</tr>",
-                "</tbody></table>",
-                "</div>",
+                (rp.fmt(clean_nights, 0), f"clean nights (of {rp.fmt(overnight.get('overnight_nights'), 0)})"),
+                (rp.fmt(clean_hours, 0), "clean overnight hours"),
+                (rp.fmt(overnight.get("mean_glucose"), 0, suffix=" mg/dL"), "average glucose in clean stretches"),
             ]
-        )
-    rows = []
-    for row in result.research_gate.itertuples(index=False):
-        rows.append(
-            "<tr>"
-            f"<td>{html.escape(str(row.parameter))}</td>"
-            f"<td>{html.escape(str(row.estimand))}</td>"
-            f"<td><code>{html.escape(str(row.identifiability))}</code></td>"
-            f"<td><code>{html.escape(str(row.gate_status))}</code></td>"
-            f"<td><code>{html.escape(str(row.source_quality_status))}</code></td>"
-            f"<td><code>{html.escape(str(row.closed_loop_confounding_risk))}</code></td>"
-            "</tr>"
-        )
-    return "\n".join(
-        [
-            "<div class='section'>",
-            "<h2>Research Gate</h2>",
-            "<table>",
-            "<thead><tr><th>parameter</th><th>estimand</th><th>identifiability</th><th>gate_status</th><th>source_quality</th><th>confounding</th></tr></thead>",
-            "<tbody>",
-            *rows,
-            "</tbody></table>",
-            "</div>",
-        ]
+        ),
+        rp.section(
+            "How much should I trust this?",
+            rp.bullets(
+                [
+                    "A night counts as clean when there was no meal, bolus, exercise or Control-IQ adjustment in the previous 2 hours and CGM was working.",
+                    f"Clean data span {rp.fmt(overnight.get('stable_epochs'), 0)} periods with unchanged pump settings." if overnight.get("stable_epochs") else "",
+                    validation_line,
+                    f"Data: {rp.esc(_date_span(preparation.final_dataset_start, preparation.final_dataset_end))}; Apple Health {'included' if preparation.apple_available else 'not included'}.",
+                ]
+            ),
+        ),
+        rp.details(
+            "Details: why overnight time was excluded",
+            rp.bar_list(
+                [(rp.plain(row.reason), float(row.count) * 5 / 60) for row in exclusions.itertuples(index=False) if row.count],
+                value_format="{:,.0f} h",
+            )
+            + rp.caption("Hours of overnight data excluded for each reason. One stretch can have several reasons.")
+            if not exclusions.empty and pd.to_numeric(exclusions["count"], errors="coerce").fillna(0).gt(0).any()
+            else "<p>No overnight time was excluded.</p>",
+        ),
+        rp.details("Details: recent overnight glucose", _overnight_figure(research_result) or "<p>No overnight data.</p>"),
+        rp.details("Details: what can be estimated for each setting", rp.table(["setting", "can it be estimated?", "status", "Control-IQ interference"], gate_rows)),
+        rp.details(
+            "Files behind this page",
+            _files(
+                root,
+                artifact_href_prefix,
+                [
+                    ("model_data_preparation.md", "how the 5-minute dataset was built"),
+                    ("therapy_research_gate.md", "which settings can be estimated"),
+                    ("therapy_feature_audit.md", "inputs used by the models"),
+                    ("therapy_model_comparison.md", "how the candidate models compare"),
+                    ("therapy_segment_evidence.csv", "evidence for each time-of-day segment"),
+                    ("therapy_recommendation_research.md", "research-only setting signals"),
+                    ("tandem_source_report_card.md", "Tandem data quality"),
+                    ("apple_source_report_card.md", "Apple Health data quality"),
+                ]
+                + (
+                    [
+                        ("therapy_infra_validation.md", "simulation checks of the method"),
+                        ("therapy_synthetic_results.csv", "results of each simulation scenario"),
+                    ]
+                    if validation_result is not None
+                    else []
+                ),
+            ),
+        ),
+        rp.glossary(
+            [
+                ("Basal", "Background insulin delivered continuously by the pump."),
+                ("Clean overnight time", "Overnight periods with no meal, bolus, exercise or Control-IQ adjustment in the previous 2 hours and working CGM."),
+                ("Stable settings period", "A stretch of time in which the programmed pump settings did not change."),
+            ]
+        ),
+    ]
+    return _write(
+        path,
+        rp.page(
+            title="Overnight Basal Evidence",
+            question="Is there enough data to judge my overnight basal?",
+            subtitle=f"{rp.esc(_date_span(preparation.final_dataset_start, preparation.final_dataset_end))}. {_generated()}",
+            body=body,
+        ),
     )
 
 
-def _latent_meal_semantics_html(result: LatentMealResearchResult) -> str:
-    frame = result.research_frame.copy()
-    if frame.empty:
-        return "<div class='section'><h2>Meal Truth Semantics</h2><div class='empty-state'>No research rows were available.</div></div>"
-    status_counts = frame.get("meal_truth_status", pd.Series(dtype=str)).astype(str).value_counts(dropna=False)
-    rows = []
-    for status, count in status_counts.items():
-        rows.append(
-            "<tr>"
-            f"<td><code>{html.escape(str(status))}</code></td>"
-            f"<td>{int(count)}</td>"
-            "</tr>"
+# ---------------------------------------------------------------------------
+# Latent meal / breakfast I:C
+# ---------------------------------------------------------------------------
+
+
+def _period_label(row: Any) -> str:
+    start = pd.to_datetime(row["period_start"], errors="coerce")
+    end = pd.to_datetime(row["period_end"], errors="coerce")
+    if pd.isna(start) or pd.isna(end):
+        return "no breakfasts"
+    return f"{start:%b %Y}" if (start.year, start.month) == (end.year, end.month) else f"{start:%b %Y} to {end:%b %Y}"
+
+
+def _meal_points(result: LatentMealResearchResult) -> list[rp.ScatterPoint]:
+    estimates = result.latent_carb_estimates
+    windows = result.meal_windows
+    if estimates is None or estimates.empty or windows.empty or "stated_carbs" not in windows:
+        return []
+    merged = estimates.merge(windows[["meal_id", "stated_carbs"]], on="meal_id", how="left")
+    points = []
+    for row in merged.itertuples(index=False):
+        logged = pd.to_numeric(getattr(row, "stated_carbs", None), errors="coerce")
+        estimate = pd.to_numeric(getattr(row, "latent_carb_median", None), errors="coerce")
+        if pd.isna(logged) or pd.isna(estimate) or float(logged) <= 0:
+            continue
+        lower = pd.to_numeric(getattr(row, "latent_carb_lower_90", None), errors="coerce")
+        upper = pd.to_numeric(getattr(row, "latent_carb_upper_90", None), errors="coerce")
+        when = pd.to_datetime(getattr(row, "meal_start", None), errors="coerce")
+        points.append(
+            rp.ScatterPoint(
+                x=float(logged),
+                y=float(estimate),
+                lower=None if pd.isna(lower) else float(lower),
+                upper=None if pd.isna(upper) else float(upper),
+                strong=str(getattr(row, "analysis_tier", "")) == "clean_reference",
+                tooltip=f"{when:%Y-%m-%d} logged {float(logged):.0f} g, implied {float(estimate):.0f} g ({float(lower):.0f} to {float(upper):.0f}), bolus {float(row.bolus_units):.2f} U"
+                if pd.notna(when)
+                else f"logged {float(logged):.0f} g, implied {float(estimate):.0f} g",
+            )
         )
-    explicit_available = bool(getattr(result.prepared_dataset, "explicit_carb_source_available", False))
-    return "\n".join(
-        [
-            "<div class='section'>",
-            "<h2>Meal Truth Semantics</h2>",
-            f"<div class='muted'>Explicit carb source available: <code>{str(explicit_available).lower()}</code>. Legacy meal columns remain for compatibility and are not treated as observed truth when the explicit source is unavailable.</div>",
-            "<table>",
-            "<thead><tr><th>meal_truth_status</th><th>count</th></tr></thead>",
-            "<tbody>",
-            *rows,
-            "</tbody></table>",
-            "</div>",
-        ]
-    )
+    return points
 
 
-def _first_meal_clean_window_html(result: LatentMealResearchResult) -> str:
-    if result.meal_windows.empty:
-        return "<div class='section'><h2>First Meal Clean Windows</h2><div class='empty-state'>No morning first-meal candidates were evaluated.</div></div>"
-    top = result.meal_windows.head(20)
-    rows = []
-    for row in top.itertuples(index=False):
-        rows.append(
-            "<tr>"
-            f"<td>{html.escape(str(row.candidate_id))}</td>"
-            f"<td>{html.escape(str(row.timestamp))}</td>"
-            f"<td>{html.escape(str(row.segment))}</td>"
-            f"<td>{'yes' if bool(row.included) else 'no'}</td>"
-            f"<td>{'NA' if pd.isna(row.premeal_glucose) else f'{float(row.premeal_glucose):.1f}'}</td>"
-            f"<td>{'NA' if pd.isna(row.premeal_iob) else f'{float(row.premeal_iob):.2f}'}</td>"
-            f"<td>{float(row.cgm_coverage_fraction):.3f}</td>"
-            f"<td>{html.escape(str(row.exclusion_reasons or 'none'))}</td>"
-            "</tr>"
-        )
-    return "\n".join(
-        [
-            "<div class='section'>",
-            "<h2>First Meal Clean Windows</h2>",
-            "<table>",
-            "<thead><tr><th>candidate_id</th><th>timestamp</th><th>segment</th><th>included</th><th>premeal_glucose</th><th>premeal_iob</th><th>cgm_coverage</th><th>exclusions</th></tr></thead>",
-            "<tbody>",
-            *rows,
-            "</tbody></table>",
-            "</div>",
-        ]
-    )
+def _latent_counts(result: LatentMealResearchResult) -> dict[str, int]:
+    windows = result.meal_windows
+    included = pd.to_numeric(windows.get("included"), errors="coerce").fillna(0).astype(bool) if not windows.empty else pd.Series(dtype=bool)
+    estimates = result.latent_carb_estimates if result.latent_carb_estimates is not None else pd.DataFrame()
+    tiers = estimates.get("analysis_tier", pd.Series(dtype=str)).astype(str) if not estimates.empty else pd.Series(dtype=str)
+    logged = 0
+    if not windows.empty and "stated_carbs" in windows:
+        logged = int((included & pd.to_numeric(windows["stated_carbs"], errors="coerce").gt(0)).sum())
+    return {
+        "candidates": int(len(windows)),
+        "accepted": int(included.sum()),
+        "logged": logged,
+        "clean": int(tiers.eq("clean_reference").sum()),
+    }
 
 
-def _first_meal_exclusion_html(result: LatentMealResearchResult) -> str:
-    if result.first_meal_exclusion_summary.empty:
-        return "<div class='section'><h2>Exclusion Summary</h2><div class='empty-state'>No exclusion summary was available.</div></div>"
-    rows = []
-    for row in result.first_meal_exclusion_summary.itertuples(index=False):
-        rows.append(
-            "<tr>"
-            f"<td>{html.escape(str(row.reason))}</td>"
-            f"<td>{int(row.count)}</td>"
-            "</tr>"
-        )
-    return "\n".join(
-        [
-            "<div class='section'>",
-            "<h2>Exclusion Summary</h2>",
-            "<table>",
-            "<thead><tr><th>reason</th><th>count</th></tr></thead>",
-            "<tbody>",
-            *rows,
-            "</tbody></table>",
-            "</div>",
-        ]
-    )
-
-
-def _latent_meal_model_comparison_html(result: LatentMealResearchResult) -> str:
-    if result.model_comparison.empty:
-        return "<div class='section'><h2>Model Comparison</h2><div class='empty-state'>No model comparison rows were available.</div></div>"
-    rows = []
-    for row in result.model_comparison.itertuples(index=False):
-        rows.append(
-            "<tr>"
-            f"<td>{html.escape(str(row.model))}</td>"
-            f"<td>{int(row.meal_count)}</td>"
-            f"<td>{'NA' if pd.isna(row.stated_carb_mae) else f'{float(row.stated_carb_mae):.3f}'}</td>"
-            f"<td>{'NA' if pd.isna(row.peak_delta_mae) else f'{float(row.peak_delta_mae):.3f}'}</td>"
-            f"<td>{'NA' if pd.isna(row.peak_delta_correlation) else f'{float(row.peak_delta_correlation):.3f}'}</td>"
-            f"<td>{'yes' if bool(row.selected) else 'no'}</td>"
-            "</tr>"
-        )
-    return "\n".join(
-        [
-            "<div class='section'>",
-            "<h2>Model Comparison</h2>",
-            "<table>",
-            "<thead><tr><th>model</th><th>meal_count</th><th>stated_carb_mae</th><th>peak_delta_mae</th><th>peak_delta_correlation</th><th>selected</th></tr></thead>",
-            "<tbody>",
-            *rows,
-            "</tbody></table>",
-            "</div>",
-        ]
-    )
-
-
-def _latent_meal_posterior_html(result: LatentMealResearchResult) -> str:
-    if result.posterior_meals.empty:
-        return "<div class='section'><h2>Posterior Meals</h2><div class='empty-state'>No posterior meal estimates were generated.</div></div>"
-    top = result.posterior_meals.copy()
-    confidence_column = "confidence" if "confidence" in top.columns else "carb_accuracy_score"
-    top = top.sort_values([confidence_column, "timestamp"], ascending=[False, True]).head(15)
-    rows = []
-    for row in top.itertuples(index=False):
-        lower_90 = getattr(row, "latent_carb_lower_90", getattr(row, "latent_carbs_lower", float("nan")))
-        upper_90 = getattr(row, "latent_carb_upper_90", getattr(row, "latent_carbs_upper", float("nan")))
-        median = getattr(row, "latent_carb_median", getattr(row, "latent_carbs_posterior_mean", float("nan")))
-        confidence = getattr(row, "confidence", getattr(row, "carb_accuracy_score", float("nan")))
-        flags = getattr(row, "flags", getattr(row, "suppression_reason", ""))
-        rows.append(
-            "<tr>"
-            f"<td>{html.escape(str(row.meal_id))}</td>"
-            f"<td>{html.escape(str(row.timestamp))}</td>"
-            f"<td>{html.escape(str(row.segment))}</td>"
-            f"<td>{html.escape(str(row.evidence_source))}</td>"
-            f"<td>{'NA' if pd.isna(row.stated_carbs) else f'{float(row.stated_carbs):.1f}'}</td>"
-            f"<td>{float(median):.1f}</td>"
-            f"<td>[{float(lower_90):.1f}, {float(upper_90):.1f}]</td>"
-            f"<td>{float(confidence):.3f}</td>"
-            f"<td>{html.escape(str(row.identifiability_status))}</td>"
-            f"<td>{html.escape(str(flags or 'none'))}</td>"
-            "</tr>"
-        )
-    return "\n".join(
-        [
-            "<div class='section'>",
-            "<h2>Posterior Meals</h2>",
-            "<table>",
-            "<thead><tr><th>meal_id</th><th>timestamp</th><th>segment</th><th>evidence</th><th>stated_carbs</th><th>latent_carb_median</th><th>90% interval</th><th>confidence</th><th>identifiability</th><th>flags</th></tr></thead>",
-            "<tbody>",
-            *rows,
-            "</tbody></table>",
-            "</div>",
-        ]
-    )
-
-
-def _latent_meal_artifact_index_html(
-    artifact_root: Path,
-    *,
-    research_scope: str = "foundation",
-    artifact_href_prefix: str = "",
-) -> str:
-    if research_scope == "foundation":
-        artifacts = [
-            "latent_meal_research_gate.md",
-            "meal_truth_semantics_report.md",
-            "meal_event_registry.csv",
-            "first_meal_clean_window_registry.csv",
-            "first_meal_clean_window_audit.md",
-            "first_meal_exclusion_summary.csv",
+def _latent_files(root: Path, prefix: str, scope: str) -> str:
+    if scope == "foundation":
+        entries = [
+            ("latent_meal_research_gate.md", "what can be estimated"),
+            ("meal_event_registry.csv", "every detected meal"),
+            ("first_meal_clean_window_registry.csv", "every first meal and whether it was used"),
+            ("first_meal_clean_window_audit.md", "summary of the breakfast selection"),
+            ("first_meal_exclusion_summary.csv", "counts of exclusion reasons"),
         ]
     else:
-        artifacts = [
-            "latent_meal_research_gate.md",
-            "meal_event_registry.csv",
-            "meal_window_audit.md",
-            "latent_meal_window_audit.csv",
-            "latent_carb_estimator_report.md",
-            "latent_carb_estimates.csv",
-            "latent_meal_fit_summary.md",
-            "latent_meal_posterior_meals.csv",
-            "latent_meal_confidence_report.md",
-            "latent_meal_model_comparison.md",
+        entries = [
+            ("latent_carb_estimator_report.md", "estimator summary and effective I:C table"),
+            ("latent_carb_estimates.csv", "per-breakfast carb estimates with 90% ranges"),
+            ("effective_icr_evidence.csv", "effective I:C by time of day"),
+            ("latent_meal_window_audit.csv", "every first meal and why it was used or excluded"),
+            ("meal_window_audit.md", "summary of the breakfast selection"),
+            ("meal_event_registry.csv", "every detected meal"),
+            ("latent_meal_research_gate.md", "what can be estimated"),
+            ("latent_meal_model_comparison.md", "comparison of the candidate estimators"),
         ]
-    rows = []
-    for artifact in artifacts:
-        path = artifact_root / artifact
-        link_target = f"{artifact_href_prefix}{artifact}"
-        link_html = f"<a href=\"{html.escape(link_target)}\">open</a>" if path.exists() else ""
-        rows.append(
-            "<tr>"
-            f"<td>{html.escape(artifact)}</td>"
-            f"<td>{'yes' if path.exists() else 'no'}</td>"
-            f"<td>{link_html}</td>"
-            "</tr>"
-        )
-    return "\n".join(
+    return _files(root, prefix, entries)
+
+
+def _latent_glossary() -> str:
+    return rp.glossary(
         [
-            "<div class='section'>",
-            "<h2>Supporting Artifacts</h2>",
-            "<table>",
-            "<thead><tr><th>artifact</th><th>exists</th><th>link</th></tr></thead>",
-            "<tbody>",
-            *rows,
-            "</tbody></table>",
-            "</div>",
+            ("I:C ratio", "Grams of carbohydrate covered by one unit of insulin. A lower number means more insulin per gram."),
+            ("Effective I:C", "The ratio that best explains how your glucose actually moved after these breakfasts, given what you logged and the insulin delivered."),
+            ("90% range", "The true value lies in this range with 90% probability, given the model and data."),
+            ("Glucose-implied carbs", "The carbohydrate amount that best explains the post-meal CGM curve, given the bolus and Control-IQ delivery."),
+            ("Fit error", "Typical distance (root mean square) between the model's predicted glucose curve and the CGM after a meal."),
         ]
     )
+
+
+def _write_latent_foundation(result: LatentMealResearchResult, path: Path, root: Path, prefix: str) -> Path:
+    counts = _latent_counts(result)
+    exclusions = result.first_meal_exclusion_summary
+    status, label = ("good", "Breakfasts available") if counts["accepted"] else ("bad", "No usable breakfasts")
+    body = [
+        rp.verdict(
+            status,
+            label,
+            f"<b>{counts['accepted']} of {counts['candidates']} first meals of the day</b> are clean enough to analyse.",
+            "Run the full analysis (--research-scope full) to estimate carbs and the effective I:C from them.",
+        ),
+        rp.details(
+            "Details: why breakfasts were excluded",
+            rp.bar_list([(rp.plain(row.reason), float(row.count)) for row in exclusions.itertuples(index=False)]) if not exclusions.empty else "<p>No exclusions.</p>",
+            open_=True,
+        ),
+        rp.details("Files behind this page", _latent_files(root, prefix, "foundation")),
+        _latent_glossary(),
+    ]
+    return _write(path, rp.page(title="Breakfast Window Review", question="Which breakfasts are clean enough to analyse?", subtitle=_generated(), body=body))
 
 
 def write_latent_meal_review_html(
@@ -1058,113 +620,218 @@ def write_latent_meal_review_html(
     artifact_href_prefix: str = "",
 ) -> Path:
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    artifact_root_path = Path(artifact_root) if artifact_root is not None else path.parent
+    root = Path(artifact_root) if artifact_root is not None else path.parent
     if str(getattr(result, "research_scope", "foundation")) == "foundation":
-        sections = [
-            _latent_meal_gate_html(result),
-            _latent_meal_semantics_html(result),
-            _first_meal_clean_window_html(result),
-            _first_meal_exclusion_html(result),
-            _latent_meal_artifact_index_html(
-                artifact_root_path,
-                research_scope="foundation",
-                artifact_href_prefix=artifact_href_prefix,
-            ),
-        ]
+        return _write_latent_foundation(result, path, root, artifact_href_prefix)
+
+    counts = _latent_counts(result)
+    estimates = result.latent_carb_estimates if result.latent_carb_estimates is not None else pd.DataFrame()
+    fit_rmse = pd.to_numeric(estimates.get("trajectory_fit_rmse_mgdl"), errors="coerce").dropna() if not estimates.empty else pd.Series(dtype=float)
+    fallback_rows = int((estimates.get("estimator", pd.Series(dtype=str)).astype(str) != "trajectory").sum()) if not estimates.empty else 0
+    median_fit = float(fit_rmse.median()) if not fit_rmse.empty else float("nan")
+    windows = result.meal_windows
+    logged_carbs = pd.to_numeric(windows.loc[pd.to_numeric(windows.get("included"), errors="coerce").fillna(0).astype(bool), "stated_carbs"], errors="coerce").dropna() if not windows.empty and "stated_carbs" in windows else pd.Series(dtype=float)
+    logged_carbs = logged_carbs[logged_carbs > 0]
+
+    all_evidence = result.effective_icr_evidence if result.effective_icr_evidence is not None else pd.DataFrame()
+    evidence = all_evidence.loc[all_evidence["analysis"].eq("primary")] if "analysis" in all_evidence else all_evidence
+    sensitivity = all_evidence.loc[all_evidence["analysis"].ne("primary") & all_evidence["is_current_setting"].astype(bool)] if "analysis" in all_evidence else all_evidence.iloc[0:0]
+    estimated = evidence.loc[pd.to_numeric(evidence.get("effective_icr"), errors="coerce").notna()] if not evidence.empty else evidence
+    current_rows = evidence.loc[evidence["is_current_setting"].astype(bool)] if not evidence.empty and "is_current_setting" in evidence else evidence.iloc[0:0]
+    current = current_rows.iloc[0] if not current_rows.empty else None
+
+    figure = ""
+    if estimated.empty:
+        status, label = "info", "Can't judge the I:C setting yet"
+        headline = "<b>No accepted window has a logged carb count</b>, so the I:C setting itself can't be assessed."
+        explanation = (
+            "Without logged carbs, an under-counted meal and a too-weak ratio produce the same glucose curve. "
+            "Log carbs on the pump at breakfast, or keep a <code>carbs.csv</code> (<code>timestamp,carb_grams</code>) in the raw data folder."
+        )
+        if counts["logged"]:
+            headline = f"<b>Only {counts['logged']} usable breakfasts have logged carbs</b>; at least 5 are needed to estimate the I:C."
+    elif current is not None and not math.isfinite(float(current["effective_icr"])):
+        last = estimated.iloc[-1]
+        status, label = "info", "Too early to judge your current setting"
+        headline = (
+            f"<b>Your current morning I:C of {float(current['programmed_icr']):.1f} g/U has {int(current['n_meals'])} usable breakfast{'' if int(current['n_meals']) == 1 else 's'} so far</b>; "
+            "at least 5 are needed."
+        )
+        explanation = (
+            f"Under your previous setting of {float(last['programmed_icr']):.1f} g/U ({rp.esc(_period_label(last))}), breakfasts behaved like "
+            f"{float(last['effective_icr']):.1f} g/U (90% range {float(last['effective_icr_lower_90']):.1f} to {float(last['effective_icr_upper_90']):.1f}): "
+            f"{rp.esc(rp.plain(last['status']))}."
+        )
     else:
-        sections = [
-            _latent_meal_gate_html(result),
-            _latent_meal_model_comparison_html(result),
-            _latent_meal_posterior_html(result),
-            _latent_meal_artifact_index_html(artifact_root_path, research_scope="full", artifact_href_prefix=artifact_href_prefix),
-        ]
-    html_text = _page_shell(
-        title="Bayesian T1DM Latent Meal Review",
-        banner_html=_latent_meal_banner(result),
-        sections=sections,
-    )
-    path.write_text(html_text, encoding="utf-8")
-    return path
+        lead = current if current is not None else estimated.iloc[-1]
+        eff, lo, hi, prog = (float(lead[k]) for k in ("effective_icr", "effective_icr_lower_90", "effective_icr_upper_90", "programmed_icr"))
+        answer = rp.icr_verdict(str(lead["segment"]), eff, lo, hi, prog, str(lead["status"]))
+        status, label = answer.status, answer.label
+        headline = f"<b>{rp.esc(answer.headline)}</b>"
+        explanation = rp.esc(answer.explanation) + (f" Based on {int(lead['n_meals'])} breakfasts at this setting ({rp.esc(_period_label(lead))})." if "period_start" in lead else "")
+        figure = rp.interval_chart(
+            estimate=eff,
+            lower=lo,
+            upper=hi,
+            reference=prog,
+            reference_label=f"pump setting {prog:.1f}",
+            axis_label="grams of carbohydrate covered by 1 unit of insulin",
+            value_label=f"{eff:.1f} ({lo:.1f} to {hi:.1f})",
+        )
+    period_rows = [
+        (
+            rp.esc(_period_label(row)) + (" (current)" if bool(row["is_current_setting"]) else ""),
+            rp.fmt(row["programmed_icr"]),
+            rp.esc(row["settings_source"]),
+            rp.fmt(row["n_meals"], 0),
+            f"{rp.fmt(row['effective_icr'])} ({rp.fmt(row['effective_icr_lower_90'])} to {rp.fmt(row['effective_icr_upper_90'])})" if math.isfinite(float(row["effective_icr"])) else "&ndash;",
+            rp.esc(rp.plain(row["status"])),
+        )
+        for _, row in evidence.iterrows()
+    ] if not evidence.empty and "period_start" in evidence else []
 
-
-def _current_status_banner(payload: dict[str, Any]) -> str:
-    overall_state = str(payload.get("overall_state") or "blocked")
-    banner_class = {
-        "recommendation_ready": "good",
-        "no_change_supported": "degraded",
-        "blocked": "broken",
-    }.get(overall_state, "degraded")
-    return (
-        f"<div class='banner {html.escape(banner_class)}'>"
-        f"{html.escape(str(payload.get('headline') or 'Status unavailable'))} "
-        f"Run id: <code>{html.escape(str(payload.get('run_id') or 'unknown'))}</code>."
-        "</div>"
-    )
-
-
-def _current_status_summary_html(payload: dict[str, Any], *, therapy_href: str, forecast_href: str) -> str:
-    data_prep = payload.get("data_prep") or {}
-    blockers = payload.get("primary_blockers") or []
-    blocker_lines = "".join(
-        f"<li><strong>{html.escape(str(item.get('label') or item.get('code')))}</strong>: {html.escape(str(item.get('detail') or ''))}</li>"
-        for item in blockers
-    ) or "<li>No active blockers.</li>"
-    next_actions = payload.get("next_actions") or []
-    next_action_lines = "".join(f"<li>{html.escape(str(item))}</li>" for item in next_actions) or "<li>No next actions recorded.</li>"
-    therapy = payload.get("therapy") or {}
-    overnight = therapy.get("overnight") or {}
-    forecast = payload.get("forecast") or {}
-    return "\n".join(
+    trust = [
+        (
+            f"<b>Model fit:</b> the fitted glucose curves are within {median_fit:.1f} mg/dL of CGM on a typical breakfast "
+            + ("(good; under 10)." if median_fit <= FIT_ERROR_GUIDE_MGDL else "(poor; over 10, so real meals don't match the model well and the result is doubtful).")
+        )
+        if math.isfinite(median_fit)
+        else "",
+        f"{fallback_rows} breakfasts used the older, less accurate estimator." if fallback_rows else "",
+        f"Only {counts['clean']} of {counts['accepted']} breakfasts passed every quality check. The rest started out of range, followed recent insulin or had Control-IQ adjusting beforehand, and count as weaker evidence."
+        if counts["accepted"] and counts["clean"] < counts["accepted"]
+        else "",
+        f"Breakfasts were small (median {logged_carbs.median():.0f} g logged), so this says little about large meals." if not logged_carbs.empty else "",
+        "It assumes your correction factor is right and your logged carbs are accurate. Consistent under-counting makes the ratio look stronger than it is." if not estimated.empty else "",
+    ]
+    next_steps = (
         [
-            "<div class='section'>",
-            "<h2>Current Verdict</h2>",
-            "<div class='card-grid'>",
-            "<div class='card'>",
-            f"<div><strong>overall_state</strong>: <code>{html.escape(str(payload.get('overall_state') or 'unknown'))}</code></div>",
-            f"<div><strong>summary</strong>: {html.escape(str(payload.get('summary') or ''))}</div>",
-            f"<div><strong>apple_available</strong>: {html.escape(str(data_prep.get('apple_available')))}</div>",
-            f"<div><strong>overlap_window</strong>: {html.escape(str(data_prep.get('overlap_start')))} to {html.escape(str(data_prep.get('overlap_end')))}</div>",
-            f"<div><strong>final_dataset_rows</strong>: {html.escape(str(data_prep.get('final_row_count')))}</div>",
-            "</div>",
-            "<div class='card'>",
-            "<strong>Evidence Links</strong>",
-            f"<div><a href=\"{html.escape(therapy_href)}\">Therapy evidence dashboard</a></div>",
-            f"<div><a href=\"{html.escape(forecast_href)}\">Forecast validation dashboard</a></div>",
-            "</div>",
-            "</div>",
-            "</div>",
-            "<div class='section'>",
-            "<h2>Primary Blockers</h2>",
-            "<div class='card'><ul>",
-            blocker_lines,
-            "</ul></div>",
-            "</div>",
-            "<div class='section'>",
-            "<h2>Next Actions</h2>",
-            "<div class='card'><ol>",
-            next_action_lines,
-            "</ol></div>",
-            "</div>",
-            "<div class='section'>",
-            "<h2>Therapy Summary</h2>",
-            "<div class='card-grid'>",
-            "<div class='card'>",
-            f"<div><strong>overnight_status</strong>: {html.escape(str(overnight.get('status') or 'unknown'))}</div>",
-            f"<div><strong>blocked_reason</strong>: {html.escape(str(overnight.get('reason') or 'none'))}</div>",
-            f"<div><strong>clean_rows</strong>: {html.escape(str(overnight.get('clean_rows') or 0))}</div>",
-            f"<div><strong>clean_nights</strong>: {html.escape(str(overnight.get('clean_nights') or 0))}</div>",
-            "</div>",
-            "<div class='card'>",
-            f"<div><strong>forecast_quality</strong>: {html.escape(str(forecast.get('data_quality_status') or 'unknown'))}</div>",
-            f"<div><strong>model_mae</strong>: {html.escape(str(forecast.get('model_mae') or 'NA'))}</div>",
-            f"<div><strong>persistence_mae</strong>: {html.escape(str(forecast.get('persistence_mae') or 'NA'))}</div>",
-            f"<div><strong>sampler_health</strong>: {html.escape(str(forecast.get('sampler_health') or 'unknown'))}</div>",
-            "</div>",
-            "</div>",
-            "</div>",
+            "Nothing to change on the pump from this result alone. Bring it to your endocrinologist as supporting evidence."
+            if status == "good"
+            else "Discuss this with your endocrinologist before changing the pump.",
+            "To narrow the range, log weighed or packaged breakfasts for a few weeks.",
         ]
+        if not estimated.empty
+        else ["Log carbs on the pump for breakfasts, then rerun this analysis."]
     )
+
+    points = _meal_points(result)
+    strong = sum(p.strong for p in points)
+    exclusions = result.first_meal_exclusion_summary
+    per_meal_rows = []
+    if not estimates.empty:
+        merged = estimates.merge(windows[["meal_id", "stated_carbs"]], on="meal_id", how="left") if "stated_carbs" in windows else estimates
+        for row in merged.sort_values("meal_start").itertuples(index=False):
+            per_meal_rows.append(
+                (
+                    rp.esc(f"{pd.to_datetime(row.meal_start):%Y-%m-%d %H:%M}"),
+                    rp.fmt(getattr(row, "stated_carbs", None), 0),
+                    f"{rp.fmt(row.latent_carb_median, 0)} ({rp.fmt(row.latent_carb_lower_90, 0)} to {rp.fmt(row.latent_carb_upper_90, 0)})",
+                    rp.fmt(row.bolus_units, 2),
+                    rp.fmt(getattr(row, "trajectory_fit_rmse_mgdl", None)),
+                    rp.esc(rp.plain(getattr(row, "analysis_tier", ""))),
+                )
+            )
+
+    body = [
+        rp.verdict(status, label, headline, explanation, figure),
+        rp.tiles(
+            [
+                (rp.fmt(counts["accepted"], 0), f"breakfasts clean enough to use (of {counts['candidates']})"),
+                (rp.fmt(counts["logged"], 0), "of those with carbs logged"),
+                (rp.fmt(median_fit, suffix=" mg/dL"), "typical fit error (good is under 10)"),
+            ]
+        ),
+        rp.section("How much should I trust this?", rp.bullets(trust)),
+        rp.section("What to do next", rp.bullets(next_steps)),
+        rp.details(
+            "Details: each breakfast",
+            (
+                rp.scatter_with_ranges(points, x_label="carbs you logged on the pump (g)", y_label="carbs implied by your glucose (g)", identity_label="implied = logged")
+                + rp.legend([(rp.PRIMARY, f"passed every check ({strong})", False), (rp.SECONDARY, f"passed looser checks ({len(points) - strong})", "ring")])
+                + rp.caption(
+                    "Each dot is one breakfast; vertical lines are 90% ranges. Horizontal position is what you logged; vertical position is the amount "
+                    "the glucose curve implies given the bolus and Control-IQ delivery. Dots above the dashed line raised glucose more than the logged carbs predict."
+                )
+                if points
+                else "<p>No breakfasts with logged carbs.</p>"
+            )
+            + rp.table(["time", "logged g", "implied g (90% range)", "bolus U", "fit error mg/dL", "quality"], per_meal_rows, numeric=[1, 2, 3, 4]),
+        ),
+        rp.details(
+            "Details: I:C by settings period",
+            rp.table(["settings period", "pump I:C (g/U)", "settings from", "breakfasts used", "effective I:C (90% range)", "result"], period_rows, numeric=[1, 3])
+            + rp.caption(
+                "Each breakfast is compared with the I:C and correction factor in force for it. The t:slim's bolus calculator records both. "
+                "The Mobi records neither: its I:C is the carbs divided by the food portion of the bolus, and its correction factor comes from "
+                "the pump's log of profile edits and switches (replayed to the segment in force), or, where the downloaded log does not include "
+                "edits, from the correction portion across a run of breakfasts. A breakfast with nothing usable takes the setting of the nearest "
+                "breakfast on the same pump and profile. A settings period is a run of breakfasts with the same I:C and correction factor."
+            ),
+        )
+        if period_rows
+        else "",
+        rp.details(
+            "Details: sensitivity analyses with logged food",
+            rp.table(
+                ["analysis", "breakfasts used", "effective I:C (90% range)", "result"],
+                [
+                    (
+                        rp.esc(row["analysis"]),
+                        rp.fmt(row["n_meals"], 0),
+                        f"{rp.fmt(row['effective_icr'])} ({rp.fmt(row['effective_icr_lower_90'])} to {rp.fmt(row['effective_icr_upper_90'])})" if math.isfinite(float(row["effective_icr"])) else "&ndash;",
+                        rp.esc(rp.plain(row["status"])),
+                    )
+                    for _, row in sensitivity.iterrows()
+                ],
+                numeric=[1],
+            )
+            + rp.caption(
+                (f"Logged food (for example Bevel) ran {float(sensitivity['logged_food_scale'].iloc[0]):.2f} times your pump entry for the same meal "
+                 f"(median over {int(sensitivity['logged_food_pairs'].iloc[0])} meals). " if math.isfinite(float(sensitivity["logged_food_scale"].iloc[0])) else "")
+                + f"Both analyses use your current setting. High fat or protein means at least {HIGH_FAT_GRAMS:g} g fat or {HIGH_PROTEIN_GRAMS:g} g protein logged within {LOGGED_FOOD_MATCH_MINUTES} minutes; breakfasts "
+                "without logged food are kept. The combined count averages your entry with the logged-food carbs rescaled to your entries, so it can reduce "
+                "noise but not move the overall level. The headline above stays on your pump entries."
+            ),
+        )
+        if not sensitivity.empty
+        else "",
+        rp.details(
+            "Details: which breakfasts were used",
+            rp.bar_list(
+                [
+                    ("first meals of the day", counts["candidates"]),
+                    ("passed quality checks", counts["accepted"]),
+                    ("with logged carbs", counts["logged"]),
+                    ("passed every check", counts["clean"]),
+                ],
+                max_value=max(counts["candidates"], 1),
+            )
+            + "<h3 style='font-size:15px;margin:16px 0 4px'>Why breakfasts were excluded</h3>"
+            + (
+                rp.bar_list([(rp.plain(row.reason), float(row.count)) for row in exclusions.sort_values("count", ascending=False).itertuples(index=False)], color=rp.SECONDARY)
+                if not exclusions.empty
+                else "<p>No exclusions.</p>"
+            )
+            + rp.caption("Number of first meals with each problem. One meal can have several, so the counts add up to more than the number excluded."),
+        ),
+        rp.details("Files behind this page", _latent_files(root, artifact_href_prefix, "full")),
+        _latent_glossary(),
+    ]
+    return _write(
+        path,
+        rp.page(
+            title="Breakfast I:C Review",
+            question="Is my morning I:C ratio right?",
+            subtitle=f"{rp.esc(_date_span(result.prepared_dataset.frame['timestamp'].min() if 'timestamp' in result.prepared_dataset.frame else None, result.prepared_dataset.frame['timestamp'].max() if 'timestamp' in result.prepared_dataset.frame else None))}. {_generated()}",
+            body=body,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Current status
+# ---------------------------------------------------------------------------
 
 
 def write_current_status_html(
@@ -1174,12 +841,57 @@ def write_current_status_html(
     therapy_href: str,
     forecast_href: str,
 ) -> Path:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    html_text = _page_shell(
-        title="Bayesian T1DM Current Status",
-        banner_html=_current_status_banner(payload),
-        sections=[_current_status_summary_html(payload, therapy_href=therapy_href, forecast_href=forecast_href)],
+    state = str(payload.get("overall_state") or "blocked")
+    status, label = {
+        "recommendation_ready": ("good", "A setting change is supported"),
+        "no_change_supported": ("info", "No change supported"),
+    }.get(state, ("bad", "Blocked"))
+    data_prep = payload.get("data_prep") or {}
+    forecast = payload.get("forecast") or {}
+    overnight = (payload.get("therapy") or {}).get("overnight") or {}
+    blockers = [
+        f"<b>{rp.esc(item.get('label') or rp.plain(item.get('code')))}</b>: {rp.esc(item.get('detail') or '')}"
+        for item in payload.get("primary_blockers") or []
+    ]
+    body = [
+        rp.verdict(status, label, f"<b>{rp.esc(payload.get('headline') or 'Status unavailable')}</b>", rp.esc(payload.get("summary") or "")),
+        rp.tiles(
+            [
+                (rp.fmt(data_prep.get("final_row_count"), 0), "5-minute rows in the dataset"),
+                (rp.fmt(overnight.get("clean_nights"), 0), "clean nights for basal"),
+                (rp.fmt(forecast.get("model_mae"), suffix=" mg/dL"), "forecast error (model)"),
+            ]
+        ),
+        rp.section("What is blocking a recommendation", rp.bullets(blockers) or "<p>Nothing is blocking.</p>"),
+        rp.section("What to do next", rp.bullets(rp.esc(item) for item in payload.get("next_actions") or []) or "<p>No next actions recorded.</p>"),
+        rp.section(
+            "Detailed reports",
+            rp.bullets(
+                [
+                    f"<a href='{rp.esc(therapy_href)}'>Overnight basal evidence</a>",
+                    f"<a href='{rp.esc(forecast_href)}'>Glucose forecast check</a>",
+                ]
+            ),
+        ),
+        rp.details(
+            "Details: data",
+            rp.table(
+                ["item", "value"],
+                [
+                    ("Apple Health included", rp.esc("yes" if data_prep.get("apple_available") else "no")),
+                    ("Tandem and Apple Health overlap", rp.esc(_date_span(data_prep.get("overlap_start"), data_prep.get("overlap_end")))),
+                    ("Forecast baseline error", rp.fmt(forecast.get("persistence_mae"), suffix=" mg/dL")),
+                    ("Model fitting checks", rp.esc(rp.plain(forecast.get("sampler_health")))),
+                ],
+            ),
+        ),
+    ]
+    return _write(
+        path,
+        rp.page(
+            title="Project Status",
+            question="Where do things stand?",
+            subtitle=f"Run {rp.esc(payload.get('run_id') or 'unknown')}. {_generated()}",
+            body=body,
+        ),
     )
-    path.write_text(html_text, encoding="utf-8")
-    return path

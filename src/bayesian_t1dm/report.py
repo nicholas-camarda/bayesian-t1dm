@@ -13,6 +13,7 @@ from .ingest import TandemCoverage
 from .model import FitDiagnostics
 from .quality import DataQualitySummary
 from .recommend import Recommendation, RecommendationPolicy
+from .report_page import forecast_fits, forecast_verdict, plain, sampler_healthy
 
 
 def build_run_summary(
@@ -45,19 +46,51 @@ def _relative_link_target(markdown_path: Path, artifact_path: str | Path) -> str
         return str(artifact_path)
 
 
+def _plain_forecast_answer(summary: dict[str, Any]) -> list[str]:
+    """Plain-language opening shared with the HTML forecast page."""
+    walk_forward = summary.get("walk_forward") or {}
+    aggregate = walk_forward.get("aggregate") or {}
+    folds = walk_forward.get("folds") or []
+    fits = forecast_fits(summary)
+    failed = sum(1 for diag in fits if not sampler_healthy(diag))
+    verdict = (
+        forecast_verdict(aggregate.get("mae"), walk_forward.get("aggregate_persistence_mae"), failed_fits=failed, total_fits=len(fits))
+        if folds
+        else forecast_verdict(None, None)
+    )
+    lines = ["## Answer", "", f"**{verdict.label}.** {verdict.headline}" + (f" {verdict.explanation}" if verdict.explanation else ""), ""]
+    coverage = aggregate.get("coverage")
+    if coverage is not None and folds:
+        lines.append(f"- The 80% forecast range contained the real value {float(coverage) * 100:.0f}% of the time (should be 70 to 90%).")
+        lines.append(f"- Tested on {len(folds)} later periods the model was not trained on.")
+    data_quality = summary.get("data_quality") or {}
+    if data_quality:
+        incomplete = int(data_quality.get("incomplete_window_count") or 0)
+        lines.append("- Data completeness: " + ("all download windows complete." if data_quality.get("status") == "good" else f"{incomplete} download windows have gaps or other problems."))
+    policy = summary.get("recommendation_policy") or {}
+    reasons = [plain(reason) for reason in policy.get("reasons") or []]
+    if reasons:
+        lines.append(f"- Settings suggestions: {plain(policy.get('status'))} ({'; '.join(reasons)}).")
+    lines.append("")
+    return lines
+
+
 def write_markdown_report(summary: dict[str, Any], path: str | Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     lines: list[str] = []
-    lines.append("# Bayesian T1DM Run Summary")
+    lines.append("# Glucose Forecast Check")
     lines.append("")
-    lines.append("## Coverage")
+    lines.extend(_plain_forecast_answer(summary))
+    lines.append("## Technical record")
+    lines.append("")
+    lines.append("### Coverage")
     coverage = summary.get("coverage", {})
     for key, value in coverage.items():
         lines.append(f"- {key}: {value}")
     if summary.get("data_quality") is not None:
         lines.append("")
-        lines.append("## Data Quality")
+        lines.append("### Data Quality")
         data_quality = summary["data_quality"]
         lines.append(f"- status: {data_quality.get('status')}")
         lines.append(f"- normalized_plausibility_status: {data_quality.get('normalized_plausibility_status')}")
@@ -82,7 +115,7 @@ def write_markdown_report(summary: dict[str, Any], path: str | Path) -> Path:
             )
     if summary.get("walk_forward"):
         lines.append("")
-        lines.append("## Walk-Forward Evaluation")
+        lines.append("### Walk-Forward Evaluation")
         walk_forward = summary["walk_forward"]
         aggregate = walk_forward.get("aggregate") or {}
         for key in ["mae", "rmse", "coverage", "interval_width"]:
@@ -116,7 +149,7 @@ def write_markdown_report(summary: dict[str, Any], path: str | Path) -> Path:
             diagnostics_rows = [fold for fold in folds if fold.get("fit_diagnostics")]
             if diagnostics_rows:
                 lines.append("")
-                lines.append("### Walk-Forward Fit Diagnostics")
+                lines.append("#### Walk-Forward Fit Diagnostics")
                 lines.append("")
                 lines.append("| fold | chains | draws | tune | divergences | max_treedepth_hits | rhat_max | ess_bulk_min | ess_tail_min |")
                 lines.append("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
@@ -137,12 +170,12 @@ def write_markdown_report(summary: dict[str, Any], path: str | Path) -> Path:
                     )
     if summary.get("fit_diagnostics") is not None:
         lines.append("")
-        lines.append("## Final Fit Diagnostics")
+        lines.append("### Final Fit Diagnostics")
         for key, value in summary["fit_diagnostics"].items():
             lines.append(f"- {key}: {value}")
     if summary.get("recommendation_policy") is not None:
         lines.append("")
-        lines.append("## Recommendation Policy")
+        lines.append("### Recommendation Policy")
         policy = summary["recommendation_policy"]
         lines.append(f"- status: {policy.get('status')}")
         lines.append(f"- validation_passed: {policy.get('validation_passed')}")
@@ -154,12 +187,12 @@ def write_markdown_report(summary: dict[str, Any], path: str | Path) -> Path:
     review_artifacts = summary.get("review_artifacts") or {}
     if review_artifacts:
         lines.append("")
-        lines.append("## Review Artifacts")
+        lines.append("### Review Artifacts")
         for name, artifact_path in sorted(review_artifacts.items()):
             target = _relative_link_target(path, artifact_path)
             lines.append(f"- [{name}]({target})")
     lines.append("")
-    lines.append("## Recommendations")
+    lines.append("### Recommendations")
     recommendations = summary.get("recommendations", [])
     if not recommendations:
         policy_status = (summary.get("recommendation_policy") or {}).get("status")
