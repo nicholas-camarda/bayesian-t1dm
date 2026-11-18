@@ -35,7 +35,8 @@ from .dataset import MergedDataset, build_merged_dataset, load_merged_dataset, m
 from .ingest import summarize_tandem_raw_dir
 from .model import BayesianGlucoseModel
 from .observability import LoggingSession, setup_run_logging
-from .outcomes_report import write_outcomes
+from .outcomes_report import current_day_parts, write_outcomes
+from .proposals import propose_breakfast_icr, proposal_markdown, segment_ends_from_parts
 from .paths import ProjectPaths
 from .recommend import RecommendationPolicy, recommend_setting_changes
 from .report import build_run_summary, write_json_report, write_markdown_report
@@ -97,6 +98,14 @@ def build_parser() -> argparse.ArgumentParser:
     outcomes = add_command("report-outcomes", "Report consensus glucose outcomes (time in range, lows, highs) overall and by pump time-of-day segment")
     outcomes.add_argument("--raw", default=None)
     outcomes.add_argument("--report-dir", default=None)
+
+    propose = add_command("propose-breakfast-icr", "Propose one small breakfast I:C change when the evidence, its checks and the low limits support it")
+    propose.add_argument("--raw", default=None)
+    propose.add_argument("--segments", default=None)
+    propose.add_argument("--report-dir", default=None)
+    propose.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
+    propose.add_argument("--research-scope", choices=["foundation", "full"], default="full")
+    propose.add_argument("--therapy-settings", default=None)
 
     screen_health = add_command("screen-health-features", "Screen imported Apple Health context features against Tandem glucose targets")
     screen_health.add_argument("--raw", default=None)
@@ -451,7 +460,7 @@ def _prepare_runtime_output(paths: ProjectPaths, *directories: str | Path) -> No
 
 
 def _apply_command_defaults(args: argparse.Namespace, paths: ProjectPaths) -> None:
-    if args.command in {"ingest", "run", "screen-health-features", "build-dataset", "research-therapy-settings", "research-latent-meal-icr", "review-therapy-evidence", "status", "report-outcomes"}:
+    if args.command in {"ingest", "run", "screen-health-features", "build-dataset", "research-therapy-settings", "research-latent-meal-icr", "review-therapy-evidence", "status", "report-outcomes", "propose-breakfast-icr"}:
         args.raw = args.raw or str(paths.cloud_raw)
         if args.command == "ingest":
             args.report = args.report or str(paths.output_source / "coverage.md")
@@ -466,6 +475,8 @@ def _apply_command_defaults(args: argparse.Namespace, paths: ProjectPaths) -> No
             args.report = args.report or str(paths.output_therapy / "therapy_review.html")
         elif args.command == "report-outcomes":
             args.report_dir = args.report_dir or str(paths.output_outcomes)
+        elif args.command == "propose-breakfast-icr":
+            args.report_dir = args.report_dir or str(paths.output_proposals)
         elif args.command in {"status", "build-dataset"}:
             pass
         else:
@@ -519,6 +530,20 @@ def _dispatch_command(
                 report_path=args.report,
                 manifest_path=args.manifest,
             )
+        return 0
+
+    if args.command == "propose-breakfast-icr":
+        preparation, result = _run_latent_meal_analysis(args=args, paths=paths, session=session)
+        merged = _load_dataset(args, session)
+        with session.stage("proposals.breakfast_icr", report_dir=args.report_dir):
+            parts, _ = current_day_parts(merged, args.raw)
+            as_of = pd.Timestamp(merged.tandem_data.cgm["timestamp"].max()).normalize()
+            proposal = propose_breakfast_icr(result.effective_icr_evidence, merged.tandem_data.cgm, segment_ends_from_parts(parts), as_of=as_of)
+            out = Path(args.report_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame([{"as_of": as_of.date(), **proposal.to_row()}]).to_csv(out / "breakfast_proposal.csv", index=False)
+            (out / "breakfast_proposal.md").write_text(proposal_markdown(proposal, as_of=as_of), encoding="utf-8")
+        print((out / "breakfast_proposal.md").read_text(encoding="utf-8"))
         return 0
 
     if args.command == "report-outcomes":

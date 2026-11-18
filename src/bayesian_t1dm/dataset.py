@@ -49,7 +49,7 @@ from .quality import REPORTED_NOT_FAILED_PLAUSIBILITY_REASONS, DataQualitySummar
 from .report_page import plain
 
 # Bump when merge, cleaning or feature code changes what the build produces; a version change forces a rebuild.
-DATASET_VERSION = 10
+DATASET_VERSION = 11
 HORIZON_MINUTES = 30
 
 

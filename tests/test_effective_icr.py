@@ -25,6 +25,7 @@ from bayesian_t1dm.latent_meal_validation import (
 )
 from bayesian_t1dm.review import write_latent_meal_review_html
 from bayesian_t1dm.therapy_research import (
+    AGREEMENT_CHECKS,
     LatentMealTherapySettings,
     parse_therapy_segments,
     run_latent_meal_icr_research,
@@ -196,7 +197,7 @@ def test_pipeline_recovers_effective_icr_from_logged_breakfasts(tmp_path, assert
 
     evidence = result.effective_icr_evidence
     assert evidence is not None
-    morning = evidence.set_index("segment").loc["morning"]
+    morning = evidence[evidence["analysis"].eq("primary")].set_index("segment").loc["morning"]
     assert int(morning["n_meals"]) >= 8
     assert morning["status"] == "carbs_hit_harder_than_programmed"
     assert morning["effective_icr"] == pytest.approx(true_icr, rel=0.08)
@@ -292,7 +293,7 @@ def test_cli_workflow_from_raw_tree_with_hand_kept_carb_log(tmp_path, monkeypatc
         )
 
     output = runtime / "output" / "latent_meal"
-    evidence = pd.read_csv(output / "effective_icr_evidence.csv").set_index("segment").loc["morning"]
+    evidence = pd.read_csv(output / "effective_icr_evidence.csv").query("analysis == 'primary'").set_index("segment").loc["morning"]
     assert int(evidence["n_meals"]) >= 8
     assert evidence["status"] == "carbs_hit_softer_than_programmed"
     assert evidence["effective_icr"] == pytest.approx(12.5, rel=0.08)
@@ -312,7 +313,7 @@ def test_each_breakfast_is_judged_against_the_setting_in_force_and_reported_per_
     """True sensitivity is 8 g/U throughout; the pump was set to 10 g/U, then corrected to 8 g/U."""
     schedule = [10.0] * 12 + [8.0] * 12
     result = _run_full(_simulated_breakfast_data(days=24, true_icr=8.0, log_carbs=True, seed=4, pump_icr_by_day=schedule))
-    evidence = result.effective_icr_evidence.set_index("programmed_icr")
+    evidence = result.effective_icr_evidence.query("analysis == 'primary'").set_index("programmed_icr")
 
     assert list(evidence.index) == [10.0, 8.0]
     assert evidence["settings_source"].eq("bolus calculator").all()
@@ -375,8 +376,10 @@ def test_logged_food_sensitivity_analyses_leave_the_primary_result_alone():
         with_food = run_latent_meal_icr_research(dataset, nutrition=food, **common).effective_icr_evidence
 
     primary = with_food.loc[with_food["analysis"].eq("primary")].reset_index(drop=True)
-    pd.testing.assert_frame_equal(primary.drop(columns=["logged_food_scale", "logged_food_pairs"]), without.drop(columns=["logged_food_scale", "logged_food_pairs"]))
-    assert set(with_food["analysis"]) == {"primary", "without high fat or protein breakfasts", "pump and logged-food carbs combined"}
+    without_primary = without.loc[without["analysis"].eq("primary")].reset_index(drop=True)
+    pd.testing.assert_frame_equal(primary.drop(columns=["logged_food_scale", "logged_food_pairs"]), without_primary.drop(columns=["logged_food_scale", "logged_food_pairs"]))
+    agreement_checks = {name for name, _ in AGREEMENT_CHECKS}
+    assert set(with_food["analysis"]) == {"primary", "without high fat or protein breakfasts", "pump and logged-food carbs combined"} | agreement_checks
     assert with_food["logged_food_scale"].iloc[0] == pytest.approx(1.22, rel=0.1)
     by_analysis = with_food.set_index("analysis")
     assert by_analysis.loc["without high fat or protein breakfasts", "n_meals"] < by_analysis.loc["primary", "n_meals"]

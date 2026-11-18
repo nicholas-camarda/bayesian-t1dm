@@ -98,7 +98,7 @@ Each phase is its own branch and pull request. A phase is done when: tests for i
 | 6 | F basal from the controller pattern | Control-IQ's commanded vs profile rate by time of day, lows as a hard stop |
 | 7 | G correction factor | after phases 2 to 6 |
 
-Carried into phase 2 (from the review of the pump-history work): a settings period breaks whenever a meal's own I:C or CF differs, so most periods hold fewer than 5 breakfasts; profile lookup uses carb times rounded down to 5 minutes; the plausible-carb ceiling comes from the latest snapshot.
+Done in phase 2: settings periods are formed per pump segment, which cut periods with fewer than 5 breakfasts from 149 of 173 to 22 of 44. Still open from the review: profile lookup uses carb times rounded down to 5 minutes; the plausible-carb ceiling comes from the latest snapshot.
 
 Still open from earlier: keep `context_events.csv` current; travel and time zones; whether CGM gaps should block anything (the plausibility check no longer fails on readings at the sensor's limits, only on impossible values); the forecast lane, to be retired if it does not beat persistence by 10%; `tandem_export_manifest.csv` should have one writer.
 

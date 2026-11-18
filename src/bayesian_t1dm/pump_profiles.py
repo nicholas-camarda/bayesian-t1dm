@@ -55,9 +55,12 @@ PROFILE_EVENT_COLUMNS = (
 # Columns attached to each carb entry: the profile active at the meal and, when its edits are visible in the
 # archive, that profile's segment in force at the meal's time of day.
 # ``profile_edits_visible`` is 1 while the archive shows that pump's profile edits and 0 after, when a profile's
-# values may have changed unseen.
+# values may have changed unseen. ``profile_segment_start_minutes`` is the start of the segment covering the meal's
+# time of day: from the meal's own moment while edits are visible, and otherwise from the profile's segments as
+# last seen (a later edit to a start time would not show).
 PROFILE_SETTING_COLUMNS = (
     "profile_id", "profile_edits_visible", "profile_carb_ratio_g_per_unit", "profile_isf_mgdl_per_unit", "profile_target_bg_mgdl",
+    "profile_segment_start_minutes",
 )
 
 
@@ -296,7 +299,13 @@ class ProfileHistory:
             span = self.visible.get(pump_serial)
             out.at[index, "profile_edits_visible"] = float(span is not None and span[0] <= moment.date() <= span[1])
             segment = self.segment_in_force(pump_serial, profile_id, moment)
+            last_seen = self.visible[pump_serial][1] if pump_serial in self.visible else None
+            if segment is None and last_seen is not None and moment.date() > last_seen:
+                earlier = self.segment_in_force(pump_serial, profile_id, dt.datetime.combine(last_seen, moment.time()))
+                if earlier is not None:
+                    out.at[index, "profile_segment_start_minutes"] = earlier["start_minutes"]
             if segment is not None:
+                out.at[index, "profile_segment_start_minutes"] = segment["start_minutes"]
                 out.at[index, "profile_carb_ratio_g_per_unit"] = segment["carb_ratio_g_per_unit"]
                 out.at[index, "profile_isf_mgdl_per_unit"] = segment["isf_mgdl_per_unit"]
                 out.at[index, "profile_target_bg_mgdl"] = segment["target_bg_mgdl"]

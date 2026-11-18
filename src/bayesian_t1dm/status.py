@@ -22,6 +22,7 @@ TOP_LEVEL_ENTRYPOINTS = {
     "therapy",
     "latent_meal",
     "outcomes",
+    "proposals",
     "fixture",
     "source",
     "prepare",
