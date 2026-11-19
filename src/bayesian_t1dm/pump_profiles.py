@@ -330,8 +330,14 @@ class ProfileHistory:
             return None
         return table[covering]
 
-    def basal_rates(self, pumps: pd.Series, timestamps: pd.Series) -> np.ndarray:
-        """Vectorized exact-time replay, retaining unknown slots in incomplete profiles."""
+    def values_at(self, pumps: pd.Series, timestamps: pd.Series, field: str) -> np.ndarray:
+        """The value of ``field`` (a profile segment value such as ``basal_units_per_hour``, ``carb_ratio_g_per_unit``,
+        ``isf_mgdl_per_unit``, ``target_bg_mgdl`` or ``start_minutes``) the profile in force holds at each time, for the
+        pump named at the same position.
+
+        Vectorized exact-time replay: an edit applies from its own timestamp, a time outside the span where the pump's
+        edits are visible, before the first activation, or inside a slot the archive never saw is NaN.
+        """
         stamps = pd.DatetimeIndex(timestamps)
         times = stamps.to_numpy(dtype="datetime64[ns]")
         minutes = np.asarray(stamps.hour * 60 + stamps.minute)
@@ -360,7 +366,7 @@ class ProfileHistory:
                     if not starts:
                         continue
                     bounds, slots = zip(*starts)
-                    values = [table[i]["basal_units_per_hour"] if
+                    values = [table[i][field] if
                               (i + 1 < len(table) and table[i + 1] is not None or
                                i + 1 == len(table) and self._complete[key][k]) else np.nan for i in slots]
                     covering = np.searchsorted(bounds, minutes[positions], side="right") - 1
