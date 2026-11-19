@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 
@@ -13,6 +14,7 @@ from scipy.stats import norm
 from .basal_validation import HALF_LIFE_DAYS, HOLDOUT_DAYS, THRESHOLD
 from .model import FitDiagnostics, extract_fit_diagnostics
 
+LOGGER = logging.getLogger(__name__)
 WEEK_DAYS = 7
 TARGET_ACCEPT = 0.95
 MAX_TREEDEPTH = 10
@@ -148,16 +150,20 @@ def attach_origin_features(rows: pd.DataFrame, analysis) -> pd.DataFrame:
             seen = np.r_[0, np.cumsum(finite)]
             count = seen[right] - seen[left]
             rows[destination] = np.divide(mass[right] - mass[left], count, out=np.full(len(count), np.nan), where=count > 0)
-    workouts = analysis.merged.data.workouts
-    workouts = workouts.loc[workouts.duration_seconds.ge(EXERCISE_MIN_MINUTES * 60)].dropna(subset=["end_timestamp"]).sort_values("end_timestamp")
+    exports = analysis.merged.data.workouts
+    workouts = exports.loc[exports.duration_seconds.ge(EXERCISE_MIN_MINUTES * 60)].dropna(subset=["end_timestamp"]).sort_values("end_timestamp")
     ends = pd.DatetimeIndex(workouts.end_timestamp)
     right = ends.searchsorted(origin, side="left")
     left = ends.searchsorted(origin - pd.Timedelta(days=1))
     matched = ends.to_series(index=np.arange(len(ends))).reindex(right - 1)
     rows["hours_since_workout"] = (origin - matched.reset_index(drop=True)).dt.total_seconds() / 3600
     energy = np.r_[0, workouts.active_energy_value.fillna(0).cumsum()]
-    rows["workout_energy_24h"] = np.where(origin.between(ends.min(), ends.max()), energy[right] - energy[left], np.nan)
-    rows["previous_sleep_mode_share"] = rows.groupby(["part", "context"]).sleep_share.shift(1)
+    # No workout in the previous 24 hours is a zero, but only where the Apple Health exports cover the origin.
+    covered = origin.between(exports.covered_start_date.min(), exports.covered_end_date.max())
+    rows["workout_energy_24h"] = np.where(covered, energy[right] - energy[left], np.nan)
+    # The previous eligible observation is the previous one in date order, whatever the row order of the frame.
+    by_date = rows.sort_values("date", kind="stable")
+    rows["previous_sleep_mode_share"] = by_date.groupby(["part", "context"]).sleep_share.shift(1).reindex(rows.index)
     # A forecast for post-dinner behavior conditions on the exposure category. Use only earlier logged food values.
     nutrition = analysis.merged.data.nutrition
     if not nutrition.empty:
@@ -288,7 +294,11 @@ def validate(raw, output, *, pilot=False):
         # Hold the profile fixed for the comparison. An intervening edit makes this forecast conditional on the wrong exposure.
         test = test.loc[np.isclose(test.profile_rate, outcome_rate, atol=0.00051)].copy()
         test.to_csv(output / f"{origin.date()}-holdout.csv", index=False)
+        if test.empty:
+            LOGGER.warning("Origin %s has no eligible held-out observation with an unchanged profile; no model was fitted", origin.date())
+            continue
         scored = predict_at_origin(train, test, predictors, output_dir=output / f"{origin.date()}")
+        scored.to_csv(output / f"{origin.date()}" / "scores.csv", index=False)
         all_folds.append(scored)
     pd.concat(all_folds, ignore_index=True).to_csv(output / "paired_scores.csv", index=False)
 

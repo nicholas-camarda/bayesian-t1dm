@@ -40,10 +40,12 @@ def _fake_analysis():
                         "glucose": [100.0, np.nan, 120.0, 140.0]})
     data = SimpleNamespace(
         sleep=pd.DataFrame({"sleep_end": [day - pd.Timedelta(hours=17)], "total_sleep_hours": [7.5]}),
-        workouts=pd.DataFrame({"duration_seconds": [3600.0], "end_timestamp": [day - pd.Timedelta(hours=30)],
+        workouts=pd.DataFrame({"duration_seconds": [3600.0], "end_timestamp": [day - pd.Timedelta(hours=10)],
                                "active_energy_value": [300.0]}),
         nutrition=pd.DataFrame(),
     )
+    data.workouts["covered_start_date"] = pd.Timestamp("2026-01-01")
+    data.workouts["covered_end_date"] = pd.Timestamp("2026-12-31")
     site = pd.DataFrame({"timestamp": [day - pd.Timedelta(days=3)]})
     return SimpleNamespace(merged=SimpleNamespace(data=data), cgm=cgm, site_events=site), day
 
@@ -67,7 +69,13 @@ def test_origin_features_ignore_row_order_and_missing_glucose():
     assert out.loc[1, "days_since_site"] == pytest.approx(3.0)
     assert out.loc[1, "prior_sleep_hours"] == pytest.approx(7.5)
     assert np.isnan(out.loc[0, "prior_sleep_hours"])
-    assert out.loc[1, "hours_since_workout"] == pytest.approx(30.0)
+    assert out.loc[1, "hours_since_workout"] == pytest.approx(10.0)
+    # The workout ended 10 h before midnight on `day`: it is inside that day's previous 24 h and outside day+2's, which is zero, not missing.
+    assert out.loc[0, "workout_energy_24h"] == 0.0
+    assert out.loc[1, "workout_energy_24h"] == pytest.approx(300.0)
+    # Previous share follows date order within a context: row 1 (day) precedes row 0 (day+2).
+    assert out.loc[0, "previous_sleep_mode_share"] == pytest.approx(0.2)
+    assert np.isnan(out.loc[1, "previous_sleep_mode_share"])
 
 
 def test_design_and_model_build_on_synthetic_rows():
