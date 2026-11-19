@@ -32,7 +32,6 @@ class ProjectPaths:
     raw: Path
     processed: Path
     reports: Path
-    output_forecast: Path
     output_therapy: Path
     output_latent_meal: Path
     output_outcomes: Path
@@ -47,7 +46,6 @@ class ProjectPaths:
     cache_analysis_ready: Path
     cache_latent_meal: Path
     cache_prepare: Path
-    cache_forecast: Path
     cache_status: Path
     logs: Path
     runtime_archive: Path
@@ -91,7 +89,6 @@ class ProjectPaths:
             raw=root_path / "data" / "raw",
             processed=root_path / "data" / "processed",
             reports=runtime_path / "output",
-            output_forecast=runtime_path / "output" / "forecast",
             output_therapy=runtime_path / "output" / "therapy",
             output_latent_meal=runtime_path / "output" / "latent_meal",
             output_outcomes=runtime_path / "output" / "outcomes",
@@ -106,7 +103,6 @@ class ProjectPaths:
             cache_analysis_ready=runtime_path / "cache" / "analysis_ready",
             cache_latent_meal=runtime_path / "cache" / "latent_meal",
             cache_prepare=runtime_path / "cache" / "prepare",
-            cache_forecast=runtime_path / "cache" / "forecast",
             cache_status=runtime_path / "cache" / "status",
             logs=runtime_path / "logs",
             runtime_archive=runtime_path / "archive",
@@ -123,7 +119,6 @@ class ProjectPaths:
         for path in [
             self.runtime,
             self.reports,
-            self.output_forecast,
             self.output_therapy,
             self.output_latent_meal,
             self.output_outcomes,
@@ -137,7 +132,6 @@ class ProjectPaths:
             self.cache_analysis_ready,
             self.cache_latent_meal,
             self.cache_prepare,
-            self.cache_forecast,
             self.cache_status,
             self.logs,
             self.runtime_archive,

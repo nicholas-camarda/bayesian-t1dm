@@ -74,8 +74,7 @@ Each of these changed results; anything computed before the fix should be regene
 | Merged 5-minute dataset | Runs on real data; validated in `validation_report.md` |
 | Latent meal: breakfast effective I:C | Primary lane. Runs on real data with pump-entered carbs; validated in simulation. Real-data result is in `output/latent_meal/latent_meal_review.html` |
 | Therapy research (overnight basal identifiability) | Runs on real data. Its synthetic "truth recovery" uses frames without meal or insulin dynamics, so it is weaker evidence than the name suggests |
-| Forecast validation | Runs on real data. Kept only as a check on model quality; the answer is on `output/forecast/forecast_review.html` |
-| Forecast-based recommendations | Always suppressed. The scenario math is a sensitivity analysis of a predictive regression, not a causal estimate |
+| 5-minute glucose forecast and its scenario recommendations | Retired 2026-11-19 (tag `pre-forecast-lane-removal-20261119`); see Retired in `docs/technical.md` |
 
 ## Scientific frame and priority cohort
 
@@ -100,7 +99,7 @@ Each phase is its own branch and pull request. A phase is done when: tests for i
 
 Done in phase 2: settings periods are formed per pump segment, which cut periods with fewer than 5 breakfasts from 149 of 173 to 22 of 44. Still open from the review: profile lookup uses carb times rounded down to 5 minutes; the plausible-carb ceiling comes from the latest snapshot.
 
-Still open from earlier: keep `context_events.csv` current; travel and time zones; whether CGM gaps should block anything (the plausibility check no longer fails on readings at the sensor's limits, only on impossible values); the forecast lane, to be retired if it does not beat persistence by 10%; `tandem_export_manifest.csv` should have one writer.
+Still open from earlier: keep `context_events.csv` current; travel and time zones; whether CGM gaps should block anything (the plausibility check no longer fails on readings at the sensor's limits, only on impossible values); `tandem_export_manifest.csv` should have one writer.
 
 Explicitly deferred: global basal optimization as the headline; claiming exact carb truth for any single bolus; weighed breakfasts (not planned, so the effective I:C keeps absorbing carb-counting bias, which is the ratio that works with how the carbs are counted).
 

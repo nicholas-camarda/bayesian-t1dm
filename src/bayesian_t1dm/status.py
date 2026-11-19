@@ -17,8 +17,6 @@ from .therapy_research import TherapyResearchResult, summarize_overnight_basal_e
 TOP_LEVEL_ENTRYPOINTS = {
     "current_status.html",
     "therapy_review.html",
-    "forecast_review.html",
-    "forecast",
     "therapy",
     "latent_meal",
     "outcomes",
@@ -106,68 +104,19 @@ def reset_output_directory(path: str | Path) -> Path:
     return path
 
 
-def _sampler_health(summary: dict[str, Any]) -> tuple[str, list[dict[str, str]]]:
-    folds = ((summary.get("walk_forward") or {}).get("folds") or [])
+def _source_quality_blockers(data_quality: dict[str, Any]) -> tuple[list[dict[str, str]], dict[str, Any]]:
     blockers: list[dict[str, str]] = []
-    if not folds:
-        return "not_available", blockers
-    failing = False
-    for fold in folds:
-        diagnostics = fold.get("fit_diagnostics") or {}
-        if not diagnostics:
-            continue
-        rhat_max = diagnostics.get("rhat_max")
-        ess_bulk_min = diagnostics.get("ess_bulk_min")
-        divergences = diagnostics.get("divergences")
-        if (rhat_max is not None and float(rhat_max) > 1.1) or (ess_bulk_min is not None and float(ess_bulk_min) < 100.0) or int(divergences or 0) > 0:
-            failing = True
-    if failing:
-        blockers.append(
-            {
-                "code": "sampler_diagnostics_failure",
-                "label": "Sampler diagnostics failure",
-                "detail": "Walk-forward fit diagnostics did not meet basic trust thresholds.",
-            }
-        )
-        return "failed", blockers
-    return "good", blockers
-
-
-def _forecast_blockers(summary: dict[str, Any]) -> tuple[list[dict[str, str]], dict[str, Any]]:
-    blockers: list[dict[str, str]] = []
-    walk_forward = summary.get("walk_forward") or {}
-    aggregate = walk_forward.get("aggregate") or {}
-    model_mae = aggregate.get("mae")
-    persistence_mae = walk_forward.get("aggregate_persistence_mae")
-    coverage = aggregate.get("coverage")
-    data_quality = summary.get("data_quality") or {}
     if str(data_quality.get("status") or "broken") != "good":
         blockers.append(
             {
                 "code": "degraded_source_quality",
                 "label": "Degraded source quality",
-                "detail": f"Forecast validation saw source quality status {data_quality.get('status')}.",
+                "detail": f"Source quality status is {data_quality.get('status')}.",
             }
         )
-    if model_mae is None or persistence_mae is None or (float(model_mae) >= float(persistence_mae)) or (coverage is not None and float(coverage) < 0.65):
-        blockers.append(
-            {
-                "code": "weak_forecast_validation",
-                "label": "Weak forecast validation",
-                "detail": "The validation model is not clearly beating persistence or has weak interval coverage.",
-            }
-        )
-    sampler_status, sampler_blockers = _sampler_health(summary)
-    blockers.extend(sampler_blockers)
     return blockers, {
         "data_quality_status": data_quality.get("status"),
         "incomplete_window_count": data_quality.get("incomplete_window_count"),
-        "model_mae": model_mae,
-        "persistence_mae": persistence_mae,
-        "coverage": coverage,
-        "interval_width": aggregate.get("interval_width"),
-        "recommendation_policy_status": (summary.get("recommendation_policy") or {}).get("status"),
-        "sampler_health": sampler_status,
     }
 
 
@@ -256,7 +205,7 @@ def derive_current_status(
     *,
     preparation: ModelDataPreparationResult,
     research_result: TherapyResearchResult,
-    forecast_summary: dict[str, Any],
+    data_quality: dict[str, Any],
     run_id: str,
     generated_at: str | None = None,
     artifact_paths: dict[str, str] | None = None,
@@ -264,17 +213,16 @@ def derive_current_status(
     generated_at = generated_at or _utc_timestamp()
     overnight_summary, _ = summarize_overnight_basal_evidence(research_result)
     therapy_blockers, therapy_summary, recommendation_rows = _therapy_blockers(research_result, overnight_summary)
-    forecast_blockers, forecast_details = _forecast_blockers(forecast_summary)
-    primary_blockers = therapy_blockers + [blocker for blocker in forecast_blockers if blocker["code"] not in {item["code"] for item in therapy_blockers}]
+    source_blockers, source_details = _source_quality_blockers(data_quality)
+    primary_blockers = therapy_blockers + [blocker for blocker in source_blockers if blocker["code"] not in {item["code"] for item in therapy_blockers}]
 
     candidates = [row for row in recommendation_rows if row["status"] == "candidate"]
     if candidates and not primary_blockers:
         overall_state = "recommendation_ready"
         headline = "A therapy-setting change is recommendation-ready."
-        summary = "The current therapy and forecast evidence support at least one candidate change without an active blocker."
+        summary = "The current therapy evidence supports at least one candidate change without an active blocker."
         next_actions = [
             "Review the candidate change details in the therapy dashboard.",
-            "Sanity-check the forecast validation page before acting on any recommendation.",
         ]
     elif not primary_blockers:
         overall_state = "no_change_supported"
@@ -296,10 +244,6 @@ def derive_current_status(
                 next_actions.append("Inspect overnight closed-loop and proxy meal activity before trusting basal conclusions.")
             elif blocker["code"] == "degraded_source_quality":
                 next_actions.append("Repair incomplete or degraded source windows before interpreting recommendations.")
-            elif blocker["code"] == "weak_forecast_validation":
-                next_actions.append("Treat the current forecast model as untrusted until it clearly beats persistence on held-out folds.")
-            elif blocker["code"] == "sampler_diagnostics_failure":
-                next_actions.append("Fix sampler diagnostics before using model-based recommendations.")
             elif blocker["code"] == "insufficient_carb_or_meal_signal":
                 next_actions.append("Capture stronger meal evidence before evaluating meal-linked settings.")
         if not next_actions:
@@ -312,7 +256,7 @@ def derive_current_status(
         "primary_blockers": primary_blockers,
         "next_actions": next_actions,
         "therapy": therapy_summary,
-        "forecast": forecast_details,
+        "source_quality": source_details,
         "data_prep": {
             "mode": preparation.dataset.mode,
             "apple_available": preparation.apple_available,

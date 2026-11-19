@@ -160,36 +160,8 @@ def _research_result(
     )
 
 
-def _forecast_summary(*, strong: bool = True, diagnostics_good: bool = True, quality_status: str = "good") -> dict[str, object]:
-    return {
-        "walk_forward": {
-            "aggregate": {
-                "mae": 10.0 if strong else 15.0,
-                "rmse": 12.0,
-                "coverage": 0.8 if strong else 0.2,
-                "interval_width": 20.0,
-            },
-            "aggregate_persistence_mae": 14.0,
-            "folds": [
-                {
-                    "fold": 1,
-                    "fit_diagnostics": {
-                        "chains": 2,
-                        "divergences": 0 if diagnostics_good else 12,
-                        "rhat_max": 1.01 if diagnostics_good else 1.8,
-                        "ess_bulk_min": 200.0 if diagnostics_good else 5.0,
-                    },
-                }
-            ],
-        },
-        "data_quality": {
-            "status": quality_status,
-            "incomplete_window_count": 0 if quality_status == "good" else 2,
-        },
-        "recommendation_policy": {
-            "status": "skipped",
-        },
-    }
+def _data_quality(status: str = "good") -> dict[str, object]:
+    return {"status": status, "incomplete_window_count": 0 if status == "good" else 2}
 
 
 def test_derive_current_status_marks_candidate_as_recommendation_ready():
@@ -205,7 +177,7 @@ def test_derive_current_status_marks_candidate_as_recommendation_ready():
             proxy_meal_rows=0,
             recommendation_status="candidate",
         ),
-        forecast_summary=_forecast_summary(strong=True, diagnostics_good=True),
+        data_quality=_data_quality(),
         run_id="run123",
     )
 
@@ -226,7 +198,7 @@ def test_derive_current_status_marks_stable_case_as_no_change_supported():
             proxy_meal_rows=0,
             recommendation_status="suppressed",
         ),
-        forecast_summary=_forecast_summary(strong=True, diagnostics_good=True),
+        data_quality=_data_quality(),
         run_id="run123",
     )
 
@@ -247,7 +219,7 @@ def test_derive_current_status_marks_overnight_or_confounding_case_as_blocked():
             proxy_meal_rows=10,
             recommendation_status="suppressed",
         ),
-        forecast_summary=_forecast_summary(strong=False, diagnostics_good=False, quality_status="degraded"),
+        data_quality=_data_quality("degraded"),
         run_id="run123",
     )
 
@@ -255,6 +227,28 @@ def test_derive_current_status_marks_overnight_or_confounding_case_as_blocked():
     assert payload["overall_state"] == "blocked"
     assert "insufficient_clean_overnight_windows" in codes
     assert "high_closed_loop_confounding" in codes
+
+
+def test_degraded_source_quality_blocks_an_otherwise_ready_status():
+    dataset = _dataset()
+    payload = derive_current_status(
+        preparation=_preparation(dataset),
+        research_result=_research_result(
+            overnight_clean_rows=96,
+            overnight_nights=4,
+            stable_epochs=3,
+            confounding="moderate",
+            direct_meal_rows=60,
+            proxy_meal_rows=0,
+            recommendation_status="candidate",
+        ),
+        data_quality=_data_quality("degraded"),
+        run_id="run123",
+    )
+
+    assert payload["overall_state"] == "blocked"
+    assert [item["code"] for item in payload["primary_blockers"]] == ["degraded_source_quality"]
+    assert payload["source_quality"]["incomplete_window_count"] == 2
 
 
 def test_output_cleanup_moves_top_level_clutter_into_runtime_archive(tmp_path):
@@ -279,10 +273,10 @@ def test_output_cleanup_moves_top_level_clutter_into_runtime_archive(tmp_path):
     (log_dir / "events.jsonl").write_text("{}\n", encoding="utf-8")
     assert finalize_status_logs(paths, log_dir) == log_dir
 
-    source_html = paths.output_forecast / "forecast_review.html"
-    source_html.write_text("<html>forecast</html>", encoding="utf-8")
-    published = publish_html_entrypoint(source_html, paths.reports / "forecast_review.html")
-    assert published.read_text(encoding="utf-8") == "<html>forecast</html>"
+    source_html = paths.output_therapy / "therapy_review.html"
+    source_html.write_text("<html>therapy</html>", encoding="utf-8")
+    published = publish_html_entrypoint(source_html, paths.reports / "therapy_review.html")
+    assert published.read_text(encoding="utf-8") == "<html>therapy</html>"
 
 
 def test_output_cleanup_migrates_legacy_output_logs_into_runtime_logs(tmp_path):
@@ -305,7 +299,7 @@ def test_output_cleanup_migrates_legacy_output_logs_into_runtime_logs(tmp_path):
 
 
 def test_reset_output_directory_replaces_stale_contents(tmp_path):
-    directory = tmp_path / "output" / "forecast"
+    directory = tmp_path / "output" / "therapy"
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "stale.md").write_text("stale", encoding="utf-8")
 

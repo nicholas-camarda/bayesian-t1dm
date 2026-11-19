@@ -8,16 +8,16 @@ from types import SimpleNamespace
 import pandas as pd
 
 import bayesian_t1dm.cli as cli
-from bayesian_t1dm.evaluate import CalibrationSummary, WalkForwardReport
 from bayesian_t1dm.cli import main
 
 
 def _fake_merged(preparation):
     """A merged dataset with the parts the research commands read: no food log, no workouts, no pump modes, an empty analysis grid."""
     grid = pd.DataFrame(columns=["timestamp", "glucose", "carb_grams", "bolus_units"])
-    return SimpleNamespace(preparation=preparation, grid=grid, mode_events=pd.DataFrame(), data=SimpleNamespace(nutrition=pd.DataFrame(), workouts=pd.DataFrame()))
+    return SimpleNamespace(preparation=preparation, data_quality=DataQualitySummary(status="degraded", contributing_window_ids=[], incomplete_window_count=2, reason_counts={}, evaluation_touches_incomplete_windows=False), grid=grid, mode_events=pd.DataFrame(), data=SimpleNamespace(nutrition=pd.DataFrame(), workouts=pd.DataFrame()))
 from bayesian_t1dm.acquisition import ExportWindow, NormalizedWindowResult
 from bayesian_t1dm.health_auto_export import ModelDataPreparationResult
+from bayesian_t1dm.quality import DataQualitySummary
 from bayesian_t1dm.therapy_research import TherapyInfraValidationResult, TherapyResearchResult, _synthetic_base_dataset
 
 
@@ -353,50 +353,6 @@ def test_normalize_raw_command_rebuilds_archived_window(tmp_path, monkeypatch):
     assert exit_code == 0
     assert (cloud_root / "data" / "raw" / "tconnectsync" / "2024-05-01__2024-05-03" / "window_manifest.csv").exists()
     assert (runtime_root / "output" / "source" / "normalize_raw_summary.md").exists()
-
-
-class _FailIfFitModel:
-    def __init__(self, **kwargs) -> None:
-        self.kwargs = kwargs
-
-    def fit(self, feature_frame):
-        raise AssertionError("final fit should be skipped when --skip-recommendations is set")
-
-
-def test_run_skip_recommendations_writes_skipped_policy(tmp_path, tandem_fixture_dir, monkeypatch):
-    workspace_root = tmp_path / "repo"
-    workspace_root.mkdir()
-    monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(tmp_path / "cloud"))
-    monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(tmp_path / "runtime"))
-    monkeypatch.setattr(cli, "BayesianGlucoseModel", _FailIfFitModel)
-    monkeypatch.setattr(
-        cli,
-        "run_walk_forward",
-        lambda features, model, n_folds=4: WalkForwardReport(
-            folds=[],
-            aggregate=CalibrationSummary(mae=10.0, rmse=12.0, coverage=0.8, interval_width=30.0),
-            aggregate_persistence_mae=14.0,
-        ),
-    )
-
-    raw_root = _built_raw_tree(tmp_path, workspace_root, tandem_fixture_dir)
-    exit_code = main(["--root", str(workspace_root), "run", "--raw", str(raw_root), "--skip-recommendations"])
-
-    assert exit_code == 0
-    report_json = tmp_path / "runtime" / "cache" / "forecast" / "run_summary.json"
-    payload = json.loads(report_json.read_text(encoding="utf-8"))
-    assert payload["fit_diagnostics"] is None
-    assert payload["data_quality"]["status"] in {"good", "degraded"}
-    assert payload["recommendation_policy"]["status"] == "skipped"
-    assert payload["recommendation_policy"]["reasons"] == ["skipped_by_flag"]
-    assert (tmp_path / "runtime" / "output" / "forecast_review.html").exists()
-    assert (tmp_path / "runtime" / "output" / "forecast" / "forecast_review.html").exists()
-    report_text = (tmp_path / "runtime" / "output" / "forecast" / "run_summary.md").read_text(encoding="utf-8")
-    assert "[forecast_review_html](forecast_review.html)" in report_text
-    run_dir = _latest_log_dir(tmp_path / "runtime", "run")
-    events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert any(event["event"] == "command.stage.start" and event["stage"] == "run.walk_forward" for event in events)
-    assert any(event["event"] == "command.complete" and event["status"] == "success" for event in events)
 
 
 def test_build_dataset_without_apple_writes_tandem_only_dataset_and_skips_unchanged_inputs(tmp_path, monkeypatch):
@@ -742,21 +698,6 @@ def test_status_command_writes_curated_latest_outputs_and_cache_artifacts(tmp_pa
             recommendation_audit_markdown="# audit\n",
         ),
     )
-    monkeypatch.setattr(
-        cli,
-        "_build_forecast_summary",
-        lambda *args, **kwargs: {
-            "walk_forward": {
-                "aggregate": {"mae": 16.0, "rmse": 20.0, "coverage": 0.2, "interval_width": 10.0},
-                "aggregate_persistence_mae": 14.0,
-                "folds": [{"fold": 1, "fit_diagnostics": {"chains": 2, "divergences": 4, "rhat_max": 1.7, "ess_bulk_min": 8.0}}],
-            },
-            "data_quality": {"status": "degraded", "incomplete_window_count": 2},
-            "recommendation_policy": {"status": "skipped", "reasons": ["skipped_by_flag"]},
-            "recommendations": [],
-        },
-    )
-
     output_root = runtime_root / "output"
     output_root.mkdir(parents=True, exist_ok=True)
     (output_root / "old_artifact.md").write_text("old", encoding="utf-8")
@@ -776,12 +717,9 @@ def test_status_command_writes_curated_latest_outputs_and_cache_artifacts(tmp_pa
     assert current_payload["overall_state"] == "blocked"
     assert (output_root / "current_status.html").exists()
     assert (output_root / "therapy_review.html").exists()
-    assert (output_root / "forecast_review.html").exists()
     assert not (output_root / "old_artifact.md").exists()
     assert (output_root / "therapy" / "therapy_review.html").exists()
-    assert (output_root / "forecast" / "forecast_review.html").exists()
     assert (output_root / "therapy" / "model_data_preparation.md").exists()
-    assert (runtime_root / "cache" / "forecast" / "run_summary.json").exists()
     assert _latest_log_dir(runtime_root, "status").joinpath("events.jsonl").exists()
 
 

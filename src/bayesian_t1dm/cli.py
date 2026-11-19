@@ -12,9 +12,7 @@ import sys
 
 import pandas as pd
 
-import warnings
 
-from .evaluate import run_walk_forward
 from .acquisition import (
     load_local_env_file,
     ExportWindow,
@@ -37,7 +35,6 @@ from .health_auto_export import (
 from .latent_meal_validation import run_effective_icr_recovery, run_latent_meal_truth_recovery, write_latent_meal_recovery_artifacts
 from .dataset import MergedDataset, build_merged_dataset, load_merged_dataset, merged_dir
 from .ingest import summarize_tandem_raw_dir
-from .model import BayesianGlucoseModel
 from .observability import LoggingSession, setup_run_logging
 from .analysis_data import AnalysisData, exercise_for, load_analysis_data, unlogged_for
 from .outcomes_report import write_outcomes
@@ -52,11 +49,9 @@ from .publish import current_commit, publish_run, working_tree_is_clean
 from .records import evaluate_open, load_records, register_proposal, save_records, sync_with_pump
 from .proposals import propose_breakfast_icr, proposal_markdown, segment_ends_from_parts, segment_markdown, segment_summary
 from .paths import ProjectPaths
-from .recommend import RecommendationPolicy, recommend_setting_changes
-from .report import build_run_summary, write_json_report, write_markdown_report
-from .review import write_coverage_review_html, write_current_status_html, write_latent_meal_review_html, write_run_review_html, write_therapy_evidence_review_html
-from .features import FeatureFrame
-from .status import cleanup_legacy_top_level_output, derive_current_status, finalize_status_logs, publish_html_entrypoint, reset_output_directory, write_status_json
+from .report import build_coverage_summary, write_coverage_markdown
+from .review import write_coverage_review_html, write_current_status_html, write_latent_meal_review_html, write_therapy_evidence_review_html
+from .status import cleanup_legacy_top_level_output, derive_current_status, finalize_status_logs, reset_output_directory, write_status_json
 from .therapy_research import (
     load_excluded_periods,
     build_representative_latent_meal_fixture,
@@ -137,7 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
     research_therapy = add_command("research-therapy-settings", "Run research-grade therapy setting analysis on prepared Tandem and Apple Health data")
     research_therapy.add_argument("--raw", default=None)
     research_therapy.add_argument("--segments", default=None, help="Comma-separated day segments like overnight=00:00-06:00,morning=06:00-11:00")
-    research_therapy.add_argument("--include-models", default=None, help="Comma-separated model families such as bayesian,ridge,elastic_net,segmented_ridge,tree_boost,ensemble")
+    research_therapy.add_argument("--include-models", default=None, help="Comma-separated model families such as ridge,elastic_net,segmented_ridge,tree_boost,ensemble")
     research_therapy.add_argument("--report-dir", default=None)
     research_therapy.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
     research_therapy.add_argument("--ic-policy", choices=["exploratory_only", "conservative", "off"], default="exploratory_only")
@@ -190,23 +185,6 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--include-models", default=None)
     status.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
     status.add_argument("--ic-policy", choices=["exploratory_only", "conservative", "off"], default="exploratory_only")
-    status.add_argument("--eval-folds", type=int, default=4)
-    status.add_argument("--draws", type=int, default=1000)
-    status.add_argument("--tune", type=int, default=1000)
-    status.add_argument("--chains", type=int, default=4)
-    status.add_argument("--target-accept", type=float, default=0.95)
-    status.add_argument("--max-treedepth", type=int, default=12)
-
-    run = add_command("run", "Run the full forecasting and recommendation pipeline")
-    run.add_argument("--raw", default=None)
-    run.add_argument("--report", default=None)
-    run.add_argument("--eval-folds", type=int, default=4)
-    run.add_argument("--draws", type=int, default=1000)
-    run.add_argument("--tune", type=int, default=1000)
-    run.add_argument("--chains", type=int, default=4)
-    run.add_argument("--target-accept", type=float, default=0.95)
-    run.add_argument("--max-treedepth", type=int, default=12)
-    run.add_argument("--skip-recommendations", action=argparse.BooleanOptionalAction, default=False)
 
     collect = add_command("collect", "Fetch one Tandem Source window through tconnectsync")
     collect.add_argument("--start-date", default=None, help="Requested window start date (YYYY-MM-DD)")
@@ -231,16 +209,6 @@ def build_parser() -> argparse.ArgumentParser:
     edits.add_argument("--env-file", default=None, help="Optional .env file with Tandem credentials")
 
     return parser
-
-
-def _build_feature_frame_from_prepared(dataset) -> FeatureFrame:
-    return FeatureFrame(
-        frame=dataset.frame,
-        feature_columns=list(dataset.feature_columns),
-        target_column=dataset.target_column,
-        horizon_minutes=dataset.horizon_minutes,
-        config=dataset.config,
-    )
 
 
 def _session_stage(session: LoggingSession | None, stage: str, **fields: object):
@@ -302,67 +270,6 @@ def _write_therapy_outputs(
         validation_result=validation_result,
         artifact_root=supporting_dir,
         artifact_href_prefix=artifact_href_prefix,
-    )
-
-
-def _build_forecast_summary(
-    *,
-    args,
-    merged: MergedDataset,
-    session: LoggingSession | None = None,
-    skip_recommendations: bool = False,
-) -> dict[str, object]:
-    prepared = merged.preparation.dataset
-    feature_frame = _build_feature_frame_from_prepared(prepared)
-    data = merged.data
-    coverage = merged.coverage
-    data_quality = merged.data_quality
-    if args.chains < 2:
-        warnings.warn(
-            f"--chains={args.chains} may produce unreliable diagnostics; use at least 2 chains for MCMC.",
-            UserWarning,
-            stacklevel=2,
-        )
-    with _session_stage(session, "run.walk_forward", eval_folds=args.eval_folds):
-        model = BayesianGlucoseModel(
-            draws=args.draws,
-            tune=args.tune,
-            chains=args.chains,
-            target_accept=args.target_accept,
-            max_treedepth=args.max_treedepth,
-        )
-        walk_forward = run_walk_forward(feature_frame, model, n_folds=args.eval_folds)
-    fit_diagnostics = None
-    recommendations = []
-    if skip_recommendations:
-        recommendation_policy = RecommendationPolicy(
-            status="skipped",
-            reasons=["skipped_by_flag"],
-            validation_passed=False,
-            sampler_passed=False,
-            signal_passed=False,
-        )
-    else:
-        with _session_stage(session, "run.recommendations", skip_recommendations=False):
-            fit = model.fit(feature_frame)
-            fit_diagnostics = fit.diagnostics
-            recommendations, _, recommendation_policy = recommend_setting_changes(
-                model,
-                fit,
-                feature_frame.frame,
-                walk_forward=walk_forward,
-                data_quality=data_quality,
-                carbs_present=bool(getattr(prepared, "explicit_carb_source_available", False)),
-                activity_present=not data.activity.empty or not data.health_activity.empty,
-            )
-    return build_run_summary(
-        coverage=coverage,
-        walk_forward=walk_forward,
-        recommendations=recommendations,
-        fit_diagnostics=fit_diagnostics,
-        data_quality=data_quality,
-        recommendation_policy=recommendation_policy,
-        review_artifacts={},
     )
 
 
@@ -491,12 +398,10 @@ def _prepare_runtime_output(paths: ProjectPaths, *directories: str | Path) -> No
 
 
 def _apply_command_defaults(args: argparse.Namespace, paths: ProjectPaths) -> None:
-    if args.command in {"ingest", "run", "screen-health-features", "build-dataset", "research-therapy-settings", "research-latent-meal-icr", "review-therapy-evidence", "status", "report-outcomes", "propose-breakfast-icr"}:
+    if args.command in {"ingest", "screen-health-features", "build-dataset", "research-therapy-settings", "research-latent-meal-icr", "review-therapy-evidence", "status", "report-outcomes", "propose-breakfast-icr"}:
         args.raw = args.raw or str(paths.cloud_raw)
         if args.command == "ingest":
             args.report = args.report or str(paths.output_source / "coverage.md")
-        elif args.command == "run":
-            args.report = args.report or str(paths.output_forecast / "run_summary.md")
         elif args.command == "research-therapy-settings":
             args.report_dir = args.report_dir or str(paths.output_therapy)
         elif args.command == "research-latent-meal-icr":
@@ -540,12 +445,12 @@ def _dispatch_command(
         coverage, data_quality, quality_rows = merged.coverage, merged.data_quality, merged.quality_rows
         review_path = str(Path(args.report).with_name("coverage_review.html"))
         with session.stage("ingest.reporting", report_path=args.report, review_path=review_path):
-            summary = build_run_summary(
+            summary = build_coverage_summary(
                 coverage=coverage,
                 data_quality=data_quality,
                 review_artifacts={"coverage_review_html": review_path},
             )
-            write_markdown_report(summary, args.report)
+            write_coverage_markdown(summary, args.report)
             write_coverage_review_html(summary, quality_rows, review_path)
         return 0
 
@@ -732,10 +637,8 @@ def _dispatch_command(
             research_stage="status.therapy_research",
             validation_stage="status.therapy_validation",
         )
-        with session.stage("status.forecast_validation", forecast_root=str(paths.output_forecast)):
-            forecast_summary = _build_forecast_summary(args=args, merged=merged, session=session, skip_recommendations=True)
         with session.stage("status.initialize", output_root=str(paths.reports)):
-            _prepare_runtime_output(paths, paths.output_therapy, paths.output_forecast)  # only after both analyses succeeded
+            _prepare_runtime_output(paths, paths.output_therapy)  # only after the analysis succeeded
         with session.stage("status.write_therapy_bundle", therapy_root=str(paths.output_therapy)):
             _write_therapy_outputs(
                 preparation=preparation,
@@ -753,20 +656,6 @@ def _dispatch_command(
                 artifact_root=paths.output_therapy,
                 artifact_href_prefix="therapy/",
             )
-        with session.stage("status.write_forecast_bundle", forecast_root=str(paths.output_forecast)):
-            forecast_report_path = paths.output_forecast / "run_summary.md"
-            forecast_review_path = paths.output_forecast / "forecast_review.html"
-            forecast_json_path = paths.cache_forecast / "run_summary.json"
-            write_markdown_report(
-                {
-                    **forecast_summary,
-                    "review_artifacts": {"forecast_review_html": "forecast_review.html"},
-                },
-                forecast_report_path,
-            )
-            write_json_report(forecast_summary, forecast_json_path)
-            write_run_review_html(forecast_summary, forecast_review_path)
-            publish_html_entrypoint(forecast_review_path, paths.reports / "forecast_review.html")
         with session.stage("status.write_status", output_root=str(paths.reports)):
             top_level_status_html = paths.reports / "current_status.html"
             cached_status_json = paths.cache_status / "current_status.json"
@@ -774,16 +663,13 @@ def _dispatch_command(
                 "current_status_html": str(top_level_status_html),
                 "current_status_json": str(cached_status_json),
                 "therapy_review_html": str(paths.reports / "therapy_review.html"),
-                "forecast_review_html": str(paths.reports / "forecast_review.html"),
                 "therapy_dir": str(paths.output_therapy),
-                "forecast_dir": str(paths.output_forecast),
                 "merged_dataset_dir": str(merged_dir(args.raw)),
-                "forecast_summary_json": str(paths.cache_forecast / "run_summary.json"),
             }
             payload = derive_current_status(
                 preparation=preparation,
                 research_result=research_result,
-                forecast_summary=forecast_summary,
+                data_quality=dataclasses.asdict(merged.data_quality),
                 run_id=session.context.run_id,
                 artifact_paths=artifact_paths,
             )
@@ -791,7 +677,6 @@ def _dispatch_command(
                 payload,
                 top_level_status_html,
                 therapy_href="therapy_review.html",
-                forecast_href="forecast_review.html",
             )
             write_status_json(payload, cached_status_json)
         return 0
@@ -806,27 +691,6 @@ def _dispatch_command(
             Path(args.scores).parent.mkdir(parents=True, exist_ok=True)
             screening.scores.to_csv(args.scores, index=False)
             write_health_screening_report(screening, args.report)
-        return 0
-
-    if args.command == "run":
-        publish_latest = _path_matches(args.report, paths.output_forecast / "run_summary.md")
-        summary = _build_forecast_summary(
-            args=args,
-            merged=_load_dataset(args, session),
-            session=session,
-            skip_recommendations=bool(args.skip_recommendations),
-        )
-        if publish_latest:
-            # Clear the previous run's output only once the new fit has succeeded, so a failed run leaves it in place.
-            _prepare_runtime_output(paths, paths.output_forecast)
-        review_path = str(Path(args.report).with_name("forecast_review.html"))
-        with session.stage("run.reporting", report_path=args.report, review_path=review_path):
-            write_markdown_report({**summary, "review_artifacts": {"forecast_review_html": review_path}}, args.report)
-            json_path = paths.cache_forecast / "run_summary.json" if publish_latest else Path(args.report).with_suffix(".json")
-            write_json_report(summary, json_path)
-            write_run_review_html(summary, review_path)
-            if publish_latest:
-                publish_html_entrypoint(review_path, paths.reports / "forecast_review.html")
         return 0
 
     if args.command == "validate-raw":

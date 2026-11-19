@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 from .evaluate import walk_forward_splits
-from .features import MEAL_RECORD_COLUMNS, FeatureConfig, FeatureFrame, recompute_scenario_features
+from .features import MEAL_RECORD_COLUMNS, FeatureConfig, recompute_scenario_features
 from .health_auto_export import AnalysisReadyHealthDataset
 from . import meal_flags
 from .context_rules import inside_intervals
@@ -24,7 +24,6 @@ from .latent_meal_trajectory import (
     observe_carb_sensitivity,
     pool_effective_icr,
 )
-from .model import BayesianGlucoseModel, FitDiagnostics
 from .report_page import icr_verdict, plain
 
 
@@ -228,7 +227,6 @@ class _ModelPrediction:
 class _ModelFitBundle:
     feature_names: list[str]
     prediction: callable
-    diagnostics: FitDiagnostics | None = None
     feature_importance: dict[str, float] | None = None
     feature_importance_by_segment: dict[str, dict[str, float]] | None = None
 
@@ -276,11 +274,18 @@ def parse_therapy_segments(spec: str | None = None) -> tuple[TherapySegment, ...
     return tuple(segments)
 
 
+MODEL_FAMILIES = ("ridge", "elastic_net", "segmented_ridge", "tree_boost", "ensemble")
+
+
 def parse_model_list(value: str | None) -> tuple[str, ...]:
-    raw = value or "bayesian,ridge,elastic_net,segmented_ridge,tree_boost,ensemble"
+    """Parse a comma-separated model-family list; an unknown family (for example the retired "bayesian") raises."""
+    raw = value or ",".join(MODEL_FAMILIES)
     names = tuple(dict.fromkeys(item.strip() for item in raw.split(",") if item.strip()))
     if not names:
         raise ValueError("At least one model family must be requested")
+    unknown = [name for name in names if name not in MODEL_FAMILIES]
+    if unknown:
+        raise ValueError(f"Unsupported model family: {', '.join(unknown)}; choose from {', '.join(MODEL_FAMILIES)}")
     return names
 
 
@@ -1224,47 +1229,6 @@ def _fit_tree_boost(
     return _ModelFitBundle(feature_names=feature_names, prediction=predict, feature_importance=importance)
 
 
-def _fit_bayesian(
-    train: pd.DataFrame,
-    feature_names: list[str],
-    *,
-    target_col: str,
-    horizon_minutes: int,
-    draws: int = 150,
-    tune: int = 150,
-    chains: int = 2,
-) -> _ModelFitBundle:
-    frame = FeatureFrame(
-        frame=train.loc[:, ["timestamp", *feature_names, target_col]].copy(),
-        feature_columns=feature_names,
-        target_column=target_col,
-        horizon_minutes=horizon_minutes,
-        config=FeatureConfig(horizon_minutes=horizon_minutes),
-    )
-    model = BayesianGlucoseModel(draws=draws, tune=tune, chains=chains)
-    fit = model.fit(frame)
-    importance: dict[str, float] | None = None
-    try:
-        beta = fit.posterior.posterior["beta"].stack(sample=("chain", "draw")).values
-        if beta.ndim == 2:
-            importance = {
-                name: float(np.mean(np.abs(beta[index])))
-                for index, name in enumerate(feature_names)
-            }
-    except Exception:
-        importance = None
-
-    def predict(frame: pd.DataFrame) -> _ModelPrediction:
-        preds = model.predict(fit, frame.loc[:, ["timestamp", *feature_names, target_col]])
-        return _ModelPrediction(
-            mean=preds["mean"].to_numpy(dtype=float),
-            lower=preds["lower"].to_numpy(dtype=float),
-            upper=preds["upper"].to_numpy(dtype=float),
-        )
-
-    return _ModelFitBundle(feature_names=feature_names, prediction=predict, diagnostics=fit.diagnostics, feature_importance=importance)
-
-
 def _fit_ensemble(
     train: pd.DataFrame,
     feature_names: list[str],
@@ -1297,7 +1261,6 @@ def _fit_model_family(
     feature_names: list[str],
     *,
     target_col: str,
-    horizon_minutes: int,
 ) -> _ModelFitBundle:
     if model_name == "ridge":
         return _fit_ridge(train, feature_names, target_col=target_col, alpha=1.0)
@@ -1309,8 +1272,6 @@ def _fit_model_family(
         return _fit_tree_boost(train, feature_names, target_col=target_col, n_estimators=18, learning_rate=0.1)
     if model_name == "ensemble":
         return _fit_ensemble(train, feature_names, target_col=target_col)
-    if model_name == "bayesian":
-        return _fit_bayesian(train, feature_names, target_col=target_col, horizon_minutes=horizon_minutes)
     raise ValueError(f"Unsupported model family: {model_name}")
 
 
@@ -1399,7 +1360,6 @@ def run_model_comparison(
     research_frame: pd.DataFrame,
     *,
     include_models: tuple[str, ...],
-    horizon_minutes: int,
 ) -> tuple[pd.DataFrame, dict[str, str]]:
     rows: list[dict[str, Any]] = []
     notes: dict[str, str] = {}
@@ -1459,7 +1419,6 @@ def run_model_comparison(
                         train,
                         feature_names,
                         target_col=TARGET_DELTA_COLUMN,
-                        horizon_minutes=horizon_minutes,
                     )
                 except Exception as exc:
                     failed_note = str(exc)
@@ -1480,7 +1439,6 @@ def run_model_comparison(
                         "low_bg_mae": _low_glucose_mae(actual_future, pred_future),
                         "safety_weighted_mae": _safety_weighted_mae(actual_future, pred_future),
                         "n_test": int(len(test)),
-                        "fit_diagnostics": fit_bundle.diagnostics,
                         "actual_delta_mean": float(np.mean(actual_delta)) if len(actual_delta) else float("nan"),
                     }
                 )
@@ -1529,7 +1487,6 @@ def run_model_comparison(
                     "fold_mae_std": float(fold_frame["mae"].std(ddof=0)) if len(fold_frame) > 1 else 0.0,
                     "fold_safety_std": float(fold_frame["safety_weighted_mae"].std(ddof=0)) if len(fold_frame) > 1 else 0.0,
                     "top_features": _top_features(fit_example.feature_importance if fit_example is not None else None),
-                    "diagnostics_status": "available" if fit_example is not None and fit_example.diagnostics is not None else "not_available",
                 }
             )
     result = pd.DataFrame(rows)
@@ -1606,7 +1563,6 @@ def build_segment_evidence_and_recommendations(
     *,
     include_models: tuple[str, ...],
     segments: tuple[TherapySegment, ...],
-    horizon_minutes: int,
     ic_policy: str = "exploratory_only",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     evidence_rows: list[dict[str, Any]] = []
@@ -1672,7 +1628,6 @@ def build_segment_evidence_and_recommendations(
                 train,
                 feature_names,
                 target_col=TARGET_DELTA_COLUMN,
-                horizon_minutes=horizon_minutes,
             )
             base_pred = fit_bundle.prediction(test).mean + test["glucose"].to_numpy(dtype=float)
             base_loss = _score_loss(base_pred)
@@ -1892,7 +1847,6 @@ def run_therapy_research(
     model_comparison, notes = run_model_comparison(
         research_frame,
         include_models=include_models,
-        horizon_minutes=dataset.horizon_minutes,
     )
     segment_evidence, recommendations = build_segment_evidence_and_recommendations(
         research_frame,
@@ -1900,7 +1854,6 @@ def run_therapy_research(
         model_comparison,
         include_models=include_models,
         segments=segments,
-        horizon_minutes=dataset.horizon_minutes,
         ic_policy=ic_policy,
     )
     model_comparison_markdown = render_model_comparison_markdown(model_comparison, notes)

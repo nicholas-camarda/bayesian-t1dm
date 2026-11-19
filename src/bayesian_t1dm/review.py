@@ -17,7 +17,6 @@ import pandas as pd
 
 from . import report_page as rp
 from .health_auto_export import ModelDataPreparationResult
-from .dataset import HORIZON_MINUTES
 from .therapy_research import HIGH_FAT_GRAMS, HIGH_PROTEIN_GRAMS, LOGGED_FOOD_MATCH_MINUTES, LatentMealResearchResult, TherapyInfraValidationResult, TherapyResearchResult, summarize_overnight_basal_evidence
 
 FIT_ERROR_GUIDE_MGDL = 10.0
@@ -162,192 +161,6 @@ def _completeness_phrase(data_quality: dict[str, Any]) -> str:
     if status == "good":
         return "all download windows complete"
     return f"{incomplete} download windows have gaps or other problems"
-
-
-def _forecast_trace_figure(summary: dict[str, Any]) -> str:
-    folds = (summary.get("walk_forward") or {}).get("folds", [])
-    traced = [fold for fold in folds if fold.get("prediction_trace")]
-    if not traced:
-        return ""
-    fold = traced[-1]
-    trace = fold["prediction_trace"]
-    frame = pd.DataFrame(
-        {
-            "timestamp": pd.to_datetime(trace.get("timestamps", []), errors="coerce"),
-            "actual": pd.to_numeric(pd.Series(trace.get("actual", [])), errors="coerce"),
-            "predicted": pd.to_numeric(pd.Series(trace.get("predicted", [])), errors="coerce"),
-            "lower": pd.to_numeric(pd.Series(trace.get("lower", [])), errors="coerce"),
-            "upper": pd.to_numeric(pd.Series(trace.get("upper", [])), errors="coerce"),
-        }
-    ).dropna(subset=["timestamp"])
-    if frame.empty:
-        return ""
-    end = frame["timestamp"].max()
-    frame = frame.loc[frame["timestamp"] > end - pd.Timedelta(hours=48)].copy()
-    # Keep the axis readable: CGM reports 40 to 400 mg/dL, so clip forecasts to a little beyond that.
-    model_columns = ["predicted", "lower", "upper"]
-    out_of_range = int(((frame[model_columns] < TRACE_CLIP_MGDL[0]) | (frame[model_columns] > TRACE_CLIP_MGDL[1])).any(axis=1).sum())
-    frame[model_columns] = frame[model_columns].clip(*TRACE_CLIP_MGDL)
-    figure = rp.time_series(
-        frame["timestamp"].tolist(),
-        [
-            ("CGM", frame["actual"].tolist(), "#3B3B3B", False),
-            ("model forecast", frame["predicted"].tolist(), rp.PRIMARY, False),
-        ],
-        band=(frame["lower"].tolist(), frame["upper"].tolist(), rp.PRIMARY),
-        y_label="glucose (mg/dL)",
-    )
-    return (
-        figure
-        + rp.legend([("#3B3B3B", "CGM", False), (rp.PRIMARY, f"model forecast with {FORECAST_INTERVAL_PERCENT}% range", False)])
-        + rp.caption(
-            f"Last 48 hours of validation period {rp.esc(fold.get('fold'))}. Each point is the forecast made {HORIZON_MINUTES} minutes earlier."
-            + (
-                f" At {out_of_range} of {len(frame)} time points the forecast or its range went outside {TRACE_CLIP_MGDL[0]:.0f} to {TRACE_CLIP_MGDL[1]:.0f} mg/dL and is drawn at that edge."
-                if out_of_range
-                else ""
-            )
-        )
-    )
-
-
-def write_run_review_html(summary: dict[str, Any], path: str | Path) -> Path:
-    walk_forward = summary.get("walk_forward") or {}
-    aggregate = walk_forward.get("aggregate") or {}
-    folds = walk_forward.get("folds") or []
-    model_mae = aggregate.get("mae")
-    baseline_mae = walk_forward.get("aggregate_persistence_mae")
-    coverage = aggregate.get("coverage")
-    policy = summary.get("recommendation_policy") or {}
-    data_quality = summary.get("data_quality") or {}
-
-    def finite(value: Any) -> bool:
-        try:
-            return math.isfinite(float(value))
-        except (TypeError, ValueError):
-            return False
-
-    fits = rp.forecast_fits(summary)
-    failed_fits = sum(1 for diag in fits if not rp.sampler_healthy(diag))
-    answer = rp.forecast_verdict(model_mae, baseline_mae, failed_fits=failed_fits, total_fits=len(fits)) if folds else rp.forecast_verdict(None, None)
-    status, label = answer.status, answer.label
-    headline, explanation = f"<b>{rp.esc(answer.headline)}</b>", rp.esc(answer.explanation)
-
-    width = aggregate.get("interval_width")
-    trust = [
-        (
-            f"<b>The model fitting failed its checks in {failed_fits} of {len(fits)} fits</b> (the sampler did not settle on an answer), so none of the model's numbers can be trusted."
-            if failed_fits
-            else f"Model fitting passed its checks in all {len(fits)} fits."
-        )
-        if fits
-        else "",
-        (
-            f"The {FORECAST_INTERVAL_PERCENT}% forecast range contained the real value {rp.fmt(float(coverage) * 100, 0)}% of the time "
-            f"(target {FORECAST_COVERAGE_RANGE[0]:.0%} to {FORECAST_COVERAGE_RANGE[1]:.0%}); on average the range was {rp.fmt(width, 0)} mg/dL wide."
-        )
-        if finite(coverage)
-        else "",
-        f"Tested on {len(folds)} later periods that the model was not trained on." if folds else "",
-        (f"Data completeness: {_completeness_phrase(data_quality)}.") if data_quality else "",
-    ]
-
-    policy_status = str(policy.get("status") or "")
-    reasons = [rp.plain(reason) for reason in policy.get("reasons") or []]
-    if summary.get("recommendations"):
-        next_steps = ["Settings suggestions were generated; see the run summary file."]
-    elif policy_status == "skipped":
-        next_steps = ["Settings suggestions were not requested for this run."]
-    elif policy_status == "suppressed":
-        next_steps = ["Settings suggestions were held back because: " + "; ".join(reasons) + "."]
-    else:
-        next_steps = ["No settings suggestions were produced."]
-
-    fold_rows = [
-        (
-            f"period {fold.get('fold')}",
-            float(fold["model_mae"]) if finite(fold.get("model_mae")) else None,
-            float(fold["persistence_mae"]) if finite(fold.get("persistence_mae")) else None,
-        )
-        for fold in folds
-    ]
-    plottable = all(row[1] is None or row[1] < 10 * max((row[2] or 1), 1) for row in fold_rows)
-    fold_table = rp.table(
-        ["period", "test dates", "test points", "model error (mg/dL)", "baseline error (mg/dL)", f"in {FORECAST_INTERVAL_PERCENT}% range"],
-        [
-            (
-                rp.esc(fold.get("fold")),
-                rp.esc(_date_span(fold.get("test_start_timestamp"), fold.get("test_end_timestamp"))),
-                rp.fmt(fold.get("n_test"), 0),
-                rp.fmt(fold.get("model_mae")),
-                rp.fmt(fold.get("persistence_mae")),
-                rp.fmt(float(fold["model_coverage"]) * 100 if finite(fold.get("model_coverage")) else None, 0, suffix="%"),
-            )
-            for fold in folds
-        ],
-        numeric=[2, 3, 4, 5],
-    )
-
-    sampler_rows = []
-    for name, diag in [(f"period {fold.get('fold')}", fold.get("fit_diagnostics") or {}) for fold in folds] + [("final fit", summary.get("fit_diagnostics") or {})]:
-        if not diag:
-            continue
-        sampler_rows.append(
-            (
-                rp.esc(name),
-                rp.esc(diag.get("chains")),
-                rp.esc(diag.get("divergences")),
-                rp.fmt(diag.get("rhat_max"), 3),
-                rp.fmt(diag.get("ess_bulk_min"), 0),
-                "OK" if rp.sampler_healthy(diag) else "failed",
-            )
-        )
-
-    body = [
-        rp.verdict(status, label, headline, explanation),
-        rp.tiles(
-            [
-                (rp.fmt(model_mae, suffix=" mg/dL"), "model forecast error"),
-                (rp.fmt(baseline_mae, suffix=" mg/dL"), "error if glucose stays the same"),
-                (rp.fmt(float(coverage) * 100 if finite(coverage) else None, 0, suffix="%"), f"of readings inside the {FORECAST_INTERVAL_PERCENT}% range"),
-            ]
-        ),
-        rp.section("How much should I trust this?", rp.bullets(trust)),
-        rp.section("What to do next", rp.bullets(next_steps)),
-        rp.details(
-            "Details: error in each validation period",
-            (
-                rp.paired_dots(fold_rows, first_label="model", second_label="baseline", axis_label="average forecast error (mg/dL)")
-                + rp.legend([(rp.PRIMARY, "model", False), (rp.COMPARATOR, "glucose stays the same", False)])
-                if plottable
-                else rp.caption("The model's error in at least one period is too large to plot on the same scale as the baseline; see the table.")
-            )
-            + fold_table,
-            open_=True,
-        ),
-        rp.details("Details: forecast against CGM", _forecast_trace_figure(summary) or "<p>No forecast trace was saved.</p>"),
-        rp.details(
-            "Details: model fitting checks",
-            rp.table(["fit", "chains", "divergences", "R-hat (max)", "effective samples (min)", "status"], sampler_rows, numeric=[1, 2, 3, 4])
-            + rp.caption(f"OK means R-hat under {rp.SAMPLER_RHAT_MAX}, no divergences and at least {rp.SAMPLER_ESS_PER_CHAIN} effective samples per chain. Anything else means the sampler did not settle on an answer and the fit is not reliable.")
-            if sampler_rows
-            else "<p>No fitting diagnostics were recorded.</p>",
-        ),
-        rp.glossary(
-            [
-                ("Forecast error", "Average distance in mg/dL between the 30-minute forecast and the CGM reading that followed (mean absolute error)."),
-                ("Baseline", f"Forecasting that glucose in {HORIZON_MINUTES} minutes equals glucose now. A useful model must beat it."),
-                (f"{FORECAST_INTERVAL_PERCENT}% range", f"The band the model expects to contain the real value {FORECAST_INTERVAL_PERCENT}% of the time."),
-                ("Validation period", "A later stretch of data held out from training, used to test the model as if forecasting the future."),
-            ]
-        ),
-    ]
-    return _write(path, rp.page(title="Glucose Forecast Check", question=f"Can the model forecast glucose {HORIZON_MINUTES} minutes ahead?", subtitle=_generated(), body=body))
-
-
-# ---------------------------------------------------------------------------
-# Therapy evidence (overnight basal)
-# ---------------------------------------------------------------------------
 
 
 def _overnight_figure(research_result: TherapyResearchResult) -> str:
@@ -839,7 +652,6 @@ def write_current_status_html(
     path: str | Path,
     *,
     therapy_href: str,
-    forecast_href: str,
 ) -> Path:
     state = str(payload.get("overall_state") or "blocked")
     status, label = {
@@ -847,7 +659,7 @@ def write_current_status_html(
         "no_change_supported": ("info", "No change supported"),
     }.get(state, ("bad", "Blocked"))
     data_prep = payload.get("data_prep") or {}
-    forecast = payload.get("forecast") or {}
+    source_quality = payload.get("source_quality") or {}
     overnight = (payload.get("therapy") or {}).get("overnight") or {}
     blockers = [
         f"<b>{rp.esc(item.get('label') or rp.plain(item.get('code')))}</b>: {rp.esc(item.get('detail') or '')}"
@@ -859,7 +671,7 @@ def write_current_status_html(
             [
                 (rp.fmt(data_prep.get("final_row_count"), 0), "5-minute rows in the dataset"),
                 (rp.fmt(overnight.get("clean_nights"), 0), "clean nights for basal"),
-                (rp.fmt(forecast.get("model_mae"), suffix=" mg/dL"), "forecast error (model)"),
+                (rp.fmt(source_quality.get("incomplete_window_count"), 0), "incomplete source windows"),
             ]
         ),
         rp.section("What is blocking a recommendation", rp.bullets(blockers) or "<p>Nothing is blocking.</p>"),
@@ -869,7 +681,6 @@ def write_current_status_html(
             rp.bullets(
                 [
                     f"<a href='{rp.esc(therapy_href)}'>Overnight basal evidence</a>",
-                    f"<a href='{rp.esc(forecast_href)}'>Glucose forecast check</a>",
                 ]
             ),
         ),
@@ -880,8 +691,7 @@ def write_current_status_html(
                 [
                     ("Apple Health included", rp.esc("yes" if data_prep.get("apple_available") else "no")),
                     ("Tandem and Apple Health overlap", rp.esc(_date_span(data_prep.get("overlap_start"), data_prep.get("overlap_end")))),
-                    ("Forecast baseline error", rp.fmt(forecast.get("persistence_mae"), suffix=" mg/dL")),
-                    ("Model fitting checks", rp.esc(rp.plain(forecast.get("sampler_health")))),
+                    ("Source quality", rp.esc(rp.plain(source_quality.get("data_quality_status")))),
                 ],
             ),
         ),

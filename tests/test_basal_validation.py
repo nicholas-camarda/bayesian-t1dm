@@ -83,7 +83,7 @@ def test_design_and_model_build_on_synthetic_rows():
     import pandas as pd
 
     from bayesian_t1dm.basal_model import build_model, design_for_training, sampler_gate
-    from bayesian_t1dm.model import FitDiagnostics
+    from bayesian_t1dm.sampler_health import FitDiagnostics
 
     day = pd.Timestamp("2026-01-01")
     train = pd.DataFrame({"date": list(pd.date_range(day, periods=30)) * 2, "part": "p",
