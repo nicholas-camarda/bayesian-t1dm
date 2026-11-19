@@ -54,6 +54,18 @@ LAST_SLOT_MIN_RECORDS = 12  # one hour of the pump's five-minute records
 LAST_SLOT_MIN_AGREEMENT = 0.95
 LAST_SLOT_RATE_TOLERANCE = 0.0006  # the pump logs the rate in thousandths of a unit per hour
 _TANDEM_EPOCH = dt.datetime(2008, 1, 1)
+# Why ProfileHistory.values_at is NaN, in the order of the replay's branches (``unknown_reasons`` returns these names).
+UNKNOWN_REASONS = (
+    "no_visible_span",  # the pump has no activation events or no span over which its profile edits are visible
+    "outside_visible_span",  # the time is outside the span over which the pump's profile edits are visible
+    "before_first_activation",  # no profile had been activated yet
+    "active_profile_never_seen",  # the active profile has no record in the archive
+    "before_profile_first_record",  # before the archive's first record of the active profile
+    "before_first_known_start",  # before the first slot start the archive knows (or no slot is known)
+    "next_slot_unseen",  # the covering slot's successor was never seen, so where the slot ends is unknown
+    "last_slot_profile_not_whole",  # the last slot of a profile the archive never saw created, not shown to run to midnight
+)
+_REASON_CODE = {name: index + 1 for index, name in enumerate(UNKNOWN_REASONS)}
 
 PROFILE_EVENT_COLUMNS = (
     "pump_serial", "timestamp", "sequence", "event", "profile_id", "status", "source_profile_id", "profile_name",
@@ -408,41 +420,68 @@ class ProfileHistory:
         Vectorized exact-time replay: an edit applies from its own timestamp, a time outside the span where the pump's
         edits are visible, before the first activation, or inside a slot the archive never saw is NaN.
         """
+        return self._replay(pumps, timestamps, field)[0]
+
+    def unknown_reasons(self, pumps: pd.Series, timestamps: pd.Series) -> np.ndarray:
+        """Why ``values_at`` is NaN at each time: one of ``UNKNOWN_REASONS``, or ``""`` where the value is known.
+
+        This is the same replay as ``values_at`` (one code path), so the reasons partition exactly the times at which
+        ``values_at`` returns NaN, whichever field is asked for.
+        """
+        codes = self._replay(pumps, timestamps, "start_minutes")[1]
+        return np.asarray(["", *UNKNOWN_REASONS], dtype=object)[codes]
+
+    def _replay(self, pumps: pd.Series, timestamps: pd.Series, field: str) -> tuple[np.ndarray, np.ndarray]:
+        """The value of ``field`` at each time and, where it is NaN, the index into ``UNKNOWN_REASONS`` plus one (0 where known)."""
         stamps = pd.DatetimeIndex(timestamps)
         times = stamps.to_numpy(dtype="datetime64[ns]")
         minutes = np.asarray(stamps.hour * 60 + stamps.minute)
         serials = pumps.map(pump_key).to_numpy()
         rates = np.full(len(times), np.nan)
+        reasons = np.full(len(times), _REASON_CODE["no_visible_span"], dtype=np.int8)  # a pump with no visible span or no activation
         for pump, (activations, profiles) in self._active.items():
             if pump not in self.visible:
                 continue
             first, last = self.visible[pump]
-            selected = np.flatnonzero((serials == pump) & (times >= np.datetime64(first)) &
-                                      (times < np.datetime64(last + dt.timedelta(days=1))))
+            ours = serials == pump
+            inside = ours & (times >= np.datetime64(first)) & (times < np.datetime64(last + dt.timedelta(days=1)))
+            reasons[ours & ~inside] = _REASON_CODE["outside_visible_span"]
+            selected = np.flatnonzero(inside)
             activation = np.searchsorted(np.asarray(activations, dtype="datetime64[ns]"), times[selected], side="right") - 1
+            reasons[selected[activation < 0]] = _REASON_CODE["before_first_activation"]
             selected = selected[activation >= 0]
             active = np.asarray(profiles)[activation[activation >= 0]]
             for profile in np.unique(active):
                 key = (pump, profile)
+                idx = selected[active == profile]
                 if key not in self._tables:
+                    reasons[idx] = _REASON_CODE["active_profile_never_seen"]
                     continue
                 edits, snapshots = self._tables[key]
-                idx = selected[active == profile]
                 version = np.searchsorted(np.asarray(edits, dtype="datetime64[ns]"), times[idx], side="right") - 1
+                reasons[idx[version < 0]] = _REASON_CODE["before_profile_first_record"]
                 for k in np.unique(version[version >= 0]):
                     positions = idx[version == k]
                     table = snapshots[k]
                     starts = sorted((seg["start_minutes"], i) for i, seg in enumerate(table) if seg is not None)
                     if not starts:
+                        reasons[positions] = _REASON_CODE["before_first_known_start"]
                         continue
                     bounds, slots = zip(*starts)
-                    values = [table[i][field] if
-                              (i + 1 < len(table) and table[i + 1] is not None or
-                               i + 1 == len(table) and self._closed[key][k]) else np.nan for i in slots]
+                    values, why = [], []
+                    for i in slots:
+                        if i + 1 < len(table) and table[i + 1] is not None or i + 1 == len(table) and self._closed[key][k]:
+                            values.append(table[i][field])
+                            why.append(0)
+                        else:
+                            values.append(np.nan)
+                            why.append(_REASON_CODE["next_slot_unseen" if i + 1 < len(table) else "last_slot_profile_not_whole"])
                     covering = np.searchsorted(bounds, minutes[positions], side="right") - 1
                     valid = covering >= 0
                     rates[positions[valid]] = np.asarray(values)[covering[valid]]
-        return rates
+                    reasons[positions[valid]] = np.asarray(why, dtype=np.int8)[covering[valid]]
+                    reasons[positions[~valid]] = _REASON_CODE["before_first_known_start"]
+        return rates, reasons
 
     def settings_for(self, carbs: pd.DataFrame) -> pd.DataFrame:
         """``PROFILE_SETTING_COLUMNS`` for each carb entry (by ``pump_serial`` and ``timestamp``)."""
