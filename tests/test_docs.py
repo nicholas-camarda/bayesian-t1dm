@@ -18,6 +18,7 @@ REQUIRED_SECTIONS = (
     "## Outcome metrics (goal A)",
     "## Hour-day table and settings in force",
     "## Replay of past setting changes (exploratory)",
+    "## Hour-day outcomes model",
 )
 
 

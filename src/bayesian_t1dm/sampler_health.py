@@ -115,3 +115,14 @@ def stack_draws(posterior: object, name: str) -> np.ndarray:
     variable = posterior.posterior[name].stack(sample=("chain", "draw"))
     dims = ["sample"] + [dim for dim in variable.dims if dim != "sample"]
     return variable.transpose(*dims).values
+
+
+R_HAT_LIMIT = 1.01
+ESS_LIMIT = 400
+
+
+def sampler_gate(diagnostics: FitDiagnostics) -> bool:
+    """True when the fit may be used: R-hat below 1.01, bulk and tail effective sample size above 400 for every parameter, no divergences."""
+    rhat, bulk, tail = diagnostics.rhat_max, diagnostics.ess_bulk_min, diagnostics.ess_tail_min
+    return bool(rhat is not None and bulk is not None and tail is not None and
+                rhat < R_HAT_LIMIT and min(bulk, tail) > ESS_LIMIT and diagnostics.divergences == 0)

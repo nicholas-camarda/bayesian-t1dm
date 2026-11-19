@@ -21,6 +21,7 @@ TOP_LEVEL_ENTRYPOINTS = {
     "latent_meal",
     "outcomes",
     "replay",
+    "outcomes_model",
     "proposals",
     "refresh",
     "fixture",
