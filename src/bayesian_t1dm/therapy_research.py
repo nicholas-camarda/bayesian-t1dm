@@ -2141,29 +2141,23 @@ def build_first_meal_clean_window_registry(
 
     # The first bolus of 1.5 U or more in each meal segment of each day.
     candidate_rows = morning_candidates.groupby(["date", morning_candidates["therapy_segment"].astype(str)], as_index=False).head(1).copy().reset_index(drop=True)
+    stamps = pd.DatetimeIndex(ordered["timestamp"])
+
+    def window(start: pd.Timestamp, end: pd.Timestamp, *, include_start: bool = True, include_end: bool = True) -> pd.DataFrame:
+        first = stamps.searchsorted(start, side="left" if include_start else "right")
+        last = stamps.searchsorted(end, side="right" if include_end else "left")
+        return ordered.iloc[first:last]
+
     rows: list[dict[str, Any]] = []
     for candidate_index, candidate in enumerate(candidate_rows.itertuples(index=False), start=1):
         timestamp = pd.Timestamp(candidate.timestamp)
-        pre = ordered.loc[
-            ordered["timestamp"].ge(timestamp - pd.Timedelta(minutes=premeal_minutes))
-            & ordered["timestamp"].lt(timestamp)
-        ].copy()
-        evaluation_window = ordered.loc[
-            ordered["timestamp"].ge(timestamp - pd.Timedelta(minutes=premeal_minutes))
-            & ordered["timestamp"].le(timestamp + pd.Timedelta(minutes=postmeal_minutes))
-        ].copy()
-        post_early = ordered.loc[
-            ordered["timestamp"].ge(timestamp)
-            & ordered["timestamp"].le(timestamp + pd.Timedelta(minutes=90))
-        ].copy()
-        prior_bolus_window = ordered.loc[
-            ordered["timestamp"].ge(timestamp - pd.Timedelta(hours=4))
-            & ordered["timestamp"].lt(timestamp)
-        ].copy()
-        post_bolus_window = ordered.loc[
-            ordered["timestamp"].gt(timestamp)
-            & ordered["timestamp"].le(timestamp + pd.Timedelta(minutes=120))
-        ].copy()
+        beginning = timestamp - pd.Timedelta(minutes=premeal_minutes)
+        end = timestamp + pd.Timedelta(minutes=postmeal_minutes)
+        pre = window(beginning, timestamp, include_end=False)
+        evaluation_window = window(beginning, end)
+        post_early = window(timestamp, timestamp + pd.Timedelta(minutes=90))
+        prior_bolus_window = window(timestamp - pd.Timedelta(hours=4), timestamp, include_end=False)
+        post_bolus_window = window(timestamp, timestamp + pd.Timedelta(minutes=120), include_start=False)
 
         pre_glucose_series = pd.to_numeric(pre.get("glucose"), errors="coerce").dropna()
         anchor_glucose = float(pd.to_numeric(pd.Series([getattr(candidate, "glucose", np.nan)]), errors="coerce").iloc[0])
@@ -2216,28 +2210,14 @@ def build_first_meal_clean_window_registry(
         # A carb entry rarely lands in the same 5-minute bin as the bolus, so take every
         # explicit entry from 20 minutes before to 30 minutes after the bolus.
         stated_carbs = float("nan")
-        if "explicit_carb_grams" in ordered.columns:
-            nearby_carbs = pd.to_numeric(
-                ordered.loc[
-                    ordered["timestamp"].ge(timestamp - pd.Timedelta(minutes=20))
-                    & ordered["timestamp"].le(timestamp + pd.Timedelta(minutes=30)),
-                    "explicit_carb_grams",
-                ],
-                errors="coerce",
-            )
-            nearby_carbs = nearby_carbs.loc[nearby_carbs.gt(0)]
-            if not nearby_carbs.empty:
-                stated_carbs = float(nearby_carbs.sum())
-        # Settings the bolus calculator used for the largest logged entry in that range, if recorded.
         recorded_settings = {column: float("nan") for column in MEAL_RECORD_COLUMNS}
-        if np.isfinite(stated_carbs) and "explicit_carb_grams" in ordered.columns:
-            nearby = ordered.loc[
-                ordered["timestamp"].ge(timestamp - pd.Timedelta(minutes=20))
-                & ordered["timestamp"].le(timestamp + pd.Timedelta(minutes=30))
-                & pd.to_numeric(ordered["explicit_carb_grams"], errors="coerce").gt(0)
-            ]
-            if not nearby.empty:
-                largest = nearby.loc[pd.to_numeric(nearby["explicit_carb_grams"], errors="coerce").idxmax()]
+        if "explicit_carb_grams" in ordered.columns:
+            nearby = window(timestamp - pd.Timedelta(minutes=20), timestamp + pd.Timedelta(minutes=30))
+            carb = pd.to_numeric(nearby["explicit_carb_grams"], errors="coerce")
+            positive = carb[carb.gt(0)]
+            if not positive.empty:
+                stated_carbs = float(positive.sum())
+                largest = nearby.loc[positive.idxmax()]
                 recorded_settings = {column: _as_float(largest.get(column)) for column in MEAL_RECORD_COLUMNS}
         rows.append(
             {

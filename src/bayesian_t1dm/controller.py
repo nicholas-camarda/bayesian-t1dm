@@ -18,14 +18,13 @@ import numpy as np
 import pandas as pd
 
 from .context_rules import exercise_intervals, inside_intervals
-from .outcomes import MIN_DAY_COVERAGE, DayPart
+from .outcomes import MIN_DAY_COVERAGE, TARGET_HIGH, TARGET_LOW, VERY_LOW, DayPart
 from .pump_profiles import pump_key
 
 MODE_NAMES = {0: "standard", 1: "sleep", 2: "exercise"}
 MAX_INTERVAL_MINUTES = 10  # delivery records come every ~5 minutes; longer gaps are not bridged
 AFTER_MEAL_HOURS = 4          # the strict rule: this long after any carbohydrate or bolus of 0.5 U or more
 MIN_MEAL_BOLUS = 0.5
-TARGET_LOW, TARGET_HIGH = 70.0, 180.0
 
 
 def _mode_at(times: pd.Series, modes: pd.DataFrame) -> np.ndarray:
@@ -179,7 +178,7 @@ def daily_controller_pattern(
                     "excess_units": float(group["excess_units"].sum()), "excess_fraction": float(group["excess_units"].sum() / profile_units) if profile_units > 0 else np.nan,
                     "mean_glucose": float(clean.mean()) if len(clean) else np.nan, "time_in_range_pct": float(100 * ((clean >= TARGET_LOW) & (clean <= TARGET_HIGH)).mean()) if len(clean) else np.nan,
                     "below_70_pct": float(100 * (clean < TARGET_LOW).mean()) if len(clean) else np.nan,
-                    "below_54_pct": float(100 * (clean < 54.0).mean()) if len(clean) else np.nan,
+                    "below_54_pct": float(100 * (clean < VERY_LOW).mean()) if len(clean) else np.nan,
                     "sleep_share": float((group["mode"] == 1).mean()),
                 }
             )
