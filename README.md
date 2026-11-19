@@ -15,6 +15,7 @@ It is research and decision support, not a medical device; nothing here changes 
 | Where do time in range, lows and highs stand? | `report-outcomes` | `output/outcomes/outcomes_report.html` |
 | Is there enough clean overnight data to judge basal? | `review-therapy-evidence` | `output/therapy/therapy_review.html` |
 | Is the Tandem data complete? | `ingest` | `output/source/coverage_review.html` |
+| Do outcomes after past settings changes differ from placebo dates? (exploratory) | `python -m bayesian_t1dm.replay` | `output/replay/replay_figure.png` |
 | Where does everything stand? | `status` | `output/current_status.html` |
 
 Every page opens with the question, a one-sentence answer, how much to trust it and what to do next; figures, tables and the files behind it fold out below. Methods are in [`docs/technical.md`](docs/technical.md); current scientific status is in [`docs/TECHNICAL_LAB_NOTEBOOK.md`](docs/TECHNICAL_LAB_NOTEBOOK.md).

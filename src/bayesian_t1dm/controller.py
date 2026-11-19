@@ -27,7 +27,7 @@ AFTER_MEAL_HOURS = 4          # the strict rule: this long after any carbohydrat
 MIN_MEAL_BOLUS = 0.5
 
 
-def _mode_at(times: pd.Series, modes: pd.DataFrame) -> np.ndarray:
+def mode_at(times: pd.Series, modes: pd.DataFrame) -> np.ndarray:
     if modes.empty:
         return np.zeros(len(times), dtype=int)
     position = np.searchsorted(modes["timestamp"].to_numpy(dtype="datetime64[ns]"), times.to_numpy(dtype="datetime64[ns]"), side="right") - 1
@@ -76,7 +76,7 @@ def _inside_windows(times: pd.Series, meals: pd.DataFrame) -> np.ndarray:
 
 def profile_rate_at(history, pump_serials: pd.Series, times: pd.Series) -> np.ndarray:
     """Programmed basal in U/h at the exact moment of each pump record."""
-    return history.basal_rates(pump_serials, times)
+    return history.values_at(pump_serials, times, "basal_units_per_hour")
 
 
 def programmed_units_by_slot(analysis):
@@ -103,7 +103,7 @@ def programmed_units_by_slot(analysis):
         observed = multiplicity > 0
         times = pd.Series(left[observed])
         hours = (edges[1:] - left).total_seconds().to_numpy()[observed] / 3600
-        rate = analysis.history.basal_rates(pd.Series(pump, index=times.index), times)
+        rate = analysis.history.values_at(pd.Series(pump, index=times.index), times, "basal_units_per_hour")
         totals.append(pd.DataFrame({"slot": times.dt.floor("5min"), "units": rate * hours * multiplicity[observed],
                                     "unknown": ~np.isfinite(rate), "pump": pump}))
     if not totals:
@@ -165,7 +165,7 @@ def daily_controller_pattern(
     if intervals.empty:
         return pd.DataFrame()
     stamp = intervals["timestamp"]
-    mode = _mode_at(stamp, modes)
+    mode = mode_at(stamp, modes)
     intervals["minute"] = stamp.dt.hour * 60 + stamp.dt.minute
     excluded = {pd.Timestamp(day).normalize() for day in excluded_days}
     keep = np.ones(len(intervals), dtype=bool)

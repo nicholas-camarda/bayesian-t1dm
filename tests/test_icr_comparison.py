@@ -14,7 +14,7 @@ def test_programmed_units_split_at_edits_and_mask_unknown_delivery():
     basal = pd.DataFrame({"pump_serial": ["1", "1"], "start_timestamp": [start, later],
                           "end_timestamp": [later, later + pd.Timedelta(minutes=5)]})
     history = SimpleNamespace(events=pd.DataFrame({"pump_serial": ["1"], "timestamp": [edit], "start_minutes": [0]}),
-                              basal_rates=lambda pumps, times: np.select([times < edit, times < later], [1, 2], default=np.nan))
+                              values_at=lambda pumps, times, field: np.select([times < edit, times < later], [1, 2], default=np.nan))
     analysis = SimpleNamespace(merged=SimpleNamespace(tandem_data=SimpleNamespace(basal=basal)), history=history)
     units = programmed_units_by_slot(analysis)
     assert units[start] == pytest.approx((2 + 3 * 2) / 60)
