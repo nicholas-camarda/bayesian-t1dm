@@ -218,3 +218,17 @@ def test_predictive_quantiles_match_fitted_student_likelihood():
     expected = 110 + fit.target_scale * t.ppf([0.05, 0.95], df=5)
     np.testing.assert_allclose(summary.loc[0, ["lower", "upper"]], expected, atol=0.4)
     assert summary.loc[0, "mean"] == 110
+
+
+def test_diagnostic_extrema_do_not_broadcast_independent_dimensions():
+    from bayesian_t1dm.model import _finite_dataset_stat
+
+    class SeparateParameters:
+        data_vars = {"level": xr.DataArray([1.0, 1.04], dims=["day"]),
+                     "beta": xr.DataArray([1.01, 1.02, np.nan], dims=["coef"])}
+
+        def to_array(self):
+            raise AssertionError("broadcast independent dimensions")
+
+    assert _finite_dataset_stat(SeparateParameters(), np.max) == 1.04
+    assert _finite_dataset_stat(SeparateParameters(), np.min) == 1.0
