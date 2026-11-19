@@ -92,7 +92,7 @@ def load_analysis_data(raw_root: str | Path, merged: MergedDataset | None = None
     pump = pump_key(merged.tandem_data.cgm.sort_values("timestamp")["pump_serial"].dropna().iloc[-1])
     if pump not in visible:
         raise ValueError(f"The pump profile history has no visible segments for pump {pump}; time-of-day bins cannot be built.")
-    history = ProfileHistory(merged.profile_events, visible)
+    history = ProfileHistory(merged.profile_events, visible, merged.profile_rates)
     moment = dt.datetime.combine(visible[pump][1], dt.time(23, 59))  # one moment for the bins and the settings
     profile_id = history.active_profile(pump, moment)
     if profile_id is None:

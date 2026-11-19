@@ -7,6 +7,8 @@ the CGM, bolus and basal tables; no byte offsets are interpreted here.
 
 - ``modes``: one row per mode change (``mode`` 0 standard, 1 sleep, 2 exercise) with the moment it began.
 - ``sites``: one row per cartridge, cannula or tubing fill.
+- ``rates``: the basal rate the active profile calls for (event 279, about every five minutes), in units per hour; the
+  profile history uses it to show that a profile's last slot runs to midnight.
 - ``coverage``: for each pump, the first and last date of the windows that hold pump events, so a missing event can be told
   apart from an unobserved period.
 """
@@ -24,9 +26,12 @@ import pandas as pd
 from .pump_profiles import pump_key
 
 MODE_EVENT = 229
+BASAL_DELIVERY_EVENT = 279
+NO_RATE = 65535  # the pump's "not set" value for a rate
 SITE_EVENT_CODES = {33: "cartridge filled", 61: "cannula filled", 63: "tubing filled"}
 MODE_COLUMNS = ["pump_serial", "sequence", "timestamp", "mode"]
 SITE_COLUMNS = ["pump_serial", "sequence", "timestamp", "kind"]
+RATE_COLUMNS = ["pump_serial", "sequence", "timestamp", "rate"]
 
 
 def _wall_clock(value: Any) -> pd.Timestamp:
@@ -35,45 +40,53 @@ def _wall_clock(value: Any) -> pd.Timestamp:
     return stamp.tz_localize(None) if stamp.tzinfo is not None else stamp
 
 
-def _binary_rows(path: Path, pump: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _binary_rows(path: Path, pump: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     from tconnectsync.eventparser.generic import Events, decode_raw_events  # type: ignore
     from tconnectsync.eventparser.raw_event import EVENT_LEN  # type: ignore
 
     text = path.read_text(encoding="utf-8").strip()
     if not text:
-        return [], []
+        return [], [], []
     if text.startswith('"'):
         text = json.loads(text)
     data = decode_raw_events(text)
     records = np.frombuffer(data[: len(data) - len(data) % EVENT_LEN], dtype=np.uint8).reshape(-1, EVENT_LEN)
     event_id = ((records[:, 0].astype(np.int64) << 8) | records[:, 1]) & 0x0FFF
-    wanted = records[np.isin(event_id, (MODE_EVENT, *SITE_EVENT_CODES))]
+    wanted = records[np.isin(event_id, (MODE_EVENT, BASAL_DELIVERY_EVENT, *SITE_EVENT_CODES))]
     modes: list[dict[str, Any]] = []
     sites: list[dict[str, Any]] = []
+    rates: list[dict[str, Any]] = []
     for event in Events(wanted.tobytes()):
         record = event.todict()
         row = {"pump_serial": pump, "sequence": int(record["seqNum"]), "timestamp": _wall_clock(record["eventTimestamp"])}
         if record["id"] == MODE_EVENT:
             modes.append({**row, "mode": int(record["currentUserModeRaw"])})
+        elif record["id"] == BASAL_DELIVERY_EVENT:
+            if int(record["profileBasalRate"]) != NO_RATE:
+                rates.append({**row, "rate": int(record["profileBasalRate"]) / 1000.0})
         else:
             sites.append({**row, "kind": SITE_EVENT_CODES[int(record["id"])]})
-    return modes, sites
+    return modes, sites, rates
 
 
-def _json_rows(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _json_rows(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     pump = pump_key(payload["pump_serial"])
     modes: list[dict[str, Any]] = []
     sites: list[dict[str, Any]] = []
+    rates: list[dict[str, Any]] = []
     for chunk in payload["chunks"]:
         for event in chunk["response"].get("events") or []:
             code = event["eventCode"]
             row = {"pump_serial": pump, "sequence": int(event["sequenceNumber"]), "timestamp": _wall_clock(event["pumpDateTime"])}
             if code == MODE_EVENT:
                 modes.append({**row, "mode": int(event["eventProperties"]["currentUserMode"])})
+            elif code == BASAL_DELIVERY_EVENT:
+                if int(event["eventProperties"]["profileBasalRate"]) != NO_RATE:
+                    rates.append({**row, "rate": int(event["eventProperties"]["profileBasalRate"]) / 1000.0})
             elif code in SITE_EVENT_CODES:
                 sites.append({**row, "kind": SITE_EVENT_CODES[code]})
-    return modes, sites
+    return modes, sites, rates
 
 
 def _window_dates(window_dir: Path) -> tuple[dt.date, dt.date]:
@@ -81,11 +94,12 @@ def _window_dates(window_dir: Path) -> tuple[dt.date, dt.date]:
     return dt.date.fromisoformat(start), dt.date.fromisoformat(end)
 
 
-def decode_device_events(tandem_root: str | Path) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, tuple[dt.date, dt.date]]]:
-    """Mode changes, site events and, per pump, the dates the archive's pump events span."""
+def decode_device_events(tandem_root: str | Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, tuple[dt.date, dt.date]]]:
+    """Mode changes, site events, the profile basal rate the pump logged and, per pump, the dates the archive's pump events span."""
     tandem_root = Path(tandem_root)
     modes: list[dict[str, Any]] = []
     sites: list[dict[str, Any]] = []
+    rates: list[dict[str, Any]] = []
     spans: dict[str, list[dt.date]] = {}
     window_dirs = sorted(path for path in tandem_root.iterdir() if path.is_dir() and "__" in path.name) if tandem_root.exists() else []
     for window_dir in window_dirs:
@@ -98,6 +112,7 @@ def decode_device_events(tandem_root: str | Path) -> tuple[pd.DataFrame, pd.Data
             found = _binary_rows(path, pump)
             modes += found[0]
             sites += found[1]
+            rates += found[2]
             if path.stat().st_size:
                 spans.setdefault(pump, []).extend([start, end])
         for path in sorted(raw.glob("pump_logs_*.json")):
@@ -106,6 +121,7 @@ def decode_device_events(tandem_root: str | Path) -> tuple[pd.DataFrame, pd.Data
             found = _json_rows(path)
             modes += found[0]
             sites += found[1]
+            rates += found[2]
             spans.setdefault(pump_key(json.loads(path.read_text(encoding="utf-8"))["pump_serial"]), []).extend([start, end])
 
     def frame(rows: list[dict[str, Any]], columns: list[str]) -> pd.DataFrame:
@@ -121,4 +137,4 @@ def decode_device_events(tandem_root: str | Path) -> tuple[pd.DataFrame, pd.Data
         last = out["pump_serial"].map(lambda pump: pd.Timestamp(coverage[pump][1]) + pd.Timedelta(days=1) if pump in coverage else pd.NaT)
         return out[(out["timestamp"] >= first) & (out["timestamp"] < last)].reset_index(drop=True)
 
-    return inside_archive(frame(modes, MODE_COLUMNS)), inside_archive(frame(sites, SITE_COLUMNS)), coverage
+    return inside_archive(frame(modes, MODE_COLUMNS)), inside_archive(frame(sites, SITE_COLUMNS)), inside_archive(frame(rates, RATE_COLUMNS)), coverage
