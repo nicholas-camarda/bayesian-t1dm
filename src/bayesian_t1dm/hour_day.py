@@ -37,6 +37,7 @@ from .outcomes import DayPart, READING_MINUTES, _prepare
 from .pump_profiles import pump_key
 
 SLOTS_PER_HOUR = 60 // READING_MINUTES
+HOURS_PER_DAY = 24
 SLEEP_MODE = 1
 LOCAL_ZONE = ZoneInfo("America/New_York")
 SETTING_FIELDS = {
@@ -92,30 +93,41 @@ def _share_inside(moments: pd.DatetimeIndex, intervals: pd.DataFrame, n_hours: i
 
 
 def _settings(analysis: AnalysisData, hours: pd.DatetimeIndex, pumps: pd.Series) -> pd.DataFrame:
+    """Settings in force per hour, and what changed against the same 5-minute moments of the previous day."""
     moments = _slot_moments(hours)
     moment_pumps = pd.Series(np.repeat(pumps.to_numpy(), SLOTS_PER_HOUR))
     out: dict[str, np.ndarray] = {}
     known = np.zeros((len(hours), SLOTS_PER_HOUR), dtype=bool)
     mixed = np.zeros(len(hours), dtype=bool)
+    changed = np.zeros(len(hours), dtype=bool)
+    # Day-over-day comparison needs both moments on the same pump; a pump swap is a change of device, not of settings.
+    same_pump = np.zeros((len(hours), SLOTS_PER_HOUR), dtype=bool)
+    same_pump[HOURS_PER_DAY:] = (pumps.to_numpy()[HOURS_PER_DAY:] == pumps.to_numpy()[:-HOURS_PER_DAY])[:, None]
     for name, field in {**SETTING_FIELDS, "segment_start": "start_minutes"}.items():
         values = analysis.history.values_at(moment_pumps, pd.Series(moments), field).reshape(len(hours), SLOTS_PER_HOUR)
         finite = np.isfinite(values)
         if name == "basal":
             known = finite  # a segment whose rate is unknown is unknown for every value of that segment
         counts = finite.sum(axis=1)
-        with np.errstate(invalid="ignore"):
-            if name == "segment_start":
-                # The segment start covering most of the hour's moments.
-                out[name] = np.array([np.nan if not row.any() else pd.Series(v[row]).mode().iloc[0] for v, row in zip(values, finite)])
-            else:
-                total = np.where(finite, values, 0.0).sum(axis=1)
-                out[name] = np.where(counts > 0, total / np.maximum(counts, 1), np.nan)
-                low = np.where(finite, values, np.inf).min(axis=1)
-                high = np.where(finite, values, -np.inf).max(axis=1)
-                mixed |= (counts > 0) & (high - low > 1e-9)
+        if name == "segment_start":
+            # The segment start covering most of the hour's moments.
+            out[name] = np.array([np.nan if not row.any() else pd.Series(v[row]).mode().iloc[0] for v, row in zip(values, finite)])
+            continue
+        total = np.where(finite, values, 0.0).sum(axis=1)
+        out[name] = np.where(counts > 0, total / np.maximum(counts, 1), np.nan)
+        low = np.where(finite, values, np.inf).min(axis=1)
+        high = np.where(finite, values, -np.inf).max(axis=1)
+        mixed |= (counts > 0) & (high - low > 1e-9)
+        previous = np.full_like(values, np.nan)
+        previous[HOURS_PER_DAY:] = values[:-HOURS_PER_DAY]
+        difference = np.where(same_pump & finite & np.isfinite(previous), values - previous, np.nan)
+        comparable = np.isfinite(difference).sum(axis=1)
+        out["d_" + name] = np.where(comparable > 0, np.nansum(difference, axis=1) / np.maximum(comparable, 1), np.nan)
+        changed |= (np.abs(np.nan_to_num(difference)) > 1e-9).any(axis=1)
     frame = pd.DataFrame(out, index=hours)
     frame["settings_known_slots"] = known.sum(axis=1)
     frame["settings_mixed"] = mixed
+    frame["settings_changed"] = changed
     return frame
 
 

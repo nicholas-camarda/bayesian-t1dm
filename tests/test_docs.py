@@ -16,6 +16,8 @@ REQUIRED_SECTIONS = (
     "## The front page and the runtime tree",
     "## Planned: probabilities for every outcome, and the Bayesian basal model",
     "## Outcome metrics (goal A)",
+    "## Hour-day table and settings in force",
+    "## Replay of past setting changes (exploratory)",
 )
 
 

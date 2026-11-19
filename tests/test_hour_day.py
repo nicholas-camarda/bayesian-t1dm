@@ -87,6 +87,30 @@ def test_an_edit_inside_an_hour_mixes_the_settings_of_that_hour(table):
     assert table["segment_start"].eq(0).all()
 
 
+def test_changed_settings_are_marked_on_the_day_of_the_edit_only():
+    analysis = _analysis()
+    day0 = DAY1 - pd.Timedelta(days=1)
+    segment = dict(event=SEGMENT_EVENT, status=15, segment_index=0, start_minutes=0, basal_units_per_hour=0.8, isf_mgdl_per_unit=65, target_bg_mgdl=110)
+    events = pd.DataFrame([
+        _event(day0, 1, event=PROFILE_EVENT, status=0, source_profile_id=0),
+        _event(day0, 2, modification=0, carb_ratio_g_per_unit=7.0, **segment),
+        _event(day0, 3, event=PROFILE_EVENT, status=3, source_profile_id=0),
+        _event(EDIT, 4, modification=3, carb_ratio_g_per_unit=10.0, **segment),
+    ])
+    analysis.history = ProfileHistory(events, {PUMP: (day0.date(), dt.date(2025, 9, 2))})
+    slots = pd.date_range(day0, DAY1 + pd.Timedelta(days=2) - pd.Timedelta(minutes=5), freq="5min")
+    analysis.cgm = pd.DataFrame({"timestamp": slots, "glucose": 100.0, "pump_serial": PUMP})
+    table = build_hour_day_table(analysis).set_index("hour_start")
+
+    assert table.loc["2025-09-01", "settings_changed"].tolist() == [False] * 9 + [True] * 15      # from the 09:05 moment on
+    assert not table.loc["2025-08-31", "settings_changed"].any()
+    # The hours that had already passed on the day of the edit first run the new value the next day; after that nothing changes.
+    assert table.loc["2025-09-02", "settings_changed"].tolist() == [True] * 10 + [False] * 14   # through the 09:00-09:05 moments of the edited hour
+    assert table.loc["2025-09-01 09:00", "d_icr"] == pytest.approx(3.0 * 10 / 12)   # ten of twelve moments went from 7 to 10
+    assert table.loc["2025-09-01 12:00", "d_icr"] == pytest.approx(3.0) and table.loc["2025-09-01 12:00", ["d_cf", "d_basal", "d_target"]].eq(0).all()
+    assert table["settings_changed"].sum() == 25
+
+
 def test_settings_agree_with_the_profile_in_force_at_random_moments():
     analysis = _analysis()
     rng = np.random.default_rng(5)
@@ -154,3 +178,31 @@ def test_rollup_counts_hours_that_straddle_a_boundary(table):
     rolled, split_hours = rollup_segment_days(table.reset_index(), parts)
     assert split_hours == 2   # the 09:00 hour on each day holds 30 minutes of each part
     assert rolled["n_valid"].sum() == table["n_valid"].sum()
+
+
+def test_an_edit_to_a_profile_that_is_not_running_is_no_change_but_a_profile_switch_is():
+    analysis = _analysis()
+    day0 = DAY1
+    segment = dict(event=SEGMENT_EVENT, status=15, segment_index=0, start_minutes=0, basal_units_per_hour=0.8, isf_mgdl_per_unit=65, target_bg_mgdl=110)
+
+    def profile_event(timestamp, sequence, profile, **fields):
+        return {**_event(timestamp, sequence, **fields), "profile_id": profile}
+
+    events = pd.DataFrame([
+        profile_event(day0, 1, 0, event=PROFILE_EVENT, status=0, source_profile_id=0),
+        profile_event(day0, 2, 0, modification=0, carb_ratio_g_per_unit=7.0, **segment),
+        profile_event(day0, 3, 0, event=PROFILE_EVENT, status=3, source_profile_id=0),
+        profile_event(day0, 4, 1, event=PROFILE_EVENT, status=0, source_profile_id=1),
+        profile_event(day0, 5, 1, modification=0, carb_ratio_g_per_unit=6.0, **segment),
+        profile_event(day0 + pd.Timedelta(days=1, hours=12), 6, 1, modification=3, carb_ratio_g_per_unit=5.0, **segment),   # profile 1 is not running
+        profile_event(day0 + pd.Timedelta(days=2, hours=8), 7, 1, event=PROFILE_EVENT, status=3, source_profile_id=1),      # then it is switched on
+    ])
+    analysis.history = ProfileHistory(events, {PUMP: (day0.date(), dt.date(2025, 9, 4))})
+    slots = pd.date_range(day0, day0 + pd.Timedelta(days=4) - pd.Timedelta(minutes=5), freq="5min")
+    analysis.cgm = pd.DataFrame({"timestamp": slots, "glucose": 100.0, "pump_serial": PUMP})
+    table = build_hour_day_table(analysis).set_index("hour_start")
+
+    assert not table.loc["2025-09-02", "settings_changed"].any()           # the edit to the idle profile changes nothing in force
+    assert table.loc["2025-09-03", "settings_changed"].tolist() == [False] * 8 + [True] * 16    # the switch at 08:00 puts I:C 5 in force
+    assert table.loc["2025-09-03 09:00", "d_icr"] == pytest.approx(-2.0)
+    assert table.loc["2025-09-04", "settings_changed"].tolist() == [True] * 8 + [False] * 16    # hours already passed first run it the next day
