@@ -120,6 +120,7 @@ def daily_controller_pattern(
     min_clean_fraction: float | None = MIN_DAY_COVERAGE,
     min_clean_hours: float = 0.0,
     workouts: pd.DataFrame | None = None,
+    flow: list[dict] | None = None,
 ) -> pd.DataFrame:
     """One row per day and pump segment: extra insulin as a share of the profile's, and mean glucose, over the clean time.
 
@@ -131,13 +132,27 @@ def daily_controller_pattern(
         return pd.DataFrame()
     stamp = intervals["timestamp"]
     mode = _mode_at(stamp, modes)
-    keep = ~_inside_windows(stamp, meals)
-    keep &= ~inside_intervals(stamp, exercise_intervals(workouts, modes))  # the shared exercise rule: workouts and exercise mode, plus the hours after
+    intervals["minute"] = stamp.dt.hour * 60 + stamp.dt.minute
+    excluded = {pd.Timestamp(day).normalize() for day in excluded_days}
+    keep = np.ones(len(intervals), dtype=bool)
+
+    def audit(stage):
+        if flow is None:
+            return
+        for part in parts:
+            group = intervals.loc[keep & part.contains(intervals["minute"])]
+            flow.append({"stage": stage, "part": part.name, "days": part.analysis_date(group.timestamp).nunique(),
+                         "hours": group.hours.sum(), "first": group.timestamp.min(), "last": group.timestamp.max()})
+
+    audit("Paired programmed and commanded rates")
+    keep &= ~_inside_windows(stamp, meals)
+    audit("After meal exclusions")
+    keep &= ~inside_intervals(stamp, exercise_intervals(workouts, modes))
+    audit("After exercise exclusions")
     if unlogged is not None and not unlogged.empty:
         keep &= ~inside_intervals(stamp, unlogged[["start", "end"]])
-    excluded = {pd.Timestamp(day).normalize() for day in excluded_days}
+    audit("After unlogged-food exclusions")
     intervals = intervals.assign(mode=mode)[keep].copy()
-    intervals["minute"] = intervals["timestamp"].dt.hour * 60 + intervals["timestamp"].dt.minute
     glucose = cgm[["timestamp", "glucose"]].copy()
     glucose["timestamp"] = pd.to_datetime(glucose["timestamp"])
     glucose = glucose.dropna().sort_values("timestamp")
@@ -146,6 +161,9 @@ def daily_controller_pattern(
         inside = intervals[part.contains(intervals["minute"])].copy()
         inside["date"] = part.analysis_date(inside["timestamp"])
         inside = inside[~inside["date"].isin(excluded)]
+        if flow is not None:
+            flow.append({"stage": "After context-day exclusions", "part": part.name, "days": inside.date.nunique(),
+                         "hours": inside.hours.sum(), "first": inside.timestamp.min(), "last": inside.timestamp.max()})
         for date, group in inside.groupby("date"):
             hours = float(group["hours"].sum())
             profile_units = float(group["profile_units"].sum())
@@ -165,7 +183,14 @@ def daily_controller_pattern(
                     "sleep_share": float((group["mode"] == 1).mean()),
                 }
             )
-    return pd.DataFrame(rows)
+    result = pd.DataFrame(rows)
+    if flow is not None:
+        for part in parts:
+            group = result[result.part.eq(part.name)] if len(result) else result
+            flow.append({"stage": "Meets daily clean-time and profile support", "part": part.name, "days": len(group),
+                         "hours": group.clean_hours.sum() if len(group) else 0,
+                         "first": group.date.min() if len(group) else pd.NaT, "last": group.date.max() if len(group) else pd.NaT})
+    return result
 
 
 def controller_summary(daily: pd.DataFrame) -> pd.DataFrame:
@@ -269,7 +294,7 @@ def basal_signal(daily: pd.DataFrame, current_rates: dict[str, float] | None = N
     return pd.DataFrame(rows)
 
 
-def controller_inputs(analysis, parts: list[DayPart], *, strict: bool = False, rates: pd.DataFrame | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def controller_inputs(analysis, parts: list[DayPart], *, strict: bool = False, rates: pd.DataFrame | None = None, flow: list[dict] | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """The daily controller pattern with its meal, unlogged-food and exercise exclusions, from the shared ``AnalysisData``.
 
     Returns the daily table, the rate records it was built from (empty when the archive holds no rate records) and the
@@ -282,5 +307,5 @@ def controller_inputs(analysis, parts: list[DayPart], *, strict: bool = False, r
         return pd.DataFrame(), rates, pd.DataFrame()
     cgm, bolus, carbs = analysis.cgm, merged.tandem_data.bolus, merged.tandem_data.carbs
     daily = daily_controller_pattern(rates, analysis.mode_events, cgm, meal_windows(bolus, carbs, strict=strict), parts, unlogged=analysis.unlogged, excluded_days=analysis.excluded_days,
-                                     min_clean_fraction=None, min_clean_hours=MIN_CLEAN_HOURS, workouts=merged.data.workouts)
+                                     min_clean_fraction=None, min_clean_hours=MIN_CLEAN_HOURS, workouts=merged.data.workouts, flow=flow)
     return daily, rates, analysis.unlogged
