@@ -51,7 +51,7 @@ def baseline_distribution(history: pd.DataFrame, origin: pd.Timestamp, *, decay:
     weights = hours * np.exp2(-age / HALF_LIFE_DAYS) if decay else hours
     if not len(units):
         return None
-    weights /= weights.sum()
+    weights = weights / weights.sum()
     # Jeffreys smoothing on the effective weighted days keeps rare zero outcomes scoreable.
     effective_days = 1 / np.sum(weights**2)
     zero = units == 0

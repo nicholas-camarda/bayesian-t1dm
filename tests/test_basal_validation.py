@@ -9,6 +9,7 @@ def test_baseline_excludes_origin_and_future_and_scores_zero():
     forecast = baseline_distribution(rows, dates[3], decay=True)
     assert forecast == baseline_distribution(rows.iloc[:3], dates[3], decay=True)
     assert forecast["training_days"] == 3
+    assert baseline_distribution(rows, dates[3], decay=False)["training_days"] == 3
     scored = score_distribution(forecast, 0)
     assert scored["lower_90"] == 0
     assert scored["hit_below"] and not scored["hit_above"]
