@@ -99,8 +99,8 @@ def _checks(results: dict[str, pd.DataFrame], table: pd.DataFrame) -> pd.DataFra
     changes = primary[primary["kind"].eq("change")]
     matched = primary[primary["kind"].eq("matched placebo")]
     random = primary[primary["kind"].eq("random placebo")]
-    gap_matched = float((matched["pre_tir"].to_numpy() - changes["pre_tir"].repeat(replay.PLACEBOS_PER_EVENT).to_numpy()).__abs__().mean())
-    gap_random = float((random["pre_tir"].to_numpy() - changes["pre_tir"].repeat(replay.PLACEBOS_PER_EVENT).to_numpy()).__abs__().mean())
+    gap_matched = float(np.abs(matched["pre_tir"].to_numpy() - changes["pre_tir"].repeat(replay.PLACEBOS_PER_EVENT).to_numpy()).mean())
+    gap_random = float(np.abs(random["pre_tir"].to_numpy() - changes["pre_tir"].repeat(replay.PLACEBOS_PER_EVENT).to_numpy()).mean())
     coverage = results["calibration"].query("kind == 'matched placebo' and predictor == @replay.PRIMARY").iloc[0]
     isolated = int(changes["isolated"].sum())
     mixed = float(changes["direction"].eq("mixed").mean())

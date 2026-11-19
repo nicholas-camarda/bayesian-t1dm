@@ -284,7 +284,7 @@ def placebo_candidates(grid: DayGrid, event: Event, flagged: np.ndarray) -> np.n
     near = np.concatenate([[0], np.cumsum(flagged)])
     candidates = []
     for day in range(BEFORE_DAYS, n - event.span - AFTER_DAYS + 1):
-        low, high = max(day - CLEARANCE_DAYS, 0), min(day + event.span + AFTER_DAYS + CLEARANCE_DAYS, n)
+        low, high = max(day - CLEARANCE_DAYS, 0), min(day + event.span + CLEARANCE_DAYS, n)  # the 14 days after are inside it
         if near[high] - near[low] > 0:
             continue
         seasonal = abs((grid.dates[day].dayofyear - grid.dates[event.first].dayofyear + 183) % 365 - 183)

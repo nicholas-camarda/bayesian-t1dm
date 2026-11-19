@@ -41,9 +41,17 @@ def test_a_planted_shift_is_recovered_and_no_shift_covers_zero():
     row = shifted.query("group == 'all changes' and predictor == @replay.PRIMARY and measure == 'tir'").iloc[0]
     assert row["delta"] == pytest.approx(10.0, abs=2.5)
     assert row["delta_lower_90"] > 0
-    plain = replay.summarize(replay.run_replay(_table(shift=0.0))["scores"])
-    row = plain.query("group == 'all changes' and predictor == @replay.PRIMARY and measure == 'tir'").iloc[0]
-    assert row["delta_lower_90"] < 0 < row["delta_upper_90"]
+
+
+def test_without_a_planted_shift_the_estimate_is_near_zero_and_its_interval_usually_covers_it():
+    covered, deltas = 0, []
+    for seed in (3, 4, 5, 6):   # a 90% interval misses zero by chance about one time in ten, so judge several records
+        plain = replay.summarize(replay.run_replay(_table(shift=0.0, seed=seed))["scores"])
+        row = plain.query("group == 'all changes' and predictor == @replay.PRIMARY and measure == 'tir'").iloc[0]
+        covered += int(row["delta_lower_90"] < 0 < row["delta_upper_90"])
+        deltas.append(row["delta"])
+    assert covered >= 3
+    assert np.abs(np.mean(deltas)) < 1.0
 
 
 def test_changes_five_days_apart_share_a_cluster_and_are_not_isolated():
