@@ -142,7 +142,7 @@ def _warnings(results: dict[str, pd.DataFrame]) -> pd.DataFrame:
         ("Overlapping windows", "Changes closer than 28 days share before or after days; the bootstrap resamples clusters, so the interval reflects it, but the number of independent changes is the cluster count, not the change count."),
         ("Baselines ignore the settings", "The predictors do not use the settings, so the residual contains every difference between the periods (season, illness, new device) except what placebo dates share."),
         ("Pump change", "On the day the active pump changes, settings are not compared across pumps; a real change on that day is not seen."),
-        ("Early record", "Until a segment of the first pump's profile was edited or seen in the archive its values are unknown (early 2024), so changes there are not detected."),
+        ("Early record", "Until a segment of the first pump's profile was edited or seen in the archive its values are unknown, so changes there are not detected."),
     ]
     return pd.DataFrame(rows, columns=["limitation", "detail"])
 

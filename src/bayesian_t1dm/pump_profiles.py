@@ -249,11 +249,12 @@ class ProfileHistory:
 
     events: pd.DataFrame
     visible: dict[str, tuple[dt.date, dt.date]]
-    profile_rates: pd.DataFrame | None = None  # pump_serial, timestamp, rate (U/h): the basal rate the active profile calls for, logged by the pump
+    profile_rates: pd.DataFrame  # pump_serial, timestamp, rate (U/h): the basal rate the active profile calls for, logged by the pump
     _tables: dict[tuple[str, int], tuple[list[dt.datetime], list[list[dict[str, float] | None]]]] = field(init=False, default_factory=dict)
     _active: dict[str, tuple[list[dt.datetime], list[int]]] = field(init=False, default_factory=dict)
     _whole: set[tuple[str, int]] = field(init=False, default_factory=set)  # profiles whose whole history the archive holds
     _complete: dict[tuple[str, int], list[bool]] = field(init=False, default_factory=dict)
+    _breaks: dict[tuple[str, int], list[bool]] = field(init=False, default_factory=dict)  # the event may have changed slots the archive never saw
     _closed: dict[tuple[str, int], list[bool]] = field(init=False, default_factory=dict)  # the table's last slot is known to run to midnight
 
     def __post_init__(self) -> None:
@@ -261,6 +262,7 @@ class ProfileHistory:
         state: dict[tuple[str, int], list[dict[str, float] | None]] = {}
         for row in actions.itertuples(index=False):
             key = (row.pump_serial, int(row.profile_id))
+            unseen_change = False
             if int(row.event) == PROFILE_EVENT:
                 status = int(row.status)
                 if status == PROFILE_CREATED:
@@ -269,6 +271,7 @@ class ProfileHistory:
                 elif status == PROFILE_COPIED:
                     source = (row.pump_serial, int(row.source_profile_id))
                     state[key] = [None if seg is None else dict(seg) for seg in state.get(source, [])]
+                    unseen_change = True  # a copy can bring in slots of a source the archive saw only in part
                     if source in self._whole:
                         self._whole.add(key)
                     else:
@@ -294,7 +297,8 @@ class ProfileHistory:
                         table.pop(index)
                     elif key in self._whole:
                         raise ValueError(f"Profile history deletes segment {index} of profile {key} at {row.timestamp}, which it never saw.")
-                    # otherwise the profile predates the archive: the slot was never seen and the table stays partly unknown
+                    else:
+                        unseen_change = True  # the profile predates the archive: the slot was never seen and the table stays partly unknown
                 else:
                     table.extend([None] * (index + 1 - len(table)))
                     table[index] = values if complete else None
@@ -303,18 +307,20 @@ class ProfileHistory:
             tables.append(list(state.get(key, [])))
             wholes = self._complete.setdefault(key, [])
             wholes.append(key in self._whole)
+            self._breaks.setdefault(key, []).append(unseen_change)
         activations = self.events[self.events["event"].eq(PROFILE_EVENT) & self.events["status"].eq(PROFILE_ACTIVATED)]
         for pump_serial, group in activations.sort_values("timestamp").groupby("pump_serial"):
             self._active[pump_serial] = (list(group["timestamp"]), [int(v) for v in group["profile_id"]])
         self._closed = {key: list(flags) for key, flags in self._complete.items()}
-        if self.profile_rates is not None and not self.profile_rates.empty:
+        if not self.profile_rates.empty:
             self._confirm_last_slots(self.profile_rates)
 
     def _confirm_last_slots(self, rates: pd.DataFrame) -> None:
         """Mark each stretch of a profile's history whose last slot the pump's own rate log shows running to midnight.
 
         A stretch is a run of snapshots in which the last slot keeps its start, rate and index: edits elsewhere in the
-        profile do not end it, and a slot added or removed after it does. The pump logs the rate the active profile
+        profile do not end it, and a slot added or removed after it does, as does a copy into the profile or a delete of
+        a slot the archive never saw. Only records inside the pump's visible span count, as everywhere else in this class. The pump logs the rate the active profile
         calls for about every five minutes. Over the last hour of the day, records at or after the last slot's start
         whose rate equals that slot's rate confirm it; the whole stretch then counts as closed. A stretch without
         enough records, or with records that disagree, stays unknown.
@@ -329,7 +335,11 @@ class ProfileHistory:
             activations, profiles = self._active[pump]
             position = np.searchsorted(np.asarray(activations, dtype="datetime64[ns]"), times, side="right") - 1
             active = np.where(position >= 0, np.asarray(profiles)[np.maximum(position, 0)], -1)
-            late = (position >= 0) & (minutes >= LAST_SLOT_EVIDENCE_FROM_MINUTE) & np.isfinite(logged)
+            span = self.visible.get(pump)
+            if span is None:
+                continue
+            in_span = np.asarray([span[0] <= day <= span[1] for day in stamps.normalize().date])
+            late = in_span & (position >= 0) & (minutes >= LAST_SLOT_EVIDENCE_FROM_MINUTE) & np.isfinite(logged)
             for profile in np.unique(active[late]):
                 key = (pump, int(profile))
                 if key not in self._tables:
@@ -341,7 +351,7 @@ class ProfileHistory:
                     same = (last[k] is not None and last[k - 1] is not None and len(tables[k]) == len(tables[k - 1])
                             and last[k]["start_minutes"] == last[k - 1]["start_minutes"]
                             and last[k]["basal_units_per_hour"] == last[k - 1]["basal_units_per_hour"])
-                    run[k] = run[k - 1] + (0 if same else 1)
+                    run[k] = run[k - 1] + (0 if same and not self._breaks[key][k] else 1)
                 chosen = np.flatnonzero(late & (active == profile))
                 version = np.searchsorted(np.asarray(edits, dtype="datetime64[ns]"), times[chosen], side="right") - 1
                 chosen, version = chosen[version >= 0], version[version >= 0]
@@ -354,7 +364,7 @@ class ProfileHistory:
                 agrees = np.abs(logged[chosen] - expected) <= LAST_SLOT_RATE_TOLERANCE
                 for stretch in np.unique(run[version]):
                     inside = run[version] == stretch
-                    if inside.sum() >= LAST_SLOT_MIN_RECORDS and agrees[inside].mean() >= LAST_SLOT_MIN_AGREEMENT and last[int(np.flatnonzero(run == stretch)[0])] is not None:
+                    if inside.sum() >= LAST_SLOT_MIN_RECORDS and agrees[inside].mean() >= LAST_SLOT_MIN_AGREEMENT:
                         for k in np.flatnonzero(run == stretch):
                             self._closed[key][k] = True
 

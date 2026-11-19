@@ -31,7 +31,7 @@ def _history() -> ProfileHistory:
         _event(DAY1, 3, event=PROFILE_EVENT, status=3, source_profile_id=0),
         _event(EDIT, 4, modification=3, carb_ratio_g_per_unit=10.0, **segment),
     ])
-    return ProfileHistory(events, {PUMP: (dt.date(2025, 9, 1), dt.date(2025, 9, 2))})
+    return ProfileHistory(events, {PUMP: (dt.date(2025, 9, 1), dt.date(2025, 9, 2))}, pd.DataFrame(columns=["pump_serial", "sequence", "timestamp", "rate"]))
 
 
 def _analysis() -> SimpleNamespace:
@@ -97,7 +97,7 @@ def test_changed_settings_are_marked_on_the_day_of_the_edit_only():
         _event(day0, 3, event=PROFILE_EVENT, status=3, source_profile_id=0),
         _event(EDIT, 4, modification=3, carb_ratio_g_per_unit=10.0, **segment),
     ])
-    analysis.history = ProfileHistory(events, {PUMP: (day0.date(), dt.date(2025, 9, 2))})
+    analysis.history = ProfileHistory(events, {PUMP: (day0.date(), dt.date(2025, 9, 2))}, pd.DataFrame(columns=["pump_serial", "sequence", "timestamp", "rate"]))
     slots = pd.date_range(day0, DAY1 + pd.Timedelta(days=2) - pd.Timedelta(minutes=5), freq="5min")
     analysis.cgm = pd.DataFrame({"timestamp": slots, "glucose": 100.0, "pump_serial": PUMP})
     table = build_hour_day_table(analysis).set_index("hour_start")
@@ -197,7 +197,7 @@ def test_an_edit_to_a_profile_that_is_not_running_is_no_change_but_a_profile_swi
         profile_event(day0 + pd.Timedelta(days=1, hours=12), 6, 1, modification=3, carb_ratio_g_per_unit=5.0, **segment),   # profile 1 is not running
         profile_event(day0 + pd.Timedelta(days=2, hours=8), 7, 1, event=PROFILE_EVENT, status=3, source_profile_id=1),      # then it is switched on
     ])
-    analysis.history = ProfileHistory(events, {PUMP: (day0.date(), dt.date(2025, 9, 4))})
+    analysis.history = ProfileHistory(events, {PUMP: (day0.date(), dt.date(2025, 9, 4))}, pd.DataFrame(columns=["pump_serial", "sequence", "timestamp", "rate"]))
     slots = pd.date_range(day0, day0 + pd.Timedelta(days=4) - pd.Timedelta(minutes=5), freq="5min")
     analysis.cgm = pd.DataFrame({"timestamp": slots, "glucose": 100.0, "pump_serial": PUMP})
     table = build_hour_day_table(analysis).set_index("hour_start")

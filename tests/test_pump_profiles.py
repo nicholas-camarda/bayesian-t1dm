@@ -12,6 +12,8 @@ import pytest
 from bayesian_t1dm.pump_profiles import ProfileHistory, decode_profile_events
 
 EPOCH = dt.datetime(2008, 1, 1)
+NO_RATES = pd.DataFrame(columns=["pump_serial", "sequence", "timestamp", "rate"])
+SYNTHETIC_PUMP = "900001"
 
 
 def _record(event_id: int, when: dt.datetime, sequence: int, payload_le: bytes) -> bytes:
@@ -65,7 +67,7 @@ def test_profile_history_replays_edits_copies_deletes_and_switches(tmp_path):
     root = _archive(tmp_path, {"2025-08-25__2025-09-23": records})
     events, visible = decode_profile_events(root)
     assert visible == {"1453346": (dt.date(2025, 9, 1), dt.date(2025, 9, 23))}  # from the first profile event
-    history = ProfileHistory(events, visible)
+    history = ProfileHistory(events, visible, NO_RATES)
 
     def at(when):
         carbs = pd.DataFrame({"timestamp": [when], "pump_serial": ["1453346"]})
@@ -93,7 +95,7 @@ def test_deleting_a_segment_of_a_fully_seen_profile_that_never_existed_fails(tmp
     ]})
     events, visible = decode_profile_events(root)
     with pytest.raises(ValueError, match="never saw"):
-        ProfileHistory(events, visible)
+        ProfileHistory(events, visible, NO_RATES)
 
 
 def test_profile_history_outranks_carrying_and_a_profile_switch_ends_the_carry():
@@ -187,7 +189,7 @@ def test_segment_edits_from_pump_logs_json_extend_the_visible_history(tmp_path):
     (raw / "pump_profile_edits_1453346_dev.json").write_text(json.dumps({"pump_serial": "1453346", "chunks": [{"start": "2026-04-23", "end": "2026-05-22", "response": {"events": [e for e in events if e["eventCode"] == 68]}}]}))
     frame, visible = decode_profile_events(root)
     assert visible == {"1453346": (dt.date(2026, 4, 23), dt.date(2026, 5, 22))}
-    history = ProfileHistory(frame, visible)
+    history = ProfileHistory(frame, visible, NO_RATES)
     before = history.segment_in_force("1453346", 0, dt.datetime(2026, 5, 9, 7, 30))
     after = history.segment_in_force("1453346", 0, dt.datetime(2026, 5, 11, 7, 30))
     assert (before["carb_ratio_g_per_unit"], after["carb_ratio_g_per_unit"]) == (7.0, 6.5)
@@ -203,7 +205,7 @@ def test_asking_about_other_hours_uses_the_profile_as_it_stood_at_the_given_mome
         _segment(day.replace(hour=9, minute=30), 5, profile=0, index=1, modification=4, start=300, icr=6.5, isf=65),
     ]
     events, visible = decode_profile_events(_archive(tmp_path, {"2025-08-25__2025-09-23": records}))
-    history = ProfileHistory(events, visible)
+    history = ProfileHistory(events, visible, NO_RATES)
     at_noon = dt.datetime(2025, 9, 1, 12, 0)
     assert history.segment_in_force("1453346", 0, at_noon, minute_of_day=6 * 60)["carb_ratio_g_per_unit"] == 6.5
     # Asked at 07:00, before the 09:30 edit, the same hour of the day still shows the old value.
@@ -219,7 +221,7 @@ def test_a_meal_is_judged_by_the_profile_at_the_moment_recorded_not_its_grid_slo
         _segment(day.replace(hour=7, minute=57), 4, profile=0, index=0, modification=4, start=0, icr=6.5, isf=65),
     ]
     events, visible = decode_profile_events(_archive(tmp_path, {"2025-08-25__2025-09-23": records}))
-    history = ProfileHistory(events, visible)
+    history = ProfileHistory(events, visible, NO_RATES)
     carbs = pd.DataFrame(
         {
             "timestamp": pd.to_datetime(["2025-09-01 07:55", "2025-09-01 07:55"]),  # both on the 07:55 grid slot
@@ -239,7 +241,7 @@ def test_values_at_use_exact_edit_time_and_pump(tmp_path):
         _activate(day, 3, profile=0, name="Main"),
         _segment(edit, 4, profile=0, index=0, modification=4, start=0, icr=7, isf=65, basal=0.9),
     ]}, serial="10001"))
-    history = ProfileHistory(events, visible)
+    history = ProfileHistory(events, visible, NO_RATES)
     stamps = pd.Series([edit - dt.timedelta(seconds=1), edit, edit.replace(minute=10), edit, day - dt.timedelta(days=1)])
     rates = history.values_at(pd.Series(["10001"] * 3 + ["another", "10001"]), stamps, "basal_units_per_hour")
     np.testing.assert_allclose(rates, [0.8, 0.9, 0.9, np.nan, np.nan])
@@ -259,17 +261,19 @@ def _last_slot_history(tmp_path, rates, *, extra=()):
         *extra,
     ]
     home = tmp_path / str(len(list(tmp_path.iterdir())))  # one folder per history, so a test can build several
-    events, visible = decode_profile_events(_archive(home, {"2025-08-25__2025-09-23": records}))
+    events, visible = decode_profile_events(_archive(home, {"2025-08-25__2025-09-23": records}, serial=SYNTHETIC_PUMP))
     return ProfileHistory(events, visible, rates)
 
 
 def _rates(rate, *, day=dt.datetime(2025, 9, 2), count=12, start_minute=23 * 60):
+    """``count`` logged profile rates, five minutes apart from ``start_minute`` of ``day``."""
     stamps = [day + dt.timedelta(minutes=start_minute + 5 * i) for i in range(count)]
-    return pd.DataFrame({"pump_serial": "1453346", "sequence": range(count), "timestamp": stamps, "rate": rate})
+    return pd.DataFrame({"pump_serial": SYNTHETIC_PUMP, "sequence": range(count), "timestamp": stamps, "rate": rate})
 
 
 def _basal_at(history, *stamps):
-    return history.values_at(pd.Series(["1453346"] * len(stamps)), pd.Series(stamps), "basal_units_per_hour")
+    """The basal rate in force at each time on the synthetic pump."""
+    return history.values_at(pd.Series([SYNTHETIC_PUMP] * len(stamps)), pd.Series(stamps), "basal_units_per_hour")
 
 
 NIGHT = dt.datetime(2025, 9, 3, 22, 0)
@@ -277,21 +281,55 @@ NOON = dt.datetime(2025, 9, 3, 12, 0)
 
 
 def test_a_last_slot_the_archive_cannot_close_stays_unknown_without_the_pumps_rate_log(tmp_path):
-    np.testing.assert_allclose(_basal_at(_last_slot_history(tmp_path, None), NOON, NIGHT), [0.8, np.nan])
+    np.testing.assert_allclose(_basal_at(_last_slot_history(tmp_path, NO_RATES), NOON, NIGHT), [0.8, np.nan])
 
 
 def test_the_pumps_rate_log_shows_the_last_slot_runs_to_midnight_and_changes_nothing_already_known(tmp_path):
     history = _last_slot_history(tmp_path, _rates(0.9))
     np.testing.assert_allclose(_basal_at(history, NOON, NIGHT), [0.8, 0.9])
-    assert history.values_at(pd.Series(["1453346"]), pd.Series([NIGHT]), "carb_ratio_g_per_unit")[0] == 6.0
-    assert history.segment_in_force("1453346", 0, NIGHT)["isf_mgdl_per_unit"] == 60
+    assert history.values_at(pd.Series([SYNTHETIC_PUMP]), pd.Series([NIGHT]), "carb_ratio_g_per_unit")[0] == 6.0
+    assert history.segment_in_force(SYNTHETIC_PUMP, 0, NIGHT)["isf_mgdl_per_unit"] == 60
 
 
 def test_a_rate_log_that_disagrees_or_is_too_short_does_not_close_the_last_slot(tmp_path):
     np.testing.assert_allclose(_basal_at(_last_slot_history(tmp_path, _rates(0.75)), NIGHT), [np.nan])
     np.testing.assert_allclose(_basal_at(_last_slot_history(tmp_path, _rates(0.9, count=11)), NIGHT), [np.nan])
-    # Records before the last slot starts say nothing about it.
+    # Records at 20:00-20:55 are before the evidence window.
     np.testing.assert_allclose(_basal_at(_last_slot_history(tmp_path, _rates(0.9, start_minute=20 * 60, count=12)), NIGHT), [np.nan])
+
+
+def test_records_before_the_last_slot_starts_say_nothing_about_it(tmp_path):
+    late_slot = [_segment(dt.datetime(2025, 9, 1), 4, profile=0, index=2, modification=4, start=1410, icr=5.0, isf=55, basal=1.0)]
+    # The 23:30 slot is last; records from 23:00 to 23:55 at 0.9 U/h (the 21:00 slot's rate) must not confirm it.
+    history = _last_slot_history(tmp_path, _rates(0.9, count=12), extra=late_slot)
+    np.testing.assert_allclose(_basal_at(history, dt.datetime(2025, 9, 3, 23, 45)), [np.nan])
+
+
+def test_the_agreement_threshold_is_95_percent(tmp_path):
+    stamps = [dt.datetime(2025, 9, 2) + dt.timedelta(minutes=23 * 60 + 2 * i) for i in range(20)]
+    def log(disagreeing):
+        rate = [0.9] * (20 - disagreeing) + [0.5] * disagreeing
+        return pd.DataFrame({"pump_serial": SYNTHETIC_PUMP, "sequence": range(20), "timestamp": stamps, "rate": rate})
+    np.testing.assert_allclose(_basal_at(_last_slot_history(tmp_path, log(1)), NIGHT), [0.9])
+    np.testing.assert_allclose(_basal_at(_last_slot_history(tmp_path, log(2)), NIGHT), [np.nan])
+
+
+def test_a_delete_of_an_unseen_slot_ends_the_stretch_so_later_evidence_does_not_reach_back(tmp_path):
+    delete = [_segment(dt.datetime(2025, 9, 10), 4, profile=0, index=5, modification=1, start=1410, icr=5.0, isf=55, basal=1.0)]
+    # Evidence exists only after the delete (09-12); the days before it stay unknown.
+    history = _last_slot_history(tmp_path, _rates(0.9, day=dt.datetime(2025, 9, 12)), extra=delete)
+    np.testing.assert_allclose(_basal_at(history, dt.datetime(2025, 9, 5, 22, 0), dt.datetime(2025, 9, 13, 22, 0)), [np.nan, 0.9])
+
+
+def test_rate_records_outside_the_visible_span_do_not_count(tmp_path):
+    history = _last_slot_history(tmp_path, _rates(0.9, day=dt.datetime(2025, 10, 5)))  # the archive's profile events end 2025-09-23
+    np.testing.assert_allclose(_basal_at(history, NIGHT), [np.nan])
+
+
+def test_records_logged_while_another_profile_is_active_do_not_count(tmp_path):
+    switch = [_activate(dt.datetime(2025, 9, 2, 12, 0), 4, profile=1, name="Other")]
+    history = _last_slot_history(tmp_path, _rates(0.9, day=dt.datetime(2025, 9, 3)), extra=switch)
+    np.testing.assert_allclose(_basal_at(history, NIGHT), [np.nan])
 
 
 def test_a_slot_added_after_the_confirmed_one_ends_the_confirmation(tmp_path):
