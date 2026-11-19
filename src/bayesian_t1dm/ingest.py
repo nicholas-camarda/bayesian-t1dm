@@ -786,6 +786,29 @@ def _load_canonical_normalized_table(path: Path) -> tuple[str, pd.DataFrame] | N
     return None
 
 
+def reconcile_carb_entries(carbs: pd.DataFrame) -> pd.DataFrame:
+    """Preserve individual pump requests and reconcile duplicate representations in a bolus or later export."""
+    carbs = carbs.copy()
+    source = carbs["_carb_source_priority"]
+    # Pump request sequence and exact time distinguish two entries of equal size in one slot.
+    # Older tables and hand logs have only a timestamp and grams.
+    exact = pd.to_datetime(carbs.get("event_time", carbs["timestamp"]), format="mixed")
+    carbs["_moment"] = exact.fillna(carbs["timestamp"])
+    keys = [c for c in ["pump_serial", "_moment", "source_seq_num", "carb_grams"] if c in carbs]
+    direct = carbs.loc[source.eq(0)].drop_duplicates(keys)
+    bolus = carbs.loc[source.ne(0)].drop_duplicates(keys)
+    if len(direct) and len(bolus):
+        slot = [c for c in ["timestamp", "pump_serial"] if c in carbs]
+        # A normalized bolus may hold the sum for the slot. An export may also repeat one request.
+        totals = direct.groupby(slot, as_index=False, dropna=False)["carb_grams"].sum()
+        repeats = pd.concat([direct[slot + ["carb_grams"]], totals]).drop_duplicates()
+        identity = slot + ["carb_grams"]
+        keep = ~pd.MultiIndex.from_frame(bolus[identity]).isin(pd.MultiIndex.from_frame(repeats[identity]))
+        bolus = bolus.loc[keep]
+    return pd.concat([direct, bolus]).sort_values(["timestamp", "_moment"], kind="stable").drop(
+        columns=["_moment", "_carb_source_priority"]).reset_index(drop=True)
+
+
 def _dedupe_canonical_events(kind: str, frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty:
         return frame
@@ -874,7 +897,7 @@ def load_tandem_exports(raw_dir: str | Path, *, include_health_auto_export: bool
             elif kind == "bolus":
                 bolus_frames.append(frame)
                 if "carb_grams" in frame.columns:
-                    carb_frame = frame.loc[:, [column for column in ["timestamp", "carb_grams", "source_file", "source_sheet", "source_label"] if column in frame.columns]].copy()
+                    carb_frame = frame.loc[:, [column for column in ["timestamp", "carb_grams", "pump_serial", "source_file", "source_sheet", "source_label"] if column in frame.columns]].copy()
                     carb_frame["source_label"] = carb_frame.get("source_label", "bolus")
                     carb_frame["_carb_source_priority"] = 1
                     carb_frames.append(carb_frame)
@@ -1012,11 +1035,7 @@ def load_tandem_exports(raw_dir: str | Path, *, include_health_auto_export: bool
         sort_columns = [column for column in ["timestamp", "_carb_source_priority", "source_file", "source_label"] if column in carbs.columns]
         if sort_columns:
             carbs = carbs.sort_values(sort_columns, na_position="last")
-        dedupe_subset = [column for column in ["timestamp", "carb_grams"] if column in carbs.columns]
-        if dedupe_subset:
-            carbs = carbs.drop_duplicates(subset=dedupe_subset, keep="first")
-        carbs = carbs.drop(columns=[column for column in ["_carb_source_priority"] if column in carbs.columns])
-        ingested.carbs = _dedupe_canonical_events("carbs", carbs.reset_index(drop=True))
+        ingested.carbs = reconcile_carb_entries(carbs.dropna(subset=["carb_grams"]))
     ingested.manifest = build_export_manifest(ingested)
     if include_health_auto_export:
         return attach_health_auto_export(ingested, raw_path)

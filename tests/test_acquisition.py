@@ -784,3 +784,12 @@ def test_renormalizing_an_archived_window_never_rewrites_its_raw_folder(tmp_path
 
     assert {path.name: path.read_bytes() for path in raw_dir.iterdir()} == before
     assert (raw_dir.parent / "normalized" / "cgm.csv").exists()
+
+
+def test_two_equal_carb_requests_in_one_slot_survive_repeated_export():
+    window = ExportWindow(date(2024, 6, 1), date(2024, 6, 1))
+    first = {"eventDateTime": "2024-06-01T08:00:10", "carbs": 15, "pump_serial": "1", "source_seq_num": 2}
+    second = {**first, "eventDateTime": "2024-06-01T08:02:20", "source_seq_num": 3}
+    data, _ = normalize_tconnectsync_payloads({"carbs": [first, second, first]}, window=window, endpoint_family="carbs")
+    assert data.carbs.carb_grams.tolist() == [15, 15]
+    assert data.carbs.event_time.nunique() == 2
