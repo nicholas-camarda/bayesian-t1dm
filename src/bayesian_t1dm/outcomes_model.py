@@ -133,6 +133,21 @@ def build_design(table: pd.DataFrame, *, outcome: str, center: pd.Series | None 
     )
 
 
+def _variance_inflation(matrix: np.ndarray) -> np.ndarray:
+    """Variance inflation factor of each column: 1 / (1 - R^2) of its least-squares fit on the other columns (huge, never negative, for exact collinearity)."""
+    centered = matrix - matrix.mean(axis=0)
+    factors = np.empty(centered.shape[1])
+    for column in range(centered.shape[1]):
+        others = np.delete(centered, column, axis=1)
+        if others.shape[1] == 0:
+            factors[column] = 1.0
+            continue
+        fitted = others @ np.linalg.lstsq(others, centered[:, column], rcond=None)[0]
+        unexplained = float(np.sum((centered[:, column] - fitted) ** 2) / np.sum(centered[:, column] ** 2))
+        factors[column] = 1.0 / max(unexplained, 1e-16)
+    return factors
+
+
 def collinearity(design: OutcomeDesign) -> pd.DataFrame:
     """Variance inflation factors of the covariates, raw and after removing each clock hour's mean; a covariate that does not vary within clock hours has no within-hour value (not assessed)."""
     out = {}
@@ -142,7 +157,7 @@ def collinearity(design: OutcomeDesign) -> pd.DataFrame:
     for label, values in (("vif_raw", frame), ("vif_within_hour", demeaned)):
         varying = values.std(ddof=0) > 1e-12
         vif = pd.Series(np.nan, index=values.columns)
-        vif[varying] = np.diag(np.linalg.inv(np.corrcoef(values.loc[:, varying].to_numpy(), rowvar=False)))
+        vif[varying] = _variance_inflation(values.loc[:, varying].to_numpy())
         out[label] = vif.to_numpy()
     table = pd.DataFrame(out, index=list(COVARIATES)).rename_axis("covariate").reset_index()
     values = table[["vif_raw", "vif_within_hour"]]
