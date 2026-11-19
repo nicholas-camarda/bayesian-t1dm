@@ -865,7 +865,7 @@ def _dedupe_canonical_events(kind: str, frame: pd.DataFrame) -> pd.DataFrame:
         out = out.dropna(subset=["start_timestamp", "end_timestamp", "basal_units_per_hour"])
         subset = [
             column
-            for column in ["start_timestamp", "end_timestamp", "basal_units_per_hour", "pump_serial", "tconnect_device_id"]
+            for column in ["start_timestamp", "end_timestamp", "basal_units_per_hour", "pump_serial", "tconnect_device_id", "start_utc", "end_utc"]
             if column in out.columns
         ]
         return out.drop_duplicates(subset=subset, keep="first").reset_index(drop=True)

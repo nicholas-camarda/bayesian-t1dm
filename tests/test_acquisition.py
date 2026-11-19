@@ -793,3 +793,16 @@ def test_two_equal_carb_requests_in_one_slot_survive_repeated_export():
     data, _ = normalize_tconnectsync_payloads({"carbs": [first, second, first]}, window=window, endpoint_family="carbs")
     assert data.carbs.carb_grams.tolist() == [15, 15]
     assert data.carbs.event_time.nunique() == 2
+
+
+@pytest.mark.parametrize(("day", "start", "end", "expected"),
+                         [(date(2025, 3, 9), "01:58:00-05:00", "03:03:00-04:00", [2, 3]),
+                          (date(2025, 11, 2), "01:58:00-04:00", "01:03:00-05:00", [3, 2])])
+def test_basal_preserves_elapsed_exposure_at_clock_change(day, start, end, expected):
+    window = ExportWindow(day, day)
+    data, _ = normalize_tconnectsync_payloads(
+        {"basal": [{"startDateTime": f"{day}T{start}", "endDateTime": f"{day}T{end}", "basalRate": 1}]},
+        window=window, endpoint_family="basal", timezone="America/New_York",
+    )
+    elapsed = (data.basal.end_timestamp - data.basal.start_timestamp).dt.total_seconds() / 60
+    assert elapsed.tolist() == expected
