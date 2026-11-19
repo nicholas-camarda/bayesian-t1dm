@@ -26,7 +26,7 @@ Every page opens with the question, a one-sentence answer, how much to trust it 
 - macOS or Linux with Conda
 - A Tandem Source account (pump data is pulled with [`tconnectsync`](https://github.com/jwoglom/tconnectsync) 3.x)
 - Optional: Apple Health exports from the Health Auto Export app (JSON)
-- The Bayesian models compile with PyTensor's C backend. On macOS 15 or later PyTensor passes `-ld64` to clang, which the current Xcode linker rejects (`library 'd64' not found`); point `PYTENSOR_FLAGS=cxx=<path>` at a `clang++` wrapper that drops that argument
+- The Bayesian models run on PyTensor's Numba backend. `environment.yml` sets `PYTENSOR_FLAGS=mode=NUMBA,cxx=`, so the conda environment needs no C compiler; run the models with `conda run -n bt1dm` or an activated `bt1dm` environment
 
 ## Install
 

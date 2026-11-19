@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
-import os
-import tempfile
 from dataclasses import dataclass
 
 import numpy as np
-
-os.environ.setdefault("PYTENSOR_FLAGS", f"compiledir={tempfile.gettempdir()}/bayesian_t1dm_pytensor")
 
 
 @dataclass(frozen=True)
