@@ -203,6 +203,7 @@ class LatentMealResearchResult:
     tier_summary: pd.DataFrame | None = None
     tier_summary_markdown: str = ""
     effective_icr_evidence: pd.DataFrame | None = None
+    icr_support: pd.DataFrame | None = None
 
 
 @dataclass(frozen=True)
@@ -3106,6 +3107,7 @@ def _first_meal_window_trajectories(
     window_metrics: pd.DataFrame,
     *,
     programmed_units: pd.Series | None = None,
+    missing_basal_windows: set[str] | None = None,
     postmeal_minutes: int = 180,
     basal_reference_minutes: int = 180,
     insulin_action_minutes: int = 300,
@@ -3139,6 +3141,10 @@ def _first_meal_window_trajectories(
             & ordered["timestamp"].le(anchor_time + pd.Timedelta(minutes=postmeal_minutes))
         ]
         if post.empty:
+            continue
+        if programmed_units is not None and scheduled_basal.loc[post.index].isna().any():
+            if missing_basal_windows is not None:
+                missing_basal_windows.add(str(row.meal_id))
             continue
         iob = pd.to_numeric(post["iob_units"], errors="coerce")
         bolus = pd.to_numeric(post["bolus_units"], errors="coerce").fillna(0.0)
@@ -3434,6 +3440,8 @@ def _effective_icr_evidence(
     settings: LatentMealTherapySettings,
     bevel_scale: float = float("nan"),
     bevel_pairs: int = 0,
+    support: list[dict[str, Any]] | None = None,
+    missing_basal_windows: set[str] | None = None,
 ) -> pd.DataFrame:
     """Effective I:C from accepted windows with a logged carb count, per segment and settings period.
 
@@ -3506,7 +3514,14 @@ def _effective_icr_evidence(
                 observed: list[tuple[dict[str, Any], int, CarbSensitivityObservation]] = []
                 for meal in period:
                     trajectory = trajectories.get(str(meal["row"].meal_id))
-                    if trajectory is None:
+                    missing = trajectory is None
+                    snapshot = support is not None and meal["source"] == "pump profile"
+                    if support is not None and analysis == "primary":
+                        support.append({"date": meal["timestamp"].date(), "segment": segment,
+                                        "historical_basal_supported": str(meal["row"].meal_id) not in (missing_basal_windows or set()),
+                                        "settings_supported": not snapshot,
+                                        "in_estimate": False})
+                    if missing or snapshot:
                         continue
                     tier = next(
                         (item for item in LATENT_MEAL_ANALYSIS_TIERS if str(item["analysis_tier"]) == str(getattr(meal["row"], "analysis_tier", "clean_reference"))),
@@ -3521,6 +3536,8 @@ def _effective_icr_evidence(
                         uncertainty_multiplier=float(tier["uncertainty_multiplier"]),
                     )
                     if observation is not None:
+                        if support is not None and analysis == "primary":
+                            support[-1]["in_estimate"] = True
                         observations.append(observation)
                         observed.append((meal, int(tier["analysis_tier_rank"]), observation))
                 period_fields = {
@@ -4629,6 +4646,7 @@ def run_latent_meal_icr_research(
     unlogged: pd.DataFrame | None = None,
     exercise: pd.DataFrame | None = None,
     meal_segments: tuple[str, ...] = ("morning",),
+    programmed_units: pd.Series | None = None,
 ) -> LatentMealResearchResult:
     if research_scope not in {"foundation", "full"}:
         raise ValueError(f"Unsupported research_scope: {research_scope}")
@@ -4674,7 +4692,9 @@ def run_latent_meal_icr_research(
     settings = _settings_for_estimation(therapy_settings)
     window_metrics = _attach_resolved_settings(window_metrics, settings)
     model_comparison, selected_model, params = _latent_meal_model_comparison(window_metrics, therapy_settings=settings)
-    trajectories = _first_meal_window_trajectories(research_frame, window_metrics)
+    missing_basal_windows: set[str] = set()
+    trajectories = _first_meal_window_trajectories(research_frame, window_metrics, programmed_units=programmed_units,
+                                                 missing_basal_windows=missing_basal_windows)
     posterior_meals = _build_latent_meal_posterior_meals(
         window_metrics,
         model_name=selected_model,
@@ -4686,7 +4706,9 @@ def run_latent_meal_icr_research(
     posterior_samples = _build_latent_carb_posterior_samples(window_metrics, settings=settings, params=params, trajectories=trajectories)
     window_metrics = _attach_logged_food(window_metrics, nutrition)
     bevel_scale, bevel_pairs = _logged_food_scale(research_frame, nutrition)
-    effective_icr_evidence = _effective_icr_evidence(window_metrics, trajectories, settings=settings, bevel_scale=bevel_scale, bevel_pairs=bevel_pairs)
+    support = [] if programmed_units is not None else None
+    effective_icr_evidence = _effective_icr_evidence(window_metrics, trajectories, settings=settings, bevel_scale=bevel_scale,
+                                                    bevel_pairs=bevel_pairs, support=support, missing_basal_windows=missing_basal_windows)
     gate, gate_markdown = _render_full_latent_meal_gate(dataset, meal_windows, posterior_meals, research_scope=research_scope)
     return LatentMealResearchResult(
         prepared_dataset=dataset,
@@ -4725,6 +4747,7 @@ def run_latent_meal_icr_research(
             effective_icr_evidence=effective_icr_evidence,
         ),
         effective_icr_evidence=effective_icr_evidence,
+        icr_support=pd.DataFrame(support, columns=["date", "segment", "historical_basal_supported", "settings_supported", "in_estimate"]) if support is not None else None,
     )
 
 

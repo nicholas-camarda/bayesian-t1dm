@@ -21,6 +21,7 @@ RUN_LAYOUT: dict[str, str] = {
     "A_outcomes/supporting/outcomes_daily.csv": "outcomes/outcomes_daily.csv",
     "B_icr/icr_proposal.md": "proposals/breakfast_proposal.md",
     "B_icr/segment_summary.csv": "proposals/segment_summary.csv",
+    "B_icr/supporting/icr_support.csv": "proposals/icr_support.csv",
     "B_icr/supporting/effective_icr_evidence.csv": "proposals/effective_icr_evidence.csv",
     "B_icr/supporting/proposal_row.csv": "proposals/breakfast_proposal.csv",
     "C_changes/change_log.md": "proposals/change_log.md",
