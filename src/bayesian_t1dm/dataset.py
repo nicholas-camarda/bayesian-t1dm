@@ -50,7 +50,7 @@ from .quality import REPORTED_NOT_FAILED_PLAUSIBILITY_REASONS, DataQualitySummar
 from .report_page import plain
 
 # Bump when merge, cleaning or feature code changes what the build produces; a version change forces a rebuild.
-DATASET_VERSION = 16
+DATASET_VERSION = 17
 HORIZON_MINUTES = 30
 
 
@@ -79,6 +79,7 @@ class MergedDataset:
     profile_events: pd.DataFrame = field(default_factory=pd.DataFrame)  # pump profile edits and switches, whole archive
     mode_events: pd.DataFrame = field(default_factory=pd.DataFrame)  # Control-IQ mode changes: pump_serial, sequence, timestamp, mode (0 standard, 1 sleep, 2 exercise)
     site_events: pd.DataFrame = field(default_factory=pd.DataFrame)  # cartridge, cannula and tubing fills
+    profile_rates: pd.DataFrame = field(default_factory=pd.DataFrame)  # the basal rate the active profile calls for, logged by the pump (event 279)
     grid: pd.DataFrame = field(default_factory=pd.DataFrame)  # every 5-minute slot with glucose (observed only), bolus, carbs and IOB
 
 
@@ -277,11 +278,11 @@ def build_merged_dataset(paths: ProjectPaths, *, raw_root: str | Path | None = N
 
     log("Reading Tandem data...")
     tandem = load_tandem_exports(raw_root, include_health_auto_export=False)
+    log("Decoding Control-IQ modes, site changes and the profile basal rate the pump logged...")
+    mode_events, site_events, profile_rates, device_event_span = decode_device_events(raw_root / "tconnectsync")
     log("Replaying pump profile history...")
     profile_events, profile_edits_visible = decode_profile_events(raw_root / "tconnectsync")
-    profile_settings = ProfileHistory(profile_events, profile_edits_visible).settings_for(tandem.carbs)
-    log("Decoding Control-IQ modes and site changes...")
-    mode_events, site_events, device_event_span = decode_device_events(raw_root / "tconnectsync")
+    profile_settings = ProfileHistory(profile_events, profile_edits_visible, profile_rates).settings_for(tandem.carbs)
     tandem.carbs = pd.concat([tandem.carbs.drop(columns=list(profile_settings.columns), errors="ignore"), profile_settings], axis=1)
     log("Adding Apple Health...")
     merged = attach_health_auto_export(tandem, raw_root)
@@ -316,6 +317,7 @@ def build_merged_dataset(paths: ProjectPaths, *, raw_root: str | Path | None = N
     _to_parquet(profile_events, out_dir / "tables" / "pump_profile_events.parquet")
     _to_parquet(mode_events, out_dir / "tables" / "pump_mode_events.parquet")
     _to_parquet(site_events, out_dir / "tables" / "site_events.parquet")
+    _to_parquet(profile_rates, out_dir / "tables" / "pump_profile_rates.parquet")
 
     manifest = {
         "dataset_version": DATASET_VERSION,
@@ -447,6 +449,7 @@ def load_merged_dataset(raw_root: str | Path, *, inputs: list[InputFile] | None 
         profile_events=pd.read_parquet(out_dir / "tables" / "pump_profile_events.parquet"),
         mode_events=pd.read_parquet(out_dir / "tables" / "pump_mode_events.parquet"),
         site_events=pd.read_parquet(out_dir / "tables" / "site_events.parquet"),
+        profile_rates=pd.read_parquet(out_dir / "tables" / "pump_profile_rates.parquet"),
         grid=pd.read_parquet(out_dir / "analysis_grid_5min.parquet"),
     )
 

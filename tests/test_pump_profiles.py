@@ -247,3 +247,57 @@ def test_values_at_use_exact_edit_time_and_pump(tmp_path):
     ratios = history.values_at(pd.Series(["10001"] * 3), stamps.iloc[:3], "carb_ratio_g_per_unit")
     np.testing.assert_allclose(ratios, [7.0, 7.0, 7.0])
     np.testing.assert_allclose(history.values_at(pd.Series(["10001"] * 3), stamps.iloc[:3], "isf_mgdl_per_unit"), [65.0, 65.0, 65.0])
+
+
+def _last_slot_history(tmp_path, rates, *, extra=()):
+    """A profile the archive never saw created: slot 0 from midnight (0.8 U/h) and slot 1 from 21:00 (0.9 U/h), switched on at 09-01."""
+    day = dt.datetime(2025, 9, 1)
+    records = [
+        _segment(day, 1, profile=0, index=0, modification=4, start=0, icr=7.0, isf=65, basal=0.8),
+        _segment(day, 2, profile=0, index=1, modification=4, start=1260, icr=6.0, isf=60, basal=0.9),
+        _activate(day, 3, profile=0, name="Main"),
+        *extra,
+    ]
+    home = tmp_path / str(len(list(tmp_path.iterdir())))  # one folder per history, so a test can build several
+    events, visible = decode_profile_events(_archive(home, {"2025-08-25__2025-09-23": records}))
+    return ProfileHistory(events, visible, rates)
+
+
+def _rates(rate, *, day=dt.datetime(2025, 9, 2), count=12, start_minute=23 * 60):
+    stamps = [day + dt.timedelta(minutes=start_minute + 5 * i) for i in range(count)]
+    return pd.DataFrame({"pump_serial": "1453346", "sequence": range(count), "timestamp": stamps, "rate": rate})
+
+
+def _basal_at(history, *stamps):
+    return history.values_at(pd.Series(["1453346"] * len(stamps)), pd.Series(stamps), "basal_units_per_hour")
+
+
+NIGHT = dt.datetime(2025, 9, 3, 22, 0)
+NOON = dt.datetime(2025, 9, 3, 12, 0)
+
+
+def test_a_last_slot_the_archive_cannot_close_stays_unknown_without_the_pumps_rate_log(tmp_path):
+    np.testing.assert_allclose(_basal_at(_last_slot_history(tmp_path, None), NOON, NIGHT), [0.8, np.nan])
+
+
+def test_the_pumps_rate_log_shows_the_last_slot_runs_to_midnight_and_changes_nothing_already_known(tmp_path):
+    history = _last_slot_history(tmp_path, _rates(0.9))
+    np.testing.assert_allclose(_basal_at(history, NOON, NIGHT), [0.8, 0.9])
+    assert history.values_at(pd.Series(["1453346"]), pd.Series([NIGHT]), "carb_ratio_g_per_unit")[0] == 6.0
+    assert history.segment_in_force("1453346", 0, NIGHT)["isf_mgdl_per_unit"] == 60
+
+
+def test_a_rate_log_that_disagrees_or_is_too_short_does_not_close_the_last_slot(tmp_path):
+    np.testing.assert_allclose(_basal_at(_last_slot_history(tmp_path, _rates(0.75)), NIGHT), [np.nan])
+    np.testing.assert_allclose(_basal_at(_last_slot_history(tmp_path, _rates(0.9, count=11)), NIGHT), [np.nan])
+    # Records before the last slot starts say nothing about it.
+    np.testing.assert_allclose(_basal_at(_last_slot_history(tmp_path, _rates(0.9, start_minute=20 * 60, count=12)), NIGHT), [np.nan])
+
+
+def test_a_slot_added_after_the_confirmed_one_ends_the_confirmation(tmp_path):
+    later = dt.datetime(2025, 9, 10)
+    extra = [_segment(later, 4, profile=0, index=2, modification=0, start=1410, icr=5.0, isf=55, basal=1.0)]
+    history = _last_slot_history(tmp_path, _rates(0.9), extra=extra)
+    before, after = dt.datetime(2025, 9, 5, 23, 45), dt.datetime(2025, 9, 12, 23, 45)
+    # Slot 1 (21:00) is now followed by a seen slot, so 22:00 is known on both sides; the new last slot (23:30) is unconfirmed.
+    np.testing.assert_allclose(_basal_at(history, before, dt.datetime(2025, 9, 12, 22, 0), after), [0.9, 0.9, np.nan])

@@ -118,7 +118,7 @@ def _checks(outcome: str, design: om.OutcomeDesign, diagnostics: FitDiagnostics,
                      "no concern" if better else "concern"))
     if skipped is not None and not skipped.empty:
         rows.append(("Rolling origins not scored", "; ".join(f"{row.origin}: {row.reason}" for row in skipped.itertuples()), "not assessed"))
-    rows.append(("Settings known for every row", "rows with any unknown setting moment are not modelled (see Denominators_Flow); unknown moments cluster in 2024 and in the 21:00-24:00 segment of the first pump", "not assessed"))
+    rows.append(("Settings known for every row", "rows with any unknown setting moment are not modelled (see Denominators_Flow); the remaining unknown moments are in early 2024, before the first pump's early profile slots were seen", "not assessed"))
     return pd.DataFrame(rows, columns=["check", "result", "status"])
 
 
@@ -144,7 +144,7 @@ def _warnings() -> pd.DataFrame:
         ("Association", "Settings and context change together and were chosen by the person and the controller in response to glucose; a coefficient is not the effect of changing that setting."),
         ("Settings that rarely changed", "A setting that changed a few times is estimated from those episodes; its interval is wide and its sign can follow whatever else changed then."),
         ("No slow drift term", "The person's level may drift over weeks or months; the model has only day-to-day effects. A random-walk level over weeks or 28-day blocks did not sample reliably (its scale is not identified beside the day effects), so a slow trend that coincides with a setting change can load on that setting."),
-        ("Rows with unknown settings", "Hours with any unknown setting moment, early 2024 and the 21:00-24:00 segment of the first pump, are not modelled."),
+        ("Rows with unknown settings", "Hours with any unknown setting moment, which are in early 2024 before the first pump's early profile slots were seen, are not modelled."),
         ("Rolling-origin window", "Four fortnights are scored; days in context-event fortnights and days with unknown settings are not, so some fortnights hold few days. The comparison with the last-28-day baseline is over the scored days only and carries no interval: a small difference in CRPS is within noise."),
         ("Context events", "Days listed in context_events.csv are left out, so the model says nothing about those days."),
     ]
