@@ -34,7 +34,7 @@ All real-data results produced before November 17, 2026 are void. Until then the
 
 These results come from tests and simulation, not from the personal data.
 
-- The test suite runs without clinical data in CI on Python 3.11, the version in `environment.yml`.
+- The test suite runs without clinical data in CI on Python 3.11 and 3.13.
 - The trajectory-based latent carb estimator recovers simulated carbohydrate. Against meals bolused for a mis-counted amount, bolus x I:C is off by about 17 g on average; the trajectory estimator is off by 2.5 to 9 g in seven of eight scenarios, with 90% intervals that cover truth at least 90% of the time. Reproduce with `bayesian-t1dm validate-latent-meal`.
 - With 20 logged meals, the effective I:C estimator recovers a true ratio of 8 or 12.5 against a programmed 10 to within about 3%.
 - The full command chain runs end to end on a simulated raw tree laid out like the Tandem archive (an automated test).
