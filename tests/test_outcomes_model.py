@@ -87,13 +87,13 @@ def test_collinearity_marks_a_covariate_constant_within_hours_as_not_assessed() 
     assert vif.loc["log_cf", "status"] == "not assessed"
 
 
-def test_thin_days_keeps_whole_days() -> None:
+def test_rolling_origin_skips_a_window_without_usable_days_and_says_why() -> None:
     table = synthetic_table(days=20)
-    thinned = om.thin_days(table, 5)
-    assert sorted(thinned["date"].unique()) == list(pd.date_range("2025-01-01", periods=20, freq="D")[::5])
-    assert len(thinned) == 4 * 24
-    with pytest.raises(ValueError):
-        om.thin_days(table, 0)
+    origin = pd.Timestamp("2025-01-15")
+    table.loc[table["date"] >= origin, "excluded_day"] = True
+    scores, skipped = om.rolling_origin(table, outcome="tir", origins=[origin], draws=10, tune=10, chains=2)
+    assert scores.empty
+    assert list(skipped["origin"]) == [origin.date()] and "no usable day" in skipped["reason"].iloc[0]
 
 
 def test_model_logp_is_finite_and_prior_predictive_respects_counts() -> None:
@@ -103,6 +103,7 @@ def test_model_logp_is_finite_and_prior_predictive_respects_counts() -> None:
     assert np.isfinite(model.compile_logp()(model.initial_point()))
     check = om.prior_predictive(design, samples=20)
     assert 0 <= check["overall_share_5th"] <= check["overall_share_95th"] <= 1
+    assert check["prior_mean"] == om.OUTCOME_PRIOR_MEAN["tir"]
 
 
 def test_fit_recovers_an_icr_coefficient() -> None:

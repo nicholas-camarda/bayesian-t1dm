@@ -32,7 +32,9 @@ import numpy as np
 import pandas as pd
 
 from .hour_day import SLOTS_PER_HOUR
-from .sampler_health import ESS_LIMIT, R_HAT_LIMIT, FitDiagnostics, extract_fit_diagnostics, sampler_gate
+from scipy.special import expit
+
+from .sampler_health import ESS_LIMIT, R_HAT_LIMIT, FitDiagnostics, extract_fit_diagnostics, sampler_gate, stack_draws
 
 LOGGER = logging.getLogger(__name__)
 
@@ -80,10 +82,13 @@ def covariate_frame(table: pd.DataFrame) -> pd.DataFrame:
     }, index=table.index)
 
 
+def _usable_mask(table: pd.DataFrame, covariates: pd.DataFrame) -> pd.Series:
+    return (table["n_valid"] > 0) & (table["settings_known_slots"] == SLOTS_PER_HOUR) & ~table["excluded_day"] & np.isfinite(covariates).all(axis=1)
+
+
 def usable_rows(table: pd.DataFrame) -> pd.Series:
     """Hours with readings, every setting known for all twelve moments, every covariate present and not on a context-event day."""
-    covariates = covariate_frame(table)
-    return (table["n_valid"] > 0) & (table["settings_known_slots"] == SLOTS_PER_HOUR) & ~table["excluded_day"] & np.isfinite(covariates).all(axis=1)
+    return _usable_mask(table, covariate_frame(table))
 
 
 def design_flow(table: pd.DataFrame) -> pd.DataFrame:
@@ -111,10 +116,12 @@ def build_design(table: pd.DataFrame, *, outcome: str, center: pd.Series | None 
     """
     if outcome not in OUTCOME_COLUMNS:
         raise ValueError(f"Unknown outcome {outcome!r}; choose from {sorted(OUTCOME_COLUMNS)}")
-    rows = table.loc[usable_rows(table)].reset_index(drop=True)
+    covariates = covariate_frame(table)
+    keep = _usable_mask(table, covariates)
+    rows = table.loc[keep].reset_index(drop=True)
     if rows.empty:
         raise ValueError("No usable hour-day rows")
-    covariates = covariate_frame(rows)
+    covariates = covariates.loc[keep].reset_index(drop=True)
     center = covariates.mean() if center is None else center
     scale = covariates.std(ddof=0).replace(0, 1.0) if scale is None else scale
     days = pd.DatetimeIndex(sorted(rows["date"].unique()))
@@ -166,20 +173,17 @@ def build_model(design: OutcomeDesign):
 
 
 def prior_predictive(design: OutcomeDesign, *, samples: int = 200) -> dict[str, float]:
-    """Prior predictive check: the share of draws whose daily share of readings is extreme, and the share of hours with all twelve readings in the outcome."""
+    """Prior predictive check: the 5th and 95th percentiles, over prior draws, of the overall share of readings in the outcome."""
     import pymc as pm
 
     with build_model(design):
         draws = pm.sample_prior_predictive(draws=samples, random_seed=SEED, var_names=["y"]).prior_predictive["y"].to_numpy().reshape(samples, -1)
     share = draws.sum(axis=1) / design.n.sum()
-    return {
-        "overall_share_5th": float(np.percentile(share, 5)), "overall_share_95th": float(np.percentile(share, 95)),
-        "hours_all_twelve_in_outcome": float(((draws == design.n[None, :]) & (design.n[None, :] == SLOTS_PER_HOUR)).mean()),
-    }
+    return {"overall_share_5th": float(np.percentile(share, 5)), "overall_share_95th": float(np.percentile(share, 95)), "prior_mean": OUTCOME_PRIOR_MEAN[design.outcome]}
 
 
 def fit(design: OutcomeDesign, *, draws: int, tune: int, chains: int, target_accept: float = TARGET_ACCEPT) -> tuple[object, FitDiagnostics, dict[str, float]]:
-    """Sample the model; returns the draws, the sampler diagnostics and the timing (model build, compile, sampling) in seconds."""
+    """Sample the model; returns the draws, the sampler diagnostics and the timing (model build, compile of the gradient, sampling) in seconds."""
     import pymc as pm
 
     timing: dict[str, float] = {}
@@ -187,8 +191,7 @@ def fit(design: OutcomeDesign, *, draws: int, tune: int, chains: int, target_acc
     model = build_model(design)
     timing["build_seconds"] = time.perf_counter() - started
     started = time.perf_counter()
-    logp = model.compile_logp()
-    logp(model.initial_point())
+    model.compile_dlogp()(model.initial_point())
     timing["compile_seconds"] = time.perf_counter() - started
     started = time.perf_counter()
     with model:
@@ -202,8 +205,6 @@ def fit(design: OutcomeDesign, *, draws: int, tune: int, chains: int, target_acc
 
 def _posterior_sample(idata, draws: int, seed: int) -> np.ndarray:
     """Sorted indices of ``draws`` posterior samples (chains x draws stacked) picked without replacement."""
-    from .sampler_health import stack_draws
-
     total = stack_draws(idata, "alpha").shape[0]
     return np.sort(np.random.default_rng(seed).choice(total, size=min(draws, total), replace=False))
 
@@ -213,15 +214,13 @@ def predict_day_shares(idata, held_out: OutcomeDesign, *, draws: int = 500, seed
 
     Day effects are new standard-normal draws, so the spread covers a day the model has not seen. Counts are simulated from the beta-binomial of each hour.
     """
-    from .sampler_health import stack_draws
-
     rng = np.random.default_rng(seed)
     pick = _posterior_sample(idata, draws, seed)
     alpha, beta, z_hour, hour_scale, day_scale, log_phi = (stack_draws(idata, name)[pick] for name in ("alpha", "beta", "z_hour", "hour_scale", "day_scale", "log_phi"))
     n_draws = len(pick)
     eta = (alpha[:, None] + hour_scale[:, None] * z_hour[:, held_out.hour]
            + day_scale[:, None] * rng.normal(size=(n_draws, len(held_out.days)))[:, held_out.day] + beta @ held_out.x.T)
-    mu = 1.0 / (1.0 + np.exp(-eta))
+    mu = expit(eta)
     phi = np.exp(log_phi)[:, None]
     share = rng.beta(mu * phi, (1.0 - mu) * phi)
     counts = rng.binomial(held_out.n[None, :], share)
@@ -232,8 +231,6 @@ def predict_day_shares(idata, held_out: OutcomeDesign, *, draws: int = 500, seed
 
 def posterior_eta(idata, design: OutcomeDesign, *, draws: int = 300, seed: int = SEED) -> tuple[np.ndarray, np.ndarray]:
     """Linear predictor of every training row for a thinned set of posterior draws (draws x rows), and the draw indices used."""
-    from .sampler_health import stack_draws
-
     pick = _posterior_sample(idata, draws, seed)
     alpha, beta, z_hour, z_day, hour_scale, day_scale = (stack_draws(idata, name)[pick] for name in ("alpha", "beta", "z_hour", "z_day", "hour_scale", "day_scale"))
     eta = alpha[:, None] + hour_scale[:, None] * z_hour[:, design.hour] + day_scale[:, None] * z_day[:, design.day] + beta @ design.x.T
@@ -242,11 +239,9 @@ def posterior_eta(idata, design: OutcomeDesign, *, draws: int = 300, seed: int =
 
 def hourly_check(idata, design: OutcomeDesign, *, draws: int = 300) -> pd.DataFrame:
     """Share of readings in the outcome by clock hour: observed, and the posterior predictive 5th, 50th and 95th percentiles."""
-    from .sampler_health import stack_draws
-
     eta, pick = posterior_eta(idata, design, draws=draws)
     rng = np.random.default_rng(SEED + 1)
-    mu = 1.0 / (1.0 + np.exp(-eta))
+    mu = expit(eta)
     phi = np.exp(stack_draws(idata, "log_phi")[pick])[:, None]
     counts = rng.binomial(design.n[None, :], rng.beta(mu * phi, (1.0 - mu) * phi))
     readings = np.bincount(design.hour, weights=design.n, minlength=24)
@@ -259,10 +254,8 @@ def hourly_check(idata, design: OutcomeDesign, *, draws: int = 300) -> pd.DataFr
 
 def effects_table(idata, design: OutcomeDesign, *, draws: int = 300) -> pd.DataFrame:
     """Each covariate's coefficient (log odds per standard deviation) and its change in the share of readings in the outcome, in percentage points per standard deviation."""
-    from .sampler_health import stack_draws
-
     eta, pick = posterior_eta(idata, design, draws=draws)
-    mu = 1.0 / (1.0 + np.exp(-eta))
+    mu = expit(eta)
     slope = (mu * (1.0 - mu)).mean(axis=1)
     beta = stack_draws(idata, "beta")[pick]
     points = 100.0 * beta * slope[:, None]
@@ -278,8 +271,6 @@ def effects_table(idata, design: OutcomeDesign, *, draws: int = 300) -> pd.DataF
 
 def scale_summary(idata) -> pd.DataFrame:
     """Posterior mean and 90% interval of the hour and day scales and the dispersion."""
-    from .sampler_health import stack_draws
-
     rows = []
     for name in ("hour_scale", "day_scale"):
         values = stack_draws(idata, name)
@@ -294,42 +285,41 @@ def daily_shares(design: OutcomeDesign) -> np.ndarray:
     return np.bincount(design.day, weights=design.y, minlength=len(design.days)) / np.bincount(design.day, weights=design.n, minlength=len(design.days))
 
 
-def rolling_origin(table: pd.DataFrame, *, outcome: str, origins: list[pd.Timestamp], span_days: int = 14, draws: int, tune: int, chains: int) -> pd.DataFrame:
+def rolling_origin(table: pd.DataFrame, *, outcome: str, origins: list[pd.Timestamp], span_days: int = 14, draws: int, tune: int, chains: int) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Fit on the days before each origin and score the next ``span_days`` days' daily share against the last-28-days baseline.
 
-    The model predicts each held-out day from that day's actual settings and context; the baseline draws one day at random from the 28 days before the origin and ignores the settings. Both are scored by CRPS and by whether the 90% interval holds the observed share. Every fit must pass the sampler gate.
+    The model predicts each held-out day from that day's actual settings and context; the baseline draws one day at random from the 28 days before the origin and ignores the settings. Both are scored by CRPS and by whether the 90% interval holds the observed share. Every fit must pass the sampler gate. An origin whose window has no usable day is not scored and is returned in the second table with the reason.
     """
     from .replay import crps
 
-    rows = []
+    rows, skipped = [], []
     for origin in origins:
         train_table = table[table["date"] < origin]
         held_table = table[(table["date"] >= origin) & (table["date"] < origin + pd.Timedelta(days=span_days))]
+        if not usable_rows(held_table).any():
+            LOGGER.warning("rolling origin %s skipped: no usable day in the next %d days", origin.date(), span_days)
+            skipped.append({"origin": origin.date(), "reason": f"no usable day in the {span_days} days from the origin (context-event days, unknown settings or no readings)"})
+            continue
         train = build_design(train_table, outcome=outcome)
         held = build_design(held_table, outcome=outcome, center=train.center, scale=train.scale)
-        idata, diagnostics, timing = fit(train, draws=draws, tune=tune, chains=chains)
+        idata, diagnostics, _ = fit(train, draws=draws, tune=tune, chains=chains)
         if not sampler_gate(diagnostics):
             raise RuntimeError(f"Rolling-origin fit before {origin.date()} fails the sampler gate: {diagnostics}")
         model_draws = predict_day_shares(idata, held)
-        recent = daily_shares(train)[train.days > train.days[-1] - pd.Timedelta(days=28)]
+        recent = daily_shares(train)[train.days >= origin - pd.Timedelta(days=28)]
+        if recent.size == 0:
+            LOGGER.warning("rolling origin %s skipped: no usable training day in the 28 days before it", origin.date())
+            skipped.append({"origin": origin.date(), "reason": "no usable training day in the 28 days before the origin for the baseline"})
+            continue
         observed = daily_shares(held)
         rng = np.random.default_rng([SEED, int(origin.strftime("%Y%m%d"))])
         baseline = rng.choice(recent, size=2000)
         for position, date in enumerate(held.days):
-            for name, draws_ in (("hour-day model", model_draws[:, position]), ("last 28 days", baseline)):
-                low, high = np.percentile(draws_, [5, 95])
-                rows.append({"origin": origin.date(), "date": date.date(), "predictor": name, "observed": observed[position], "predicted_mean": float(draws_.mean()),
-                             "lower_90": float(low), "upper_90": float(high), "crps": crps(draws_, observed[position]), "inside_90": bool(low <= observed[position] <= high),
-                             "fit_seconds": timing["sample_seconds"]})
-    return pd.DataFrame(rows)
-
-
-def thin_days(table: pd.DataFrame, step: int) -> pd.DataFrame:
-    """Every ``step``-th calendar day of the table, for timing pilots that keep the whole span (and so the variation in settings)."""
-    if step < 1:
-        raise ValueError("step must be at least 1")
-    day_number = (table["date"] - table["date"].min()).dt.days
-    return table[day_number % step == 0]
+            for name, predicted in (("hour-day model", model_draws[:, position]), ("last 28 days", baseline)):
+                low, high = np.percentile(predicted, [5, 95])
+                rows.append({"origin": origin.date(), "date": date.date(), "predictor": name, "observed": observed[position], "predicted_mean": float(predicted.mean()),
+                             "lower_90": float(low), "upper_90": float(high), "crps": crps(predicted, observed[position]), "inside_90": bool(low <= observed[position] <= high)})
+    return pd.DataFrame(rows), pd.DataFrame(skipped, columns=["origin", "reason"])
 
 
 def fortnight_origins(table: pd.DataFrame, count: int, span_days: int = 14) -> list[pd.Timestamp]:
@@ -348,7 +338,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--raw", default=None, help="Raw data root (default: the Project Vault data/raw)")
     parser.add_argument("--output", default=None, help="Output folder (default: runtime/output/outcomes_model)")
     parser.add_argument("--outcome", default="tir", choices=sorted(OUTCOME_COLUMNS))
-    parser.add_argument("--thin-days", type=int, default=1, help="Keep every Nth calendar day (a timing pilot; 1 keeps all)")
     parser.add_argument("--origins", type=int, default=4, help="Fortnightly rolling origins to score at the end (0 skips)")
     parser.add_argument("--draws", type=int, default=1000)
     parser.add_argument("--tune", type=int, default=1000)
@@ -362,7 +351,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=[logging.StreamHandler(), logging.FileHandler(output / f"outcomes_model_run_{run_id}.log")])
     started = time.time()
     LOGGER.info("outcomes model started run_id=%s outcome=%s raw=%s", run_id, args.outcome, raw)
-    table = thin_days(build_hour_day_table(load_analysis_data(raw)), args.thin_days)
+    table = build_hour_day_table(load_analysis_data(raw))
     design = build_design(table, outcome=args.outcome)
     LOGGER.info("design: %d rows, %d days\n%s", design.rows, len(design.days), design_flow(table).to_string(index=False))
     vif = collinearity(design)
@@ -378,8 +367,8 @@ def main(argv: list[str] | None = None) -> int:
     (output / f"outcomes_model_fit_{run_id}.json").write_text(json.dumps({"diagnostics": diagnostics.__dict__, "timing": timing}, indent=2))
     if not sampler_gate(diagnostics):
         raise RuntimeError(f"The fit fails the sampler gate (R-hat < {R_HAT_LIMIT}, ESS > {ESS_LIMIT}, no divergences): {diagnostics}")
-    scores = rolling_origin(table, outcome=args.outcome, origins=fortnight_origins(table, args.origins), draws=args.draws, tune=args.tune, chains=args.chains) if args.origins else None
-    write_outputs(outcome=args.outcome, table=table, design=design, idata=idata, diagnostics=diagnostics, timing=timing, vif=vif, prior=prior, origin_scores=scores,
+    scores, skipped = rolling_origin(table, outcome=args.outcome, origins=fortnight_origins(table, args.origins), draws=args.draws, tune=args.tune, chains=args.chains) if args.origins else (None, None)
+    write_outputs(outcome=args.outcome, table=table, design=design, idata=idata, diagnostics=diagnostics, timing=timing, vif=vif, prior=prior, origin_scores=scores, skipped_origins=skipped,
                   draws=args.draws, tune=args.tune, chains=args.chains, output=output, run_id=run_id, raw=raw, seconds=time.time() - started)
     LOGGER.info("outcomes model finished in %.1f s", time.time() - started)
     return 0
