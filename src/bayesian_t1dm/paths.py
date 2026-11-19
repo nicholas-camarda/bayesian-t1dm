@@ -36,6 +36,7 @@ class ProjectPaths:
     output_latent_meal: Path
     output_outcomes: Path
     output_replay: Path
+    output_outcomes_model: Path
     output_proposals: Path
     current: Path
     runs: Path
@@ -94,6 +95,7 @@ class ProjectPaths:
             output_latent_meal=runtime_path / "output" / "latent_meal",
             output_outcomes=runtime_path / "output" / "outcomes",
             output_replay=runtime_path / "output" / "replay",
+            output_outcomes_model=runtime_path / "output" / "outcomes_model",
             output_proposals=runtime_path / "output" / "proposals",
             current=runtime_path / "current",
             runs=runtime_path / "runs",
@@ -125,6 +127,7 @@ class ProjectPaths:
             self.output_latent_meal,
             self.output_outcomes,
             self.output_replay,
+            self.output_outcomes_model,
             self.output_proposals,
             self.runs,
             self.output_fixture,

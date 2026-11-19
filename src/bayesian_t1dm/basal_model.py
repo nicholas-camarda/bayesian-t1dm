@@ -12,14 +12,12 @@ from scipy.special import logsumexp
 from scipy.stats import norm
 
 from .basal_validation import HALF_LIFE_DAYS, HOLDOUT_DAYS, THRESHOLD
-from .sampler_health import FitDiagnostics, extract_fit_diagnostics, stack_draws
+from .sampler_health import extract_fit_diagnostics, sampler_gate, stack_draws
 
 LOGGER = logging.getLogger(__name__)
 WEEK_DAYS = 7
 TARGET_ACCEPT = 0.95
 MAX_TREEDEPTH = 10
-R_HAT_LIMIT = 1.01
-ESS_LIMIT = 400
 SEED = 20261118
 
 
@@ -67,12 +65,6 @@ def build_model(data: ControllerDesign):
         zero_probability = pm.Deterministic("p_zero", pm.math.sigmoid(zero_center + zero_scale * zero_effect))
         pm.Bernoulli("suspended", p=zero_probability[data.group], observed=~positive)
     return model
-
-
-def sampler_gate(diagnostics: FitDiagnostics) -> bool:
-    rhat, bulk, tail = diagnostics.rhat_max, diagnostics.ess_bulk_min, diagnostics.ess_tail_min
-    return bool(rhat is not None and bulk is not None and tail is not None and
-                rhat < R_HAT_LIMIT and min(bulk, tail) > ESS_LIMIT and diagnostics.divergences == 0)
 
 
 def fit_model(data: ControllerDesign, *, draws: int = 600, tune: int = 600, chains: int = 4):

@@ -16,6 +16,7 @@ It is research and decision support, not a medical device; nothing here changes 
 | Is there enough clean overnight data to judge basal? | `review-therapy-evidence` | `output/therapy/therapy_review.html` |
 | Is the Tandem data complete? | `ingest` | `output/source/coverage_review.html` |
 | Do outcomes after past settings changes differ from placebo dates? (exploratory) | `python -m bayesian_t1dm.replay` | `output/replay/replay_figure.png` |
+| How well do the settings in force and the context predict the share of readings in range, by clock hour? | `python -m bayesian_t1dm.outcomes_model` | `output/outcomes_model/outcomes_model_figure.png` |
 | Where does everything stand? | `status` | `output/current_status.html` |
 
 Every page opens with the question, a one-sentence answer, how much to trust it and what to do next; figures, tables and the files behind it fold out below. Methods are in [`docs/technical.md`](docs/technical.md); current scientific status is in [`docs/TECHNICAL_LAB_NOTEBOOK.md`](docs/TECHNICAL_LAB_NOTEBOOK.md).
@@ -25,6 +26,7 @@ Every page opens with the question, a one-sentence answer, how much to trust it 
 - macOS or Linux with Conda
 - A Tandem Source account (pump data is pulled with [`tconnectsync`](https://github.com/jwoglom/tconnectsync) 3.x)
 - Optional: Apple Health exports from the Health Auto Export app (JSON)
+- The Bayesian models compile with PyTensor's C backend. On macOS 15 or later PyTensor passes `-ld64` to clang, which the current Xcode linker rejects (`library 'd64' not found`); point `PYTENSOR_FLAGS=cxx=<path>` at a `clang++` wrapper that drops that argument
 
 ## Install
 
