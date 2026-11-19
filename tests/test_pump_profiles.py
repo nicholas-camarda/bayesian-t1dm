@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from bayesian_t1dm.pump_profiles import ProfileHistory, decode_profile_events
+from bayesian_t1dm.pump_profiles import PROFILE_EVENT, PROFILE_EVENT_COLUMNS, SEGMENT_EVENT, UNKNOWN_REASONS, ProfileHistory, decode_profile_events
 
 EPOCH = dt.datetime(2008, 1, 1)
 NO_RATES = pd.DataFrame(columns=["pump_serial", "sequence", "timestamp", "rate"])
@@ -339,3 +339,143 @@ def test_a_slot_added_after_the_confirmed_one_ends_the_confirmation(tmp_path):
     before, after = dt.datetime(2025, 9, 5, 23, 45), dt.datetime(2025, 9, 12, 23, 45)
     # Slot 1 (21:00) is now followed by a seen slot, so 22:00 is known on both sides; the new last slot (23:30) is unconfirmed.
     np.testing.assert_allclose(_basal_at(history, before, dt.datetime(2025, 9, 12, 22, 0), after), [0.9, 0.9, np.nan])
+
+
+def _reason_history() -> ProfileHistory:
+    """One synthetic pump whose profiles reach every branch of the replay that can leave a value unknown."""
+    rows: list[dict] = []
+
+    def add(when: str, **fields) -> None:
+        row = {name: np.nan for name in PROFILE_EVENT_COLUMNS}
+        row.update(pump_serial=SYNTHETIC_PUMP, timestamp=pd.Timestamp(when).to_pydatetime(), sequence=len(rows) + 1, profile_name="x", source_profile_id=0, **fields)
+        rows.append(row)
+
+    def segment(when: str, profile: int, index: int, start: int, *, status: int = 15, modification: int = 4) -> None:
+        add(when, event=SEGMENT_EVENT, profile_id=profile, status=status, segment_index=index, modification=modification, start_minutes=start,
+            basal_units_per_hour=0.8 + index / 10, isf_mgdl_per_unit=60 + index, target_bg_mgdl=110, carb_ratio_g_per_unit=7 + index)
+
+    add("2025-09-02 00:00", event=PROFILE_EVENT, profile_id=1, status=0)  # profile 1 is created in the archive: whole
+    segment("2025-09-02 00:00", 1, 0, 0, modification=0)
+    segment("2025-09-02 00:00", 1, 1, 720, modification=0)
+    segment("2025-09-02 01:00", 2, 0, 420)  # profile 2: only its 07:00 slot is ever seen, from 09:00 on 09-03
+    segment("2025-09-02 01:00", 4, 1, 1080)  # profile 4: slot 0 never seen
+    segment("2025-09-02 01:00", 5, 0, 0)  # profile 5: slot 1 never seen, slot 2 from 15:00
+    segment("2025-09-02 01:00", 5, 2, 900)
+    segment("2025-09-02 01:00", 6, 0, 0, status=3)  # profile 6: its only record lacks values
+    add("2025-09-02 06:00", event=PROFILE_EVENT, profile_id=1, status=3)
+    add("2025-09-03 00:00", event=PROFILE_EVENT, profile_id=7, status=3)  # profile 7 has no record at all
+    add("2025-09-03 06:00", event=PROFILE_EVENT, profile_id=3, status=3)  # profile 3: first record at 09:00
+    segment("2025-09-03 09:00", 3, 0, 420)
+    add("2025-09-03 12:00", event=PROFILE_EVENT, profile_id=4, status=3)
+    add("2025-09-04 00:00", event=PROFILE_EVENT, profile_id=5, status=3)
+    add("2025-09-04 18:00", event=PROFILE_EVENT, profile_id=6, status=3)
+    events = pd.DataFrame(rows).sort_values("timestamp", kind="stable").reset_index(drop=True)
+    return ProfileHistory(events, {SYNTHETIC_PUMP: (dt.date(2025, 9, 2), dt.date(2025, 9, 4))}, NO_RATES)
+
+
+def test_unknown_reasons_partition_exactly_the_times_values_at_cannot_show():
+    history = _reason_history()
+    stamps = pd.Series(pd.date_range("2025-09-01 00:00", "2025-09-05 00:00", freq="30min").tolist() * 2)
+    pumps = pd.Series([SYNTHETIC_PUMP] * (len(stamps) // 2) + ["another"] * (len(stamps) // 2))
+    reasons = history.unknown_reasons(pumps, stamps)
+    for field in ("basal_units_per_hour", "carb_ratio_g_per_unit", "isf_mgdl_per_unit", "target_bg_mgdl", "start_minutes"):
+        values = history.values_at(pumps, stamps, field)
+        assert (reasons == "").tolist() == np.isfinite(values).tolist(), field  # a reason exactly where the value is NaN
+    assert set(reasons) - {""} == set(UNKNOWN_REASONS)  # the fixture reaches every branch
+    assert set(reasons[len(stamps) // 2 :]) == {"no_visible_span"}
+    by_time = dict(zip(stamps[: len(stamps) // 2].astype(str), reasons[: len(stamps) // 2]))
+    assert by_time["2025-09-01 12:00:00"] == "outside_visible_span"
+    assert by_time["2025-09-02 03:00:00"] == "before_first_activation"
+    assert by_time["2025-09-02 12:00:00"] == ""
+    assert by_time["2025-09-03 03:00:00"] == "active_profile_never_seen"
+    assert by_time["2025-09-03 07:00:00"] == "before_profile_first_record"
+    assert by_time["2025-09-03 10:00:00"] == "last_slot_profile_not_whole"
+    assert by_time["2025-09-03 14:00:00"] == "before_first_known_start"
+    assert by_time["2025-09-04 10:00:00"] == "next_slot_unseen"
+    assert by_time["2025-09-04 20:00:00"] == "before_first_known_start"
+
+
+def test_a_created_segment_is_inserted_and_pushes_the_later_segments_down(tmp_path):
+    day = dt.datetime(2025, 9, 1)
+    records = [
+        _segment(day, 1, profile=0, index=0, modification=4, start=0, icr=7.0, isf=65, basal=0.8),
+        _segment(day, 2, profile=0, index=1, modification=4, start=1260, icr=6.0, isf=60, basal=0.9),
+        _activate(day, 3, profile=0, name="Main"),
+        _segment(dt.datetime(2025, 9, 5), 4, profile=0, index=1, modification=0, start=720, icr=5.0, isf=50, basal=1.0),
+    ]
+    events, visible = decode_profile_events(_archive(tmp_path, {"2025-08-25__2025-09-23": records}, serial=SYNTHETIC_PUMP))
+    history = ProfileHistory(events, visible, NO_RATES)
+    stamps = [dt.datetime(2025, 9, 6, 7, 0), dt.datetime(2025, 9, 6, 15, 0), dt.datetime(2025, 9, 6, 22, 0)]
+    # The 21:00 slot moved from index 1 to index 2; it is still the last, so its end is unknown without a rate log.
+    np.testing.assert_allclose(_basal_at(history, *stamps), [0.8, 1.0, np.nan])
+
+
+DAY = dt.datetime(2025, 9, 1)
+
+
+def _create_history(tmp_path, records):
+    events, visible = decode_profile_events(_archive(tmp_path, {"2025-08-25__2025-09-23": records}, serial=SYNTHETIC_PUMP))
+    return ProfileHistory(events, visible, NO_RATES)
+
+
+def _placeholder(when, sequence, *, index):
+    """A segment the pump creates with status 0: the values arrive in a later record."""
+    return _segment(when, sequence, profile=0, index=index, modification=0, start=0, icr=0.0, isf=0, basal=0.0, status=0)
+
+
+def test_a_created_segment_is_a_placeholder_until_a_later_record_fills_it(tmp_path):
+    records = [
+        _profile_action(DAY, 1, profile=0, status=0, name="Main"),
+        _placeholder(DAY, 2, index=0),
+        _segment(DAY, 3, profile=0, index=0, modification=3, start=0, icr=7.0, isf=65, basal=0.8),
+        _activate(DAY, 4, profile=0, name="Main"),
+    ]
+    history = _create_history(tmp_path, records)
+    stamps = [DAY + dt.timedelta(hours=3)]
+    np.testing.assert_allclose(_basal_at(history, *stamps), [0.8])
+    placeholder_only = _create_history(tmp_path / "b", records[:2] + records[3:])
+    assert np.isnan(_basal_at(placeholder_only, *stamps)).all()
+
+
+def test_a_segment_created_at_the_end_of_a_whole_profile_is_appended(tmp_path):
+    records = [
+        _profile_action(DAY, 1, profile=0, status=0, name="Main"),
+        _segment(DAY, 2, profile=0, index=0, modification=0, start=0, icr=7.0, isf=65, basal=0.8),
+        _segment(DAY, 3, profile=0, index=1, modification=0, start=720, icr=5.0, isf=50, basal=1.0),
+        _activate(DAY, 4, profile=0, name="Main"),
+    ]
+    np.testing.assert_allclose(_basal_at(_create_history(tmp_path, records), DAY + dt.timedelta(hours=5), DAY + dt.timedelta(hours=15)), [0.8, 1.0])
+
+
+def test_a_segment_created_past_the_end_of_a_whole_profile_raises(tmp_path):
+    records = [
+        _profile_action(DAY, 1, profile=0, status=0, name="Main"),
+        _segment(DAY, 2, profile=0, index=0, modification=0, start=0, icr=7.0, isf=65, basal=0.8),
+        _segment(DAY, 3, profile=0, index=2, modification=0, start=720, icr=5.0, isf=50, basal=1.0),
+    ]
+    with pytest.raises(ValueError, match="creates segment 2"):
+        _create_history(tmp_path, records)
+
+
+def test_a_segment_created_in_a_copy_does_not_change_its_source(tmp_path):
+    records = [
+        _profile_action(DAY, 1, profile=0, status=0, name="Main"),
+        _segment(DAY, 2, profile=0, index=0, modification=0, start=0, icr=7.0, isf=65, basal=0.8),
+        _profile_action(DAY, 3, profile=1, status=1, source=0, name="Copy"),
+        _segment(DAY, 4, profile=1, index=1, modification=0, start=720, icr=5.0, isf=50, basal=1.0),
+        _activate(DAY, 5, profile=1, name="Copy"),
+        _activate(DAY + dt.timedelta(days=1), 6, profile=0, name="Main"),
+    ]
+    history = _create_history(tmp_path, records)
+    copy_noon = DAY + dt.timedelta(hours=15)
+    np.testing.assert_allclose(_basal_at(history, copy_noon, copy_noon + dt.timedelta(days=1, hours=1)), [1.0, 0.8])
+
+
+def test_a_segment_created_in_a_profile_the_archive_never_saw_created_pads_the_unseen_slots(tmp_path):
+    records = [
+        _segment(DAY, 1, profile=0, index=2, modification=0, start=720, icr=5.0, isf=50, basal=1.0),
+        _activate(DAY, 2, profile=0, name="Main"),
+    ]
+    history = _create_history(tmp_path, records)
+    values = _basal_at(history, DAY + dt.timedelta(hours=5), DAY + dt.timedelta(hours=15))
+    assert np.isnan(values).all()          # slots 0 and 1 were never seen, so neither is the end of the new one

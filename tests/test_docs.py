@@ -19,6 +19,7 @@ REQUIRED_SECTIONS = (
     "## Hour-day table and settings in force",
     "## Replay of past setting changes (exploratory)",
     "## Hour-day outcomes model",
+    "## Data-quality audit (step A)",
 )
 
 
