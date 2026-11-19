@@ -67,10 +67,20 @@ def _finite_stat(values: np.ndarray, reducer) -> float | None:
     return float(reducer(finite))
 
 
-def _finite_dataset_stat(dataset, reducer) -> float | None:
-    # Independent parameter dimensions must never broadcast against one another.
-    extrema = [_finite_stat(np.asarray(item), reducer) for item in dataset.data_vars.values()]
-    return _finite_stat(np.asarray([value for value in extrema if value is not None]), reducer)
+def _dataset_extremum(dataset, reducer, name: str) -> float:
+    """Reduce each parameter on its own so independent dimensions never broadcast against one another.
+
+    A non-finite value means the diagnostic is undefined for that parameter, so convergence cannot be assessed.
+    """
+    extrema = []
+    for variable, item in dataset.data_vars.items():
+        values = np.asarray(item)
+        if not np.isfinite(values).all():
+            raise ValueError(f"{name} is not finite for parameter '{variable}'; convergence cannot be assessed")
+        extrema.append(reducer(values))
+    if not extrema:
+        raise ValueError(f"{name} was computed for no parameters")
+    return float(reducer(extrema))
 
 
 def extract_fit_diagnostics(
@@ -113,21 +123,9 @@ def extract_fit_diagnostics(
     ess_bulk_min: float | None = None
     ess_tail_min: float | None = None
     if az is not None and chains >= 2:
-        try:
-            rhat_dataset = az.rhat(posterior)
-            rhat_max = _finite_dataset_stat(rhat_dataset, np.max)
-        except Exception:
-            rhat_max = None
-        try:
-            ess_bulk_dataset = az.ess(posterior, method="bulk")
-            ess_bulk_min = _finite_dataset_stat(ess_bulk_dataset, np.min)
-        except Exception:
-            ess_bulk_min = None
-        try:
-            ess_tail_dataset = az.ess(posterior, method="tail")
-            ess_tail_min = _finite_dataset_stat(ess_tail_dataset, np.min)
-        except Exception:
-            ess_tail_min = None
+        rhat_max = _dataset_extremum(az.rhat(posterior), np.max, "R-hat")
+        ess_bulk_min = _dataset_extremum(az.ess(posterior, method="bulk"), np.min, "Bulk ESS")
+        ess_tail_min = _dataset_extremum(az.ess(posterior, method="tail"), np.min, "Tail ESS")
 
     return FitDiagnostics(
         draws=draws,
