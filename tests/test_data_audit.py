@@ -82,37 +82,71 @@ def test_calculator_and_basal_checks_agree_with_the_profile_and_flag_a_wrong_set
     assert checks["status"].tolist() == ["concern"] and issues["n"].sum() == 2
 
 
-def test_clock_jumps_classify_one_hour_zone_and_other_jumps():
-    zone = ZoneInfo("America/New_York")
-    table = pd.DataFrame({"hour_start": pd.date_range("2025-01-01", "2025-12-31 23:00", freq="h")})
+def _jump(stamp: str, minutes: float, sequence: int, event: int = audit.TIME_CHANGED_EVENT, pump: str = PUMP) -> dict:
+    when = pd.Timestamp(stamp)
+    return {"pump_serial": pump, "sequence": sequence, "timestamp": when, "previous_timestamp": when - pd.Timedelta(minutes=minutes), "event": event, "jump_minutes": minutes}
 
-    def jump(stamp: str, minutes: float, sequence: int, event: int = audit.TIME_CHANGED_EVENT) -> dict:
-        when = pd.Timestamp(stamp)
-        return {"pump_serial": PUMP, "sequence": sequence, "timestamp": when, "previous_timestamp": when - pd.Timedelta(minutes=minutes), "event": event, "jump_minutes": minutes}
 
+YEAR = pd.DataFrame({"hour_start": pd.date_range("2025-01-01", "2025-12-31 23:00", freq="h"), "date": pd.date_range("2025-01-01", "2025-12-31 23:00", freq="h").normalize(), "pump_serial": PUMP})
+NEW_YORK = ZoneInfo("America/New_York")
+
+
+def test_a_time_change_and_the_date_change_that_follows_it_net_to_one_shift():
     jumps = pd.DataFrame([
-        jump("2025-03-09 08:00", 60, 1),       # spring forward on 2025-03-09; the person sets the pump five hours after the wall clock jumps
-        jump("2025-06-01 09:00", 180, 2),      # a clock 3 hours away
-        jump("2025-06-20 09:00", -180, 3),     # and back
-        jump("2025-07-04 09:00", 600, 4),      # a clock far from the right time
-        jump("2025-08-01 09:00", -30, 5, event=90),  # an event stamped before the one preceding it
+        _jump("2025-06-02 00:00", -1462, 10, event=90),      # the new-day event stamped a day too early
+        _jump("2025-06-02 00:22", 22, 11, event=audit.DATE_CHANGED_EVENT),
+        _jump("2025-06-02 21:22", 1260, 12),                  # the time set 21 hours on
     ])
-    changes, checks, issues = audit.clock_jumps(jumps, table, zone=zone)
-    assert changes["class"].tolist() == ["one hour", "time-zone change (2-3.5 hours)", "time-zone change (2-3.5 hours)", "other jump"]
+    changes, checks, issues = audit.clock_jumps(jumps, YEAR, zone=NEW_YORK)
+    assert changes["class"].tolist() == ["time-zone change (2-3.5 hours)"] and changes["net_minutes"].iloc[0] == pytest.approx(-180)   # one change of 3 hours, not three jumps
+    assert checks.set_index("check").loc["Timestamp inversions", "result"] == 0               # the negative jump belongs to the clock change
+    assert issues["step"].tolist() == ["pump clock jump"] and issues["value"].tolist() == ["-180"]
+
+
+def test_clock_changes_are_classed_by_their_net_shift():
+    jumps = pd.DataFrame([
+        _jump("2025-03-09 08:00", 60, 100),                          # spring forward on 2025-03-09; the person sets the pump five hours after the wall clock jumps
+        _jump("2025-04-01 09:00", 5, 300),                           # under 50 minutes: no clock change
+        _jump("2025-06-01 09:00", 180, 500),
+        _jump("2025-06-20 09:00", -180, 700),                        # back from a clock three hours away
+        _jump("2025-07-04 09:00", 600, 900),                         # a clock far from the right time
+        _jump("2025-08-01 09:00", -30, 1100, event=90),              # an event stamped before the one preceding it, outside a clock change
+        _jump("2025-09-01 09:00", 1e7, 1300),                        # more than a month: the pump's clock set at first use
+    ])
+    changes, checks, issues = audit.clock_jumps(jumps, YEAR, zone=NEW_YORK)
+    assert changes["class"].tolist() == ["one hour", "time-zone change (2-3.5 hours)", "time-zone change (2-3.5 hours)", "other jump", "pump set-up"]
     assert changes["follows_clock_change"].tolist()[0] and changes["hours_after_clock_change"].iloc[0] == pytest.approx(5.0)   # the wall clock reads 03:00 right after the transition
     status = checks.set_index("check")["status"]
-    assert status["Clock changes at local clock-change dates"] == "no concern"
     assert status["Other clock jumps"] == "concern" and status["Timestamp inversions"] == "concern"
     assert status["Shared clock of glucose, bolus and settings"] == "not assessed"
-    assert issues["step"].value_counts().to_dict() == {"pump clock jump": 4, "timestamp inversion": 1}
+    assert issues["step"].value_counts().to_dict() == {"pump clock jump": 5, "timestamp inversion": 1}
     assert set(checks["status"]) <= STATUSES
+
+
+def test_time_away_from_home_follows_the_running_sum_and_ends_when_the_pump_is_back():
+    out_and_back = pd.DataFrame([_jump("2025-06-01 09:00", 180, 500), _jump("2025-06-11 09:00", -180, 7)])
+    _, checks, _ = audit.clock_jumps(out_and_back, YEAR, zone=NEW_YORK)
+    assert checks.set_index("check").loc["Time spent on a clock away from home", "result"].startswith("about 10 days")
+    with_other = pd.DataFrame([_jump("2025-06-01 09:00", 180, 500), _jump("2025-06-05 09:00", 960, 700), _jump("2025-06-11 09:00", -1140, 9)])   # an odd 16 hours on top of the 3, then home
+    _, checks, _ = audit.clock_jumps(with_other, YEAR, zone=NEW_YORK)
+    assert checks.set_index("check").loc["Time spent on a clock away from home", "result"].startswith("about 10 days")
+
+
+def test_a_local_clock_change_the_pump_never_followed_is_counted():
+    followed = pd.DataFrame([_jump("2025-03-09 08:00", 60, 1)])
+    _, checks, _ = audit.clock_jumps(followed, YEAR, zone=NEW_YORK)
+    row = checks.set_index("check").loc["Clock changes at local clock-change dates"]
+    assert row["result"].startswith("1 of 2 transitions uncorrected") and row["status"] == "concern"
+    both = pd.DataFrame([_jump("2025-03-09 08:00", 60, 100), _jump("2025-11-02 09:00", -60, 3)])
+    _, checks, _ = audit.clock_jumps(both, YEAR, zone=NEW_YORK)
+    assert checks.set_index("check").loc["Clock changes at local clock-change dates", "status"] == "no concern"
 
 
 def _unknown_table() -> pd.DataFrame:
     """Four weeks of hours: hours 0-5 of the second half have unknown settings and the same time in range as known hours of those hours."""
     hours = pd.date_range("2025-01-01", periods=28 * 24, freq="h")
     rng = np.random.default_rng(3)
-    table = pd.DataFrame({"hour_start": hours, "date": hours.normalize(), "hour": hours.hour, "n_valid": 12})
+    table = pd.DataFrame({"hour_start": hours, "date": hours.normalize(), "hour": hours.hour, "n_valid": 12, "excluded_day": False})
     table["settings_known_slots"] = 12
     table.loc[(table["date"] >= "2025-01-15") & (table["hour"] < 6), "settings_known_slots"] = 0
     night = table["hour"] < 6
@@ -170,7 +204,7 @@ def test_event_log_reader_finds_clock_changes_in_a_binary_window(tmp_path):
     raw.mkdir(parents=True)
     (raw / f"pump_events_raw_{PUMP}_x.txt").write_text(base64.b64encode(b"".join(records)).decode())
     log = report.read_event_log(tmp_path / "tconnectsync")
-    assert len(log["jumps"]) == 1 and log["jumps"]["event"].iloc[0] == 13 and log["jumps"]["jump_minutes"].iloc[0] == pytest.approx(65.0)
+    assert log["jumps"]["event"].tolist() == [13] and log["jumps"]["jump_minutes"].iloc[0] == pytest.approx(65.0)
     assert log["overview"]["events"].tolist() == [4]
 
 
@@ -221,6 +255,12 @@ def test_workbook_written_from_the_checks_reconciles_with_the_hour_day_table(tmp
     broken = {**sheets, "Denominators_Flow": sheets["Denominators_Flow"].assign(n=lambda f: np.where(f["stage"].eq("clock hours in the record"), 49, f["n"]))}
     with pytest.raises(RuntimeError, match="clock hours in the record"):
         report.reconcile(write_workbook(tmp_path / "broken.xlsx", broken), table, results)
+    unflagged = {**sheets, "Leakage": sheets["Leakage"].assign(status=lambda f: np.where(f["column"].eq("site_age_days"), "no concern", f["status"]))}
+    with pytest.raises(RuntimeError, match="site_age_days"):
+        report.reconcile(write_workbook(tmp_path / "unflagged.xlsx", unflagged), table, results)
+    miscounted = {**sheets, "Denominators_Flow": sheets["Denominators_Flow"].assign(n=lambda f: np.where(f["stage"].str.startswith("hours with readings and settings"), f["n"] + 1, f["n"]))}
+    with pytest.raises(RuntimeError, match="reasons leave"):
+        report.reconcile(write_workbook(tmp_path / "miscounted.xlsx", miscounted), table, results)
     summary = tmp_path / "summary.md"
     report.write_summary(summary, read_workbook(path), "test")
     assert "test" in summary.read_text()
@@ -242,3 +282,118 @@ def _merged(analysis):
     rates = pd.DataFrame({"pump_serial": [PUMP], "timestamp": [DAY1 + pd.Timedelta(hours=12)], "rate": [0.8]})
     return SimpleNamespace(tandem_data=SimpleNamespace(cgm=cgm, basal=basal, bolus=boluses, carbs=carbs), profile_events=analysis.history.events, profile_rates=rates,
                            data=analysis.merged.data, manifest={"dataset_version": "synthetic", "built_at": "n/a"})
+
+
+def test_zero_readings_are_reported_apart_from_readings_of_1_to_39():
+    stamps = _slots("2025-09-01", 30)
+    glucose = np.linspace(100, 160, 30).round()
+    glucose[3], glucose[4], glucose[5] = 0.0, 0.0, 35.0
+    raw = pd.DataFrame({"timestamp": stamps, "glucose": glucose, "pump_serial": PUMP, "duplicate_count": 1})
+    checks, issues = audit.cgm_duplicates_and_values(raw, raw[raw["glucose"] >= 40])
+    result = checks.set_index("check")["result"]
+    assert result["Zero-valued readings (sensor error)"] == 2 and result["Readings below the sensor floor (LOW)"].startswith("1;")
+    assert issues["reason"].value_counts().to_dict() == {"reading of 0 mg/dL (sensor error)": 2, "reading of 1 to 39 mg/dL (LOW)": 1}
+
+
+def test_pump_eras_overlap_is_read_from_slots_not_whole_days():
+    table = pd.DataFrame({"n_valid": [12, 12]})
+    first, second = _slots("2025-09-01 20:00", 12), _slots("2025-09-01 21:00", 12)       # the hand-over is on one date, in different slots
+    raw = pd.DataFrame({"timestamp": list(first) + list(second), "pump_serial": ["900001"] * 12 + ["900002"] * 12})
+    row = audit.pump_eras(raw, table).set_index("check").loc["Pump eras overlap"]
+    assert row["status"] == "no concern" and row["result"] == "0 slots; 1 dates"
+    raw.loc[raw["pump_serial"].eq("900002"), "timestamp"] = list(first)
+    assert audit.pump_eras(raw, table).set_index("check").loc["Pump eras overlap", "status"] == "concern"
+
+
+def test_a_pump_change_with_no_readings_in_a_block_is_not_assessed():
+    hours = pd.date_range("2025-01-01", periods=60 * 24, freq="h")
+    table = pd.DataFrame({"date": hours.normalize(), "hour": hours.hour, "pump_serial": np.where(hours < "2025-02-10", "900001", "900002"), "n_valid": 0,
+                          "n_in_range": 0, "n_below_70": 0, "glucose_sum": 0.0, "n_below_54": 0, "n_above_180": 0})
+    assert audit.pump_change_break(table)["status"].tolist() == ["not assessed"] * 3
+
+
+def _gap_table(low_next_to_gap: int, low_elsewhere: int) -> pd.DataFrame:
+    hours = pd.date_range("2025-01-01", periods=200 * 24, freq="h")
+    table = pd.DataFrame({"date": hours.normalize(), "hour": hours.hour, "n_valid": 12, "n_in_range": 10, "n_below_70": low_elsewhere, "n_above_180": 0, "settings_known_slots": 12, "excluded_day": False})
+    table.loc[::24, "n_valid"] = 0
+    table.loc[table["n_valid"].eq(0), "n_below_70"] = 0
+    neighbours = (table["n_valid"].shift(1).eq(0) | table["n_valid"].shift(-1).eq(0)) & table["n_valid"].gt(0)
+    table.loc[neighbours, "n_below_70"] = low_next_to_gap
+    return table
+
+
+def test_hours_next_to_a_gap_are_judged_by_a_ratio_of_time_below_70():
+    status = lambda t: audit.missingness(t).set_index("check").loc["Hours next to a gap in readings (is missing not at random?)", "status"]   # noqa: E731
+    assert status(_gap_table(3, 1)) == "concern"      # 3 times as much time below 70 next to a gap, though the difference is only a few points
+    assert status(_gap_table(1, 1)) == "no concern"
+
+
+def test_unknown_hours_clustered_in_one_month_are_a_concern_even_when_spread_over_the_day():
+    hours = pd.date_range("2025-01-01", periods=300 * 24, freq="h")
+    table = pd.DataFrame({"date": hours.normalize(), "hour": hours.hour, "n_valid": 12, "n_in_range": 9, "n_below_70": 0, "n_above_180": 0, "settings_known_slots": 12, "excluded_day": False})
+    table.loc[(table["date"] < "2025-01-15"), "settings_known_slots"] = 0
+    row = audit.missingness(table).set_index("check").loc["Hours with settings not known for all 12 moments"]
+    assert row["status"] == "concern" and "in 2025-01" in row["reason"]
+
+
+def test_composition_test_leaves_out_unknown_hours_in_cells_without_known_hours():
+    table = _unknown_table()
+    table.loc[(table["date"] >= "2025-01-15") & (table["hour"] == 23), "settings_known_slots"] = 0   # unknown at 23:00 whole record: no known hour in those cells after mid-January
+    table.loc[(table["date"] < "2025-01-15") & (table["hour"] == 23), "n_valid"] = 0                 # and no known 23:00 hour before
+    summary, check = audit.composition_test(table, draws=100, seed=2)
+    assert summary["readings"].iloc[2] < (table["settings_known_slots"].lt(12) & table["n_valid"].gt(0)).mul(table["n_valid"]).sum()
+    assert "left out of both sides" in check["result"].iloc[0] and not check["result"].iloc[0].split("; ")[-1].startswith("0.0%")
+
+
+def test_composition_test_leaves_out_context_event_days():
+    table = _unknown_table()
+    with_all, _ = audit.composition_test(table, draws=50, seed=2)
+    table.loc[table["date"].between("2025-01-16", "2025-01-20"), "excluded_day"] = True
+    without, _ = audit.composition_test(table, draws=50, seed=2)
+    assert without["readings"].iloc[2] < with_all["readings"].iloc[2]
+
+
+def test_carbohydrate_windows_are_whole_windows_and_a_window_without_entries_counts():
+    days = pd.date_range("2025-01-01", periods=60)
+    when = list(days[:14]) + list(days[28:56]) + list(days[56:58])            # window 1 (days 14-27) has no entry; days 56-59 are a partial window
+    entries = pd.DataFrame({"event_time": pd.to_datetime(when) + pd.Timedelta(hours=8), "carb_grams": 30.0, "pump_serial": PUMP})
+    entries["timestamp"] = entries["event_time"]
+    bolus = pd.DataFrame({"timestamp": entries["event_time"], "bolus_units": 3.0, "bolus_type_raw": 16, "bolus_source_raw": 1, "requested_later_units": 0.0, "pump_serial": PUMP})
+    row = audit.meal_checks(entries, bolus)[0].set_index("check").loc["Carbohydrate entries per 14-day window"]
+    assert row["result"].startswith("1 of 4 whole windows (1 with no entry") and row["status"] == "concern"
+
+
+def test_stationarity_leaves_out_the_days_the_model_drops():
+    days = pd.date_range("2025-01-01", periods=70)
+    table = pd.DataFrame({"date": np.repeat(days, 24), "hour": np.tile(np.arange(24), 70), "n_valid": 12, "n_in_range": 9, "n_below_70": 0, "n_below_54": 0, "n_above_180": 3, "glucose_sum": 12 * 120.0,
+                          "settings_known_slots": 12, "excluded_day": False})
+    table.loc[table["date"].between("2025-03-01", "2025-03-10"), ["n_in_range", "excluded_day"]] = [0, True]   # ten days of poor glucose, all context-event days
+    assert audit.fortnight_series(table)["tir_pct"].eq(75.0).all()
+    assert audit.daily_series(table)["tir_pct"].eq(75.0).all()
+    assert len(audit.daily_series(table)) == 60
+
+
+def test_calculator_agreement_is_not_assessed_without_comparable_meals():
+    history = _analysis().history
+    meal = pd.Timestamp("2026-03-01 10:00")           # outside the span the profile history shows
+    carbs = pd.DataFrame({"event_time": [meal], "timestamp": [meal], "pump_serial": [PUMP], "carb_ratio_g_per_unit": [10.0], "isf_mgdl_per_unit": [65.0], "target_bg_mgdl": [110.0]})
+    checks, issues = audit.calculator_agreement(carbs, history)
+    assert checks["status"].tolist() == ["not assessed"] * 3 and issues.empty
+
+
+def test_the_reason_of_an_hour_with_tied_moments_does_not_depend_on_the_hash_seed():
+    from types import SimpleNamespace
+
+    first, second = audit.UNKNOWN_REASONS[1], audit.UNKNOWN_REASONS[4]
+    row = [first] * 6 + [second] * 6
+    history = SimpleNamespace(unknown_reasons=lambda pumps, moments: np.array((row * 3)[: len(moments)], dtype=object))
+    table = pd.DataFrame({"hour_start": pd.date_range("2025-09-01", periods=3, freq="h"), "pump_serial": PUMP})
+    assert audit.hour_unknown_reasons(history, table).tolist() == [first] * 3
+
+
+def test_reason_and_unknown_colors_are_not_the_pump_colors():
+    from bayesian_t1dm.figures import PUMP_STYLE, REASON_COLORS, UNKNOWN_SETTINGS_COLOR
+
+    pumps = {style.color for style in PUMP_STYLE.values()}
+    assert not pumps & set(REASON_COLORS.values()) and UNKNOWN_SETTINGS_COLOR not in pumps
+    assert len(set(REASON_COLORS.values())) == len(REASON_COLORS)

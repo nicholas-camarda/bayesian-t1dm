@@ -20,7 +20,7 @@ import pandas as pd
 
 from . import data_audit as audit
 from .diagnostics_workbook import read_workbook, write_workbook
-from .figures import NEUTRAL_BAND, NEUTRAL_BAR, NEUTRAL_LINE, PUMP_STYLE, REASON_COLORS, assert_ascii
+from .figures import NEUTRAL_BAND, NEUTRAL_BAR, NEUTRAL_LINE, PUMP_STYLE, REASON_COLORS, UNKNOWN_SETTINGS_COLOR, assert_ascii
 from .hour_day import SLOTS_PER_HOUR, build_hour_day_table, hour_day_flow
 from .outcomes_model import COVARIATES, design_flow
 from .publish import current_commit, working_tree_is_clean
@@ -58,6 +58,7 @@ def _binary_event_ids(path: Path, pump: str) -> pd.DataFrame:
 
 
 def _json_event_ids(path: Path) -> pd.DataFrame:
+    """Event code, time and sequence of every event of one archived pump-logs JSON file."""
     payload = json.loads(path.read_text(encoding="utf-8"))
     pump = pump_key(payload["pump_serial"])
     rows = [(pump, int(event["sequenceNumber"]), pd.Timestamp(event["pumpDateTime"]).tz_localize(None) if pd.Timestamp(event["pumpDateTime"]).tzinfo else pd.Timestamp(event["pumpDateTime"]), int(event["eventCode"]))
@@ -69,7 +70,7 @@ def read_event_log(tandem_root: str | Path) -> dict[str, pd.DataFrame]:
     """Clock jumps and sensor-session events from the archived pump events (every window, binary and JSON), deduplicated by pump and sequence.
 
     Returns:
-        ``jumps``: one row per pair of consecutive events (by sequence) whose timestamps differ by more than 20 minutes or go backward;
+        ``jumps``: one row per time-changed or date-changed event, and per event whose timestamp differs from the one before it (by sequence) by more than 20 minutes or goes backward;
         ``sessions``: join and stop events of the sensor (``kind``); ``overview``: events, first and last time per pump.
     """
     tandem_root = Path(tandem_root)
@@ -84,7 +85,8 @@ def read_event_log(tandem_root: str | Path) -> dict[str, pd.DataFrame]:
     events = pd.concat(pieces, ignore_index=True).drop_duplicates(["pump_serial", "sequence"]).sort_values(["pump_serial", "sequence"]).reset_index(drop=True)
     events["previous_timestamp"] = events.groupby("pump_serial")["timestamp"].shift()
     events["jump_minutes"] = (events["timestamp"] - events["previous_timestamp"]).dt.total_seconds() / 60.0
-    jumps = events[(events["jump_minutes"].abs() > JUMP_MINUTES) | (events["jump_minutes"] < -1)][["pump_serial", "sequence", "timestamp", "previous_timestamp", "event", "jump_minutes"]].reset_index(drop=True)
+    clock_events = events["event"].isin((TIME_CHANGED_EVENT, DATE_CHANGED_EVENT))
+    jumps = events[clock_events | (events["jump_minutes"].abs() > JUMP_MINUTES) | (events["jump_minutes"] < -1)][["pump_serial", "sequence", "timestamp", "previous_timestamp", "event", "jump_minutes"]].reset_index(drop=True)
     sessions = events[events["event"].isin(SESSION_EVENTS)].assign(kind=lambda f: f["event"].map(SESSION_EVENTS))[["pump_serial", "timestamp", "kind"]].reset_index(drop=True)
     overview = events.groupby("pump_serial").agg(events=("sequence", "size"), first=("timestamp", "min"), last=("timestamp", "max")).reset_index()
     return {"jumps": jumps, "sessions": sessions, "overview": overview}
@@ -152,11 +154,13 @@ def run_checks(analysis, table: pd.DataFrame, event_log: dict[str, pd.DataFrame]
 
 
 def _no_reading_issues(table: pd.DataFrame) -> pd.DataFrame:
+    """Record issues for the runs of hours without a valid CGM reading."""
     flags = table["n_valid"].eq(0).to_numpy()
     return audit._issues(audit._run_issues(table, flags, step="no readings (hours)", reason="no valid CGM reading in the hour", field="n_valid", value="0"))
 
 
 def _excluded_day_issues(table: pd.DataFrame) -> pd.DataFrame:
+    """Record issues for the runs of hours on days listed in context_events.csv."""
     flags = table["excluded_day"].to_numpy(dtype=bool)
     return audit._issues(audit._run_issues(table, flags, step="context-event day (hours)", reason="day listed in context_events.csv", field="excluded_day", value="True"))
 
@@ -166,6 +170,7 @@ def _excluded_day_issues(table: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def _specification() -> pd.DataFrame:
+    """The Specification_Coding sheet: question, claim type, unit, status meanings, thresholds and how the main checks are defined."""
     rows = [
         ("Question", "Is the record fit to be modelled: what does each stream hold, where is it unreliable, and does anything in how the hour-day table is built change how a result must be read?"),
         ("Claim type", "Descriptive. Nothing here estimates an effect; the checks say where later estimates could be distorted."),
@@ -173,14 +178,16 @@ def _specification() -> pd.DataFrame:
         ("Statuses", "no concern: the check ran and met its rule. concern: it ran and did not. not assessed: it could not be run (the reason says why). not applicable: descriptive, no rule."),
         ("Thresholds", f"Active time {int(100 * audit.ACTIVE_TIME_MIN)}% per {audit.WINDOW_DAYS}-day window (CGM consensus); flat run {audit.FLAT_RUN_SLOTS}+ identical readings; sensor range {audit.SENSOR_FLOOR_MGDL:.0f}-{audit.SENSOR_CEILING_MGDL:.0f} mg/dL; reconstruction agrees at {int(100 * audit.AGREEMENT_MIN)}% or more of compared moments; carbohydrate heaping at most {int(100 * audit.HEAPING_MAX_SHARE)}% multiples of 5 g. The thresholds are flags for reading results, not tests."),
         ("Unknown settings", "An hour's settings are unknown when any of its twelve 5-minute moments is not shown by the pump's profile history; the reason is the branch of ProfileHistory.values_at that returned no value (UNKNOWN_REASONS)."),
-        ("Composition test", "Hours with known settings are standardised to the clock-hour and calendar-quarter mix of the unknown hours (direct standardisation, weights = the unknown hours' share of readings in each clock-hour x quarter cell); 90% intervals resample days."),
+        ("Composition test", "Hours with known settings are standardised to the clock-hour and calendar-quarter mix of the unknown hours (direct standardisation, weights = the unknown hours' share of readings in each clock-hour x quarter cell); unknown hours in a cell with no known hours are left out of both sides; 90% intervals resample the same days for both sides, and a cell with no known reading in a resample is missing from it."),
         ("Pump-change break", "The step in 28-day outcomes at the pump change against the steps between all other adjacent non-overlapping 28-day blocks."),
+        ("Stationarity", "Trend, autocorrelation, fortnights and the composition test use the days the model uses: context-event days are left out."),
         ("Interpretation", "A concern is a reason to look before relying on a result, not a finding about the person's glucose."),
     ]
     return pd.DataFrame(rows, columns=["item", "value"])
 
 
 def _flow(table: pd.DataFrame, analysis, reasons: pd.Series) -> pd.DataFrame:
+    """The Denominators_Flow sheet: hours, readings and settings counts from the hour-day table, and the outcomes model's row flow."""
     flow = hour_day_flow(table)
     readings = int(table["n_valid"].sum())
     unknown_with = int((table["n_valid"].gt(0) & table["settings_known_slots"].lt(SLOTS_PER_HOUR)).sum())
@@ -196,6 +203,7 @@ STEP_FLOW = {"no readings (hours)": "hours without readings", "settings unknown 
 
 
 def _warnings() -> pd.DataFrame:
+    """The Warnings_Limitations sheet."""
     rows = [
         ("Record_Issues holds identifiers", "Its rows carry dates, hours and pump serials: the workbook goes to the Project Vault with the outputs and never to Git or public documentation."),
         ("Not an estimate", "The audit reads one person's record and states what the record contains; thresholds flag a check for review and are not tests."),
@@ -203,12 +211,14 @@ def _warnings() -> pd.DataFrame:
         ("LOW and HIGH", "The archive stores a glucose value per reading; readings below the sensor floor or above the ceiling are counted here and dropped by every analysis, so how they would enter an outcome is a separate decision."),
         ("Compression lows", "The compression-low check is a pattern (abrupt fall, short low, fast recovery at night), not a classification of a reading."),
         ("Leakage table", "The classification of when each covariate is known is a design judgement written in code; the settings column of the table gives how often the settings change over two weeks."),
-        ("Event log ids", "Sensor sessions are read from event ids 213/394 (join) and 214/447 (stop). Time changes are read as jumps in time between consecutive events, not from the payload of event 13."),
+        ("Event log ids", "Sensor sessions are read from event ids 213/394 (join) and 214/447 (stop). A clock change is the run of consecutive events that holds a time-changed (13) or date-changed (14) event, netted as the last timestamp minus the timestamp before the run; it is accurate to the minutes between the events and is not read from the payload of event 13. The time away from home assumes the pump clock was right when the pump was first used."),
+        ("Basal-log agreement", "The pump-logged basal rate (event 279) is also what confirms that a profile's last slot runs to midnight, so agreement in the last slot of a profile is partly circular; the calculator check at meals is the independent comparison."),
     ]
     return pd.DataFrame(rows, columns=["limitation", "detail"])
 
 
 def _provenance(table: pd.DataFrame, analysis, raw: str, run_id: str, seconds: float, files: list[str]) -> pd.DataFrame:
+    """The Artifacts_Provenance sheet: run id, commit and whether the working tree was clean, data version, span, seed and files."""
     manifest = analysis.merged.manifest
     dirty = not working_tree_is_clean(REPO_ROOT)
     rows = [("run id", run_id), ("commit", current_commit(REPO_ROOT)), ("working tree clean", "no" if dirty else "yes"), ("raw data root", raw), ("dataset version", manifest.get("dataset_version")), ("dataset built", manifest.get("built_at")),
@@ -245,6 +255,10 @@ def reconcile(path: Path, table: pd.DataFrame, results: dict) -> None:
     if int(flow["readings counted in the hour-day table"]) != int(flow["valid CGM readings (sensor range, one per slot)"]):
         raise RuntimeError("Readings in the hour-day table differ from the valid CGM readings")
     issues = workbook["Record_Issues"]
+    # The unknown-settings hours are recounted from the replay's reason codes, not from the table column the flow and the issues come from.
+    from_reasons = int((results["reasons"].ne("") & table["n_valid"].gt(0)).sum())
+    if from_reasons != int(flow[STEP_FLOW["settings unknown (hours with readings)"]]):
+        raise RuntimeError(f"The replay's reasons leave {from_reasons} hours with readings unknown, the flow says {int(flow[STEP_FLOW['settings unknown (hours with readings)']])}")
     for step, stage in STEP_FLOW.items():
         listed = int(issues.loc[issues["step"].eq(step), "n"].sum())
         if listed != int(flow[stage]):
@@ -254,11 +268,11 @@ def reconcile(path: Path, table: pd.DataFrame, results: dict) -> None:
     for name in CHECK_SHEETS:
         if workbook[name]["status"].isna().any():
             raise RuntimeError(f"Sheet {name} has a check without a status")
-    leakage = workbook["Leakage"]
-    for column in ("carbs_prev3h_g", "exercise_share", "sleep_mode_share", "site_age_days", "excluded_day"):
-        row = leakage[leakage["column"].str.contains(column)]
-        if row.empty or row["status"].iloc[0] != "concern":
-            raise RuntimeError(f"Leakage table does not flag {column}")
+    leakage = workbook["Leakage"].set_index("column")
+    for names, _, when, _ in audit.LEAKAGE:
+        used = any(audit.MODEL_COVARIATES.get(column.strip()) in COVARIATES for column in names.split(","))
+        if when != audit.KNOWN_AT_ORIGIN and (used or "excluded_day" in names) and leakage.loc[names, "status"] != "concern":
+            raise RuntimeError(f"Leakage table does not flag {names}, which the model reads or filters on and which is not known at the forecast origin")
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +280,7 @@ def reconcile(path: Path, table: pd.DataFrame, results: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _save(figure, output: Path, stem: str) -> list[Path]:
+    """Save a figure as png and svg in ``output`` and close it; returns the two paths."""
     import matplotlib.pyplot as plt
 
     paths = []
@@ -278,12 +293,14 @@ def _save(figure, output: Path, stem: str) -> list[Path]:
 
 
 def _pump_change(table: pd.DataFrame) -> pd.Timestamp | None:
+    """The start of the first hour whose pump differs from the one before, or None when the record has one pump."""
     pumps = table["pump_serial"].astype(str).to_numpy()
     change = np.flatnonzero(pumps[1:] != pumps[:-1]) + 1
     return pd.Timestamp(table["hour_start"].iloc[change[0]]) if len(change) else None
 
 
 def _era_of(dates: pd.Series, change: pd.Timestamp | None) -> pd.Series:
+    """The label first pump or second pump for each date, by the pump change."""
     return pd.Series(np.where(dates < change, "first pump", "second pump") if change is not None else "first pump", index=dates.index)
 
 
@@ -400,7 +417,7 @@ def figure_stationarity(results: dict, table: pd.DataFrame, output: Path) -> lis
         right.text(0.5, 0.5, "No hour with unknown settings", ha="center", va="center", transform=right.transAxes)
     else:
         labels = ["Known settings,\nas observed", "Known settings,\nstandardised to the\nunknown hours' mix", "Unknown settings"]
-        colors = [NEUTRAL_BAR, NEUTRAL_LINE, PUMP_STYLE["second pump"].color]
+        colors = [NEUTRAL_BAR, NEUTRAL_LINE, UNKNOWN_SETTINGS_COLOR]
         for position, (_, row) in enumerate(composition.iterrows()):
             lo, hi = (float(x) for x in row["interval_90"].split(" to "))
             right.errorbar(row["time_in_range_pct"], position, xerr=[[row["time_in_range_pct"] - lo], [hi - row["time_in_range_pct"]]], fmt="o", color=colors[position], capsize=4, linewidth=2.2, markersize=7)

@@ -408,3 +408,74 @@ def test_a_created_segment_is_inserted_and_pushes_the_later_segments_down(tmp_pa
     stamps = [dt.datetime(2025, 9, 6, 7, 0), dt.datetime(2025, 9, 6, 15, 0), dt.datetime(2025, 9, 6, 22, 0)]
     # The 21:00 slot moved from index 1 to index 2; it is still the last, so its end is unknown without a rate log.
     np.testing.assert_allclose(_basal_at(history, *stamps), [0.8, 1.0, np.nan])
+
+
+DAY = dt.datetime(2025, 9, 1)
+
+
+def _create_history(tmp_path, records):
+    events, visible = decode_profile_events(_archive(tmp_path, {"2025-08-25__2025-09-23": records}, serial=SYNTHETIC_PUMP))
+    return ProfileHistory(events, visible, NO_RATES)
+
+
+def _placeholder(when, sequence, *, index):
+    """A segment the pump creates with status 0: the values arrive in a later record."""
+    return _segment(when, sequence, profile=0, index=index, modification=0, start=0, icr=0.0, isf=0, basal=0.0, status=0)
+
+
+def test_a_created_segment_is_a_placeholder_until_a_later_record_fills_it(tmp_path):
+    records = [
+        _profile_action(DAY, 1, profile=0, status=0, name="Main"),
+        _placeholder(DAY, 2, index=0),
+        _segment(DAY, 3, profile=0, index=0, modification=3, start=0, icr=7.0, isf=65, basal=0.8),
+        _activate(DAY, 4, profile=0, name="Main"),
+    ]
+    history = _create_history(tmp_path, records)
+    stamps = [DAY + dt.timedelta(hours=3)]
+    np.testing.assert_allclose(_basal_at(history, *stamps), [0.8])
+    placeholder_only = _create_history(tmp_path / "b", records[:2] + records[3:])
+    assert np.isnan(_basal_at(placeholder_only, *stamps)).all()
+
+
+def test_a_segment_created_at_the_end_of_a_whole_profile_is_appended(tmp_path):
+    records = [
+        _profile_action(DAY, 1, profile=0, status=0, name="Main"),
+        _segment(DAY, 2, profile=0, index=0, modification=0, start=0, icr=7.0, isf=65, basal=0.8),
+        _segment(DAY, 3, profile=0, index=1, modification=0, start=720, icr=5.0, isf=50, basal=1.0),
+        _activate(DAY, 4, profile=0, name="Main"),
+    ]
+    np.testing.assert_allclose(_basal_at(_create_history(tmp_path, records), DAY + dt.timedelta(hours=5), DAY + dt.timedelta(hours=15)), [0.8, 1.0])
+
+
+def test_a_segment_created_past_the_end_of_a_whole_profile_raises(tmp_path):
+    records = [
+        _profile_action(DAY, 1, profile=0, status=0, name="Main"),
+        _segment(DAY, 2, profile=0, index=0, modification=0, start=0, icr=7.0, isf=65, basal=0.8),
+        _segment(DAY, 3, profile=0, index=2, modification=0, start=720, icr=5.0, isf=50, basal=1.0),
+    ]
+    with pytest.raises(ValueError, match="creates segment 2"):
+        _create_history(tmp_path, records)
+
+
+def test_a_segment_created_in_a_copy_does_not_change_its_source(tmp_path):
+    records = [
+        _profile_action(DAY, 1, profile=0, status=0, name="Main"),
+        _segment(DAY, 2, profile=0, index=0, modification=0, start=0, icr=7.0, isf=65, basal=0.8),
+        _profile_action(DAY, 3, profile=1, status=1, source=0, name="Copy"),
+        _segment(DAY, 4, profile=1, index=1, modification=0, start=720, icr=5.0, isf=50, basal=1.0),
+        _activate(DAY, 5, profile=1, name="Copy"),
+        _activate(DAY + dt.timedelta(days=1), 6, profile=0, name="Main"),
+    ]
+    history = _create_history(tmp_path, records)
+    copy_noon = DAY + dt.timedelta(hours=15)
+    np.testing.assert_allclose(_basal_at(history, copy_noon, copy_noon + dt.timedelta(days=1, hours=1)), [1.0, 0.8])
+
+
+def test_a_segment_created_in_a_profile_the_archive_never_saw_created_pads_the_unseen_slots(tmp_path):
+    records = [
+        _segment(DAY, 1, profile=0, index=2, modification=0, start=720, icr=5.0, isf=50, basal=1.0),
+        _activate(DAY, 2, profile=0, name="Main"),
+    ]
+    history = _create_history(tmp_path, records)
+    values = _basal_at(history, DAY + dt.timedelta(hours=5), DAY + dt.timedelta(hours=15))
+    assert np.isnan(values).all()          # slots 0 and 1 were never seen, so neither is the end of the new one

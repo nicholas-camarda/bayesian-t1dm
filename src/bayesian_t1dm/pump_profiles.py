@@ -5,10 +5,11 @@ A Tandem pump logs every edit to a personal profile and every profile switch:
 - ``LID_IDP_TD_SEG`` (event 68): one time-of-day segment of one profile after a change, with its start time,
   basal rate, correction factor (ISF), target and carb ratio. ``modificationType`` says what changed. Replaying
   the archive shows 1 is a segment *deleted* (a profile copied from another is trimmed by deleting its segments
-  one at a time, each record carrying the deleted segment's values) and every other value (0 created, 2 start
-  time changed, 3-6 a value edited, 7 re-logged unchanged) leaves the segment at its index with these values;
-  this reading agrees with the t:slim's own calculator records for 99.9% of carb entries (the earlier
-  reading, 1 = insert and 2 = delete, agreed for 99.7% and left duplicate start times in 93 snapshots).
+  one at a time, each record carrying the deleted segment's values), 0 is a segment *created* (inserted at its
+  index, pushing the later segments down) and every other value (2 start time changed, 3-6 a value edited, 7
+  re-logged unchanged) leaves the segment at its index with these values; this reading agrees with the t:slim's
+  own calculator records (``data_audit`` reports the agreement). A segment created past the end of a profile
+  the archive saw created is an error, like a delete past the end.
   ``status`` is a bitmask of the values that are set, 15 meaning all four.
 - ``LID_IDP`` (event 69): an action on a whole profile; ``status`` 0 created, 1 copied (from ``sourceIdp``),
   2 deleted, 3 activated. ``LID_IDP_MSG2`` (57) carries the rest of the profile name.
@@ -312,7 +313,12 @@ class ProfileHistory:
                         raise ValueError(f"Profile history deletes segment {index} of profile {key} at {row.timestamp}, which it never saw.")
                     else:
                         unseen_change = True  # the profile predates the archive: the slot was never seen and the table stays partly unknown
-                elif int(row.modification) == SEGMENT_CREATE and index <= len(table):
+                elif int(row.modification) == SEGMENT_CREATE:
+                    if index > len(table):
+                        if key in self._whole:
+                            raise ValueError(f"Profile history creates segment {index} of profile {key} at {row.timestamp}, past the {len(table)} segments it saw.")
+                        table.extend([None] * (index - len(table)))  # the profile predates the archive: the slots before it were never seen
+                        unseen_change = True
                     table.insert(index, values if complete else None)  # a new segment pushes the later ones down
                 else:
                     table.extend([None] * (index + 1 - len(table)))

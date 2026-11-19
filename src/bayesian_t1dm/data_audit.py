@@ -25,7 +25,7 @@ from scipy.stats import kendalltau
 
 from .hour_day import GLUCOSE_COLUMNS, HOURS_PER_DAY, LOCAL_ZONE, SLOTS_PER_HOUR
 from .outcomes import READING_MINUTES, READINGS_PER_DAY, MIN_DAY_COVERAGE
-from .pump_profiles import pump_key
+from .pump_profiles import UNKNOWN_REASONS, pump_key
 
 CHECK_COLUMNS = ["check", "source", "statistic", "result", "rule", "status", "reason"]
 ISSUE_COLUMNS = ["step", "reason", "pump_serial", "start", "end", "n", "unit", "field", "value"]
@@ -51,18 +51,35 @@ MEAL_BOLUS_WINDOW = pd.Timedelta(minutes=10)
 
 
 def _row(check: str, source: str, statistic: str, result: object, rule: str, status: str, reason: str) -> dict[str, object]:
+    """One check row: what was checked, the stream it read, the statistic and its value, the rule, and the status with its reason.
+
+    Args:
+        check: the name of the check.
+        source: the stream or table the check reads.
+        statistic: what is measured.
+        result: the measured value, as shown.
+        rule: the rule that sets the status.
+        status: no concern, concern, not assessed or not applicable.
+        reason: what the status means for the analysis.
+
+    Returns:
+        The row as a dict keyed by ``CHECK_COLUMNS``.
+    """
     return {"check": check, "source": source, "statistic": statistic, "result": result, "rule": rule, "status": status, "reason": reason}
 
 
 def _frame(rows: Iterable[dict[str, object]]) -> pd.DataFrame:
+    """Check rows as a table with the ``CHECK_COLUMNS``, in order."""
     return pd.DataFrame(list(rows), columns=CHECK_COLUMNS)
 
 
 def _issues(rows: list[dict[str, object]]) -> pd.DataFrame:
+    """Record-issue rows as a table with the ``ISSUE_COLUMNS``, in order."""
     return pd.DataFrame(rows, columns=ISSUE_COLUMNS)
 
 
 def _pct(numerator: float, denominator: float) -> float:
+    """Percentage rounded to two places; NaN when the denominator is 0."""
     return float("nan") if not denominator else round(100.0 * float(numerator) / float(denominator), 2)
 
 
@@ -198,6 +215,7 @@ def cgm_duplicates_and_values(raw: pd.DataFrame, valid: pd.DataFrame) -> tuple[p
     """
     glucose = pd.to_numeric(raw["glucose"], errors="coerce")
     below, ceiling = glucose < SENSOR_FLOOR_MGDL, glucose >= SENSOR_CEILING_MGDL
+    zero, low_band = glucose == 0, (glucose > 0) & below
     low_total = int(((glucose < LOW_MGDL) & glucose.notna()).sum())
     dup = pd.to_numeric(raw["duplicate_count"], errors="coerce") if "duplicate_count" in raw else pd.Series(1, index=raw.index)
     stamps = pd.to_datetime(raw["timestamp"])
@@ -206,17 +224,21 @@ def cgm_duplicates_and_values(raw: pd.DataFrame, valid: pd.DataFrame) -> tuple[p
              "one reading per slot and pump" if not raw.duplicated(["timestamp", "pump_serial"]).any() else "duplicate slots remain after the merge"),
         _row("Raw reports merged into one slot", "Tandem CGM rows", "slots built from 2 or more raw reports", f"{_pct((dup > 1).sum(), len(raw))}% of slots (up to {int(dup.max())} reports)", "none", "not applicable",
              "a slot's reports come from overlapping downloads and backfill; they are one reading after the merge"),
-        _row("Readings below the sensor floor (LOW)", "Tandem CGM rows", f"readings under {SENSOR_FLOOR_MGDL:.0f} mg/dL (of which exactly 0)", f"{int(below.sum())} ({int((glucose == 0).sum())} are 0); {_pct(below.sum(), low_total)}% of the {low_total} readings under {LOW_MGDL:.0f}",
-             "readings under 40 are outside the reporting range and are left out of every analysis", "concern" if below.any() else "no concern",
-             "a LOW reading is dropped, not counted as below 54: time below 54 is slightly understated" if below.any() else "no reading under 40"),
+        _row("Zero-valued readings (sensor error)", "Tandem CGM rows", "readings of exactly 0 mg/dL", int(zero.sum()), "a reading of 0 is not a glucose value", "concern" if zero.any() else "no concern",
+             "a zero is a failed reading stored as a value; it is dropped from every analysis" if zero.any() else "no reading of 0"),
+        _row("Readings below the sensor floor (LOW)", "Tandem CGM rows", f"readings of 1 to {SENSOR_FLOOR_MGDL - 1:.0f} mg/dL", f"{int(low_band.sum())}; {_pct(low_band.sum(), low_total)}% of the {low_total} readings under {LOW_MGDL:.0f}",
+             "readings under 40 are outside the reporting range and are left out of every analysis", "concern" if low_band.any() else "no concern",
+             "a LOW reading is dropped, not counted as below 54: time below 54 is slightly understated" if low_band.any() else "no reading from 1 to 39"),
         _row("Readings at the sensor ceiling (HIGH)", "Tandem CGM rows", f"readings of {SENSOR_CEILING_MGDL:.0f} mg/dL or more", int(ceiling.sum()), "readings above 400 are outside the reporting range", "concern" if ceiling.any() else "no concern",
              "HIGH readings are dropped, so time above 250 is understated" if ceiling.any() else "none present; the maximum stored reading is " + f"{glucose.max():.0f} mg/dL"),
-        _row("Non-integer or missing glucose", "Tandem CGM rows", "rows", int(glucose.isna().sum() + (glucose.dropna() % 1 != 0).sum()), "readings are whole mg/dL", "no concern" if not (glucose.isna().any() or (glucose.dropna() % 1 != 0).any()) else "concern", "units look like mg/dL"),
+        _row("Non-integer or missing glucose", "Tandem CGM rows", "rows", int(glucose.isna().sum() + (glucose.dropna() % 1 != 0).sum()), "readings are whole mg/dL", "no concern" if not (glucose.isna().any() or (glucose.dropna() % 1 != 0).any()) else "concern",
+             "readings are whole mg/dL values" if not (glucose.isna().any() or (glucose.dropna() % 1 != 0).any()) else "some readings are missing or fractional, so they may not be mg/dL"),
         _row("Units", "valid CGM readings", "median glucose (mg/dL)", f"{valid['glucose'].median():.0f}", "a median under 30 would mean mmol/L", "no concern" if valid["glucose"].median() > 30 else "concern",
              "values are on the mg/dL scale" if valid["glucose"].median() > 30 else "values look like mmol/L"),
-        _row("Readings off the 5-minute grid", "Tandem CGM rows", "readings with a minute that is not a multiple of 5 or a non-zero second", int(((stamps.dt.minute % 5 != 0) | (stamps.dt.second != 0)).sum()), "every reading sits on its 5-minute slot", "no concern" if not ((stamps.dt.minute % 5 != 0) | (stamps.dt.second != 0)).any() else "concern", "readings are placed on 5-minute slots"),
+        _row("Readings off the 5-minute grid", "Tandem CGM rows", "readings with a minute that is not a multiple of 5 or a non-zero second", int(((stamps.dt.minute % 5 != 0) | (stamps.dt.second != 0)).sum()), "every reading sits on its 5-minute slot", "no concern" if not ((stamps.dt.minute % 5 != 0) | (stamps.dt.second != 0)).any() else "concern",
+             "readings are placed on 5-minute slots" if not ((stamps.dt.minute % 5 != 0) | (stamps.dt.second != 0)).any() else "some readings are off the 5-minute grid, so they were not placed in a slot"),
     ]
-    issues = [{"step": "CGM impossible value", "reason": "reading below 40 mg/dL" if low < SENSOR_FLOOR_MGDL else "reading at or above 400 mg/dL", "pump_serial": pump_key(pump), "start": ts, "end": ts, "n": 1, "unit": "readings", "field": "glucose_mgdl", "value": f"{low:.0f}"}
+    issues = [{"step": "CGM impossible value", "reason": "reading of 0 mg/dL (sensor error)" if low == 0 else "reading of 1 to 39 mg/dL (LOW)" if low < SENSOR_FLOOR_MGDL else "reading at or above 400 mg/dL", "pump_serial": pump_key(pump), "start": ts, "end": ts, "n": 1, "unit": "readings", "field": "glucose_mgdl", "value": f"{low:.0f}"}
               for ts, pump, low in zip(raw.loc[below | ceiling, "timestamp"], raw.loc[below | ceiling, "pump_serial"], glucose[below | ceiling])]
     series = valid.sort_values("timestamp")
     values = series["glucose"].to_numpy()
@@ -325,14 +347,14 @@ def sensor_sessions(sessions: pd.DataFrame, valid: pd.DataFrame) -> pd.DataFrame
 def pump_eras(raw: pd.DataFrame, table: pd.DataFrame) -> pd.DataFrame:
     """Check rows for the pumps behind the record: spans, overlap and hours that have to be assigned to a pump without readings."""
     pumps = raw.assign(pump=raw["pump_serial"].map(pump_key)).groupby("pump")["timestamp"].agg(["min", "max", "count"]).sort_values("min")
-    overlap = 0
-    names = list(pumps.index)
-    for first, second in zip(names[:-1], names[1:]):
-        overlap += max(0, int((pumps.loc[first, "max"] - pumps.loc[second, "min"]) / pd.Timedelta(days=1)))
+    stamped = raw.assign(pump=raw["pump_serial"].map(pump_key))
+    overlap = int((stamped.groupby("timestamp")["pump"].nunique() > 1).sum())
+    shared_days = int((stamped.assign(day=pd.to_datetime(stamped["timestamp"]).dt.normalize()).groupby("day")["pump"].nunique() > 1).sum())
     empty = table[table["n_valid"].eq(0)]
     return _frame([
         _row("Pump eras", "Tandem CGM rows", "pumps, first and last reading, readings", "; ".join(f"pump {name}: {row['min'].date()} to {row['max'].date()}, {row['count']} readings" for name, row in pumps.iterrows()), "none", "not applicable", "descriptive"),
-        _row("Pump eras overlap", "Tandem CGM rows", "days on which two pumps both report readings", overlap, "one pump per day", "no concern" if overlap == 0 else "concern", "the pumps' reading spans do not overlap" if overlap == 0 else "two pumps report at once, so settings may be read from the wrong one"),
+        _row("Pump eras overlap", "Tandem CGM rows", "5-minute slots with readings from two pumps; calendar dates on which both pumps report", f"{overlap} slots; {shared_days} dates", "no slot is reported by two pumps", "no concern" if overlap == 0 else "concern",
+             "the pumps never report the same slot; a hand-over date holds readings of both, each hour is assigned to one pump" if overlap == 0 else "two pumps report the same slot, so settings may be read from the wrong one"),
         _row("Hours without readings assigned a pump", "hour-day table", "hours with no readings (pump carried from a neighbour)", len(empty), "none", "not applicable", "the settings of such an hour come from the carried pump; the hour is not modelled (no readings)"),
     ])
 
@@ -366,9 +388,13 @@ def pump_change_break(table: pd.DataFrame, *, block_days: int = BLOCK_DAYS) -> p
             end = start - pd.Timedelta(days=1)
         blocks = blocks[::-1]
         steps = np.array([b[2] - a[2] for a, b in zip(blocks[:-1], blocks[1:])]) * scale
+        steps = steps[np.isfinite(steps)]
         before = _block_value(daily.loc[day - pd.Timedelta(days=block_days):day - pd.Timedelta(days=1)], measure)
         after = _block_value(daily.loc[day:day + pd.Timedelta(days=block_days - 1)], measure)
         step = (after - before) * scale
+        if not np.isfinite(step):
+            rows.append(_row(f"Break at the pump change: {label}", "hour-day table", f"{block_days} days after minus {block_days} days before", "", "", "not assessed", "the block before or after the change holds no readings"))
+            continue
         percentile = 100 * float((np.abs(steps) < abs(step)).mean())
         rows.append(_row(f"Break at the pump change: {label}", "hour-day table", f"{block_days} days after minus {block_days} days before",
                          f"{step:+.1f} (larger in size than {percentile:.0f}% of the {len(steps)} steps between other adjacent {block_days}-day blocks; their 5th to 95th percentile {np.percentile(steps, 5):+.1f} to {np.percentile(steps, 95):+.1f})",
@@ -378,18 +404,27 @@ def pump_change_break(table: pd.DataFrame, *, block_days: int = BLOCK_DAYS) -> p
 
 
 def _block_value(window: pd.DataFrame, measure: str) -> float:
+    """Pooled time in range, time below 70 (as fractions) or mean glucose of a block of days; NaN when the block holds no readings."""
+    if not window["n_valid"].sum():
+        return float("nan")
     if measure == "mean":
         return float(window["glucose_sum"].sum() / window["n_valid"].sum())
     column = {"tir": "n_in_range", "below70": "n_below_70"}[measure]
     return float(window[column].sum() / window["n_valid"].sum())
 
 
+NO_CHANGE_MAX_MINUTES = 50  # a net shift under this is the minutes between two events, not a clock change
 ONE_HOUR_MAX_MINUTES = 75
 ZONE_CHANGE_MAX_MINUTES = 210
+SETUP_MIN_DAYS = 30  # a net shift of more than a month is a pump whose clock was set when it was first used
+CLOCK_RUN_GAP = 2  # events whose sequence numbers differ by at most this belong to one clock change
 DST_FOLLOW_DAYS = 7
+AWAY_MIN_MINUTES = 90
 CLOCK_HOURS_SHARE_MAX = 0.01
 TRAVEL_DAYS_SHARE_MAX = 0.01
 TIME_CHANGED_EVENT = 13
+DATE_CHANGED_EVENT = 14
+CLOCK_EVENTS = (TIME_CHANGED_EVENT, DATE_CHANGED_EVENT)
 
 
 def _hours_since_clock_change(when: pd.Timestamp, zone: ZoneInfo) -> tuple[float, int] | None:
@@ -403,71 +438,130 @@ def _hours_since_clock_change(when: pd.Timestamp, zone: ZoneInfo) -> tuple[float
     return (when - hours[index]).total_seconds() / 3600.0, int(np.sign(offsets[index] - offsets[index - 1]))
 
 
+def _local_transitions(first: pd.Timestamp, last: pd.Timestamp, zone: ZoneInfo) -> pd.DataFrame:
+    """The days between ``first`` and ``last`` on which the local clock changes: ``date`` and ``direction`` (+1 spring forward, -1 fall back)."""
+    days = pd.date_range(first.normalize(), last.normalize(), freq="D")
+    noon = np.array([(day + pd.Timedelta(hours=12)).to_pydatetime().replace(tzinfo=zone).utcoffset().total_seconds() for day in days])
+    moved = np.flatnonzero(np.diff(noon) != 0) + 1
+    return pd.DataFrame({"date": days[moved], "direction": np.sign(noon[moved] - noon[moved - 1]).astype(int)})
+
+
+def clock_changes(jumps: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    """Net each pump clock change from the run of events that makes it.
+
+    Setting the pump's clock writes several events in a row: a time-changed event (13), a date-changed event (14) and often a
+    new-day event (90) stamped on the wrong date, each timed against the event before it. One change is the run of such events
+    whose sequence numbers are at most ``CLOCK_RUN_GAP`` apart; its net shift is the last timestamp minus the timestamp before
+    the run (so a +21 hour time change and the -24 hour date change that follows it net to the 3 hours the clock really moved).
+    The shift is accurate to the minutes between the events.
+
+    Args:
+        jumps: one row per event of interest by pump and sequence: ``pump_serial``, ``sequence``, ``timestamp``,
+            ``previous_timestamp``, ``event`` and ``jump_minutes``.
+
+    Returns:
+        One row per run with ``pump_serial``, ``previous_timestamp``, ``timestamp``, ``net_minutes``, ``events`` and ``class``; and a
+        boolean series over ``jumps`` marking the rows that belong to a run.
+    """
+    columns = ["pump_serial", "previous_timestamp", "timestamp", "net_minutes", "events", "class"]
+    inside = pd.Series(False, index=jumps.index)
+    rows = []
+    for pump, group in jumps.sort_values(["pump_serial", "sequence"]).groupby("pump_serial", sort=False):
+        sequence = group["sequence"].to_numpy()
+        cut = [0] + [k for k in range(1, len(group)) if sequence[k] - sequence[k - 1] > CLOCK_RUN_GAP] + [len(group)]
+        for a, b in zip(cut[:-1], cut[1:]):
+            part = group.iloc[a:b]
+            if not part["event"].isin(CLOCK_EVENTS).any():
+                continue
+            inside[part.index] = True
+            before, after = part["previous_timestamp"].iloc[0], part["timestamp"].iloc[-1]
+            net = (after - before).total_seconds() / 60.0
+            size = abs(net)
+            kind = ("pump set-up" if size > SETUP_MIN_DAYS * 1440 else "no net change" if size < NO_CHANGE_MAX_MINUTES else "one hour" if size <= ONE_HOUR_MAX_MINUTES
+                    else "time-zone change (2-3.5 hours)" if size <= ZONE_CHANGE_MAX_MINUTES else "other jump")
+            rows.append({"pump_serial": pump, "previous_timestamp": before, "timestamp": after, "net_minutes": net, "events": len(part), "class": kind})
+    return pd.DataFrame(rows, columns=columns), inside
+
+
 def clock_jumps(jumps: pd.DataFrame, table: pd.DataFrame, *, zone: ZoneInfo = LOCAL_ZONE) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Pump clock changes and timestamp inversions from the pump's own event sequence.
 
-    A clock change is a time-changed event (13); its size is the jump in time from the event before it in the pump's sequence
-    (accurate to the few minutes between two events). A one-hour change within a week after a local clock change is the person
-    setting the pump to the new time; the hours between the transition and that change are hours on the wrong clock.
+    A clock change is the run of time-changed, date-changed and new-day events written when the clock is set, netted by
+    ``clock_changes``. A one-hour change within a week after a local clock change is the person setting the pump to the new
+    time; the hours between the transition and that change are hours on the wrong clock. The time away from home is read from
+    the running sum of the net shifts of each pump (in half-hour steps), leaving out the changes that follow a local clock
+    change: while the sum is 90 minutes or more from 0, the pump clock is not the home clock.
 
     Args:
-        jumps: one row per pair of consecutive events (by sequence number) whose timestamps differ by more than 20 minutes or go
-            backward: ``pump_serial``, ``sequence``, ``timestamp``, ``previous_timestamp``, ``event`` and ``jump_minutes``.
+        jumps: ``pump_serial``, ``sequence``, ``timestamp``, ``previous_timestamp``, ``event`` and ``jump_minutes`` of the
+            time-changed and date-changed events and of every event that jumps by more than 20 minutes or backward.
         table: the hour-day table (the span the checks count over).
         zone: the home time zone whose clock changes the pump is expected to follow.
 
     Returns:
-        The table of time-changed events with a class, the check rows and the issue rows.
+        The table of netted clock changes with a class, the check rows and the issue rows.
     """
     if jumps.empty:
         return jumps, _frame([_row("Pump clock changes", "pump event log", "clock changes", 0, "", "not assessed", "no event log was supplied")]), _issues([])
     first_hour, last_hour = pd.Timestamp(table["hour_start"].min()), pd.Timestamp(table["hour_start"].max()) + pd.Timedelta(hours=1)
     inside = jumps[(jumps["timestamp"] >= first_hour) & (jumps["timestamp"] <= last_hour)]
-    changes = inside[inside["event"].eq(TIME_CHANGED_EVENT)].sort_values(["pump_serial", "sequence"]).copy()
-    size = changes["jump_minutes"].abs()
-    changes["class"] = np.where(size <= ONE_HOUR_MAX_MINUTES, "one hour", np.where(size <= ZONE_CHANGE_MAX_MINUTES, "time-zone change (2-3.5 hours)", "other jump"))
+    runs, in_run = clock_changes(inside)
+    changes = runs[~runs["class"].isin(["no net change"])].sort_values(["pump_serial", "timestamp"]).reset_index(drop=True)
     follows, lag = [], []
     for _, row in changes.iterrows():
         near = _hours_since_clock_change(row["timestamp"], zone) if row["class"] == "one hour" else None
-        ok = near is not None and np.sign(row["jump_minutes"]) == near[1]
+        ok = near is not None and np.sign(row["net_minutes"]) == near[1]
         follows.append(ok)
         lag.append(near[0] if ok else np.nan)
     changes["follows_clock_change"], changes["hours_after_clock_change"] = follows, lag
     hours_in_record = len(table)
     one = changes[changes["class"].eq("one hour")]
     misaligned = float(np.nansum(one["hours_after_clock_change"]))
-    zone_changes = changes[changes["class"].str.startswith("time-zone")]
-    away = 0.0
-    for _, group in changes[~changes["follows_clock_change"] & ~changes["class"].eq("other jump")].groupby("pump_serial"):
-        offset, previous = 0.0, None  # minutes the pump clock is from home time, in half-hour steps; a change that follows a local clock change is the pump catching up
-        for stamp, jump in zip(group["timestamp"], group["jump_minutes"]):
-            if previous is not None and abs(offset) >= 90:
+    transitions = _local_transitions(first_hour, last_hour, zone)
+    pumps_by_day = table.assign(day=pd.to_datetime(table["date"])).groupby("day")["pump_serial"].first().map(pump_key)
+    uncorrected = 0
+    for _, move in transitions.iterrows():
+        pump = pumps_by_day.get(move["date"])
+        caught_up = one[one["pump_serial"].map(pump_key).eq(pump) & one["follows_clock_change"] & (np.sign(one["net_minutes"]) == move["direction"])
+                        & one["timestamp"].between(move["date"], move["date"] + pd.Timedelta(days=DST_FOLLOW_DAYS))]
+        uncorrected += int(caught_up.empty)
+    spans = table.assign(pump=table["pump_serial"].map(pump_key)).groupby("pump")["hour_start"].agg(["min", "max"])
+    away, travel_changes = 0.0, 0
+    for pump, group in changes[~changes["follows_clock_change"] & ~changes["class"].eq("pump set-up")].groupby(changes["pump_serial"].map(pump_key)):
+        offset, previous = 0.0, None  # minutes the pump clock is from home time, in half-hour steps
+        for stamp, net in zip(group["timestamp"], group["net_minutes"]):
+            if previous is not None and abs(offset) >= AWAY_MIN_MINUTES:
                 away += (stamp - previous).total_seconds() / 86400
-            offset += np.round(jump / 30.0) * 30.0
+            offset += np.round(net / 30.0) * 30.0
+            travel_changes += 1
             previous = stamp
-        if previous is not None and abs(offset) >= 90:
-            away += max(0.0, (last_hour - previous).total_seconds() / 86400)
+        if previous is not None and abs(offset) >= AWAY_MIN_MINUTES and pump in spans.index:
+            away += max(0.0, (spans.loc[pump, "max"] + pd.Timedelta(hours=1) - previous).total_seconds() / 86400)
     other = changes[changes["class"].eq("other jump")]
-    unexplained = inside[(inside["jump_minutes"] < -1) & ~inside["event"].eq(TIME_CHANGED_EVENT)]
+    zone_changes = changes[changes["class"].str.startswith("time-zone")]
+    unexplained = inside[(inside["jump_minutes"] < -1) & ~in_run]
     classes = changes["class"].value_counts()
     days = hours_in_record / 24
+    n_events = int(in_run.sum())
     rows = [
-        _row("Pump clock changes", "pump event log", "time-changed events (13) in the record with a jump of more than 20 minutes", f"{len(changes)} ({'; '.join(f'{n} {k}' for k, n in classes.items())})", "none", "not applicable", "descriptive; the list is in Record_Issues"),
-        _row("Clock changes at local clock-change dates", "pump event log", "one-hour changes within 7 days after a local clock change; hours on the wrong clock before them", f"{int(one['follows_clock_change'].sum())} of {len(one)} one-hour changes follow a clock change (median {np.nanmedian(one['hours_after_clock_change']) if one['follows_clock_change'].any() else float('nan'):.1f} h after it); {misaligned:.0f} hours on the wrong clock ({100 * misaligned / max(hours_in_record, 1):.2f}% of hours)",
-             f"under {100 * CLOCK_HOURS_SHARE_MAX:.0f}% of hours", "no concern" if misaligned / max(hours_in_record, 1) < CLOCK_HOURS_SHARE_MAX else "concern",
-             "the pump is set to the new time within hours, so few hours carry the wrong clock" if misaligned / max(hours_in_record, 1) < CLOCK_HOURS_SHARE_MAX else "the pump runs on the old clock for hours after each clock change"),
-        _row("Time spent on a clock 2-3.5 hours from home", "pump event log", "days between a time-zone change out and back", f"{len(zone_changes)} changes; about {away:.0f} days ({100 * away / max(days, 1):.1f}% of the record)",
+        _row("Pump clock changes", "pump event log", "clock changes (runs of time-changed, date-changed and new-day events netted to one shift) over 50 minutes", f"{len(changes)} from {n_events} events ({'; '.join(f'{n} {k}' for k, n in classes.items())}); {len(runs) - len(changes)} runs net to under 50 minutes",
+             "none", "not applicable", "descriptive; the list is in Record_Issues"),
+        _row("Clock changes at local clock-change dates", "pump event log", "local clock changes (daylight-saving transitions) in the record with no one-hour change of the same direction in the next 7 days; hours on the wrong clock before the one-hour changes that did follow",
+             f"{uncorrected} of {len(transitions)} transitions uncorrected; {int(one['follows_clock_change'].sum())} of {len(one)} one-hour changes follow a transition (median {np.nanmedian(one['hours_after_clock_change']) if one['follows_clock_change'].any() else float('nan'):.1f} h after it); {misaligned:.0f} hours on the wrong clock ({100 * misaligned / max(hours_in_record, 1):.2f}% of hours)",
+             f"every transition followed within 7 days, and under {100 * CLOCK_HOURS_SHARE_MAX:.0f}% of hours on the wrong clock", "no concern" if uncorrected == 0 and misaligned / max(hours_in_record, 1) < CLOCK_HOURS_SHARE_MAX else "concern",
+             "the pump is set to the new time within hours, so few hours carry the wrong clock" if uncorrected == 0 and misaligned / max(hours_in_record, 1) < CLOCK_HOURS_SHARE_MAX else "the pump ran on the old clock after a local clock change (no catch-up in a week, or hours on the wrong clock above the limit)"),
+        _row("Time spent on a clock away from home", "pump event log", f"days on which the running sum of a pump's net clock shifts is {AWAY_MIN_MINUTES} minutes or more from 0 (2-3.5 hour changes: {len(zone_changes)}; all changes in the sum: {travel_changes})", f"about {away:.0f} days ({100 * away / max(days, 1):.1f}% of the record)",
              f"under {100 * TRAVEL_DAYS_SHARE_MAX:.0f}% of days", "no concern" if away / max(days, 1) < TRAVEL_DAYS_SHARE_MAX else "concern",
              "few days are away from the home clock" if away / max(days, 1) < TRAVEL_DAYS_SHARE_MAX else "hour of day is the pump's clock: on these days it is not the home clock hour, which blurs hour-of-day patterns and the time-of-day settings"),
-        _row("Other clock jumps", "pump event log", "time-changed events larger than 3.5 hours", f"{len(other)}" + (": " + ", ".join(str(t.date()) for t in other["timestamp"].head(8)) if len(other) else ""), "none", "no concern" if other.empty else "concern",
-             "no large clock jumps" if other.empty else "the pump clock was far from the correct time on these dates, so pump-stamped events (boluses, basal, settings) may be off by hours there"),
-        _row("Timestamp inversions", "pump event log", "events stamped earlier than the event before them, other than time-changed events", len(unexplained), "none expected", "no concern" if unexplained.empty else "concern",
-             "event order and time agree" if unexplained.empty else "the pump logged events out of time order (a clock reset)"),
+        _row("Other clock jumps", "pump event log", "netted clock changes larger than 3.5 hours", f"{len(other)}" + (": " + ", ".join(str(t.date()) for t in other["timestamp"].head(8)) if len(other) else ""), "none", "no concern" if other.empty else "concern",
+             "no large clock jumps" if other.empty else "the pump clock was far from the correct time around these dates, so pump-stamped events (boluses, basal, settings) may be off by hours there"),
+        _row("Timestamp inversions", "pump event log", "events outside a clock change stamped earlier than the event before them", len(unexplained), "none expected", "no concern" if unexplained.empty else "concern",
+             "event order and time agree" if unexplained.empty else "the pump logged events out of time order"),
         _row("Shared clock of glucose, bolus and settings", "pump event log", "CGM reading times come from the sensor's own time, bolus and basal from the pump clock", "not testable on the stored tables", "the two clocks agree when the pump clock was right",
              "not assessed", "the stored CGM table keeps one time per reading; the dates of clock errors above are where the two could differ"),
     ]
-    issues = [{"step": "pump clock jump", "reason": row["class"], "pump_serial": pump_key(row["pump_serial"]), "start": row["previous_timestamp"], "end": row["timestamp"], "n": 1, "unit": "events", "field": "jump_minutes", "value": f"{row['jump_minutes']:.0f}"}
-              for _, row in changes.iterrows()]
+    issues = [{"step": "pump clock jump", "reason": row["class"], "pump_serial": pump_key(row["pump_serial"]), "start": min(row["previous_timestamp"], row["timestamp"]) if row["class"] != "pump set-up" else row["timestamp"], "end": row["timestamp"], "n": 1, "unit": "clock changes",
+               "field": "net_minutes", "value": f"{row['net_minutes']:.0f}"} for _, row in changes.iterrows()]
     issues += [{"step": "timestamp inversion", "reason": "event stamped earlier than the one before it", "pump_serial": pump_key(row["pump_serial"]), "start": row["previous_timestamp"], "end": row["timestamp"], "n": 1, "unit": "events", "field": "jump_minutes", "value": f"{row['jump_minutes']:.0f}"}
                for _, row in unexplained.iterrows()]
     return changes, _frame(rows), _issues(issues)
@@ -547,7 +641,7 @@ def hour_unknown_reasons(history, table: pd.DataFrame) -> pd.Series:
     dominant = []
     for row in codes:
         names = [name for name in row if name]
-        dominant.append(max(set(names), key=names.count) if names else "")
+        dominant.append(min(set(names), key=lambda name: (-names.count(name), UNKNOWN_REASONS.index(name))) if names else "")  # ties go to the earlier reason in the replay's order
     return pd.Series(dominant, index=table.index, name="reason")
 
 
@@ -602,17 +696,24 @@ def calculator_agreement(carbs: pd.DataFrame, history) -> tuple[pd.DataFrame, pd
         late_match = ((logged[late] - rebuilt[late]).abs() <= tolerance).mean() if late.any() else float("nan")
         matched = int(known.sum() - differs.sum())
         share = matched / known.sum() if known.any() else float("nan")
+        if not known.any():
+            rows.append(_row(f"Pump calculator {label} against the reconstruction", "carbs table, ProfileHistory", "meals with the setting reconstructed whose logged value matches", "", "", "not assessed", "no meal has both a logged and a reconstructed value"))
+            continue
         ok = share >= AGREEMENT_MIN
         rows.append(_row(f"Pump calculator {label} against the reconstruction", "carbs table, ProfileHistory", "meals with the setting reconstructed whose logged value matches",
                          f"{matched} of {int(known.sum())} ({100 * share:.1f}%); {int((usable & ~rebuilt.notna()).sum())} of {int(usable.sum())} meals have no reconstruction; 21:00-23:59: {100 * late_match:.1f}% of {int(late.sum())}" + ("" if ok else f"; disagreements in {_where(stamps[differs])}"),
                          f"at least {100 * AGREEMENT_MIN:.0f}% match", "no concern" if ok else "concern",
-                         "the reconstructed setting is what the pump used at meals" if ok else "the reconstruction disagrees with what the pump used at those meals, so the settings of the hour-day table are wrong there (they are not unknown)"))
+                         "the reconstructed setting is what the pump used at meals" if ok else "the reconstruction disagrees with what the pump used at those meals, so the settings of the hour-day table are wrong there (they are not unknown); this is the check that does not use the pump's rate log"))
         issues += _disagreement_runs(stamps[differs], pumps[differs], step=f"calculator {label} differs from the reconstruction", field=field, unit="meals")
     return _frame(rows), _issues(issues)
 
 
 def basal_log_agreement(rates: pd.DataFrame, history, *, tolerance: float = 0.0006) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Does the reconstructed basal rate equal the rate the pump logs (event 279) as the active profile's, at every known moment?
+
+    The check is partly circular for the last slot of a profile: ``ProfileHistory`` uses the same event-279 records to confirm
+    that a profile's last slot runs to midnight, so a moment is known there only when the log already agrees with it, and
+    21:00-23:59 agreement says little. The pump calculator's values at meals (``calculator_agreement``) are the independent check.
 
     Returns:
         The check row and the issue rows (one per stretch of days with disagreeing records).
@@ -621,6 +722,8 @@ def basal_log_agreement(rates: pd.DataFrame, history, *, tolerance: float = 0.00
         return _frame([_row("Pump-logged profile basal rate against the reconstruction", "event 279", "agreement", "", "", "not assessed", "no event 279 records were supplied")]), _issues([])
     rebuilt = pd.Series(history.values_at(rates["pump_serial"], rates["timestamp"], "basal_units_per_hour"), index=rates.index)
     known = rebuilt.notna()
+    if not known.any():
+        return _frame([_row("Pump-logged profile basal rate against the reconstruction", "event 279", "agreement", "", "", "not assessed", "no logged rate falls at a moment with a reconstructed basal")]), _issues([])
     logged = rates["rate"].astype(float)
     differs = known & ((logged - rebuilt).abs() > tolerance)
     late = known & pd.to_datetime(rates["timestamp"]).dt.hour.ge(21)
@@ -628,10 +731,10 @@ def basal_log_agreement(rates: pd.DataFrame, history, *, tolerance: float = 0.00
     matched = int(known.sum() - differs.sum())
     share = matched / known.sum() if known.any() else float("nan")
     ok = share >= AGREEMENT_MIN
-    row = _row("Pump-logged profile basal rate against the reconstruction", "event 279 (profile basal rate), ProfileHistory", "records at known moments whose logged rate equals the reconstructed basal",
+    row = _row("Pump-logged profile basal rate against the reconstruction", "event 279 (profile basal rate), ProfileHistory", "records at known moments whose logged rate equals the reconstructed basal (partly circular for a profile's last slot, whose end the same records confirm)",
                f"{matched} of {int(known.sum())} ({100 * share:.2f}%); {int((~known).sum())} of {len(known)} records are at moments with unknown settings; 21:00-23:59: {100 * late_agree:.2f}% of {int(late.sum())}" + ("" if ok else f"; disagreements in {_where(rates.loc[differs, 'timestamp'])}"),
                f"at least {100 * AGREEMENT_MIN:.0f}% agree", "no concern" if ok else "concern",
-               "the pump's own log confirms the reconstructed rate" if ok else "the reconstructed basal differs from the pump's own log at those moments, so the settings of the hour-day table are wrong there (they are not unknown)")
+               "the pump's own log agrees with the reconstructed rate; the calculator check is the independent one" if ok else "the reconstructed basal differs from the pump's own log at those moments, so the settings of the hour-day table are wrong there (they are not unknown)")
     return _frame([row]), _issues(_disagreement_runs(rates.loc[differs, "timestamp"], rates.loc[differs, "pump_serial"], step="pump-logged basal rate differs from the reconstruction", field="basal_units_per_hour", unit="records"))
 
 
@@ -641,7 +744,7 @@ def replay_event_crosscheck(table: pd.DataFrame, history, profile_events: pd.Dat
     Forward: each event (consecutive days holding a changed hour) must have a raw segment edit to the then-active profile, or a profile
     activation, dated between the day before its first day and its last day. Reverse: each raw edit that changed a value of the profile
     running at the time, inside the pump's visible span and not on the day the pump changed, must fall inside some event's days.
-    The 15 isolated events are recomputed from the event dates (no other event within 14 days) and compared with the replay's own count.
+    The isolated events are recomputed from the event dates (no other event within 14 days) and compared with the replay's own count.
 
     Returns:
         The per-event table, the check rows and the issue rows (events without a raw record, raw edits without an event).
@@ -725,8 +828,12 @@ def meal_checks(carbs: pd.DataFrame, bolus: pd.DataFrame) -> tuple[pd.DataFrame,
     user_without_carb = int((user & ~carb_flag).sum())
     grams = pd.to_numeric(carbs["carb_grams"], errors="coerce").dropna()
     heaping = float((grams % 5 == 0).mean())
-    windows = entries.assign(window=(entries["when"] - entries["when"].min()).dt.days // WINDOW_DAYS).groupby("window").agg(entries=("carb_grams", "size"), median_g=("carb_grams", "median"), sd_g=("carb_grams", "std"))
+    n_windows = ((entries["when"].max() - entries["when"].min()).days + 1) // WINDOW_DAYS  # whole windows only: the trailing part of the record is not a window
+    window = (entries["when"] - entries["when"].min()).dt.days // WINDOW_DAYS
+    windows = entries[window < n_windows].assign(window=window).groupby("window").agg(entries=("carb_grams", "size"), median_g=("carb_grams", "median")).reindex(range(n_windows))
+    windows["entries"] = windows["entries"].fillna(0).astype(int)  # a window with no entry has no row until it is reindexed
     thin = int((windows["entries"] < WINDOW_DAYS).sum())
+    empty = int((windows["entries"] == 0).sum())
     later = int((pd.to_numeric(boluses["requested_later_units"], errors="coerce").fillna(0) > 0).sum())
     override = int(((kind & BOLUS_OVERRIDE_BIT) > 0).sum())
     ordered = entries.reset_index(drop=True)
@@ -744,8 +851,8 @@ def meal_checks(carbs: pd.DataFrame, bolus: pd.DataFrame) -> tuple[pd.DataFrame,
         _row("Calculator overrides and extended boluses", "bolus", "boluses with the override bit; boluses with a later part", f"{override} overrides, {later} extended", "none", "not applicable", "an override changes the dose the settings would give; the settings still describe the calculator"),
         _row("Rounding of carbohydrate entries", "carbs", "share of entries that are multiples of 5 g", f"{100 * heaping:.1f}% of {len(grams)} entries (about 20% if grams were spread evenly)", f"at most {100 * HEAPING_MAX_SHARE:.0f}%", "no concern" if heaping <= HEAPING_MAX_SHARE else "concern",
              "entries are not heavily rounded" if heaping <= HEAPING_MAX_SHARE else "entries are heavily rounded to 5 g, so each is a coarse estimate of the meal"),
-        _row("Carbohydrate entries per 14-day window", "carbs", "windows with fewer than 14 entries", f"{thin} of {len(windows)} (entries per window {windows['entries'].min()} to {windows['entries'].max()}; median grams per window {windows['median_g'].min():.0f} to {windows['median_g'].max():.0f})",
-             "none below one entry a day", "no concern" if thin == 0 else "concern", "carbohydrate logging is steady across windows" if thin == 0 else "some windows hold few entries, so carbohydrate exposure there is poorly measured"),
+        _row("Carbohydrate entries per 14-day window", "carbs", "windows with fewer than 14 entries", f"{thin} of {len(windows)} whole windows ({empty} with no entry; entries per window {windows['entries'].min()} to {windows['entries'].max()}; median grams per window {windows['median_g'].min():.0f} to {windows['median_g'].max():.0f})",
+             "none below one entry a day", "no concern" if thin == 0 else "concern", "carbohydrate logging is steady across windows" if thin == 0 else "some windows hold few or no entries, so carbohydrate exposure there is poorly measured"),
     ]), _issues(entry_issues)
 
 
@@ -778,17 +885,23 @@ def insulin_checks(bolus: pd.DataFrame, basal: pd.DataFrame) -> pd.DataFrame:
 def missingness(table: pd.DataFrame) -> pd.DataFrame:
     """Which hours lack readings or settings (by clock hour, year and weekday), and whether the hours next to a gap look different."""
     frame = table.assign(no_readings=table["n_valid"].eq(0), partial=table["n_valid"].between(1, SLOTS_PER_HOUR - 1), unknown=table["settings_known_slots"].lt(SLOTS_PER_HOUR),
-                         year=pd.to_datetime(table["date"]).dt.year, weekday=pd.to_datetime(table["date"]).dt.dayofweek)
+                         year=pd.to_datetime(table["date"]).dt.year, month=pd.to_datetime(table["date"]).dt.to_period("M").astype(str), weekday=pd.to_datetime(table["date"]).dt.dayofweek)
     rows = []
     for column, label in (("no_readings", "no readings"), ("unknown", "settings not known for all 12 moments")):
         overall = float(frame[column].mean())
         by_hour = frame.groupby("hour")[column].mean()
         by_year = frame.groupby("year")[column].mean()
         by_weekday = frame.groupby("weekday")[column].mean()
-        peak = by_hour.idxmax()
+        by_month = frame.groupby("month")[column].mean()
+        peak, peak_month = by_hour.idxmax(), by_month.idxmax()
         ratio = by_hour.max() / overall if overall else float("nan")
-        rows.append(_row(f"Hours with {label}", "hour-day table", "share of hours overall; highest clock hour; by year; by weekday (range)", f"{100 * overall:.2f}% overall; peak at {peak:02d}:00 ({100 * by_hour.max():.2f}%); by year {', '.join(f'{y}: {100 * v:.1f}%' for y, v in by_year.items())}; weekdays {100 * by_weekday.min():.2f} to {100 * by_weekday.max():.2f}%",
-                         "the highest clock hour is under 3 times the overall share", "no concern" if not ratio > 3 else "concern", "missing hours are spread over the day" if not ratio > 3 else f"missing hours cluster at {peak:02d}:00"))
+        month_ratio = by_month.max() / overall if overall else float("nan")
+        spread = not (ratio > 3 or month_ratio > 3)
+        where = ([f"at {peak:02d}:00"] if ratio > 3 else []) + ([f"in {peak_month}"] if month_ratio > 3 else [])
+        rows.append(_row(f"Hours with {label}", "hour-day table", "share of hours overall; highest clock hour; highest month; by year; by weekday (range)",
+                         f"{100 * overall:.2f}% overall; peak at {peak:02d}:00 ({100 * by_hour.max():.2f}%); peak month {peak_month} ({100 * by_month.max():.2f}%, {100 * frame.loc[frame['month'].eq(peak_month), column].sum() / max(frame[column].sum(), 1):.0f}% of all such hours); by year {', '.join(f'{y}: {100 * v:.1f}%' for y, v in by_year.items())}; weekdays {100 * by_weekday.min():.2f} to {100 * by_weekday.max():.2f}%",
+                         "no clock hour and no calendar month holds a share of its hours above 3 times the overall share", "no concern" if spread else "concern",
+                         "missing hours are spread over the day and the record" if spread else "missing hours cluster " + " and ".join(where) + ", so the hours that are missing are not a random subset of the record"))
     usable = table["n_valid"].gt(0)
     # Hours next to an hour without readings (the reading may be absent because of what glucose was doing).
     missing = table["n_valid"].eq(0).to_numpy()
@@ -806,10 +919,12 @@ def missingness(table: pd.DataFrame) -> pd.DataFrame:
     n_tir = _pct(table.loc[~excl & usable, "n_in_range"].sum(), table.loc[~excl & usable, "n_valid"].sum())
     low_adjacent = _pct(table.loc[adjacent, "n_below_70"].sum(), table.loc[adjacent, "n_valid"].sum())
     low_rest = _pct(table.loc[other, "n_below_70"].sum(), table.loc[other, "n_valid"].sum())
+    low_ratio = low_adjacent / low_rest if low_rest else float("nan")
+    similar = abs(gap - rest) <= 5 and (low_ratio <= 1.5 and low_ratio >= 1 / 1.5 if np.isfinite(low_ratio) else abs(low_adjacent - low_rest) <= 0.5)
     rows += [
-        _row("Hours next to a gap in readings (is missing not at random?)", "hour-day table", "time in range and time below 70 of hours adjacent to an hour without readings, against other hours (%)", f"in range {gap} vs {rest}; below 70 {low_adjacent} vs {low_rest}",
-             "time in range within 5 points and time below 70 within 2 points", "no concern" if abs(gap - rest) <= 5 and abs(low_adjacent - low_rest) <= 2 else "concern",
-             "glucose next to missing hours looks like glucose elsewhere" if abs(gap - rest) <= 5 and abs(low_adjacent - low_rest) <= 2 else "glucose next to missing readings differs, so what is missing may depend on glucose"),
+        _row("Hours next to a gap in readings (is missing not at random?)", "hour-day table", "time in range and time below 70 of hours adjacent to an hour without readings, against other hours (%)", f"in range {gap} vs {rest}; below 70 {low_adjacent} vs {low_rest} (ratio {low_ratio:.2f})",
+             "time in range within 5 points, and time below 70 within a factor of 1.5 of the other hours", "no concern" if similar else "concern",
+             "glucose next to missing hours looks like glucose elsewhere" if similar else "glucose next to missing readings differs (time in range by more than 5 points or time below 70 by more than a factor of 1.5), so what is missing may depend on glucose"),
         _row("Partly covered hours against full hours", "hour-day table", "time in range of hours with 1 to 11 readings against 12 readings (%)", f"{p_tir} vs {f_tir}", "within 5 points", "no concern" if abs(p_tir - f_tir) <= 5 else "concern",
              "hours with some readings missing look like full hours" if abs(p_tir - f_tir) <= 5 else "hours with dropped readings differ from full hours"),
         _row("Context-event days against other days", "hour-day table", "time in range on days listed in context_events.csv against other days (%)", f"{e_tir} vs {n_tir} ({int(excl.sum() // HOURS_PER_DAY)} days left out)", "none: the days are left out on purpose", "not applicable",
@@ -818,80 +933,85 @@ def missingness(table: pd.DataFrame) -> pd.DataFrame:
     return _frame(rows)
 
 
-def _cell_arrays(table: pd.DataFrame, mask: pd.Series, cells: pd.Series, n_cells: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Per day and cell: readings in range and valid readings (the arrays a day-level bootstrap resamples)."""
-    days = pd.to_datetime(table["date"])[mask]
-    codes = days.dt.normalize().factorize()[0]
-    shape = (codes.max() + 1 if len(codes) else 0, n_cells)
-    in_range = np.zeros(shape)
-    valid = np.zeros(shape)
-    np.add.at(in_range, (codes, cells[mask].to_numpy()), table.loc[mask, "n_in_range"].to_numpy())
-    np.add.at(valid, (codes, cells[mask].to_numpy()), table.loc[mask, "n_valid"].to_numpy())
-    return in_range, valid, codes
+def _day_cell_arrays(table: pd.DataFrame, mask: pd.Series, days: np.ndarray, n_days: int, cells: np.ndarray, n_cells: int) -> tuple[np.ndarray, np.ndarray]:
+    """Per day and cell (clock hour x calendar quarter): readings in range and valid readings, for the hours in ``mask`` (the arrays a bootstrap over days resamples)."""
+    in_range = np.zeros((n_days, n_cells))
+    valid = np.zeros((n_days, n_cells))
+    keep = mask.to_numpy()
+    np.add.at(in_range, (days[keep], cells[keep]), table.loc[mask, "n_in_range"].to_numpy())
+    np.add.at(valid, (days[keep], cells[keep]), table.loc[mask, "n_valid"].to_numpy())
+    return in_range, valid
+
+
+def _standardised(k_in: np.ndarray, k_valid: np.ndarray, weights: np.ndarray) -> float:
+    """Time in range (%) of the known hours with each cell weighted by ``weights``; a cell with no known reading is missing and its weight is dropped."""
+    seen = k_valid.sum(axis=0) > 0
+    rate = k_in.sum(axis=0)[seen] / k_valid.sum(axis=0)[seen]
+    return float(100 * (weights[seen] * rate).sum() / weights[seen].sum()) if weights[seen].sum() else float("nan")
+
+
+def _share(in_range: np.ndarray, valid: np.ndarray) -> float:
+    """Time in range (%) of the pooled arrays; NaN when they hold no readings."""
+    return float(100 * in_range.sum() / valid.sum()) if valid.sum() else float("nan")
 
 
 def composition_test(table: pd.DataFrame, *, draws: int = DRAWS, seed: int = SEED) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Is the time in range of hours with unknown settings different from known-settings hours once the clock-hour and calendar-quarter mix is the same?
 
-    Known hours are standardised to the unknown hours' mix: the known time in range of each cell (clock hour x calendar quarter) is
-    weighted by the share of the unknown hours' readings in that cell. Cells with unknown hours and no known hours cannot be
-    standardised and are reported. The 90% intervals resample days.
+    Hours on the days the model drops (context-event days) are left out. Known hours are standardised to the unknown hours' mix:
+    the known time in range of each cell (clock hour x calendar quarter) is weighted by the share of the unknown hours' readings
+    in that cell. Unknown hours in a cell with no known hours cannot be standardised: they are left out of the unknown side as
+    well, so both sides cover the same cells, and their share is reported. The 90% intervals resample days, the same days for
+    both sides; a cell with no known reading in a resample is missing from that resample's standardised value, not 0%.
 
     Returns:
         The summary table and one check row.
     """
-    known = table["settings_known_slots"].eq(SLOTS_PER_HOUR) & table["n_valid"].gt(0)
-    unknown = table["settings_known_slots"].lt(SLOTS_PER_HOUR) & table["n_valid"].gt(0)
+    usable = table["n_valid"].gt(0) & ~table["excluded_day"]
+    known = usable & table["settings_known_slots"].eq(SLOTS_PER_HOUR)
+    unknown = usable & table["settings_known_slots"].lt(SLOTS_PER_HOUR)
     if unknown.sum() == 0:
-        return pd.DataFrame(), _frame([_row("Composition of unknown-settings hours", "hour-day table", "standardised time in range", "", "", "not applicable", "no hour with readings has unknown settings")])
-    quarter = pd.to_datetime(table["date"]).dt.to_period("Q").astype(str)
-    cell = (quarter + "_" + table["hour"].astype(str)).astype("category").cat.codes
-    n_cells = int(cell.max()) + 1
-    k_in, k_valid, _ = _cell_arrays(table, known, cell, n_cells)
-    u_in, u_valid, _ = _cell_arrays(table, unknown, cell, n_cells)
-    weights = u_valid.sum(axis=0)
+        return pd.DataFrame(), _frame([_row("Composition of hours with unknown settings", "hour-day table", "standardised time in range", "", "", "not applicable", "no hour with readings has unknown settings")])
+    dates = pd.to_datetime(table["date"])
+    days, day_names = pd.factorize(dates)
+    n_days = len(day_names)
+    cell_names = (dates.dt.to_period("Q").astype(str) + "_" + table["hour"].astype(str)).astype("category").cat.codes.to_numpy()
+    n_cells = int(cell_names.max()) + 1
+    k_in, k_valid = _day_cell_arrays(table, known, days, n_days, cell_names, n_cells)
+    u_in, u_valid = _day_cell_arrays(table, unknown, days, n_days, cell_names, n_cells)
     has_known = k_valid.sum(axis=0) > 0
-    usable_weight = weights * has_known
-    standard = usable_weight / usable_weight.sum()
+    outside = float(100 * u_valid[:, ~has_known].sum() / u_valid.sum())
+    u_in, u_valid = u_in * has_known, u_valid * has_known
     rng = np.random.default_rng(seed)
-
-    def standardised(in_range: np.ndarray, valid: np.ndarray) -> float:
-        rate = in_range.sum(axis=0) / np.maximum(valid.sum(axis=0), 1)
-        return float(100 * (standard * rate).sum())
-
+    boot = np.empty((draws, 3))
+    for d in range(draws):
+        pick = rng.integers(0, n_days, n_days)
+        boot[d] = (_standardised(k_in[pick], k_valid[pick], u_valid[pick].sum(axis=0)), _share(u_in[pick], u_valid[pick]), _share(k_in[pick], k_valid[pick]))
+    boot_std, boot_unknown, boot_crude = boot[:, 0], boot[:, 1], boot[:, 2]
     crude_known = 100 * k_in.sum() / k_valid.sum()
     crude_unknown = 100 * u_in.sum() / u_valid.sum()
-    std_known = standardised(k_in, k_valid)
-    boot_std, boot_unknown, boot_crude = [], [], []
-    for _ in range(draws):
-        pick = rng.integers(0, len(k_in), len(k_in))
-        boot_std.append(standardised(k_in[pick], k_valid[pick]))
-        boot_crude.append(100 * k_in[pick].sum() / k_valid[pick].sum())
-        pick = rng.integers(0, len(u_in), len(u_in))
-        boot_unknown.append(100 * u_in[pick].sum() / u_valid[pick].sum())
-    boot_std, boot_unknown, boot_crude = map(np.array, (boot_std, boot_unknown, boot_crude))
-    gap_crude = boot_unknown - boot_crude
-    gap_std = boot_unknown - boot_std
-    interval = lambda x: f"{np.percentile(x, 5):+.1f} to {np.percentile(x, 95):+.1f}"  # noqa: E731
-    outside = float(100 * weights[~has_known].sum() / weights.sum())
+    std_known = _standardised(k_in, k_valid, u_valid.sum(axis=0))
+    gap_crude, gap_std = boot_unknown - boot_crude, boot_unknown - boot_std
+    interval = lambda x: f"{np.nanpercentile(x, 5):+.1f} to {np.nanpercentile(x, 95):+.1f}"  # noqa: E731
+    ci = lambda x: f"{np.nanpercentile(x, 5):.1f} to {np.nanpercentile(x, 95):.1f}"  # noqa: E731
     summary = pd.DataFrame([
-        {"group": "known settings, as observed", "time_in_range_pct": round(crude_known, 2), "interval_90": f"{np.percentile(boot_crude, 5):.1f} to {np.percentile(boot_crude, 95):.1f}", "readings": int(k_valid.sum())},
-        {"group": "known settings, standardised to the unknown hours' clock-hour and quarter mix", "time_in_range_pct": round(std_known, 2), "interval_90": f"{np.percentile(boot_std, 5):.1f} to {np.percentile(boot_std, 95):.1f}", "readings": int(k_valid.sum())},
-        {"group": "unknown settings", "time_in_range_pct": round(crude_unknown, 2), "interval_90": f"{np.percentile(boot_unknown, 5):.1f} to {np.percentile(boot_unknown, 95):.1f}", "readings": int(u_valid.sum())},
+        {"group": "known settings, as observed", "time_in_range_pct": round(crude_known, 2), "interval_90": ci(boot_crude), "readings": int(k_valid.sum())},
+        {"group": "known settings, standardised to the unknown hours' clock-hour and quarter mix", "time_in_range_pct": round(std_known, 2), "interval_90": ci(boot_std), "readings": int(k_valid.sum())},
+        {"group": "unknown settings (cells that have known hours)", "time_in_range_pct": round(crude_unknown, 2), "interval_90": ci(boot_unknown), "readings": int(u_valid.sum())},
     ])
     gap_c, gap_s = crude_unknown - crude_known, crude_unknown - std_known
     explained = 100 * (1 - gap_s / gap_c) if abs(gap_c) > 1e-9 else float("nan")
-    excludes_zero = np.percentile(gap_std, 5) > 0 or np.percentile(gap_std, 95) < 0
+    excludes_zero = np.nanpercentile(gap_std, 5) > 0 or np.nanpercentile(gap_std, 95) < 0
     check = _frame([_row("Composition of hours with unknown settings", "hour-day table", "time in range: unknown minus known, as observed and after standardising the known hours to the unknown hours' clock-hour x quarter mix (points, 90% interval over days)",
-                         f"as observed {gap_c:+.1f} ({interval(gap_crude)}); standardised {gap_s:+.1f} ({interval(gap_std)}); composition explains {explained:.0f}% of the observed gap; {outside:.1f}% of unknown readings are in cells with no known hours (left out of the standardised comparison)",
+                         f"as observed {gap_c:+.1f} ({interval(gap_crude)}); standardised {gap_s:+.1f} ({interval(gap_std)}); composition explains {explained:.0f}% of the observed gap; {outside:.1f}% of unknown readings are in cells with no known hours (left out of both sides)",
                          "the standardised gap's 90% interval includes 0", "concern" if excludes_zero else "no concern",
                          "unknown hours differ from known hours beyond their clock-hour and quarter mix: dropping them selects a different kind of hour" if excludes_zero else f"after matching the clock-hour and quarter mix the gap is {gap_s:+.1f} points and its interval includes 0: the record cannot separate the unknown hours from known ones beyond when they fall")])
     return summary, check
 
 
 def daily_series(table: pd.DataFrame) -> pd.DataFrame:
-    """Per day: readings, time in range, time below 70 and mean glucose, for days holding at least 70% of the possible readings."""
-    daily = table.assign(date=pd.to_datetime(table["date"])).groupby("date")[GLUCOSE_COLUMNS].sum()
+    """Per day: readings, time in range, time below 70 and mean glucose, for days holding at least 70% of the possible readings; context-event days (which the model drops) are left out."""
+    daily = table[~table["excluded_day"]].assign(date=lambda f: pd.to_datetime(f["date"])).groupby("date")[GLUCOSE_COLUMNS].sum()
     daily = daily[daily["n_valid"] >= ACTIVE_TIME_MIN * READINGS_PER_DAY].copy()
     daily["tir_pct"] = 100 * daily["n_in_range"] / daily["n_valid"]
     daily["below70_pct"] = 100 * daily["n_below_70"] / daily["n_valid"]
@@ -900,13 +1020,18 @@ def daily_series(table: pd.DataFrame) -> pd.DataFrame:
 
 
 def fortnight_series(table: pd.DataFrame, *, days: int = WINDOW_DAYS) -> pd.DataFrame:
-    """Pooled time in range of consecutive ``days``-day windows counted back from the last day (so the last window is whole)."""
+    """Pooled time in range of consecutive ``days``-day windows counted back from the last day (so the last window is whole).
+
+    Context-event days, which the model drops, are left out of each window's readings; a window keeps its place when at least
+    half of its days remain (``days`` is the number of days that remain).
+    """
     frame = table.assign(date=pd.to_datetime(table["date"]))
     last = frame["date"].max()
-    window = ((last - frame["date"]).dt.days // days)
-    grouped = frame.groupby(window)
-    out = pd.DataFrame({"start": grouped["date"].min(), "end": grouped["date"].max(), "readings": grouped["n_valid"].sum(), "in_range": grouped["n_in_range"].sum(), "below70": grouped["n_below_70"].sum(), "days": grouped["date"].nunique()})
-    out = out[out["days"].eq(days)].copy()
+    frame["window"] = (last - frame["date"]).dt.days // days
+    span = frame.groupby("window")["date"].agg(start="min", end="max", whole="nunique")
+    kept = frame[~frame["excluded_day"]].groupby("window").agg(readings=("n_valid", "sum"), in_range=("n_in_range", "sum"), below70=("n_below_70", "sum"), days=("date", "nunique"))
+    out = span.join(kept, how="inner")
+    out = out[out["whole"].eq(days) & out["days"].ge(days // 2)].drop(columns="whole")
     out["tir_pct"] = 100 * out["in_range"] / out["readings"]
     out["below70_pct"] = 100 * out["below70"] / out["readings"]
     return out.sort_values("start").reset_index(drop=True)
@@ -927,9 +1052,9 @@ def monthly_table(table: pd.DataFrame) -> pd.DataFrame:
 
 
 def stationarity(table: pd.DataFrame) -> pd.DataFrame:
-    """Whether the level of glucose is steady: monthly trend, day-to-day autocorrelation, and where the latest fortnight sits among all fortnights."""
+    """Whether the level of glucose is steady: monthly trend, day-to-day autocorrelation, and where the latest fortnight sits among all fortnights, on the days the model uses (context-event days left out)."""
     daily = daily_series(table)
-    months = monthly_table(table)
+    months = monthly_table(table[~table["excluded_day"]])
     tau, p = kendalltau(np.arange(len(months)), months["time_in_range_pct"])
     slope = float(np.median([(b - a) / (j - i) for i, a in enumerate(months["time_in_range_pct"]) for j, b in enumerate(months["time_in_range_pct"]) if j > i])) if len(months) > 1 else float("nan")
     full = daily.reindex(pd.date_range(daily.index.min(), daily.index.max(), freq="D"))
