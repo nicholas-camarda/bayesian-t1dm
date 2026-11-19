@@ -926,3 +926,11 @@ def test_a_first_meal_inside_the_shared_exercise_rule_is_excluded_as_exercise():
     flagged = build_first_meal_clean_window_registry(research_frame, exercise=exercise_intervals(workouts, None))
     row = flagged[flagged["timestamp"].eq(meal)].iloc[0]
     assert row["in_exercise"] == 1 and "exercise" in row["exclusion_reasons"].split("|") and plain["in_exercise"].sum() == 0
+
+
+def test_parse_model_list_rejects_unknown_and_retired_families():
+    from bayesian_t1dm.therapy_research import parse_model_list
+
+    assert parse_model_list(None) == ("ridge", "elastic_net", "segmented_ridge", "tree_boost", "ensemble")
+    with pytest.raises(ValueError, match="Unsupported model family: bayesian"):
+        parse_model_list("ridge,bayesian")

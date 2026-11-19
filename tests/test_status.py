@@ -229,6 +229,28 @@ def test_derive_current_status_marks_overnight_or_confounding_case_as_blocked():
     assert "high_closed_loop_confounding" in codes
 
 
+def test_degraded_source_quality_blocks_an_otherwise_ready_status():
+    dataset = _dataset()
+    payload = derive_current_status(
+        preparation=_preparation(dataset),
+        research_result=_research_result(
+            overnight_clean_rows=96,
+            overnight_nights=4,
+            stable_epochs=3,
+            confounding="moderate",
+            direct_meal_rows=60,
+            proxy_meal_rows=0,
+            recommendation_status="candidate",
+        ),
+        data_quality=_data_quality("degraded"),
+        run_id="run123",
+    )
+
+    assert payload["overall_state"] == "blocked"
+    assert [item["code"] for item in payload["primary_blockers"]] == ["degraded_source_quality"]
+    assert payload["source_quality"]["incomplete_window_count"] == 2
+
+
 def test_output_cleanup_moves_top_level_clutter_into_runtime_archive(tmp_path):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()

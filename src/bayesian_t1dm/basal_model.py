@@ -202,14 +202,13 @@ def predict_at_origin(train, test, predictors, *, output_dir):
     if not sampler_gate(diagnostics):
         raise RuntimeError(f"Sampling diagnostics failed; forecasts are not scored. See {output / 'fit_diagnostics.csv'}")
 
-    draws = stack_draws
-    beta = draws(idata, "beta")
-    last = draws(idata, "level")[:, :, -1]
-    shared_scale = draws(idata, "shared_week_scale")
-    group_scale = draws(idata, "group_week_scale")
-    day_sd = draws(idata, "day_scale")
-    hour_sd = draws(idata, "hour_scale")
-    zero = draws(idata, "p_zero")
+    beta = stack_draws(idata, "beta")
+    last = stack_draws(idata, "level")[:, :, -1]
+    shared_scale = stack_draws(idata, "shared_week_scale")
+    group_scale = stack_draws(idata, "group_week_scale")
+    day_sd = stack_draws(idata, "day_scale")
+    hour_sd = stack_draws(idata, "hour_scale")
+    zero = stack_draws(idata, "p_zero")
     rng = np.random.default_rng(SEED)
     predictions = []
     for row in test.itertuples():

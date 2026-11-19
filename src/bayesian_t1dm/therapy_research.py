@@ -274,11 +274,18 @@ def parse_therapy_segments(spec: str | None = None) -> tuple[TherapySegment, ...
     return tuple(segments)
 
 
+MODEL_FAMILIES = ("ridge", "elastic_net", "segmented_ridge", "tree_boost", "ensemble")
+
+
 def parse_model_list(value: str | None) -> tuple[str, ...]:
-    raw = value or "ridge,elastic_net,segmented_ridge,tree_boost,ensemble"
+    """Parse a comma-separated model-family list; an unknown family (for example the retired "bayesian") raises."""
+    raw = value or ",".join(MODEL_FAMILIES)
     names = tuple(dict.fromkeys(item.strip() for item in raw.split(",") if item.strip()))
     if not names:
         raise ValueError("At least one model family must be requested")
+    unknown = [name for name in names if name not in MODEL_FAMILIES]
+    if unknown:
+        raise ValueError(f"Unsupported model family: {', '.join(unknown)}; choose from {', '.join(MODEL_FAMILIES)}")
     return names
 
 
