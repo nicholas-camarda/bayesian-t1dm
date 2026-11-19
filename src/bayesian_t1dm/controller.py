@@ -154,6 +154,7 @@ def daily_controller_pattern(
     min_clean_hours: float = 0.0,
     workouts: pd.DataFrame | None = None,
     flow: list[dict] | None = None,
+    post_meal: bool = False,
 ) -> pd.DataFrame:
     """One row per day and pump segment: extra insulin as a share of the profile's, and mean glucose, over the clean time.
 
@@ -178,7 +179,8 @@ def daily_controller_pattern(
                          "hours": group.hours.sum(), "first": group.timestamp.min(), "last": group.timestamp.max()})
 
     audit("Paired programmed and commanded rates")
-    keep &= ~_inside_windows(stamp, meals)
+    in_meal_window = _inside_windows(stamp, meals)
+    keep &= in_meal_window if post_meal else ~in_meal_window
     audit("After meal exclusions")
     keep &= ~inside_intervals(stamp, exercise_intervals(workouts, modes))
     audit("After exercise exclusions")
