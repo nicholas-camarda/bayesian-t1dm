@@ -10,6 +10,7 @@ import pandas as pd
 from scipy.stats import binomtest
 
 from . import outcomes_model as om
+from . import win_test as wt
 from .diagnostics_workbook import read_workbook, write_workbook
 from .figures import NEUTRAL_BAND, NEUTRAL_BAR, NEUTRAL_LINE, assert_ascii
 from .publish import current_commit, working_tree_is_clean
@@ -24,6 +25,7 @@ COVARIATE_LABELS = {
 PREDICTOR_LABELS = {"hour-day model": "Hour-day\nmodel", "last 28 days": "Last 28\ndays"}
 SETTING_COVARIATES = ("log_icr", "log_cf", "log_basal", "target_10")
 FIGURE_FILES = ("outcomes_model_figure.png", "outcomes_model_figure.svg")
+ROLLING_BLOCK_DAYS = 14
 
 
 def write_figure(outcome: str, hourly: pd.DataFrame, effects: pd.DataFrame, origin_scores: pd.DataFrame | None, output: Path) -> list[Path]:
@@ -94,6 +96,21 @@ def origin_summary(scores: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame({"crps_points": grouped["crps"].mean() * 100.0, "coverage": grouped["inside_90"].mean(), "days": grouped.size()})
 
 
+def rolling_origin_check(scores: pd.DataFrame) -> tuple[str, str]:
+    """Result text and status of the model against the last-28-day baseline over the scored days.
+
+    A lower mean CRPS is not enough: the paired day-by-day difference (model minus baseline, in time order) gets a circular block bootstrap interval with
+    a block of one fortnight (the days after one origin share a fit). Only a 90% interval entirely below zero is "no concern"; an interval that holds zero (a tie) or lies above zero is "concern".
+    """
+    summary = origin_summary(scores)
+    model, baseline = (scores[scores["predictor"] == name].sort_values(["date"]).set_index("date")["crps"] for name in ("hour-day model", "last 28 days"))
+    difference = (model - baseline).dropna().to_numpy() * 100.0
+    result = wt.paired_interval(difference, block=min(ROLLING_BLOCK_DAYS, len(difference)))
+    text = (f"mean CRPS {summary.loc['hour-day model', 'crps_points']:.2f} vs {summary.loc['last 28 days', 'crps_points']:.2f} points (model vs last-28-day baseline); 90% interval held {summary.loc['hour-day model', 'coverage']:.0%} vs {summary.loc['last 28 days', 'coverage']:.0%} of {int(summary.loc['hour-day model', 'days'])} days; "
+            + wt.verdict_text(result))
+    return text, "no concern" if result.verdict == "win" else "concern"
+
+
 def _checks(outcome: str, design: om.OutcomeDesign, diagnostics: FitDiagnostics, vif: pd.DataFrame, prior: dict[str, float], hourly: pd.DataFrame, scores: pd.DataFrame | None, skipped: pd.DataFrame | None) -> pd.DataFrame:
     above = int((hourly["observed"] > hourly["predicted_median"]).sum())
     gap = float((hourly["observed"] - hourly["predicted_median"]).mean() * 100.0)
@@ -112,10 +129,7 @@ def _checks(outcome: str, design: om.OutcomeDesign, diagnostics: FitDiagnostics,
     if scores is None:
         rows.append(("Rolling-origin check", "not run", "not assessed"))
     else:
-        summary = origin_summary(scores)
-        better = summary.loc["hour-day model", "crps_points"] < summary.loc["last 28 days", "crps_points"]
-        rows.append(("Rolling-origin check", f"mean CRPS {summary.loc['hour-day model', 'crps_points']:.2f} vs {summary.loc['last 28 days', 'crps_points']:.2f} points (model vs last-28-day baseline); 90% interval held {summary.loc['hour-day model', 'coverage']:.0%} vs {summary.loc['last 28 days', 'coverage']:.0%} of {int(summary.loc['hour-day model', 'days'])} days",
-                     "no concern" if better else "concern"))
+        rows.append(("Rolling-origin check", *rolling_origin_check(scores)))
     if skipped is not None and not skipped.empty:
         rows.append(("Rolling origins not scored", "; ".join(f"{row.origin}: {row.reason}" for row in skipped.itertuples()), "not assessed"))
     rows.append(("Settings known for every row", "rows with any unknown setting moment are not modelled (see Denominators_Flow); the remaining unknown moments are those the pump archive never showed", "not assessed"))
@@ -145,7 +159,7 @@ def _warnings() -> pd.DataFrame:
         ("Settings that rarely changed", "A setting that changed a few times is estimated from those episodes; its interval is wide and its sign can follow whatever else changed then."),
         ("No slow drift term", "The person's level may drift over weeks or months; the model has only day-to-day effects. A random-walk level over weeks or 28-day blocks did not sample reliably (its scale is not identified beside the day effects), so a slow trend that coincides with a setting change can load on that setting."),
         ("Rows with unknown settings", "Hours with any unknown setting moment (a slot the pump archive never showed) are not modelled; the counts are in Denominators_Flow."),
-        ("Rolling-origin window", "Four fortnights are scored; days in context-event fortnights and days with unknown settings are not, so some fortnights hold few days. The comparison with the last-28-day baseline is over the scored days only and carries no interval: a small difference in CRPS is within noise."),
+        ("Rolling-origin window", "Four fortnights are scored; days in context-event fortnights and days with unknown settings are not, so some fortnights hold few days. The comparison with the last-28-day baseline is over the scored days only; its 90% interval is a circular block bootstrap with a block of 14 days over at most four fits, so it is wide, and a lower mean CRPS counts as no concern only when the whole interval is below zero."),
         ("Context events", "Days listed in context_events.csv are left out, so the model says nothing about those days."),
     ]
     return pd.DataFrame(rows, columns=["limitation", "detail"])

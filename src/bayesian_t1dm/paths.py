@@ -38,6 +38,7 @@ class ProjectPaths:
     output_replay: Path
     output_outcomes_model: Path
     output_data_audit: Path
+    output_forecast_harness: Path
     output_proposals: Path
     current: Path
     runs: Path
@@ -98,6 +99,7 @@ class ProjectPaths:
             output_replay=runtime_path / "output" / "replay",
             output_outcomes_model=runtime_path / "output" / "outcomes_model",
             output_data_audit=runtime_path / "output" / "data_audit",
+            output_forecast_harness=runtime_path / "output" / "forecast_harness",
             output_proposals=runtime_path / "output" / "proposals",
             current=runtime_path / "current",
             runs=runtime_path / "runs",
@@ -131,6 +133,7 @@ class ProjectPaths:
             self.output_replay,
             self.output_outcomes_model,
             self.output_data_audit,
+            self.output_forecast_harness,
             self.output_proposals,
             self.runs,
             self.output_fixture,

@@ -20,6 +20,7 @@ REQUIRED_SECTIONS = (
     "## Replay of past setting changes (exploratory)",
     "## Hour-day outcomes model",
     "## Data-quality audit (step A)",
+    "## Forecast evaluation harness (step 2)",
 )
 
 
