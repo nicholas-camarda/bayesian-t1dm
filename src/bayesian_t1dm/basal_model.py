@@ -91,6 +91,7 @@ def score_prediction(mean, sd, p_zero, observed: float, *, rng: np.random.Genera
     lo, hi = np.quantile(predicted, [0.05, 0.95])
     log_density = np.log(p_zero) if observed == 0 else np.log1p(-p_zero) + norm.logpdf(np.log(observed), mean, sd)
     return dict(lower_90=lo, upper_90=hi, covered=lo <= observed <= hi, p_zero=p_zero.mean(),
+                hit_above=observed >= 1 + THRESHOLD, hit_below=observed <= 1 - THRESHOLD,
                 p_above=np.mean((1 - p_zero) * norm.sf(np.log1p(THRESHOLD), mean, sd)),
                 p_below=np.mean(p_zero + (1 - p_zero) * norm.cdf(np.log1p(-THRESHOLD), mean, sd)),
                 log_score=logsumexp(log_density) - np.log(len(mean)))
@@ -109,6 +110,13 @@ def design_for_training(train: pd.DataFrame, predictors: list[str]) -> tuple[Con
     return data, center, scale, groups
 
 
+def asof_previous(rows: pd.DataFrame, other: pd.DataFrame, right_on: str, **options) -> pd.DataFrame:
+    """Match each row to the latest earlier record. The result keeps the order of `rows`; only the merge is sorted."""
+    left = rows[["date"]].assign(_row=np.arange(len(rows))).sort_values("date", kind="stable")
+    merged = pd.merge_asof(left, other.sort_values(right_on), left_on="date", right_on=right_on, **options)
+    return merged.sort_values("_row").reset_index(drop=True)
+
+
 def attach_origin_features(rows: pd.DataFrame, analysis) -> pd.DataFrame:
     """Assemble features known at midnight, before any outcome from that calendar day."""
     from .context_rules import EXERCISE_MIN_MINUTES
@@ -119,8 +127,8 @@ def attach_origin_features(rows: pd.DataFrame, analysis) -> pd.DataFrame:
     rows["prior_sleep_hours"] = np.nan
     sleep = analysis.merged.data.sleep.dropna(subset=["sleep_end"]).sort_values("sleep_end")
     if not sleep.empty:
-        available = pd.merge_asof(rows[["date"]], sleep[["sleep_end", "total_sleep_hours"]],
-                                  left_on="date", right_on="sleep_end", tolerance=pd.Timedelta(hours=36))
+        available = asof_previous(rows, sleep[["sleep_end", "total_sleep_hours"]], "sleep_end",
+                                  tolerance=pd.Timedelta(hours=36))
         rows["prior_sleep_hours"] = available.total_sleep_hours
     for stream, date_column, destination, value in [
         (analysis.site_events, "timestamp", "days_since_site", None),
@@ -134,9 +142,11 @@ def attach_origin_features(rows: pd.DataFrame, analysis) -> pd.DataFrame:
             rows[destination] = (origin - matched.reset_index(drop=True)).dt.total_seconds() / 86400
         else:
             left = times.searchsorted(origin - pd.Timedelta(days=1))
-            numbers = data[value].to_numpy()
-            mass = np.r_[0, np.cumsum(numbers)]
-            count = right - left
+            numbers = data[value].to_numpy(dtype=float)
+            finite = np.isfinite(numbers)
+            mass = np.r_[0, np.cumsum(np.where(finite, numbers, 0.0))]
+            seen = np.r_[0, np.cumsum(finite)]
+            count = seen[right] - seen[left]
             rows[destination] = np.divide(mass[right] - mass[left], count, out=np.full(len(count), np.nan), where=count > 0)
     workouts = analysis.merged.data.workouts
     workouts = workouts.loc[workouts.duration_seconds.ge(EXERCISE_MIN_MINUTES * 60)].dropna(subset=["end_timestamp"]).sort_values("end_timestamp")
@@ -154,8 +164,7 @@ def attach_origin_features(rows: pd.DataFrame, analysis) -> pd.DataFrame:
         columns = [name for name in ("carb_grams", "fat_grams", "protein_grams") if name in nutrition]
         if columns:
             meals = nutrition.loc[nutrition.timestamp.dt.hour.ge(17), ["timestamp", *columns]].sort_values("timestamp")
-            previous = pd.merge_asof(rows[["date"]], meals, left_on="date", right_on="timestamp",
-                                     allow_exact_matches=False, tolerance=pd.Timedelta(hours=36))
+            previous = asof_previous(rows, meals, "timestamp", allow_exact_matches=False, tolerance=pd.Timedelta(hours=36))
             for name in columns:
                 rows["prior_dinner_" + name] = previous[name]
             rows["hours_since_dinner_log"] = (origin - previous.timestamp).dt.total_seconds() / 3600
@@ -163,8 +172,8 @@ def attach_origin_features(rows: pd.DataFrame, analysis) -> pd.DataFrame:
     return rows
 
 
-def predict_at_origin(train, test, predictors, *, output_dir, pilot=False):
-    """Fit one elapsed-data fold. Save diagnostics before deciding whether forecasts can be scored."""
+def predict_at_origin(train, test, predictors, *, output_dir):
+    """Fit one elapsed-data fold. Diagnostics are saved first; a failed sampler gate stops the run."""
     from dataclasses import asdict
     from pathlib import Path
 
@@ -184,10 +193,10 @@ def predict_at_origin(train, test, predictors, *, output_dir, pilot=False):
         {"quantity": quantity, "q05": np.quantile(draws, 0.05), "median": np.median(draws), "q95": np.quantile(draws, 0.95)}
         for quantity, draws in [("positive commanded/programmed ratio", np.exp(prior_draws)), ("zero probability", odds)]
     ]).to_csv(output / "prior_prediction.csv", index=False)
-    idata, diagnostics = fit_model(data, **({"draws": 200, "tune": 200, "chains": 2} if pilot else {}))
+    idata, diagnostics = fit_model(data)
     pd.DataFrame([asdict(diagnostics) | {"sampler_gate": sampler_gate(diagnostics)}]).to_csv(output / "fit_diagnostics.csv", index=False)
     if not sampler_gate(diagnostics):
-        return pd.DataFrame()
+        raise RuntimeError(f"Sampling diagnostics failed; forecasts are not scored. See {output / 'fit_diagnostics.csv'}")
 
     draws = BayesianGlucoseModel._stack_draws
     beta = draws(idata, "beta")
@@ -253,6 +262,8 @@ def validate(raw, output, *, pilot=False):
         test["outcome_date"] = test.date
         test["date"] = origin
         test = attach_origin_features(test, analysis)
+        # The profile rate in force on the outcome day, kept to confirm the profile did not change after the origin.
+        outcome_rate = test.profile_rate.to_numpy()
         test["previous_sleep_mode_share"] = pd.MultiIndex.from_frame(test[keys]).map(
             train.groupby(keys).sleep_share.last()
         ).to_numpy()
@@ -260,6 +271,8 @@ def validate(raw, output, *, pilot=False):
         pump_rows = analysis.merged.tandem_data.basal.loc[lambda x: x.start_timestamp.lt(origin)]
         from .pump_profiles import pump_key
 
+        if pump_rows.empty:
+            raise ValueError(f"No pump basal record before forecast origin {origin.date()}")
         active_pump = pump_key(pump_rows.sort_values("start_timestamp").pump_serial.iloc[-1])
         profile_id = analysis.history.active_profile(active_pump, origin)
         parts, _ = analysis.day_parts()
@@ -273,15 +286,11 @@ def validate(raw, output, *, pilot=False):
         test["origin"] = origin
         test["date"] = test.pop("outcome_date")
         # Hold the profile fixed for the comparison. An intervening edit makes this forecast conditional on the wrong exposure.
-        history_rate = future.set_index(keys + ["date"]).profile_rate
-        actual = history_rate.reindex(pd.MultiIndex.from_frame(test[keys + ["date"]])).to_numpy()
-        test = test.loc[np.isclose(test.profile_rate, actual, atol=0.00051)].copy()
+        test = test.loc[np.isclose(test.profile_rate, outcome_rate, atol=0.00051)].copy()
         test.to_csv(output / f"{origin.date()}-holdout.csv", index=False)
-        scored = predict_at_origin(train, test, predictors, output_dir=output / f"{origin.date()}", pilot=pilot)
-        if len(scored):
-            all_folds.append(scored)
-    if all_folds:
-        pd.concat(all_folds, ignore_index=True).to_csv(output / "paired_scores.csv", index=False)
+        scored = predict_at_origin(train, test, predictors, output_dir=output / f"{origin.date()}")
+        all_folds.append(scored)
+    pd.concat(all_folds, ignore_index=True).to_csv(output / "paired_scores.csv", index=False)
 
 
 if __name__ == "__main__":
@@ -291,6 +300,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--pilot", action="store_true", help="Fit a single origin with two short chains for execution checks")
+    parser.add_argument("--pilot", action="store_true", help="Run the first forecast origin only, with the production sampler")
     args = parser.parse_args()
     validate(args.raw, args.output, pilot=args.pilot)
