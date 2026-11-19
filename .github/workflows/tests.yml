@@ -12,6 +12,8 @@ concurrency:
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    env:
+      PYTENSOR_FLAGS: mode=NUMBA,cxx=
     strategy:
       fail-fast: false
       matrix:
