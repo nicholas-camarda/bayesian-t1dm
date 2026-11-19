@@ -67,6 +67,12 @@ def _finite_stat(values: np.ndarray, reducer) -> float | None:
     return float(reducer(finite))
 
 
+def _finite_dataset_stat(dataset, reducer) -> float | None:
+    # Independent parameter dimensions must never broadcast against one another.
+    extrema = [_finite_stat(np.asarray(item), reducer) for item in dataset.data_vars.values()]
+    return _finite_stat(np.asarray([value for value in extrema if value is not None]), reducer)
+
+
 def extract_fit_diagnostics(
     posterior: object,
     *,
@@ -109,17 +115,17 @@ def extract_fit_diagnostics(
     if az is not None and chains >= 2:
         try:
             rhat_dataset = az.rhat(posterior)
-            rhat_max = _finite_stat(np.asarray(rhat_dataset.to_array()), np.max)
+            rhat_max = _finite_dataset_stat(rhat_dataset, np.max)
         except Exception:
             rhat_max = None
         try:
             ess_bulk_dataset = az.ess(posterior, method="bulk")
-            ess_bulk_min = _finite_stat(np.asarray(ess_bulk_dataset.to_array()), np.min)
+            ess_bulk_min = _finite_dataset_stat(ess_bulk_dataset, np.min)
         except Exception:
             ess_bulk_min = None
         try:
             ess_tail_dataset = az.ess(posterior, method="tail")
-            ess_tail_min = _finite_stat(np.asarray(ess_tail_dataset.to_array()), np.min)
+            ess_tail_min = _finite_dataset_stat(ess_tail_dataset, np.min)
         except Exception:
             ess_tail_min = None
 
