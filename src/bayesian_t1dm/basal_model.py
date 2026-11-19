@@ -12,7 +12,7 @@ from scipy.special import logsumexp
 from scipy.stats import norm
 
 from .basal_validation import HALF_LIFE_DAYS, HOLDOUT_DAYS, THRESHOLD
-from .model import FitDiagnostics, extract_fit_diagnostics
+from .sampler_health import FitDiagnostics, extract_fit_diagnostics, stack_draws
 
 LOGGER = logging.getLogger(__name__)
 WEEK_DAYS = 7
@@ -186,8 +186,6 @@ def predict_at_origin(train, test, predictors, *, output_dir):
     from .basal_validation import baseline_distribution, score_distribution
     import pymc as pm
 
-    from .model import BayesianGlucoseModel
-
     data, center, scale, groups = design_for_training(train, predictors)
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -204,7 +202,7 @@ def predict_at_origin(train, test, predictors, *, output_dir):
     if not sampler_gate(diagnostics):
         raise RuntimeError(f"Sampling diagnostics failed; forecasts are not scored. See {output / 'fit_diagnostics.csv'}")
 
-    draws = BayesianGlucoseModel._stack_draws
+    draws = stack_draws
     beta = draws(idata, "beta")
     last = draws(idata, "level")[:, :, -1]
     shared_scale = draws(idata, "shared_week_scale")

@@ -1,41 +1,26 @@
 from __future__ import annotations
 
-import json
-from dataclasses import asdict
 import os
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
-from .evaluate import WalkForwardReport
 from .ingest import TandemCoverage
-from .model import FitDiagnostics
 from .quality import DataQualitySummary
-from .recommend import Recommendation, RecommendationPolicy
-from .report_page import forecast_fits, forecast_verdict, plain, sampler_healthy
 
 
-def build_run_summary(
+def build_coverage_summary(
     *,
     coverage: TandemCoverage,
-    walk_forward: WalkForwardReport | None = None,
-    recommendations: list[Recommendation] | None = None,
-    fit_diagnostics: FitDiagnostics | None = None,
     data_quality: DataQualitySummary | None = None,
-    recommendation_policy: RecommendationPolicy | None = None,
     review_artifacts: dict[str, str] | None = None,
-    model_name: str = "BayesianGlucoseModel",
 ) -> dict[str, Any]:
     return {
-        "model_name": model_name,
         "coverage": asdict(coverage),
-        "walk_forward": asdict(walk_forward) if walk_forward is not None else None,
-        "fit_diagnostics": asdict(fit_diagnostics) if fit_diagnostics is not None else None,
         "data_quality": asdict(data_quality) if data_quality is not None else None,
-        "recommendation_policy": asdict(recommendation_policy) if recommendation_policy is not None else None,
         "review_artifacts": dict(review_artifacts or {}),
-        "recommendations": [asdict(rec) for rec in (recommendations or [])],
     }
 
 
@@ -46,169 +31,35 @@ def _relative_link_target(markdown_path: Path, artifact_path: str | Path) -> str
         return str(artifact_path)
 
 
-def _plain_forecast_answer(summary: dict[str, Any]) -> list[str]:
-    """Plain-language opening shared with the HTML forecast page."""
-    walk_forward = summary.get("walk_forward") or {}
-    aggregate = walk_forward.get("aggregate") or {}
-    folds = walk_forward.get("folds") or []
-    fits = forecast_fits(summary)
-    failed = sum(1 for diag in fits if not sampler_healthy(diag))
-    verdict = (
-        forecast_verdict(aggregate.get("mae"), walk_forward.get("aggregate_persistence_mae"), failed_fits=failed, total_fits=len(fits))
-        if folds
-        else forecast_verdict(None, None)
-    )
-    lines = ["## Answer", "", f"**{verdict.label}.** {verdict.headline}" + (f" {verdict.explanation}" if verdict.explanation else ""), ""]
-    coverage = aggregate.get("coverage")
-    if coverage is not None and folds:
-        lines.append(f"- The 80% forecast range contained the real value {float(coverage) * 100:.0f}% of the time (should be 70 to 90%).")
-        lines.append(f"- Tested on {len(folds)} later periods the model was not trained on.")
-    data_quality = summary.get("data_quality") or {}
-    if data_quality:
-        incomplete = int(data_quality.get("incomplete_window_count") or 0)
-        lines.append("- Data completeness: " + ("all download windows complete." if data_quality.get("status") == "good" else f"{incomplete} download windows have gaps or other problems."))
-    policy = summary.get("recommendation_policy") or {}
-    reasons = [plain(reason) for reason in policy.get("reasons") or []]
-    if reasons:
-        lines.append(f"- Settings suggestions: {plain(policy.get('status'))} ({'; '.join(reasons)}).")
-    lines.append("")
-    return lines
-
-
-def write_markdown_report(summary: dict[str, Any], path: str | Path) -> Path:
+def write_coverage_markdown(summary: dict[str, Any], path: str | Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    lines: list[str] = []
-    lines.append("# Glucose Forecast Check")
-    lines.append("")
-    lines.extend(_plain_forecast_answer(summary))
-    lines.append("## Technical record")
-    lines.append("")
-    lines.append("### Coverage")
-    coverage = summary.get("coverage", {})
-    for key, value in coverage.items():
+    lines: list[str] = ["# Source Coverage", "", "### Coverage"]
+    for key, value in (summary.get("coverage") or {}).items():
         lines.append(f"- {key}: {value}")
-    if summary.get("data_quality") is not None:
+    data_quality = summary.get("data_quality")
+    if data_quality is not None:
         lines.append("")
         lines.append("### Data Quality")
-        data_quality = summary["data_quality"]
         lines.append(f"- status: {data_quality.get('status')}")
         lines.append(f"- normalized_plausibility_status: {data_quality.get('normalized_plausibility_status')}")
         lines.append(f"- incomplete_window_count: {data_quality.get('incomplete_window_count')}")
-        lines.append(
-            f"- evaluation_touches_incomplete_windows: {data_quality.get('evaluation_touches_incomplete_windows')}"
-        )
+        lines.append(f"- evaluation_touches_incomplete_windows: {data_quality.get('evaluation_touches_incomplete_windows')}")
         contributing = data_quality.get("contributing_window_ids") or []
         if contributing:
             lines.append(f"- contributing_window_ids: {', '.join(str(item) for item in contributing)}")
         reason_counts = data_quality.get("reason_counts") or {}
         if reason_counts:
-            lines.append(
-                "- reason_counts: "
-                + ", ".join(f"{key}={value}" for key, value in reason_counts.items())
-            )
+            lines.append("- reason_counts: " + ", ".join(f"{key}={value}" for key, value in reason_counts.items()))
         plausibility_reasons = data_quality.get("normalized_plausibility_reasons") or {}
         if plausibility_reasons:
-            lines.append(
-                "- normalized_plausibility_reasons: "
-                + ", ".join(f"{key}={value}" for key, value in plausibility_reasons.items())
-            )
-    if summary.get("walk_forward"):
-        lines.append("")
-        lines.append("### Walk-Forward Evaluation")
-        walk_forward = summary["walk_forward"]
-        aggregate = walk_forward.get("aggregate") or {}
-        for key in ["mae", "rmse", "coverage", "interval_width"]:
-            if key in aggregate:
-                lines.append(f"- aggregate_{key}: {aggregate[key]}")
-        if "aggregate_persistence_mae" in walk_forward:
-            lines.append(f"- aggregate_persistence_mae: {walk_forward['aggregate_persistence_mae']}")
-        folds = walk_forward.get("folds") or []
-        if folds:
-            lines.append("")
-            lines.append("| fold | test_span | n_train | n_test | model_mae | model_rmse | model_coverage | interval_width | persistence_mae | missing_cgm | invalid_cgm | max_gap_min |")
-            lines.append("| ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
-            for fold in folds:
-                lines.append(
-                    "| {fold} | {test_start} to {test_end} | {n_train} | {n_test} | {model_mae:.4f} | {model_rmse:.4f} | {model_coverage:.3f} | {interval_width:.2f} | {persistence_mae:.4f} | {missing_cgm:.3f} | {invalid_cgm:.3f} | {max_gap} |".format(
-                        fold=int(fold.get("fold", 0)),
-                        test_start=fold.get("test_start_timestamp") or "NA",
-                        test_end=fold.get("test_end_timestamp") or "NA",
-                        n_train=int(fold.get("n_train", 0)),
-                        n_test=int(fold.get("n_test", 0)),
-                        model_mae=float(fold.get("model_mae", float("nan"))),
-                        model_rmse=float(fold.get("model_rmse", float("nan"))),
-                        model_coverage=float(fold.get("model_coverage", float("nan"))),
-                        interval_width=float(fold.get("model_interval_width", float("nan"))),
-                        persistence_mae=float(fold.get("persistence_mae", float("nan"))),
-                        missing_cgm=float(fold.get("missing_cgm_fraction") or 0.0),
-                        invalid_cgm=float(fold.get("invalid_cgm_fraction") or 0.0),
-                        max_gap="NA" if fold.get("max_timestamp_gap_minutes") is None else f"{float(fold['max_timestamp_gap_minutes']):.1f}",
-                    )
-                )
-            diagnostics_rows = [fold for fold in folds if fold.get("fit_diagnostics")]
-            if diagnostics_rows:
-                lines.append("")
-                lines.append("#### Walk-Forward Fit Diagnostics")
-                lines.append("")
-                lines.append("| fold | chains | draws | tune | divergences | max_treedepth_hits | rhat_max | ess_bulk_min | ess_tail_min |")
-                lines.append("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
-                for fold in diagnostics_rows:
-                    diag = fold["fit_diagnostics"]
-                    lines.append(
-                        "| {fold} | {chains} | {draws} | {tune} | {divergences} | {max_treedepth_hits} | {rhat_max} | {ess_bulk_min} | {ess_tail_min} |".format(
-                            fold=int(fold.get("fold", 0)),
-                            chains=int(diag.get("chains", 0)),
-                            draws=int(diag.get("draws", 0)),
-                            tune=int(diag.get("tune", 0)),
-                            divergences=int(diag.get("divergences", 0)),
-                            max_treedepth_hits=int(diag.get("max_tree_depth_hits", 0)),
-                            rhat_max="NA" if diag.get("rhat_max") is None else f"{float(diag['rhat_max']):.3f}",
-                            ess_bulk_min="NA" if diag.get("ess_bulk_min") is None else f"{float(diag['ess_bulk_min']):.1f}",
-                            ess_tail_min="NA" if diag.get("ess_tail_min") is None else f"{float(diag['ess_tail_min']):.1f}",
-                        )
-                    )
-    if summary.get("fit_diagnostics") is not None:
-        lines.append("")
-        lines.append("### Final Fit Diagnostics")
-        for key, value in summary["fit_diagnostics"].items():
-            lines.append(f"- {key}: {value}")
-    if summary.get("recommendation_policy") is not None:
-        lines.append("")
-        lines.append("### Recommendation Policy")
-        policy = summary["recommendation_policy"]
-        lines.append(f"- status: {policy.get('status')}")
-        lines.append(f"- validation_passed: {policy.get('validation_passed')}")
-        lines.append(f"- sampler_passed: {policy.get('sampler_passed')}")
-        lines.append(f"- signal_passed: {policy.get('signal_passed')}")
-        reasons = policy.get("reasons") or []
-        if reasons:
-            lines.append(f"- reasons: {', '.join(str(reason) for reason in reasons)}")
+            lines.append("- normalized_plausibility_reasons: " + ", ".join(f"{key}={value}" for key, value in plausibility_reasons.items()))
     review_artifacts = summary.get("review_artifacts") or {}
     if review_artifacts:
         lines.append("")
         lines.append("### Review Artifacts")
         for name, artifact_path in sorted(review_artifacts.items()):
-            target = _relative_link_target(path, artifact_path)
-            lines.append(f"- [{name}]({target})")
-    lines.append("")
-    lines.append("### Recommendations")
-    recommendations = summary.get("recommendations", [])
-    if not recommendations:
-        policy_status = (summary.get("recommendation_policy") or {}).get("status")
-        if policy_status == "skipped":
-            lines.append("- Recommendations were skipped by configuration.")
-        elif policy_status == "suppressed":
-            lines.append("- Recommendations were suppressed by policy.")
-        else:
-            lines.append("- No recommendations were generated.")
-    for rec in recommendations:
-        flags = rec.get("flags") or []
-        flag_suffix = f" [flags: {', '.join(flags)}]" if flags else ""
-        lines.append(
-            f"- {rec['setting']} {rec['direction']} by {rec['change_percent']:.1f}% "
-            f"({rec.get('confidence', 'moderate')} confidence): {rec['rationale']}{flag_suffix}"
-        )
+            lines.append(f"- [{name}]({_relative_link_target(path, artifact_path)})")
     path.write_text("\n".join(lines) + "\n")
     return path
 
@@ -232,11 +83,3 @@ def _to_jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_to_jsonable(item) for item in value]
     return str(value)
-
-
-def write_json_report(summary: dict[str, Any], path: str | Path) -> Path:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = _to_jsonable(summary)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return path

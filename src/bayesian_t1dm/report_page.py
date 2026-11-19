@@ -123,59 +123,6 @@ SAMPLER_RHAT_MAX = 1.01
 SAMPLER_ESS_PER_CHAIN = 100  # Vehtari et al. (2021): bulk ESS of at least 100 per chain
 
 
-def sampler_healthy(diag: dict) -> bool:
-    """A PyMC fit is usable when R-hat is under 1.01, there are no divergences and bulk ESS is at least 100 per chain."""
-    try:
-        rhat = float(diag.get("rhat_max"))
-        ess = float(diag.get("ess_bulk_min"))
-        chains = max(int(diag.get("chains") or 1), 1)
-    except (TypeError, ValueError):
-        return False
-    return (
-        math.isfinite(rhat)
-        and rhat < SAMPLER_RHAT_MAX
-        and int(diag.get("divergences") or 0) == 0
-        and math.isfinite(ess)
-        and ess >= SAMPLER_ESS_PER_CHAIN * chains
-    )
-
-
-def forecast_fits(summary: dict) -> list[dict]:
-    """Fitting diagnostics for every validation period plus the final fit, when present."""
-    folds = (summary.get("walk_forward") or {}).get("folds") or []
-    fits = [fold.get("fit_diagnostics") or {} for fold in folds]
-    if summary.get("fit_diagnostics"):
-        fits.append(summary["fit_diagnostics"])
-    return [diag for diag in fits if diag]
-
-
-def forecast_verdict(model_mae: object, baseline_mae: object, *, failed_fits: int = 0, total_fits: int = 0) -> Verdict:
-    """Compare walk-forward model error with the persistence baseline (same 10% bar as the recommendation policy).
-
-    A fit that failed its sampler checks overrides the comparison: its error numbers are not trustworthy either way.
-    """
-    try:
-        model, baseline = float(model_mae), float(baseline_mae)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return Verdict("info", "Not assessed", "No validation results were produced.")
-    if not (math.isfinite(model) and math.isfinite(baseline)) or baseline <= 0:
-        return Verdict("info", "Not assessed", "No validation results were produced.")
-    ratio = model / baseline
-    numbers = f"{model:,.1f} mg/dL on average, against {baseline:,.1f} mg/dL for assuming glucose stays the same"
-    if failed_fits:
-        return Verdict(
-            "bad",
-            "Model fitting failed",
-            f"The model's 30-minute forecasts are off by {numbers}.",
-            f"The fitting procedure failed its checks in {failed_fits} of {total_fits} fits, so these numbers are not trustworthy and the model should not be used.",
-        )
-    if ratio <= 1 - FORECAST_REQUIRED_IMPROVEMENT:
-        return Verdict("good", "Beats the simple baseline", f"The model's 30-minute forecasts are off by {numbers}.", f"That is {(1 - ratio) * 100:.0f}% better than the baseline on data the model never saw.")
-    if ratio < 1:
-        return Verdict("warn", "Barely better than the baseline", f"The model's 30-minute forecasts are off by {numbers}.", f"It needs to be at least {FORECAST_REQUIRED_IMPROVEMENT:.0%} better before its forecasts add anything.")
-    return Verdict("bad", "Worse than the simple baseline", f"The model's 30-minute forecasts are off by {numbers}.", "Its forecasts should not be used for anything until this is fixed.")
-
-
 def icr_verdict(segment: str, effective: float, lower: float, upper: float, programmed: float, status_code: str) -> Verdict:
     """Effective I:C from logged meals against the programmed ratio."""
     difference = (programmed / effective - 1) * 100
@@ -548,31 +495,6 @@ def histogram(values: Sequence[float], *, bin_width: float, guide: float | None,
         parts.append(_text(sx(guide) + 6, 18, guide_label, ink=True, size=11))
     parts.append(_text((width + margin) / 2, height - 6, x_label, anchor="middle", size=11))
     return _svg(width, height, x_label, parts)
-
-
-def paired_dots(rows: Sequence[tuple[str, float | None, float | None]], *, first_label: str, second_label: str, axis_label: str) -> str:
-    """One row per group, two dots on a shared axis (for example model vs baseline error)."""
-    values = [v for _, a, b in rows for v in (a, b) if v is not None and math.isfinite(v)]
-    if not values:
-        return "<p class='caption'>No values to plot.</p>"
-    hi = max(values) * 1.15
-    width, row_h, label_w = 560, 34, 90
-    height = row_h * len(rows) + 46
-    sx = _Scale(0, hi, label_w, width - 20)
-    parts: list[str] = []
-    for tick in _nice_ticks(0, hi, 5):
-        parts.append(f"<line class='grid' x1='{sx(tick):.1f}' x2='{sx(tick):.1f}' y1='4' y2='{row_h * len(rows) + 4}' />")
-        parts.append(_text(sx(tick), row_h * len(rows) + 20, _tick_label(tick), anchor="middle"))
-    parts.append(_text((width + label_w) / 2, height - 6, axis_label, anchor="middle", size=11))
-    for i, (label, first, second) in enumerate(rows):
-        y = i * row_h + row_h / 2 + 4
-        parts.append(_text(label_w - 10, y + 4, label, anchor="end", ink=True))
-        if first is not None and second is not None and math.isfinite(first) and math.isfinite(second):
-            parts.append(f"<line x1='{sx(first):.1f}' x2='{sx(second):.1f}' y1='{y:.1f}' y2='{y:.1f}' class='grid' stroke-width='3' />")
-        for value, color, name in ((second, COMPARATOR, second_label), (first, PRIMARY, first_label)):
-            if value is not None and math.isfinite(value):
-                parts.append(f"<circle cx='{sx(value):.1f}' cy='{y:.1f}' r='7' fill='{color}' class='halo' stroke-width='2'><title>{esc(label)}: {esc(name)} {value:.1f}</title></circle>")
-    return _svg(width, height, axis_label, parts)
 
 
 def time_series(

@@ -30,7 +30,7 @@ How the pieces fit, and the method behind each. Every analysis follows the same 
 | F | is basal too low or high | controller's commanded minus programmed rate over clean time, pooled by hours across days and compared with the current programmed rate | day-resampling interval and "chance the rule is met" | 25% or more for at least half the clean time, glucose above 120, lows within limits | tests; real-data reread | clean time is scarce (see below); sleep-mode target is higher than daytime |
 | H | what happened in each long high or low | ordered rules over insulin, carbs, corrections, site changes, workouts, unlogged food; repeats per pump segment | Wilson 90% intervals for rates | a repeating pattern points at that segment's I:C or basal | tests; real-data reread | rules, not a fitted model; sees only recorded insulin and carbs |
 
-**Methods behind them.** *Grid Bayesian posterior* for carbohydrate per meal (the only place Bayes' rule is used today). *Random-effects pooling* with Hartung-Knapp variance across meals, so real meal-to-meal variability widens the interval. *Day-level bootstrap* wherever days are the unit (basal, change evaluation). *Wilson intervals* for rates. *Theil-Sen plus least squares* to recover the correction factor from calculator records. *Profile replay* of the pump's own edit events. *Ordered rules* for classification. *Simulation* with known truth to test an estimator before it is trusted (carbs recovered, fat/protein absorption). The 30-minute forecast model is Bayesian (PyMC) but is not part of these goals and is judged against "glucose stays the same".
+**Methods behind them.** *Grid Bayesian posterior* for carbohydrate per meal (the only place Bayes' rule is used today). *Random-effects pooling* with Hartung-Knapp variance across meals, so real meal-to-meal variability widens the interval. *Day-level bootstrap* wherever days are the unit (basal, change evaluation). *Wilson intervals* for rates. *Theil-Sen plus least squares* to recover the correction factor from calculator records. *Profile replay* of the pump's own edit events. *Ordered rules* for classification. *Simulation* with known truth to test an estimator before it is trusted (carbs recovered, fat/protein absorption).
 
 **What is not yet probabilistic.** The I:C and basal answers are intervals and a bootstrap share, not posterior probabilities, and each segment is estimated on its own. The planned model reports "probability the current setting is too weak/too low" with its interval, shares information between neighbouring segments and meals (partial pooling), and uses the nuisance factors as predictors instead of throwing time away.
 
@@ -149,8 +149,6 @@ The active pipeline is:
 11. derived insulin exposure and IOB
 12. lagged, rolling, and calendar features
 13. optional therapy research builds day-segmented contexts, audits feature engineering, and compares candidate models for basal schedule and I/C ratio inference
-14. Bayesian forecast model
-15. scenario comparison and pump-setting recommendation ranking
 
 ## Tandem Source Acquisition
 
@@ -326,46 +324,9 @@ Default horizon:
 
 - $h = 30$ minutes
 
-## Bayesian Model
+## Retired: 5-minute glucose forecast
 
-The model predicts glucose 30 minutes ahead from current and lagged measurements. Each training fold supplies its own feature and target means and standard deviations. On those standardized scales the conditional mean is a linear regression. The intercept and each coefficient have independent standard normal priors. Observation errors follow a Student-t distribution with five degrees of freedom and an exponential prior with rate one on the scale.
-
-The point forecast averages posterior conditional means in mg/dL. For a predictive interval, each draw adds a Student-t observation error at that draw's scale before taking quantiles. Held-out coverage counts future glucose measurements inside the interval. Width is reported in mg/dL alongside error and the persistence forecast.
-
-## Recommendation Scoring
-
-For each candidate scenario $s$, the pipeline re-scales the exposure features for basal, bolus, and I/C ratio changes, recomputes the derived insulin features, and predicts with every posterior draw $k$.
-
-The implemented loss is the mean absolute deviation of the predicted mean trajectory from the glucose target $y^\star$ (110 mg/dL by default):
-
-$$
-L_k(s) = \frac{1}{T} \sum_{t=1}^{T} \left| \mu_{t,k}(s) - y^\star \right|
-$$
-
-Hypo- and hyperglycaemia terms are not part of the loss; a scenario that trades a little mean deviation for more lows is not penalised for it.
-
-Two numbers are reported per scenario.
-
-**Expected gain**, computed from posterior-mean predictions $\bar{\mu}_t$:
-
-$$
-\text{gain}(s) = \frac{1}{T} \sum_{t=1}^{T} \left| \bar{\mu}_t(\text{current}) - y^\star \right| - \frac{1}{T} \sum_{t=1}^{T} \left| \bar{\mu}_t(s) - y^\star \right|
-$$
-
-**Posterior probability better**, the share of posterior draws $k$ in which the scenario beats current settings:
-
-$$
-\Pr\nolimits_k \left[ L_k(s) < L_k(\text{current}) \right]
-$$
-
-Draws are paired: both scenarios use the same parameter draw and the same latent-state innovations.
-
-A candidate is surfaced only if the expected gain clears the configured threshold, the posterior probability is at least 0.75, and the recommendation policy (validation, sampler diagnostics, data quality, carb and activity signal) passes.
-
-Two caveats that matter more than the arithmetic:
-
-- The model is a predictive regression on observational, closed-loop data. Its coefficients are not causal effects of insulin, so a scenario is a sensitivity analysis of the fitted model, not a prediction of what would happen if the setting were changed.
-- With the current Tandem archive carbohydrate records are absent, so the policy suppresses every recommendation. This lane has never produced a recommendation on real data.
+The 30-minute-ahead Bayesian glucose regression, its scenario scoring of setting changes and the forecast report (`run`, `forecast_review.html`) were removed on 2026-11-19. The regression described what happens to glucose a half-hour from now given the last few hours of readings; it could not support claims about changing a setting, because its insulin coefficients are associations in closed-loop data, not effects of a setting. On the real record (59,000 rows by 82 features per fold) the first fold ran for more than 25 minutes without finishing: the lag and rolling features are strongly collinear and the sampler saturated its tree depth. Setting-change evidence now comes from the hour-day outcomes model and the replay of past changes (see Planned). The last commit with the forecast lane is tagged `pre-forecast-lane-removal-20261119`. Kept from it: the sampler-health helper (`sampler_health.py`: R-hat, effective sample size, divergences and tree depth, used by the basal model), `walk_forward_splits` and the feature frame.
 
 ## Validation
 
@@ -373,32 +334,26 @@ Validation is intentionally time-aware.
 
 Recommended checks:
 
-- walk-forward splits instead of random train/test splits
+- chronological (walk-forward) splits instead of random train/test splits
 - calibration of posterior predictive intervals
 - posterior predictive checks
-- scenario comparison against a naive baseline
 
 Operational notes:
 
-- `bayesian-t1dm run` may perform multiple fits because walk-forward validation refits over chronological folds before any final recommendation fit.
-- `bayesian-t1dm run --skip-recommendations` is the preferred fast path when validating real data because it avoids the final full-data recommendation fit.
-- Modest MAE improvement over persistence is not enough for recommendation use if interval coverage is poor.
 
 Canonical research loop:
 
 1. `bayesian-t1dm build-dataset` to normalize and merge any new raw data into `data/merged/` (about a second when nothing changed, under a minute for a full rebuild).
 2. `bayesian-t1dm research-latent-meal-icr --research-scope foundation` to inspect honest meal-truth semantics and first-meal clean-window readiness.
 3. `bayesian-t1dm research-latent-meal-icr --research-scope full` only after the foundation cohort is actually ready for latent fitting.
-4. `bayesian-t1dm status` when you want the combined snapshot across therapy, forecast, and latent-meal lanes.
-5. `bayesian-t1dm run --skip-recommendations` only as a secondary forecast diagnostic.
-6. `bayesian-t1dm review-therapy-evidence` only when you need secondary therapy identifiability context.
+4. `bayesian-t1dm status` when you want the combined snapshot across the therapy and latent-meal lanes.
+5. `bayesian-t1dm review-therapy-evidence` only when you need secondary therapy identifiability context.
 
 Artifact reading order:
 
 1. `current_status.html` for the combined overview.
 2. `therapy_review.html` for secondary therapy identifiability.
-3. `forecast_review.html` for secondary forecast diagnostics.
-4. `output/latent_meal/` and `output/fixture/` for the scientific priority lane.
+3. `output/latent_meal/` and `output/fixture/` for the scientific priority lane.
 
 If the latent-meal foundation cohort is blocked or empty, debug cohort quality, source truth, and freshness first. Do not treat that as a model-fitting failure.
 
@@ -410,9 +365,7 @@ Step-by-step behavior:
 4. `research-latent-meal-icr --research-scope full` runs the constrained first-meal latent-response approximation on accepted windows only and writes research-only posterior, confidence, and model-comparison artifacts.
 5. `status` refreshes the combined snapshot and publishes the latest top-level HTML entrypoints, but it is still a combined overview rather than the primary scientific loop.
 6. `screen-health-features` consumes the prepared dataset and skips cleanly when Apple Health is absent.
-7. `run --skip-recommendations` is the preferred fast validation path for forecast behavior because it exercises walk-forward prediction without the final recommendation fit.
-8. `run` executes the full modeling and recommendation stack using the same prepared dataset contract: Apple-enriched when Apple data exists, Tandem-only otherwise.
-9. `research-therapy-settings` runs a distinct research-grade therapy workflow: it starts with a methodological gate, builds fasting, meal, and correction contexts, creates strict meal-bolus proxy features when explicit carbs are absent, audits Apple/Tandem feature engineering, compares Bayesian, linear, segmented, tree-boosted, and ensemble-style candidates, and writes segment-level recommendation evidence for basal and I/C ratio. Sensitivity factor remains staged and suppressed by default in the current implementation.
+9. `research-therapy-settings` runs a distinct research-grade therapy workflow: it starts with a methodological gate, builds fasting, meal, and correction contexts, creates strict meal-bolus proxy features when explicit carbs are absent, audits Apple/Tandem feature engineering, compares ridge, elastic-net, segmented, tree-boosted and ensemble candidates, and writes segment-level recommendation evidence for basal and I/C ratio. Sensitivity factor remains staged and suppressed by default in the current implementation.
 10. `validate-therapy-infra` runs a synthetic truth-recovery suite against the same therapy research contract. It checks basal direction recovery, proxy-only conservatism, Apple-helpful vs Apple-null behavior, and suppression under corrupted or low-identifiability scenarios.
 11. `review-therapy-evidence` is the therapy-facing orchestration command. It prepares the model dataset, writes the therapy research and validation artifacts, computes the overnight basal evidence summary, and renders one interactive HTML page that explains what is identifiable, what is blocked, and where in the code and artifacts the logic lives.
 
@@ -425,8 +378,7 @@ Workflow crosswalk:
 | `research-latent-meal-icr --research-scope foundation` | Is the first-meal cohort ready for Phase C? | `output/latent_meal/latent_meal_research_gate.md`, `output/latent_meal/first_meal_clean_window_audit.md` | `src/bayesian_t1dm/therapy_research.py::run_latent_meal_icr_research` | Main scientific checkpoint for latent-meal readiness. |
 | `research-latent-meal-icr --research-scope full` | Does the accepted first-meal cohort support useful latent meal fitting yet? | `output/latent_meal/latent_meal_fit_summary.md`, `output/latent_meal/latent_meal_posterior_meals.csv`, `output/latent_meal/latent_meal_model_comparison.md` | `src/bayesian_t1dm/therapy_research.py::run_latent_meal_icr_research` | Research-only constrained latent-response fit on accepted windows. |
 | `validate-latent-meal` | Does the latent carb estimator recover known truth in simulation? | `output/latent_meal/validation/latent_meal_truth_recovery.md` | `src/bayesian_t1dm/latent_meal_validation.py::run_latent_meal_truth_recovery` | Simulated meals with known carbs; scores bolus-implied, the old peak/AUC heuristic, and the trajectory estimator. Exits non-zero if the trajectory estimator stops beating bolus x I:C. |
-| `status` | What is the combined current state across lanes? | `current_status.html`, `therapy_review.html`, `forecast_review.html` | `src/bayesian_t1dm/status.py::derive_current_status` | Combined overview, not the primary science loop. |
-| `run --skip-recommendations` | Does walk-forward forecasting still behave sensibly? | `forecast_review.html`, `cache/forecast/run_summary.json` | `src/bayesian_t1dm/report.py::build_run_summary`, `src/bayesian_t1dm/review.py::write_run_review_html` | Secondary forecast diagnostic. |
+| `status` | What is the combined current state across lanes? | `current_status.html`, `therapy_review.html` | `src/bayesian_t1dm/status.py::derive_current_status` | Combined overview, not the primary science loop. |
 | `research-therapy-settings` | What therapy contexts and identifiability gates are available? | `therapy_research_gate.md`, `therapy_feature_audit.md`, `therapy_model_comparison.md` | `src/bayesian_t1dm/therapy_research.py::build_therapy_research_frame`, `src/bayesian_t1dm/therapy_research.py::run_therapy_research` | Shows whether basal / I:C / ISF are directly observed, proxy-supported, weakly identified, or blocked. |
 | `validate-therapy-infra` | Does the therapy workflow recover known truth and suppress itself correctly? | `therapy_infra_validation.md`, `therapy_synthetic_results.csv` | `src/bayesian_t1dm/therapy_research.py::validate_therapy_infra` | Tests truth-recovery and false-positive suppression, not just predictive fit. |
 | `review-therapy-evidence` | What is actually happening with overnight basal evidence in the current data? | `output/therapy/therapy_review.html` | `src/bayesian_t1dm/review.py::write_therapy_evidence_review_html` | Secondary therapy-facing explanation surface. |
@@ -507,36 +459,28 @@ Synthetic recovery (`validate-latent-meal`, 40 cohorts of 20 logged meals, progr
 
 ## Output Contract
 
-`cache/forecast/run_summary.json` includes:
+The coverage report (`output/source/coverage.md`, with `coverage_review.html` beside it) from `ingest` includes:
 
+- `coverage` with row counts, first and last timestamp and window completeness
 - `data_quality` with `good`, `degraded`, or `broken` source status
-- `walk_forward` aggregate and per-fold metrics
-- per-fold `fit_diagnostics`
-- top-level `fit_diagnostics` for the final fit, or `null` if recommendations were skipped
-- `recommendation_policy` showing whether recommendations were `generated`, `suppressed`, or `skipped`
 - `review_artifacts` pointing at the runtime HTML review pages
-- recommendation records with per-item `confidence` and `flags`
 
-Sampler diagnostics currently include:
+Sampler diagnostics (`sampler_health.FitDiagnostics`) include:
 
 - `draws`, `tune`, `chains`, `target_accept`, `max_treedepth`
 - `wall_time_seconds`
 - `divergences`
 - `max_tree_depth_observed`
 - `max_tree_depth_hits`
-- `rhat_max` when multiple chains are available
-- `ess_bulk_min` and `ess_tail_min` when available
-
-Recommendation output is policy-gated. The pipeline suppresses recommendations when predictive validation, sampler health, or available signal are not strong enough to support them.
+- `rhat_max`, `ess_bulk_min` and `ess_tail_min`, each taken as the worst value over every parameter; a fit whose convergence cannot be assessed raises instead of reporting a number
 
 In addition to markdown and JSON summaries, the active pipeline writes self-contained interactive HTML review artifacts:
 
 - `current_status.html` from `status`
 - `coverage_review.html` from `ingest`
-- `forecast_review.html` from `run`
 - `therapy_review.html` from `review-therapy-evidence` / `status`
 
-These are the primary visual inspection surfaces for active-pipeline review. They combine source completeness, walk-forward behavior, baseline comparison, and sampler diagnostics in one place.
+These are the primary visual inspection surfaces for active-pipeline review. They combine source completeness, therapy evidence and blockers in one place.
 
 Apple Health-specific working artifacts:
 
@@ -559,7 +503,6 @@ Assumptions:
 
 - Tandem export timestamps are trustworthy after normalization
 - a 5-hour insulin action approximation is acceptable as a first-order model
-- current CGM, bolus, and activity history carries signal for short-horizon prediction
 - API payloads are stable enough to support windowed backfill
 
 Known failure modes:
@@ -568,7 +511,6 @@ Known failure modes:
 - sparse meal logging
 - basal schedule changes not captured in the chosen export
 - poor calibration if the insulin action kernel is badly misspecified
-- overconfident recommendations if validation is not walk-forward based
 - silent API drift if Tandem changes undocumented endpoints
 
 ## Acquisition and Manifest Design Decisions

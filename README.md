@@ -14,7 +14,6 @@ It is research and decision support, not a medical device; nothing here changes 
 | Run everything by hand and publish it to the Vault | `refresh` | `outputs/<date>/` in the Project Vault |
 | Where do time in range, lows and highs stand? | `report-outcomes` | `output/outcomes/outcomes_report.html` |
 | Is there enough clean overnight data to judge basal? | `review-therapy-evidence` | `output/therapy/therapy_review.html` |
-| Can glucose be forecast 30 minutes ahead better than "it stays the same"? | `run --skip-recommendations` | `output/forecast/forecast_review.html` |
 | Is the Tandem data complete? | `ingest` | `output/source/coverage_review.html` |
 | Where does everything stand? | `status` | `output/current_status.html` |
 
