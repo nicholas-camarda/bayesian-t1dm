@@ -393,3 +393,18 @@ def test_unknown_reasons_partition_exactly_the_times_values_at_cannot_show():
     assert by_time["2025-09-03 14:00:00"] == "before_first_known_start"
     assert by_time["2025-09-04 10:00:00"] == "next_slot_unseen"
     assert by_time["2025-09-04 20:00:00"] == "before_first_known_start"
+
+
+def test_a_created_segment_is_inserted_and_pushes_the_later_segments_down(tmp_path):
+    day = dt.datetime(2025, 9, 1)
+    records = [
+        _segment(day, 1, profile=0, index=0, modification=4, start=0, icr=7.0, isf=65, basal=0.8),
+        _segment(day, 2, profile=0, index=1, modification=4, start=1260, icr=6.0, isf=60, basal=0.9),
+        _activate(day, 3, profile=0, name="Main"),
+        _segment(dt.datetime(2025, 9, 5), 4, profile=0, index=1, modification=0, start=720, icr=5.0, isf=50, basal=1.0),
+    ]
+    events, visible = decode_profile_events(_archive(tmp_path, {"2025-08-25__2025-09-23": records}, serial=SYNTHETIC_PUMP))
+    history = ProfileHistory(events, visible, NO_RATES)
+    stamps = [dt.datetime(2025, 9, 6, 7, 0), dt.datetime(2025, 9, 6, 15, 0), dt.datetime(2025, 9, 6, 22, 0)]
+    # The 21:00 slot moved from index 1 to index 2; it is still the last, so its end is unknown without a rate log.
+    np.testing.assert_allclose(_basal_at(history, *stamps), [0.8, 1.0, np.nan])

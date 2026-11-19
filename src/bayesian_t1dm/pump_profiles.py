@@ -42,6 +42,7 @@ PROFILE_EVENT = 69
 PROFILE_NAME_EVENT = 57
 PROFILE_ACTIVATED = 3
 SEGMENT_DELETE = 1
+SEGMENT_CREATE = 0
 PROFILE_CREATED = 0
 PROFILE_COPIED = 1
 PROFILE_DELETED = 2
@@ -311,6 +312,8 @@ class ProfileHistory:
                         raise ValueError(f"Profile history deletes segment {index} of profile {key} at {row.timestamp}, which it never saw.")
                     else:
                         unseen_change = True  # the profile predates the archive: the slot was never seen and the table stays partly unknown
+                elif int(row.modification) == SEGMENT_CREATE and index <= len(table):
+                    table.insert(index, values if complete else None)  # a new segment pushes the later ones down
                 else:
                     table.extend([None] * (index + 1 - len(table)))
                     table[index] = values if complete else None
