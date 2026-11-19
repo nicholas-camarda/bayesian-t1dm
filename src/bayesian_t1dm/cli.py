@@ -41,7 +41,7 @@ from .model import BayesianGlucoseModel
 from .observability import LoggingSession, setup_run_logging
 from .analysis_data import AnalysisData, exercise_for, load_analysis_data, unlogged_for
 from .outcomes_report import write_outcomes
-from .controller import basal_signal, controller_inputs
+from .controller import basal_signal, controller_inputs, programmed_units_by_slot
 from .dashboard import build_dashboard_data, episodes_payload
 from .dashboard_page import render_dashboard
 from .changes import EVALUATION_DAYS, SETTING_FIELDS, detect_setting_changes
@@ -126,6 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
     refresh = add_command("refresh", "Run the whole pipeline by hand: collect, build, outcomes, proposal, change record, then publish to the Vault")
     refresh.add_argument("--env-file", default=None, help="Optional .env file with Tandem credentials")
     refresh.add_argument("--collect", action=argparse.BooleanOptionalAction, default=True, help="Fetch the latest 30 days from Tandem Source first")
+    refresh.add_argument("--record", action=argparse.BooleanOptionalAction, default=True, help="Write evaluated changes and eligible proposals to the durable record")
     refresh.add_argument("--publish", action=argparse.BooleanOptionalAction, default=True)
 
     screen_health = add_command("screen-health-features", "Screen imported Apple Health context features against Tandem glucose targets")
@@ -370,6 +371,7 @@ def _run_latent_meal_analysis(
     args,
     paths: ProjectPaths,
     session: LoggingSession | None = None,
+    analysis: AnalysisData | None = None,
 ):
     therapy_settings = None
     if getattr(args, "therapy_settings", None):
@@ -379,7 +381,7 @@ def _run_latent_meal_analysis(
             args.raw,
             segments=parse_therapy_segments(args.segments),
         )
-    merged = _load_dataset(args, session)
+    merged = analysis.merged if analysis is not None else _load_dataset(args, session)
     preparation = merged.preparation
     with _session_stage(session, "latent_meal.research"):
         result = run_latent_meal_icr_research(
@@ -390,8 +392,9 @@ def _run_latent_meal_analysis(
             therapy_settings=therapy_settings,
             excluded_periods=load_excluded_periods(args.raw),
             nutrition=merged.data.nutrition,
-            unlogged=unlogged_for(merged),
-            exercise=exercise_for(merged),
+            unlogged=analysis.unlogged if analysis is not None else unlogged_for(merged),
+            exercise=analysis.exercise if analysis is not None else exercise_for(merged),
+            programmed_units=programmed_units_by_slot(analysis) if analysis is not None else None,
             meal_segments=tuple(part.strip() for part in getattr(args, "meal_segments", "morning").split(",") if part.strip()),
         )
     return preparation, result
@@ -564,9 +567,9 @@ def _dispatch_command(
         return _run_refresh(args, paths, parser)
 
     if args.command == "propose-breakfast-icr":
-        preparation, result = _run_latent_meal_analysis(args=args, paths=paths, session=session)
         merged = _load_dataset(args, session)
         analysis = load_analysis_data(args.raw, merged)
+        _, result = _run_latent_meal_analysis(args=args, paths=paths, session=session, analysis=analysis)
         with session.stage("proposals.breakfast_icr", report_dir=args.report_dir):
             parts, _ = analysis.day_parts()
             now_settings = analysis.segment_settings()
@@ -584,10 +587,9 @@ def _dispatch_command(
             )
             table.to_csv(out / "segment_summary.csv", index=False)
             result.effective_icr_evidence.to_csv(out / "effective_icr_evidence.csv", index=False)
-            change_log = ""
-            if args.record:
-                change_log, proposal = _update_change_record(args, paths, analysis, proposal, parts, as_of)
-                (out / "change_log.md").write_text(change_log, encoding="utf-8")
+            result.icr_support.to_csv(out / "icr_support.csv", index=False)
+            change_log, proposal, records = _update_change_record(paths, analysis, proposal, parts, as_of, record=args.record)
+            (out / "change_log.md").write_text(change_log, encoding="utf-8")
             pd.DataFrame([{"as_of": as_of.date(), **proposal.to_row()}]).to_csv(out / "breakfast_proposal.csv", index=False)
             current_rates = {part.name: now_settings[float(part.start_minutes)]["basal"] for part in parts if float(part.start_minutes) in now_settings}
             primary_flow, strict_flow = [], []
@@ -606,7 +608,7 @@ def _dispatch_command(
                     basal_signal(strict_daily, current_rates).to_csv(out / "basal_signal_strict.csv", index=False)
             page = build_dashboard_data(
                 cgm=cgm, parts=parts, settings_now=now_settings, segments=table, evidence=result.effective_icr_evidence, proposal_row=proposal.to_row(),
-                records=load_records(paths.cloud_root / "data" / "records" / "setting_proposals.csv"), controller_daily=controller_daily, controller_daily_strict=strict_daily, current_rates=current_rates, as_of=as_of,
+                records=records, controller_daily=controller_daily, controller_daily_strict=strict_daily, current_rates=current_rates, as_of=as_of,
                 run={"run_id": f"{pd.Timestamp.now():%Y-%m-%d}_{current_commit(paths.root)[:8]}", "commit": current_commit(paths.root), "built": f"{pd.Timestamp.now():%Y-%m-%d %H:%M}"},
                 pump_serial=proposal.pump_serial, profile_id=proposal.profile_id, episodes=episode_data,
             )
@@ -936,7 +938,7 @@ def _dispatch_command(
     return 2
 
 
-def _update_change_record(args, paths: ProjectPaths, analysis: AnalysisData, proposal, parts, as_of: pd.Timestamp):
+def _update_change_record(paths: ProjectPaths, analysis: AnalysisData, proposal, parts, as_of: pd.Timestamp, *, record: bool):
     """Sync the durable record with the pump, register the proposal, run due evaluations, and return the change log
     with the proposal (held, with the reason, when earlier changes are still being evaluated)."""
     record_path = paths.cloud_root / "data" / "records" / "setting_proposals.csv"
@@ -948,16 +950,21 @@ def _update_change_record(args, paths: ProjectPaths, analysis: AnalysisData, pro
     parts_by_start = {float(part.start_minutes): part for part in parts}
     # Changes are looked at from 30 days back so a new record also picks up edits made since the last refresh.
     records = sync_with_pump(records, changes, parts_by_start, since=as_of - pd.Timedelta(days=30))
-    records, note = register_proposal(records, proposal, as_of=as_of)
+    records = evaluate_open(records, analysis.cgm, parts_by_start, now=as_of, excluded_days=analysis.excluded_days)
+    updated, note = register_proposal(records, proposal, as_of=as_of)
     if proposal.status == "proposed" and note.startswith("not recorded"):
-        first_due = (pd.to_datetime(records.loc[records["status"].isin(["entered"]), "entered_on"]).min().normalize() + pd.Timedelta(days=EVALUATION_DAYS + 1)).date()
+        entered = pd.to_datetime(records.loc[records["status"].eq("entered"), "entered_on"]).dropna()
+        timing = f"the first can be judged on {(entered.min().normalize() + pd.Timedelta(days=EVALUATION_DAYS + 1)).date()}" if len(entered) else "an earlier proposal is awaiting entry"
         proposal = dataclasses.replace(
             proposal, status="held",
-            reason=f"waiting: earlier changes are still being evaluated (the first can be judged on {first_due}). The evidence would otherwise support {proposal.current_value:.1f} to {proposal.proposed_value:.1f} g/U "
+            reason=f"waiting: earlier changes are still being evaluated ({timing}). The evidence would otherwise support {proposal.current_value:.1f} to {proposal.proposed_value:.1f} g/U "
                    f"for the segment starting {int(proposal.segment_start_minutes) // 60:02d}:{int(proposal.segment_start_minutes) % 60:02d}",
         )
-    records = evaluate_open(records, analysis.cgm, parts_by_start, now=as_of, excluded_days=analysis.excluded_days)
-    save_records(records, record_path)
+    if record:
+        records = updated
+        save_records(records, record_path)
+    elif note == "recorded":
+        note = "preview only"
     lines = ["## Change log", "", f"Record: `{record_path}` ({note}).", ""]
     if records.empty:
         lines.append("No setting changes recorded yet.")
@@ -967,7 +974,7 @@ def _update_change_record(args, paths: ProjectPaths, analysis: AnalysisData, pro
             made = row.entered_on if pd.notna(row.entered_on) else f"proposed {row.proposed_on}"
             segment = f"{int(row.segment_start_minutes) // 60:02d}:{int(row.segment_start_minutes) % 60:02d}"
             lines.append(f"| {made} | {SETTING_FIELDS.get(row.setting, row.setting)} | {segment} | {row.old_value:g} -> {row.new_value:g} | {row.origin} | {int(row.concurrent_changes) if pd.notna(row.concurrent_changes) else 0} | {row.status} | {row.result if pd.notna(row.result) else ''} |")
-    return "\n".join(lines) + "\n", proposal
+    return "\n".join(lines) + "\n", proposal, records
 
 
 def _run_refresh(args, paths: ProjectPaths, parser) -> int:
@@ -982,7 +989,7 @@ def _run_refresh(args, paths: ProjectPaths, parser) -> int:
     steps = []
     if args.collect:
         steps.append(("collect", ["collect", *(["--env-file", args.env_file] if args.env_file else [])]))
-    steps += [("build-dataset", ["build-dataset"]), ("report-outcomes", ["report-outcomes"]), ("propose-breakfast-icr", ["propose-breakfast-icr", "--record"])]
+    steps += [("build-dataset", ["build-dataset"]), ("report-outcomes", ["report-outcomes"]), ("propose-breakfast-icr", ["propose-breakfast-icr", *(["--record"] if args.record else [])])]
     for name, argv in steps:
         code = main([*base, *argv])
         record["steps"][name] = code

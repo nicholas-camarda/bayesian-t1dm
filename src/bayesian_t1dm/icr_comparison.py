@@ -3,48 +3,13 @@
 import argparse
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 from . import therapy_research as meals
 from .analysis_data import load_analysis_data
 from .outcomes import day_part_table
 from .proposals import _assess_segment, segment_ends_from_parts, segment_summary
-from .pump_profiles import pump_key
-
-
-def programmed_units_by_slot(analysis):
-    """Integrate in-force programmed U/h over exactly the logged delivery exposure in each five-minute bin."""
-    basal = analysis.merged.tandem_data.basal
-    totals = []
-    for pump, group in basal.groupby(basal.pump_serial.map(pump_key)):
-        starts = pd.DatetimeIndex(group.start_timestamp)
-        ends = pd.DatetimeIndex(group.end_timestamp)
-        usable = starts.notna() & ends.notna() & (ends > starts)
-        starts, ends = starts[usable], ends[usable]
-        if not len(starts):
-            continue
-        slots = pd.date_range(starts.min().floor("5min"), ends.max().ceil("5min"), freq="5min")
-        edits = analysis.history.events.loc[analysis.history.events.pump_serial.eq(pump)]
-        offsets = edits.start_minutes.dropna().astype(int).unique()
-        days = pd.date_range(slots.min().normalize(), slots.max().normalize())
-        edges = slots.union(starts.unique()).union(ends.unique()).union(pd.DatetimeIndex(edits.timestamp.unique()))
-        for minute in offsets[offsets % 5 != 0]:
-            edges = edges.union(days + pd.Timedelta(minutes=int(minute)))
-        edges = edges.sort_values()
-        left = edges[:-1]
-        multiplicity = starts.sort_values().searchsorted(left, side="right") - ends.sort_values().searchsorted(left, side="right")
-        observed = multiplicity > 0
-        times = pd.Series(left[observed])
-        hours = (edges[1:] - left).total_seconds().to_numpy()[observed] / 3600
-        rate = analysis.history.basal_rates(pd.Series(pump, index=times.index), times)
-        totals.append(pd.DataFrame({"slot": times.dt.floor("5min"), "units": rate * hours * multiplicity[observed],
-                                    "unknown": ~np.isfinite(rate), "pump": pump}))
-    if not totals:
-        return pd.Series(dtype=float)
-    groups = pd.concat(totals).groupby("slot")
-    units = groups.units.sum()
-    return units.mask(groups.unknown.any() | groups.pump.nunique().gt(1))
+from .controller import programmed_units_by_slot
 
 
 def compare(raw: Path, output: Path):
