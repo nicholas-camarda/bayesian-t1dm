@@ -26,7 +26,6 @@ GROUP_STYLE = {
     "more insulin": GroupStyle("Change gives more insulin", JCO[0], "o", "-"),
     "less insulin": GroupStyle("Change gives less insulin", JCO[3], "s", "--"),
     "mixed": GroupStyle("Change in both directions", JCO[1], "D", "-."),
-    "placebo": GroupStyle("Placebo dates", JCO[2], "x", ":"),
 }
 
 
@@ -36,7 +35,3 @@ def assert_ascii(*texts: str) -> None:
         if not str(text).isascii():
             raise ValueError(f"Figure text must be ASCII: {text!r}")
 
-
-def format_p(value: float) -> str:
-    """A p-value as the manuscripts write it: 'p < 0.001' below 0.001, otherwise 'p = 0.012'."""
-    return "p < 0.001" if value < 0.001 else f"p = {value:.3f}"

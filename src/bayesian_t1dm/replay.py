@@ -56,7 +56,6 @@ INTERVAL_PERCENT = (5.0, 95.0)
 LOW_LIMIT_PERCENT = 4.0
 VERY_LOW_LIMIT_PERCENT = 1.0
 OUTCOMES = ("tir", "below70", "below54", "mean_glucose")
-OUTCOME_LABELS = {"tir": "time in range 70-180 (%)", "below70": "time below 70 (%)", "below54": "time below 54 (%)", "mean_glucose": "mean glucose (mg/dL)"}
 SETTING_LABELS = {"icr": "I:C", "cf": "CF", "basal": "basal", "target": "target"}
 # A larger value of these settings gives less insulin (a larger I:C or CF, a higher target); a larger basal gives more.
 INSULIN_SIGN = {"icr": -1, "cf": -1, "basal": 1, "target": -1}

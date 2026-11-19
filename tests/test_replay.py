@@ -6,7 +6,7 @@ import pytest
 
 from bayesian_t1dm import replay
 from bayesian_t1dm.diagnostics_workbook import STATUSES, read_workbook, write_workbook
-from bayesian_t1dm.figures import assert_ascii, format_p
+from bayesian_t1dm.figures import assert_ascii
 from bayesian_t1dm.replay_report import write_replay_outputs
 
 START = pd.Timestamp("2024-01-01")
@@ -129,8 +129,7 @@ def test_workbook_rejects_a_status_outside_the_four_and_missing_sheets(tmp_path)
         write_workbook(tmp_path / "missing.xlsx", {"Specification_Coding": sheets["Specification_Coding"]})
 
 
-def test_figure_text_helpers():
-    assert format_p(0.0004) == "p < 0.001" and format_p(0.0123) == "p = 0.012"
+def test_figure_text_must_be_ascii():
     assert_ascii("time in range 70-180 (percentage points)")
     with pytest.raises(ValueError):
         assert_ascii("± 5")
