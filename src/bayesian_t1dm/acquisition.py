@@ -780,6 +780,43 @@ def _normalize_carb_records(
     return frame
 
 
+def _basal_wall_clock_intervals(frame: pd.DataFrame, timezone: str) -> pd.DataFrame:
+    """Project offset-bearing delivery intervals onto the civil clock without changing elapsed exposure."""
+    import re
+
+    start, end = frame["start_timestamp"], frame["end_timestamp"]
+    offset = re.compile(r"(?:Z|[+-]\d{2}:?\d{2})$", re.IGNORECASE)
+    aware = start.astype("string").str.contains(offset, na=False) & end.astype("string").str.contains(offset, na=False)
+    start_utc = pd.to_datetime(start.where(aware), format="ISO8601", utc=True)
+    end_utc = pd.to_datetime(end.where(aware), format="ISO8601", utc=True)
+    frame["start_timestamp"] = to_local_wall_clock(start, timezone=timezone)
+    frame["end_timestamp"] = to_local_wall_clock(end, timezone=timezone)
+    frame["start_utc"] = start_utc
+    frame["end_utc"] = end_utc
+    crossing = aware & (end_utc > start_utc) & ((end_utc - start_utc) != (frame.end_timestamp - frame.start_timestamp))
+    extra = []
+    for i in frame.index[crossing]:
+        first = start_utc[i]
+        last = end_utc[i]
+        old_offset = first.tz_convert(timezone).utcoffset()
+        lo, hi = first.value, last.value
+        while hi - lo > 1:
+            mid = (hi + lo) // 2
+            if pd.Timestamp(mid, tz="UTC").tz_convert(timezone).utcoffset() == old_offset:
+                lo = mid
+            else:
+                hi = mid
+        boundary = pd.Timestamp(hi, tz="UTC")
+        if boundary < last:
+            remainder = frame.loc[i].copy()
+            remainder["start_timestamp"] = boundary.tz_convert(timezone).tz_localize(None)
+            remainder["start_utc"] = boundary
+            extra.append(remainder)
+        frame.loc[i, "end_timestamp"] = frame.loc[i, "start_timestamp"] + (boundary - first)
+        frame.loc[i, "end_utc"] = boundary
+    return pd.concat([frame, pd.DataFrame(extra)], ignore_index=True) if extra else frame
+
+
 def _normalize_basal_records(
     records: Sequence[Mapping[str, Any]],
     *,
@@ -817,8 +854,7 @@ def _normalize_basal_records(
     if not rows:
         return pd.DataFrame(columns=['start_timestamp', 'end_timestamp', 'basal_units_per_hour', 'source_file', 'source_label'])
     frame = pd.DataFrame(rows)
-    frame['start_timestamp'] = to_local_wall_clock(frame['start_timestamp'], timezone=_storage_timezone_name(timezone))
-    frame['end_timestamp'] = to_local_wall_clock(frame['end_timestamp'], timezone=_storage_timezone_name(timezone))
+    frame = _basal_wall_clock_intervals(frame, _storage_timezone_name(timezone))
     frame = frame.sort_values(['start_timestamp', 'end_timestamp']).reset_index(drop=True)
     if frame['start_timestamp'].notna().any():
         next_starts = frame['start_timestamp'].shift(-1)
@@ -836,7 +872,7 @@ def _normalize_basal_records(
         & frame['end_timestamp'].le(end_bound)
     )
     frame = frame.loc[mask].reset_index(drop=True)
-    frame = frame.drop_duplicates(subset=['start_timestamp', 'end_timestamp', 'basal_units_per_hour'], keep='first').reset_index(drop=True)
+    frame = frame.drop_duplicates(subset=['start_timestamp', 'end_timestamp', 'basal_units_per_hour', 'pump_serial', 'start_utc', 'end_utc'], keep='first').reset_index(drop=True)
     return frame
 
 
