@@ -125,16 +125,29 @@ def find_problem_areas(
             # The setting was changed after these meals: say whether the new value fits what they showed.
             fits = abs(item["effective"] - item["now"]) < abs(item["effective"] - item["programmed"])
             areas.append({"level": "ok" if fits else "watch", "tab": "meals", "title": f"I:C at {item['segment']} was changed to {item['now']:.1f}",
-                          "summary": f"The {item['n']} meals at {item['programmed']:.1f} behaved like {item['effective']:.1f} g/U (90% range {item['lower']:.1f} to {item['upper']:.1f}), so the change " + ("fits them. Evidence at the new setting is still being collected." if fits else "does not clearly fit them.")})
+                          "summary": f"The {item['n']} meals at {item['programmed']:.1f} behaved like {item['effective']:.1f} g/U (90% confidence interval {item['lower']:.1f} to {item['upper']:.1f}), so the change " + ("fits them. Evidence at the new setting is still being collected." if fits else "does not clearly fit them.")})
             continue
         if item["current"] and item["n"] >= 5 and item["lower"] is not None and not (item["lower"] <= item["programmed"] <= item["upper"]):
             direction = "stronger (a smaller g/U)" if item["effective"] < item["programmed"] else "weaker (a larger g/U)"
             areas.append({"level": "act", "tab": "meals", "title": f"I:C at {item['segment']} looks too weak" if item["effective"] < item["programmed"] else f"I:C at {item['segment']} looks too strong",
-                          "summary": f"{item['n']} meals behaved like {item['effective']:.1f} g/U (90% range {item['lower']:.1f} to {item['upper']:.1f}); the pump has {item['programmed']:.1f}. The evidence points to a {direction} ratio."})
+                          "summary": f"{item['n']} meals behaved like {item['effective']:.1f} g/U (90% confidence interval {item['lower']:.1f} to {item['upper']:.1f}); the pump has {item['programmed']:.1f}. The evidence points to a {direction} ratio."})
     for row in signals.itertuples(index=False):
         if row.signal in ("basal likely too low", "basal likely too high"):
-            areas.append({"level": "act", "tab": "basal", "title": f"{row.signal.capitalize()}, {row.part}",
-                          "summary": f"In the last {row.window_days} days ({row.days} days, {row.clean_hours:.0f} clean hours, any basal rate) the controller commanded 25% or more above the current programmed rate for {row.share_over_x:.0%} of the clean time (90% range {row.share_over_lo:.0%} to {row.share_over_hi:.0%}); pooled extra insulin {row.pooled_excess:+.0%}; mean glucose {row.mean_glucose:.0f} mg/dL."})
+            strict = getattr(row, "strict_signal", None)
+            summary = (f"Over {row.window_days} days ({row.days} days, {row.clean_hours:.0f} clean hours), the size-scaled rule "
+                       f"estimated {row.pooled_excess:+.0%} commanded basal relative to the current programmed rate. "
+                       f"Mean glucose was {row.mean_glucose:.0f} mg/dL.")
+            if strict == row.signal:
+                title = f"{row.signal.capitalize()}, {row.part}"
+                summary += " The strict rule gave the same signal."
+            else:
+                title = f"Basal signal depends on the clean-time rule, {row.part}"
+                strict_excess = getattr(row, "strict_excess", float("nan"))
+                if pd.notna(strict_excess):
+                    summary += f" The strict rule estimated {strict_excess:+.0%} and gave a different signal."
+                else:
+                    summary += " The strict rule had insufficient support."
+            areas.append({"level": "watch", "tab": "basal", "title": title, "summary": summary})
     for row in segments.itertuples(index=False):
         if row.below_70_90d < LOW_LIMIT_PERCENT and row.tir_90d < TIME_IN_RANGE_TARGET:
             worse = row.tir_14d < row.tir_90d - 10

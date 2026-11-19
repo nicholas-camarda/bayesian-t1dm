@@ -32,7 +32,7 @@ NO_SIGNALS = pd.DataFrame(columns=["part", "window_days", "days", "clean_hours",
 
 def test_problems_list_lows_first_then_evidence_then_what_to_watch():
     evidence = [{"segment": "19:00", "programmed": 6.8, "effective": 5.0, "lower": 4.5, "upper": 5.5, "n": 48, "current": True, "now": 6.8, "latest": False}]
-    signals = pd.DataFrame([{"part": "00:00-05:00", "window_days": 28, "days": 28, "clean_hours": 120.0, "share_over_x": 0.68, "share_over_lo": 0.5, "share_over_hi": 0.8, "pooled_excess": 0.46, "mean_glucose": 148.0, "signal": "basal likely too low"}])
+    signals = pd.DataFrame([{"part": "00:00-05:00", "window_days": 28, "days": 28, "clean_hours": 120.0, "share_over_x": 0.68, "share_over_lo": 0.5, "share_over_hi": 0.8, "pooled_excess": 0.46, "mean_glucose": 148.0, "signal": "basal likely too low", "strict_signal": "basal likely too low"}])
     segments = pd.concat([_segments(), _segments(hours="00:00-05:00", below_70_90d=5.0)], ignore_index=True)
     areas = dashboard.find_problem_areas(segments, evidence, signals, EMPTY_EPISODES, {})
     titles = [a["title"] for a in areas]
@@ -67,3 +67,13 @@ def test_the_page_embeds_its_data_and_has_every_tab():
     page = render_dashboard({"run": {}, "as_of": "2026-01-01", "problems": []})
     assert '"as_of":"2026-01-01"' in page and all(name in page for name in ("Today", "Glucose", "Meals (I:C)", "Basal", "Changes", "About"))
     assert "http://" not in page.replace("http://www.w3.org/2000/svg", "")  # self-contained: no network references
+
+
+def test_basal_sensitivity_disagreement_is_visible_on_landing_page():
+    signals = pd.DataFrame([{"part": "21:00-00:00", "window_days": 56, "days": 23, "clean_hours": 40.0,
+                            "pooled_excess": 0.69, "mean_glucose": 181.0, "signal": "basal likely too low",
+                            "strict_signal": "no consistent pattern", "strict_excess": 0.09}])
+    areas = dashboard.find_problem_areas(_segments(tir_90d=80), [], signals, EMPTY_EPISODES, {})
+    assert areas[0]["level"] == "watch"
+    assert "depends on the clean-time rule" in areas[0]["title"]
+    assert "+69%" in areas[0]["summary"] and "+9%" in areas[0]["summary"]
