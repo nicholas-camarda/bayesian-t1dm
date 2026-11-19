@@ -43,7 +43,7 @@ OUTCOME_PRIOR_MEAN = {"tir": 0.70, "below70": 0.03, "below54": 0.005}
 COVARIATES = ("log_icr", "log_cf", "log_basal", "target_10", "log_carbs_3h", "exercise_share", "sleep_mode_share", "site_age_capped")
 SITE_AGE_CAP_DAYS = 5.0
 SEED = 20261119
-TARGET_ACCEPT = 0.9
+TARGET_ACCEPT = 0.95
 MAX_TREEDEPTH = 10
 VIF_CONCERN = 5.0
 VIF_STOP = 10.0
@@ -339,7 +339,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", default=None, help="Output folder (default: runtime/output/outcomes_model)")
     parser.add_argument("--outcome", default="tir", choices=sorted(OUTCOME_COLUMNS))
     parser.add_argument("--origins", type=int, default=4, help="Fortnightly rolling origins to score at the end (0 skips)")
-    parser.add_argument("--draws", type=int, default=1000)
+    parser.add_argument("--draws", type=int, default=2000)
     parser.add_argument("--tune", type=int, default=1000)
     parser.add_argument("--chains", type=int, default=4)
     args = parser.parse_args(argv)
