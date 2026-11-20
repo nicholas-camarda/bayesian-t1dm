@@ -8,6 +8,7 @@ import pytest
 from scipy.stats import norm
 
 from bayesian_t1dm import forecast_harness as fh
+from bayesian_t1dm import outcomes_model as om
 from bayesian_t1dm import forecast_harness_report as report
 from bayesian_t1dm import outcomes_model_report as omr
 from bayesian_t1dm import win_test as wt
@@ -15,6 +16,7 @@ from bayesian_t1dm.diagnostics_workbook import STATUSES, read_workbook
 from bayesian_t1dm.sampler_health import FitDiagnostics
 
 FIRST_DAY = pd.Timestamp("2024-01-01")
+LAST_DAY = pd.Timestamp("2031-03-17")  # a synthetic last CGM day
 
 
 def synthetic_table(days: int = 700, *, seed: int = 11, first: pd.Timestamp = FIRST_DAY) -> pd.DataFrame:
@@ -59,13 +61,13 @@ def fake_posterior(origin: pd.Timestamp, draws: int = 200, seed: int = 5) -> fh.
                                  rhat_max=1.002, ess_bulk_min=900.0, ess_tail_min=950.0)
     return fh.ModelPosterior(origin=origin, alpha=rng.normal(1.0, 0.05, draws), beta=rng.normal(0, 0.05, (draws, 8)), z_hour=rng.normal(0, 0.1, (draws, 24)), hour_scale=np.full(draws, 0.3), day_scale=np.full(draws, 0.2),
                              log_phi=np.full(draws, 2.0), center=np.array([2.3, 3.8, -0.2, 11.0, 2.0, 0.0, 0.2, 1.5]), scale=np.array([0.1, 0.1, 0.1, 0.5, 1.0, 1.0, 0.4, 1.0]), diagnostics=diagnostics,
-                             timing={"sample_seconds": 1.0, "compile_seconds": 1.0, "build_seconds": 0.1}, rows=1000, days=100, fingerprint="synthetic")
+                             timing={"sample_seconds": 1.0, "compile_seconds": 1.0, "build_seconds": 0.1}, rows=1000, days=100, fingerprint="synthetic", model_hash="synthetic-model")
 
 
 # ---- origins, target, windows ------------------------------------------------
 
 def test_evaluation_origins_are_52_weekly_and_the_last_window_ends_on_the_last_day() -> None:
-    last = pd.Timestamp("2026-11-17")
+    last = LAST_DAY
     origins = fh.evaluation_origins(last)
     assert len(origins) == 52 and origins == sorted(origins)
     assert {(b - a).days for a, b in zip(origins, origins[1:])} == {7}
@@ -79,7 +81,7 @@ def test_development_origins_are_every_second_week_and_end_before_the_evaluation
     development = fh.development_origins()
     assert development[0] == pd.Timestamp("2025-01-07") and {(b - a).days for a, b in zip(development, development[1:])} == {14}
     assert development[-1] <= pd.Timestamp("2025-11-04")
-    assert development[-1] + pd.Timedelta(days=13) < fh.evaluation_origins(pd.Timestamp("2026-11-17"))[0]
+    assert development[-1] + pd.Timedelta(days=13) < fh.evaluation_origins(LAST_DAY)[0]
 
 
 def test_target_includes_excluded_days_and_unknown_settings_and_weights_by_readings() -> None:
@@ -160,15 +162,15 @@ def test_frozen_settings_ignore_a_change_inside_the_window_and_the_planned_varia
     window = fh.window_for(table, origin)
     assert fh.settings_changed_in_window(window, profiles.at(origin))
     posterior = fake_posterior(origin)
-    frozen = fh.model_draws(posterior, known, window, np.random.default_rng(3), planned=False)
+    frozen = fh.model_draws(posterior, known, window, np.random.default_rng(3), variant="frozen")
     unchanged = table.copy()
     unchanged["icr"] = 10.0
-    again = fh.model_draws(posterior, known, fh.window_for(unchanged, origin), np.random.default_rng(3), planned=False)
+    again = fh.model_draws(posterior, known, fh.window_for(unchanged, origin), np.random.default_rng(3), variant="frozen")
     assert np.array_equal(frozen, again)
-    planned = fh.model_draws(posterior, known, window, np.random.default_rng(3), planned=True)
+    planned = fh.model_draws(posterior, known, window, np.random.default_rng(3), variant="planned")
     posterior_strong = fake_posterior(origin)
     posterior_strong = fh.ModelPosterior(**{**posterior_strong.__dict__, "beta": np.tile(np.array([-2.0, 0, 0, 0, 0, 0, 0, 0]), (200, 1))})
-    differ = fh.model_draws(posterior_strong, known, window, np.random.default_rng(3), planned=True).mean() != fh.model_draws(posterior_strong, known, window, np.random.default_rng(3), planned=False).mean()
+    differ = fh.model_draws(posterior_strong, known, window, np.random.default_rng(3), variant="planned").mean() != fh.model_draws(posterior_strong, known, window, np.random.default_rng(3), variant="frozen").mean()
     assert differ and planned.shape == frozen.shape
 
 
@@ -185,7 +187,99 @@ def test_the_model_is_not_scored_where_the_frozen_profile_is_unknown() -> None:
     values = profiles.values.copy()
     values[profiles.dates.get_loc(origin), 5] = np.nan
     known = fh.known_at(origin, "tir", table, fh.daily_counts(table, "tir"), constant_tdd(table), fh.SettingsProfiles(profiles.dates, values))
-    assert "unknown" in fh.model_unscorable_reason(known, fh.window_for(table, origin), planned=False)
+    assert "unknown" in fh.model_unscorable_reason(known, fh.window_for(table, origin), variant="frozen")
+
+
+def test_model_draws_and_the_fit_ignore_glucose_on_or_after_the_origin(monkeypatch) -> None:
+    table = synthetic_table(days=520)
+    origin = pd.Timestamp("2025-03-10")
+    tdd, profiles = constant_tdd(table), constant_profiles(table)
+    sentinel = table.copy()
+    future = sentinel["date"] >= origin
+    sentinel.loc[future, ["n_in_range", "n_below_70", "n_below_54"]] = [0, 12, 12]
+    sentinel.loc[future, "carbs_prev3h_g"] = 1e6
+    posterior = fake_posterior(origin)
+    results = []
+    for data in (table, sentinel):
+        known = fh.known_at(origin, "tir", data, fh.daily_counts(data, "tir"), tdd, profiles)
+        window = fh.window_for(table, origin)  # the window's own reading counts are the same in both tables
+        for variant in fh.MODEL_VARIANTS.values():
+            results.append(fh.model_draws(posterior, known, window, np.random.default_rng(4), variant=variant))
+    half = len(results) // 2
+    for before, after in zip(results[:half], results[half:]):
+        assert np.array_equal(before, after)
+    seen = []
+
+    def stop(design, **_):
+        seen.append(design)
+        raise RuntimeError("stop after the design is built")
+
+    monkeypatch.setattr(om, "fit", stop)
+    for data in (table, sentinel):
+        with pytest.raises(RuntimeError, match="stop after"):
+            fh.fit_origin(data, origin, "tir", 10, 10, 1)
+    assert all(np.array_equal(getattr(seen[0], name), getattr(seen[1], name)) for name in ("y", "n", "hour", "day", "x"))
+
+
+def test_the_exposure_order_and_the_settings_split_follow_the_model_covariates() -> None:
+    assert om.COVARIATES[:4] == ("log_icr", "log_cf", "log_basal", "target_10")
+    assert om.COVARIATES[4:] == ("log_carbs_3h", "exercise_share", "sleep_mode_share", "site_age_capped")
+    table = synthetic_table(days=120)
+    origin = pd.Timestamp("2024-04-01")
+    known = fh.known_at(origin, "tir", table, fh.daily_counts(table, "tir"), constant_tdd(table), constant_profiles(table))
+    pool = fh.exposure_pool(known)
+    last_day = known.table[known.table["date"] == known.table["date"].max()].sort_values("hour")
+    assert np.allclose(pool[-1][:, 0], np.log1p(last_day["carbs_prev3h_g"].to_numpy()))
+    assert np.allclose(pool[-1][:, 2], last_day["sleep_mode_share"].to_numpy())
+    assert np.allclose(fh.settings_covariates(np.array([10.0, 45.0, 0.8, 110.0])), [np.log(10.0), np.log(45.0), np.log(0.8), 11.0])
+    day_number = (table["date"] - table["date"].min()).dt.days
+    table["icr"] = np.where(day_number % 2 == 0, 10.0, 20.0)
+    table["cf"] = np.where(day_number % 3 == 0, 45.0, 90.0)
+    design = om.build_design(table, outcome="tir")
+    columns = list(om.COVARIATES)
+    higher_icr = (design.x[:, columns.index("log_icr")] > 0).mean()
+    higher_cf = (design.x[:, columns.index("log_cf")] > 0).mean()
+    assert abs(higher_icr - 0.5) < 0.02 and abs(higher_cf - 2 / 3) < 0.02  # the columns hold the settings they are named for
+
+
+def test_the_ridge_training_rows_exclude_the_test_windows_and_the_features_that_look_into_them() -> None:
+    positions = np.arange(400)
+    fold = np.arange(100, 160)
+    train = fh.ridge_training_mask(positions, fold)
+    assert not train[100 - 13: 159 + 13 + 90 + 1].any()
+    assert train[:100 - 13].all() and train[159 + 13 + 90 + 1:].all()
+
+
+def test_ridge_features_at_a_position_use_only_outcomes_before_that_position() -> None:
+    table = synthetic_table(days=300)
+    origin = pd.Timestamp("2024-10-01")
+    tdd, profiles = constant_tdd(table), constant_profiles(table)
+    known = fh.known_at(origin, "tir", table, fh.daily_counts(table, "tir"), tdd, profiles)
+    features, dates = fh.ridge_features(known)
+    position = 150
+    altered = table.copy()
+    after = altered["date"] >= pd.Timestamp(dates[position])
+    altered.loc[after, ["n_in_range", "n_below_70"]] = [0, 12]
+    other, _ = fh.ridge_features(fh.known_at(origin, "tir", altered, fh.daily_counts(altered, "tir"), tdd, profiles))
+    assert np.allclose(features[position, :4], other[position, :4], equal_nan=True)
+    assert not np.allclose(features[-1, :4], other[-1, :4], equal_nan=True)
+
+
+def test_a_stored_posterior_from_other_data_or_model_code_is_refused(tmp_path) -> None:
+    table = synthetic_table(days=300)
+    origin = pd.Timestamp("2024-10-01")
+    design = om.build_design(table[table["date"] < origin], outcome="tir")
+    good = fake_posterior(origin)
+    good = fh.ModelPosterior(**{**good.__dict__, "fingerprint": fh.design_fingerprint(design), "model_hash": fh.model_hash(1000, 1000, 4)})
+    fh.save_posterior(good, tmp_path)
+    assert fh.fit_all_origins(table, [origin], outcome="tir", draws=1000, tune=1000, chains=4, workers=1, store=tmp_path)[origin].origin == origin
+    for field in ("fingerprint", "model_hash"):
+        fh.save_posterior(fh.ModelPosterior(**{**good.__dict__, field: "other"}), tmp_path)
+        with pytest.raises(RuntimeError, match="different data, model code or sampler settings"):
+            fh.fit_all_origins(table, [origin], outcome="tir", draws=1000, tune=1000, chains=4, workers=1, store=tmp_path)
+    fh.save_posterior(good, tmp_path)
+    with pytest.raises(RuntimeError, match="different data, model code or sampler settings"):
+        fh.fit_all_origins(table, [origin], outcome="tir", draws=3000, tune=1000, chains=4, workers=1, store=tmp_path)
 
 
 # ---- baselines ---------------------------------------------------------------
@@ -208,11 +302,11 @@ def test_baseline_point_and_residuals_use_only_days_and_windows_before_the_origi
 
 
 def test_a_constant_series_gives_a_degenerate_forecast_with_zero_crps() -> None:
-    table = synthetic_table(days=200)
+    table = synthetic_table(days=500)
     table["n_in_range"] = 9
     table["n_below_70"] = 3
     daily = fh.daily_counts(table, "tir")
-    origin = pd.Timestamp("2024-06-01")
+    origin = pd.Timestamp("2025-03-01")
     known = fh.known_at(origin, "tir", table, daily, constant_tdd(table), constant_profiles(table))
     for name in fh.BASELINES:
         draws = fh.baseline_draws(known, name, np.random.default_rng(0))
@@ -278,7 +372,7 @@ def test_exposure_resampling_draws_only_complete_days_from_the_28_days_before_th
     allowed = {round(np.log1p(float(k)), 6) for k in range(index - 28, index)} - {round(np.log1p(float(index - 3)), 6)}
     assert carbs_days == allowed and min(carbs_days) >= round(first, 6)
     assert pool.shape == (27, 24, 4)
-    assert fh.model_draws(fake_posterior(origin), known, fh.window_for(table, origin), np.random.default_rng(0), planned=False).shape == (200,)
+    assert fh.model_draws(fake_posterior(origin), known, fh.window_for(table, origin), np.random.default_rng(0), variant="frozen").shape == (200,)
 
 
 def test_model_draws_are_a_share_between_zero_and_one_from_the_realised_reading_counts() -> None:
@@ -286,7 +380,7 @@ def test_model_draws_are_a_share_between_zero_and_one_from_the_realised_reading_
     origin = pd.Timestamp("2024-04-10")
     window = fh.window_for(table, origin)
     known = fh.known_at(origin, "tir", table, fh.daily_counts(table, "tir"), constant_tdd(table), constant_profiles(table))
-    draws = fh.model_draws(fake_posterior(origin), known, window, np.random.default_rng(0), planned=False)
+    draws = fh.model_draws(fake_posterior(origin), known, window, np.random.default_rng(0), variant="frozen")
     assert ((draws >= 0) & (draws <= 1)).all() and 0.5 < draws.mean() < 0.95
 
 
@@ -342,7 +436,7 @@ def test_a_lower_mean_crps_with_an_interval_spanning_zero_is_a_tie_and_a_concern
     comparisons = report.build_comparisons(table)
     primary = comparisons[comparisons["role"] == "win test"].iloc[0]
     assert primary["mean_difference_points"] < 0 and primary["verdict"] == "tie" and primary["status"] == "concern"
-    sensitivity = comparisons[(comparisons["candidate"] == "hour-day model") & (comparisons["role"] == "sensitivity (block length)")]
+    sensitivity = comparisons[(comparisons["candidate"] == "hour-day model") & (comparisons["role"] == "sensitivity of the win test (block length)")]
     assert sorted(sensitivity["block_length_origins"]) == [2, 8]
 
 
@@ -374,7 +468,7 @@ def test_workbook_rule_no_longer_calls_a_lower_mean_crps_no_concern() -> None:
 # ---- the whole run on synthetic data ------------------------------------------------
 
 def test_scoring_and_reporting_a_synthetic_record_end_to_end(tmp_path) -> None:
-    table = synthetic_table(days=700)
+    table = synthetic_table(days=1000)
     daily = fh.daily_counts(table, "tir")
     profiles, tdd = constant_profiles(table), constant_tdd(table)
     evaluation, development = fh.evaluation_origins(daily.index.max()), fh.development_origins()
@@ -399,6 +493,12 @@ def test_scoring_and_reporting_a_synthetic_record_end_to_end(tmp_path) -> None:
     primary = win_test[win_test["role"] == "win test"].iloc[0]
     assert primary["status"] == ("no concern" if primary["verdict"] == "win" else "concern")
     assert (workbook["Model_Fits"]["status"] == "no concern").all()
+    others = win_test[(win_test["role"] != "win test") & (win_test["role"] != "power check")]
+    assert (others["status"] == "not applicable").all() and (others["reason"].str.startswith("does not gate")).all()
+    assert win_test[win_test["role"] == "power check"]["status"].isin(["no concern", "concern"]).all()
+    assert {"last 365 days", "all history", "hour-day model (settings pinned)", "hour-day model (trailing-mean counts)"} <= set(win_test["candidate"])
+    summary_text = (tmp_path / "forecast_harness_summary.md").read_text()
+    assert "does not show that the settings add forecasting information" in summary_text
 
 
 def test_the_run_without_the_model_says_it_was_not_assessed(tmp_path) -> None:

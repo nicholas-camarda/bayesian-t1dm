@@ -107,7 +107,8 @@ def rolling_origin_check(scores: pd.DataFrame) -> tuple[str, str]:
     difference = (model - baseline).dropna().to_numpy() * 100.0
     result = wt.paired_interval(difference, block=min(ROLLING_BLOCK_DAYS, len(difference)))
     text = (f"mean CRPS {summary.loc['hour-day model', 'crps_points']:.2f} vs {summary.loc['last 28 days', 'crps_points']:.2f} points (model vs last-28-day baseline); 90% interval held {summary.loc['hour-day model', 'coverage']:.0%} vs {summary.loc['last 28 days', 'coverage']:.0%} of {int(summary.loc['hour-day model', 'days'])} days; "
-            + wt.verdict_text(result))
+            + wt.verdict_text(result)
+            + f". With {len(difference)} days in about {max(1, len(difference) // min(ROLLING_BLOCK_DAYS, len(difference)))} blocks of {min(ROLLING_BLOCK_DAYS, len(difference))} days, this interval is unreliable; the weekly harness (forecast_harness) is the evaluation of record")
     return text, "no concern" if result.verdict == "win" else "concern"
 
 

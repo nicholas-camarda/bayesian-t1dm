@@ -39,6 +39,10 @@ PREDICTOR_STYLE = {
     "ridge": GroupStyle("Ridge", JCO[5], "D", "-"),
     "hour-day model": GroupStyle("Hour-day model", JCO[0], "o", "-"),
     "hour-day model (planned settings)": GroupStyle("Hour-day model, planned settings", JCO[3], "o", "--"),
+    "hour-day model (settings pinned)": GroupStyle("Hour-day model, settings pinned", JCO[7], "v", "--"),
+    "hour-day model (trailing-mean counts)": GroupStyle("Hour-day model, trailing-mean counts", JCO[6], "P", "--"),
+    "last 365 days": GroupStyle("Last 365 days", JCO[8], "X", "-"),
+    "all history": GroupStyle("All history", JCO[9], "*", "-"),
 }
 
 

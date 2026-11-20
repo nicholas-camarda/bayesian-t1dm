@@ -29,8 +29,12 @@ Predictors.
 - ``hour-day model``: the hour-day outcomes model refitted on the rows before every origin (its training rule unchanged). Its
   concurrent covariates are not known at the origin, so each predictive draw resamples 14 whole days of carbohydrate, exercise, sleep-mode
   and site-age exposure from the 28 days before ``t0``; its settings are the frozen profile; hourly reading counts are taken from the
-  realised window (the count of readings is not glucose information). ``hour-day model (planned settings)`` feeds the settings actually
-  in force instead; it is reported and never gates.
+  realised window (the count of readings is not glucose information). Variants that share the same fit and never gate:
+  ``hour-day model (planned settings)`` (the settings actually in force), ``hour-day model (settings pinned)`` (every setting at the
+  training centre, so the settings terms drop out) and ``hour-day model (trailing-mean counts)`` (the mean reading counts of the
+  28 days before ``t0`` in place of the realised counts).
+- ``last 365 days`` and ``all history``: means over a year and over every earlier day. Added after the first results as comparators of the
+  model's level, which has no drift term; they never gate.
 
 ``python -m bayesian_t1dm.forecast_harness`` runs it on the real record.
 """
@@ -39,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import logging
 import time
@@ -83,9 +88,16 @@ RIDGE_FOLDS = 5
 RIDGE_RESIDUALS = 120
 RIDGE_MIN_ROWS = 150
 SETTING_COLUMNS = ("icr", "cf", "basal", "target")
-PREDICTORS = ("last 28 days", "last 14 days", "recency-weighted", "ridge", "hour-day model", "hour-day model (planned settings)")
-BASELINES = ("last 28 days", "last 14 days", "recency-weighted")
+MODEL = "hour-day model"
+# Model variants share the model's fit: the settings actually in force (planned), the settings pinned at the training centre, and trailing mean reading counts in place of the realised ones.
+MODEL_VARIANTS = {MODEL: "frozen", "hour-day model (planned settings)": "planned", "hour-day model (settings pinned)": "pinned", "hour-day model (trailing-mean counts)": "trailing counts"}
+BASELINES = ("last 28 days", "last 14 days", "recency-weighted", "last 365 days", "all history")
+# The order fixes each predictor's random stream: new predictors are appended.
+PREDICTORS = ("last 28 days", "last 14 days", "recency-weighted", "ridge", *MODEL_VARIANTS, "last 365 days", "all history")
 REFERENCE = "last 28 days"
+LOOKBACK_DAYS = {"last 28 days": 28, "last 14 days": 14, "last 365 days": 365}
+ALL_HISTORY_MIN_DAYS = 28
+COUNT_DAYS = 28
 NO_SETTINGS_CHANGE = 1e-9
 
 
@@ -264,8 +276,12 @@ def lookback_points(y: np.ndarray, n: np.ndarray, kind: str) -> np.ndarray:
     """Point forecast for a window starting at every position ``s = 0..len(y)`` from the days before ``s`` only; NaN where the lookback is not fully inside the series or holds no readings."""
     length = len(y)
     positions = np.arange(length + 1)
-    if kind in ("last 28 days", "last 14 days"):
-        days = 28 if kind == "last 28 days" else 14
+    if kind == "all history":
+        sum_y = np.concatenate([[0.0], np.cumsum(y)])
+        sum_n = np.concatenate([[0.0], np.cumsum(n)])
+        return np.where((positions >= ALL_HISTORY_MIN_DAYS) & (sum_n[positions] > 0), sum_y[positions] / np.maximum(sum_n[positions], 1.0), np.nan)
+    if kind in LOOKBACK_DAYS:
+        days = LOOKBACK_DAYS[kind]
         sum_y = np.concatenate([[0.0], np.cumsum(y)])
         sum_n = np.concatenate([[0.0], np.cumsum(n)])
         low = positions - days
@@ -361,19 +377,27 @@ def _ridge_fit(z: np.ndarray, target: np.ndarray, penalty: float) -> RidgeModel:
 def blocked_cross_validation(z: np.ndarray, target: np.ndarray, positions: np.ndarray) -> tuple[float, np.ndarray, pd.DataFrame]:
     """Penalty by blocked K-fold cross-validation in time, and the out-of-fold residuals at that penalty.
 
-    Folds are contiguous in time. Training rows whose 14-day window overlaps a test row's window (positions within 13 days) are left out of that fold's fit.
+    Folds are contiguous in time. A test row's outcome (its 14-day window) must not reach a training row either through that row's own window
+    (a training start within 13 days before the fold's first start) or through its features, which look back up to 90 days from the row's start
+    (a training start up to 13 + 90 days after the fold's last start). Those training rows are left out of the fold's fit.
     """
     folds = np.array_split(np.arange(len(target)), RIDGE_FOLDS)
     errors = np.zeros((len(RIDGE_PENALTIES), len(target)))
     for fold in folds:
-        low, high = positions[fold[0]] - (WINDOW_DAYS - 1), positions[fold[-1]] + (WINDOW_DAYS - 1)
-        train = ~((positions >= low) & (positions <= high))
+        train = ridge_training_mask(positions, fold)
         for index, penalty in enumerate(RIDGE_PENALTIES):
             errors[index, fold] = target[fold] - _ridge_fit(z[train], target[train], penalty).predict(z[fold])
     rmse = np.sqrt((errors ** 2).mean(axis=1))
     best = int(np.argmin(rmse))
     table = pd.DataFrame({"penalty": RIDGE_PENALTIES, "cv_rmse_logit": rmse})
     return RIDGE_PENALTIES[best], errors[best], table
+
+
+def ridge_training_mask(positions: np.ndarray, fold: np.ndarray) -> np.ndarray:
+    """Rows that may train a fold: none whose window overlaps a test window or whose features look back into the test windows' outcomes."""
+    low = positions[fold[0]] - (WINDOW_DAYS - 1)
+    high = positions[fold[-1]] + (WINDOW_DAYS - 1) + max(RIDGE_LOOKBACKS)
+    return ~((positions >= low) & (positions <= high))
 
 
 def ridge_draws(known: Known, rng: np.random.Generator, draws: int = DRAWS) -> tuple[np.ndarray, dict]:
@@ -419,6 +443,7 @@ class ModelPosterior:
     rows: int
     days: int
     fingerprint: str
+    model_hash: str
 
 
 def design_fingerprint(design: om.OutcomeDesign) -> str:
@@ -427,6 +452,12 @@ def design_fingerprint(design: om.OutcomeDesign) -> str:
     for array in (design.y, design.n, design.hour, design.day, np.round(design.x, 10)):
         digest.update(np.ascontiguousarray(array).tobytes())
     return digest.hexdigest()
+
+
+def model_hash(draws: int, tune: int, chains: int) -> str:
+    """Hash of the model code (the source of ``outcomes_model``, which holds the priors, likelihood and sampler constants), the seed and the sampler settings: a stored fit is reused only when it is unchanged."""
+    text = inspect.getsource(om) + f"|{om.SEED}|{om.TARGET_ACCEPT}|{om.MAX_TREEDEPTH}|{draws}|{tune}|{chains}|{DRAWS}"
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def fit_origin(table: pd.DataFrame, origin: pd.Timestamp, outcome: str, draws: int, tune: int, chains: int) -> ModelPosterior:
@@ -444,7 +475,8 @@ def fit_origin(table: pd.DataFrame, origin: pd.Timestamp, outcome: str, draws: i
         return stack_draws(idata, name)[pick]
 
     return ModelPosterior(origin=origin, alpha=take("alpha"), beta=take("beta"), z_hour=take("z_hour"), hour_scale=take("hour_scale"), day_scale=take("day_scale"), log_phi=take("log_phi"),
-                          center=design.center.to_numpy(), scale=design.scale.to_numpy(), diagnostics=diagnostics, timing=timing, rows=design.rows, days=len(design.days), fingerprint=design_fingerprint(design))
+                          center=design.center.to_numpy(), scale=design.scale.to_numpy(), diagnostics=diagnostics, timing=timing, rows=design.rows, days=len(design.days), fingerprint=design_fingerprint(design),
+                          model_hash=model_hash(draws, tune, chains))
 
 
 def _fit_worker(arguments: tuple) -> ModelPosterior:
@@ -455,7 +487,7 @@ def save_posterior(posterior: ModelPosterior, folder: Path) -> Path:
     """Store a fitted origin so a later run can reuse it when the training data, outcome and sampler settings are identical."""
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"posterior_{posterior.origin.date()}.npz"
-    meta = json.dumps({"origin": str(posterior.origin.date()), "diagnostics": posterior.diagnostics.__dict__, "timing": posterior.timing, "rows": posterior.rows, "days": posterior.days, "fingerprint": posterior.fingerprint})
+    meta = json.dumps({"origin": str(posterior.origin.date()), "diagnostics": posterior.diagnostics.__dict__, "timing": posterior.timing, "rows": posterior.rows, "days": posterior.days, "fingerprint": posterior.fingerprint, "model_hash": posterior.model_hash})
     np.savez_compressed(path, alpha=posterior.alpha, beta=posterior.beta, z_hour=posterior.z_hour, hour_scale=posterior.hour_scale, day_scale=posterior.day_scale, log_phi=posterior.log_phi,
                         center=posterior.center, scale=posterior.scale, meta=np.array(meta))
     return path
@@ -466,7 +498,7 @@ def load_posterior(path: Path) -> ModelPosterior:
     meta = json.loads(str(stored["meta"]))
     return ModelPosterior(origin=pd.Timestamp(meta["origin"]), alpha=stored["alpha"], beta=stored["beta"], z_hour=stored["z_hour"], hour_scale=stored["hour_scale"], day_scale=stored["day_scale"],
                           log_phi=stored["log_phi"], center=stored["center"], scale=stored["scale"], diagnostics=FitDiagnostics(**meta["diagnostics"]), timing=meta["timing"], rows=meta["rows"], days=meta["days"],
-                          fingerprint=meta["fingerprint"])
+                          fingerprint=meta["fingerprint"], model_hash=meta["model_hash"])
 
 
 def fit_all_origins(table: pd.DataFrame, origins: list[pd.Timestamp], *, outcome: str, draws: int, tune: int, chains: int, workers: int, store: Path | None) -> dict[pd.Timestamp, ModelPosterior]:
@@ -478,9 +510,10 @@ def fit_all_origins(table: pd.DataFrame, origins: list[pd.Timestamp], *, outcome
         if path is not None and path.exists():
             stored = load_posterior(path)
             design = om.build_design(table[table["date"] < origin], outcome=outcome)
-            same = stored.fingerprint == design_fingerprint(design) and (stored.diagnostics.draws, stored.diagnostics.tune, stored.diagnostics.chains) == (draws, tune, chains)
+            same = (stored.fingerprint == design_fingerprint(design) and stored.model_hash == model_hash(draws, tune, chains)
+                    and (stored.diagnostics.draws, stored.diagnostics.tune, stored.diagnostics.chains) == (draws, tune, chains))
             if not same:
-                raise RuntimeError(f"The stored posterior {path} was fitted to different data or sampler settings; remove it to refit")
+                raise RuntimeError(f"The stored posterior {path} was fitted to different data, model code or sampler settings; remove it to refit")
             posteriors[origin] = stored
             LOGGER.info("reused stored posterior for origin %s", origin.date())
         else:
@@ -555,28 +588,45 @@ def simulate_window_share(posterior: ModelPosterior, settings: np.ndarray, expos
     return hits.sum(axis=1) / counts.sum()
 
 
-def model_draws(posterior: ModelPosterior, known: Known, window: Window, rng: np.random.Generator, *, planned: bool) -> np.ndarray:
-    """Predictive draws of the window's share from the fitted model, with frozen (or, for the planned variant, actual) settings and resampled exposures."""
+def trailing_counts(known: Known) -> np.ndarray:
+    """Reading counts per clock hour known at the origin: the mean over the 28 days before it, rounded, the same for each of the 14 days (14 x 24)."""
+    recent = known.table[known.table["date"] >= known.origin - pd.Timedelta(days=COUNT_DAYS)]
+    return np.tile(np.rint(recent.groupby("hour")["n_valid"].mean().reindex(range(HOURS_PER_DAY)).fillna(0.0).to_numpy()), (WINDOW_DAYS, 1))
+
+
+def _variant_inputs(known: Known, window: Window, variant: str, posterior: ModelPosterior | None) -> tuple[np.ndarray, np.ndarray]:
+    """Settings on the model scale (14 x 24 x 4) and reading counts (14 x 24) of one model variant."""
+    counts = trailing_counts(known) if variant == "trailing counts" else window.n_valid
+    if variant == "pinned":
+        centre = np.zeros(4) if posterior is None else posterior.center[:4]
+        return np.broadcast_to(centre, (WINDOW_DAYS, HOURS_PER_DAY, 4)), counts
+    profile = window.actual_settings if variant == "planned" else np.broadcast_to(known.profiles.at(known.origin), window.actual_settings.shape)
+    return settings_covariates(profile), counts
+
+
+def model_draws(posterior: ModelPosterior, known: Known, window: Window, rng: np.random.Generator, *, variant: str = "frozen") -> np.ndarray:
+    """Predictive draws of the window's share from the fitted model and resampled exposures.
+
+    Variants: ``frozen`` (the profile in force at the origin; the model's forecast), ``planned`` (the settings actually in force), ``pinned`` (every setting at the training centre, so the
+    settings terms drop out) and ``trailing counts`` (the frozen profile, with the mean reading counts of the 28 days before the origin in place of the realised counts).
+    """
     pool = exposure_pool(known)
     chosen = rng.integers(0, len(pool), size=(len(posterior.alpha), WINDOW_DAYS))
-    exposures = pool[chosen]
-    if planned:
-        profile = window.actual_settings
-    else:
-        frozen = known.profiles.at(known.origin)
-        profile = np.broadcast_to(frozen, (WINDOW_DAYS, HOURS_PER_DAY, 4))
-    return simulate_window_share(posterior, settings_covariates(profile), exposures, window.n_valid, rng)
+    settings, counts = _variant_inputs(known, window, variant, posterior)
+    return simulate_window_share(posterior, settings, pool[chosen], counts, rng)
 
 
-def model_unscorable_reason(known: Known, window: Window, *, planned: bool) -> str:
-    """Why the model cannot forecast this window (no complete day of exposures, or a setting unknown at an hour with readings); empty when it can."""
+def model_unscorable_reason(known: Known, window: Window, *, variant: str = "frozen") -> str:
+    """Why the model cannot forecast this window (no complete day of exposures, no readings, or a setting unknown at an hour with readings); empty when it can."""
     try:
         exposure_pool(known)
     except NotScored as problem:
         return str(problem)
-    profile = window.actual_settings if planned else np.broadcast_to(known.profiles.at(known.origin), window.actual_settings.shape)
-    if not np.isfinite(profile[window.n_valid > 0]).all():
-        return "hour-day model: a setting is unknown at an hour of the window that has readings" + ("" if planned else " (the frozen profile)")
+    settings, counts = _variant_inputs(known, window, variant, None)
+    if counts.sum() <= 0:
+        return "hour-day model: no reading counts to simulate"
+    if not np.isfinite(settings[counts > 0]).all():
+        return "hour-day model: a setting is unknown at an hour of the window that has readings" + (" (the frozen profile)" if variant != "planned" else "")
     return ""
 
 
@@ -633,11 +683,11 @@ def score_origins(table: pd.DataFrame, origins: list[pd.Timestamp], *, outcome: 
                 elif posteriors is None:
                     continue
                 else:
-                    planned = name.endswith("(planned settings)")
-                    reason = model_unscorable_reason(known, window, planned=False) or (model_unscorable_reason(known, window, planned=True) if planned else "")
+                    variant = MODEL_VARIANTS[name]
+                    reason = model_unscorable_reason(known, window, variant="frozen") or model_unscorable_reason(known, window, variant=variant)
                     if reason:
                         raise NotScored(reason)
-                    draws = model_draws(posteriors[origin], known, window, rng, planned=planned)
+                    draws = model_draws(posteriors[origin], known, window, rng, variant=variant)
             except NotScored as problem:
                 score_rows.append({"set": set_name, "origin": origin, "predictor": name, "reason": str(problem)})
                 continue
@@ -652,7 +702,7 @@ def scorable_for_model(table: pd.DataFrame, origins: list[pd.Timestamp], profile
     for origin in origins:
         if window_target(table, origin, outcome)[1] < MIN_WINDOW_COVERAGE:
             continue
-        if not model_unscorable_reason(known_at(origin, outcome, table, daily, tdd, profiles), window_for(table, origin), planned=False):
+        if not model_unscorable_reason(known_at(origin, outcome, table, daily, tdd, profiles), window_for(table, origin), variant="frozen"):
             keep.append(origin)
     return keep
 
@@ -661,7 +711,7 @@ def scorable_for_model(table: pd.DataFrame, origins: list[pd.Timestamp], profile
 # Command line
 # ---------------------------------------------------------------------------
 
-def run(raw: str | None, output: str | None, *, outcome: str, draws: int, tune: int, chains: int, workers: int, score_model: bool, reuse: bool) -> int:
+def run(raw: str | None, output: str | None, *, outcome: str, draws: int, tune: int, chains: int, workers: int, score_model: bool, reuse: bool, model_development: bool, command: str, note: str) -> int:
     from .analysis_data import load_analysis_data
     from .forecast_harness_report import write_outputs
     from .hour_day import build_hour_day_table
@@ -687,16 +737,17 @@ def run(raw: str | None, output: str | None, *, outcome: str, draws: int, tune: 
     LOGGER.info("record %s to %s; %d evaluation origins %s to %s; %d development origins", daily.index.min().date(), last_day.date(), len(evaluation), evaluation[0].date(), evaluation[-1].date(), len(development))
     posteriors = None
     if score_model:
-        todo = scorable_for_model(table, evaluation, profiles, outcome=outcome, daily=daily, tdd=tdd)
+        todo = scorable_for_model(table, evaluation + (development if model_development else []), profiles, outcome=outcome, daily=daily, tdd=tdd)
         posteriors = fit_all_origins(table, todo, outcome=outcome, draws=draws, tune=tune, chains=chains, workers=workers, store=folder / "posteriors" if reuse else None)
     results = {}
     for set_name, origins in (("evaluation", evaluation), ("development", development)):
         scores, origin_table, ridge = score_origins(table, origins, outcome=outcome, daily=daily, tdd=tdd, profiles=profiles, set_name=set_name,
-                                                    posteriors=posteriors if set_name == "evaluation" else None,
-                                                    predictors=PREDICTORS if set_name == "evaluation" else tuple(name for name in PREDICTORS if not name.startswith("hour-day")))
+                                                    posteriors=posteriors if (set_name == "evaluation" or model_development) else None,
+                                                    predictors=PREDICTORS if (set_name == "evaluation" or model_development) else tuple(name for name in PREDICTORS if name not in MODEL_VARIANTS))
         results[set_name] = (scores, origin_table, ridge)
         LOGGER.info("%s origins: %d windows scored", set_name, int(origin_table["scored"].sum()))
-    write_outputs(folder=folder, run_id=run_id, raw=raw, outcome=outcome, table=table, results=results, posteriors=posteriors, draws=draws, tune=tune, chains=chains, seconds=time.time() - started, score_model=score_model)
+    write_outputs(folder=folder, run_id=run_id, raw=raw, outcome=outcome, table=table, results=results, posteriors=posteriors, draws=draws, tune=tune, chains=chains, seconds=time.time() - started, score_model=score_model,
+                  model_development=model_development, command=command, note=note)
     LOGGER.info("forecast harness finished in %.1f s", time.time() - started)
     return 0
 
@@ -706,14 +757,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--raw", default=None, help="Raw data root (default: the Project Vault data/raw)")
     parser.add_argument("--output", default=None, help="Output folder (default: runtime/output/forecast_harness)")
     parser.add_argument("--outcome", default="tir", choices=sorted(om.OUTCOME_COLUMNS))
-    parser.add_argument("--draws", type=int, default=2000, help="Posterior draws per chain of each refit")
+    parser.add_argument("--draws", type=int, default=3000, help="Posterior draws per chain of each refit")
     parser.add_argument("--tune", type=int, default=1000)
     parser.add_argument("--chains", type=int, default=4)
     parser.add_argument("--workers", type=int, default=4, help="Origins fitted at the same time")
     parser.add_argument("--skip-model", action="store_true", help="Score the baselines and the ridge only (the power check, before any model fit)")
     parser.add_argument("--reuse-posteriors", action="store_true", help="Store each origin's fit in the output folder and reuse it when the training data and settings are identical")
+    parser.add_argument("--score-model-development", action="store_true", help="Also refit and score the model at the development origins (never used for the win test)")
+    parser.add_argument("--run-note", default="", help="Free text recorded in the summary and the workbook (for example why the sampler settings were chosen)")
     args = parser.parse_args(argv)
-    return run(args.raw, args.output, outcome=args.outcome, draws=args.draws, tune=args.tune, chains=args.chains, workers=args.workers, score_model=not args.skip_model, reuse=args.reuse_posteriors)
+    command = " ".join(["python -m bayesian_t1dm.forecast_harness", f"--outcome {args.outcome}", f"--draws {args.draws}", f"--tune {args.tune}", f"--chains {args.chains}", f"--workers {args.workers}",
+                        *(["--skip-model"] if args.skip_model else []), *(["--reuse-posteriors"] if args.reuse_posteriors else []), *(["--score-model-development"] if args.score_model_development else []),
+                        *([f'--run-note "{args.run_note}"'] if args.run_note else [])])
+    return run(args.raw, args.output, outcome=args.outcome, draws=args.draws, tune=args.tune, chains=args.chains, workers=args.workers, score_model=not args.skip_model, reuse=args.reuse_posteriors,
+               model_development=args.score_model_development and not args.skip_model, command=command, note=args.run_note)
 
 
 if __name__ == "__main__":
