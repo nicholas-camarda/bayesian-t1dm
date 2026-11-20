@@ -23,6 +23,7 @@ TOP_LEVEL_ENTRYPOINTS = {
     "replay",
     "outcomes_model",
     "data_audit",
+    "forecast_harness",
     "proposals",
     "refresh",
     "fixture",

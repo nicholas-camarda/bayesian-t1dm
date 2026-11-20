@@ -31,6 +31,21 @@ GROUP_STYLE = {
 }
 
 
+# The predictors of the forecast harness: one color, label, marker and line type in every figure (the reference baseline is grey).
+PREDICTOR_STYLE = {
+    "last 28 days": GroupStyle("Last 28 days", JCO[2], "o", "-"),
+    "last 14 days": GroupStyle("Last 14 days", JCO[1], "s", "-"),
+    "recency-weighted": GroupStyle("Recency-weighted", JCO[4], "^", "-"),
+    "ridge": GroupStyle("Ridge", JCO[5], "D", "-"),
+    "hour-day model": GroupStyle("Hour-day model", JCO[0], "o", "-"),
+    "hour-day model (planned settings)": GroupStyle("Hour-day model, planned settings", JCO[3], "o", "--"),
+    "hour-day model (settings pinned)": GroupStyle("Hour-day model, settings pinned", JCO[7], "v", "--"),
+    "hour-day model (trailing-mean counts)": GroupStyle("Hour-day model, trailing-mean counts", JCO[6], "P", "--"),
+    "last 365 days": GroupStyle("Last 365 days", JCO[8], "X", "-"),
+    "all history": GroupStyle("All history", JCO[9], "*", "-"),
+}
+
+
 # The pump behind each stretch of the record, in order: the same label and color in every figure.
 PUMP_STYLE = {
     "first pump": GroupStyle("First pump", JCO[0], "o", "-"),
