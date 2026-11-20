@@ -130,7 +130,7 @@ def settings_grid(table: pd.DataFrame) -> np.ndarray:
 
 
 def check_profiles_agree(table: pd.DataFrame, grid: replay.DayGrid, profiles: fh.SettingsProfiles) -> int:
-    """The profile frozen from the pump's history at the start of each day must equal the hour-day table's settings on every day without a changed hour; returns how many day-hours were compared.
+    """The profile frozen from the pump's history at the start of each day must equal the hour-day table's settings on every day the replay can say had no change (no changed hour and no hour whose day-to-day difference is unknown, where an edit during the day is not visible to the replay); returns how many day-hours were compared.
 
     The change's old and new settings come from the frozen profiles and the baseline settings from the table. A day without a change where they disagree means the two readings of the
     pump's settings differ, which is an error and not a difference to be predicted.
@@ -140,7 +140,8 @@ def check_profiles_agree(table: pd.DataFrame, grid: replay.DayGrid, profiles: fh
     dates = pd.DatetimeIndex(sorted(table["date"].unique()))
     if not frozen.shape[0] == table_settings.shape[0] == len(dates) or not (profiles.dates == dates).all():
         raise AssertionError("The frozen profiles and the hour-day table do not cover the same days")
-    quiet = ~grid.changed.any(axis=1)
+    undetermined = table.groupby("date")[["d_icr", "d_cf", "d_basal", "d_target"]].agg(lambda column: column.isna().any()).any(axis=1).reindex(dates).to_numpy()
+    quiet = ~grid.changed.any(axis=1) & ~undetermined
     quiet[0] = False
     both = np.isfinite(frozen) & np.isfinite(table_settings) & quiet[:, None, None]
     worst = np.abs(np.where(both, frozen - table_settings, 0.0))

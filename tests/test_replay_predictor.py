@@ -345,6 +345,17 @@ def test_the_frozen_profile_and_the_hour_day_table_must_agree_on_days_without_a_
         rp.check_profiles_agree(table, grid, broken)
 
 
+def test_a_day_whose_difference_is_unknown_is_not_compared() -> None:
+    table = synthetic_table()
+    grid = replay.day_grid(table)
+    profiles = profiles_from(table)
+    day = (table["date"] - START).dt.days.to_numpy()
+    table.loc[(day == 30) & (table["hour"] == 3).to_numpy(), "d_icr"] = np.nan
+    broken = fh.SettingsProfiles(profiles.dates, profiles.values.copy())
+    broken.values[30, 3, 0] += 0.5  # an edit during the day that the replay cannot see
+    assert rp.check_profiles_agree(table, grid, broken) > 0
+
+
 def test_unknown_settings_on_a_baseline_day_leave_the_change_out_with_a_reason() -> None:
     table = synthetic_table()
     day = (table["date"] - START).dt.days.to_numpy()
