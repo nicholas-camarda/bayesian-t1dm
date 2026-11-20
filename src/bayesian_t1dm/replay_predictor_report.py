@@ -127,14 +127,14 @@ def write_figure(joined: pd.DataFrame, information: pd.DataFrame, tracking: pd.D
 # Workbook sheets
 # ---------------------------------------------------------------------------
 
-def _specification(outcomes: tuple[str, ...], draws: int, tune: int, chains: int, min_train_days: int) -> pd.DataFrame:
+def _specification(outcomes: tuple[str, ...], draws: int, tune: int, chains: int, target_accept: float, min_train_days: int) -> pd.DataFrame:
     rows = [
         ("Question", "Do the outcomes model's predicted effects of a setting change match what happened after the past changes, and does the model with the settings in force predict the post-change window better than the same fit with the old settings?"),
         ("Claim type", "Predictive and associational, one person's retrospective record; not the effect of a setting."),
         ("Population", f"Every change the replay scored (see Denominators_Flow) with at least {min_train_days} days with usable hours before it. The replay's own counting rules apply: a day counts when at least {replay.MIN_COVERAGE:.0%} of the expected readings in the affected hours are present and it is not a context-event day."),
         ("Unit of analysis", "A change event (consecutive days holding a changed hour are one event). Intervals resample clusters of changes within 14 days of each other, with their placebos."),
         ("Outcomes", "Share of valid readings in the outcome over the replay's affected hours (the changed hours and the 4 after) on the 14 days after the change, pooled over the counted days: " + ", ".join(OUTCOME_LABELS[name] for name in outcomes) + ". Units: percentage points."),
-        ("Model", f"The hour-day outcomes model (beta-binomial, hour and day effects, 4 settings and 4 exposures), one fit per outcome refitted on the rows before the fit's cut: {chains} chains, {tune} tuning steps, {draws} draws per chain, the harness settings. Every fit must pass the sampler gate (R-hat below {om.R_HAT_LIMIT}, ESS above {om.ESS_LIMIT}, no divergences) or the run fails."),
+        ("Model", f"The hour-day outcomes model (beta-binomial, hour and day effects, 4 settings and 4 exposures), one fit per outcome refitted on the rows before the fit's cut: {chains} chains, {tune} tuning steps, {draws} draws per chain, target acceptance {target_accept}. Every fit must pass the sampler gate (R-hat below {om.R_HAT_LIMIT}, ESS above {om.ESS_LIMIT}, no divergences) or the run fails."),
         ("Fit cut", f"The first day of the change. A change within {rp.FIT_SHARE_DAYS} days after the first change of its group reuses that change's fit, so a fit never sees a day on or after the change it serves."),
         ("Predicted change", f"Expected share of readings in the outcome over the post-change window under the profile in force after the change (new, held for the 14 days) minus the expected share under the settings actually in force on each of the replay's baseline days (the qualifying days of the 28 before the change, weighted by their readings), in percentage points. This is the quantity the replay observes: the change's miss from the last-28-day predictor. Same posterior draw, day effects and resampled exposures in both; mean and 5th and 95th percentile over the {rp.DRAWS:,} posterior draws. Positive time in range: more readings in range under the new settings. For below 70 and below 54 a negative value means fewer lows. Sensitivity: the old arm as the profile in force the day before the change (Sensitivity sheet)."),
         ("Exposures", "Carbohydrate of the last 3 h, exercise share, sleep-mode share and site age: whole days resampled from the 28 days before the change, 14 per draw. Reading counts per hour are the realised ones on the counted days (the number of readings is not glucose information)."),
@@ -369,7 +369,7 @@ def write_summary(path: Path, *, run_id: str, joined: pd.DataFrame, tracking: pd
 # ---------------------------------------------------------------------------
 
 def write_outputs(*, folder: Path, run_id: str, raw: str, table: pd.DataFrame, flow: pd.DataFrame, issues: pd.DataFrame, joined: pd.DataFrame, targets: list[rp.EventTarget], posteriors: dict, replay_results: dict,
-                  draws: int, tune: int, chains: int, min_train_days: int, seconds: float, command: str, note: str) -> None:
+                  draws: int, tune: int, chains: int, target_accept: float, min_train_days: int, seconds: float, command: str, note: str) -> None:
     folder = Path(folder)
     outcomes = tuple(name for name in rp.OUTCOMES if name in posteriors)
     tracking = rp.tracking_table(joined)
@@ -381,7 +381,7 @@ def write_outputs(*, folder: Path, run_id: str, raw: str, table: pd.DataFrame, f
     joined.to_csv(folder / "replay_predictor_events.csv", index=False)
     files = ["replay_predictor_events.csv", "replay_predictor_summary.md", *[path.name for path in figures]]
     sheets = {
-        "Specification_Coding": _specification(outcomes, draws, tune, chains, min_train_days),
+        "Specification_Coding": _specification(outcomes, draws, tune, chains, target_accept, min_train_days),
         "Denominators_Flow": _flow(flow, joined, posteriors, targets, outcomes),
         "Events": _event_sheet(joined),
         "Tracking": tracking,

@@ -280,7 +280,7 @@ def test_the_report_reconciles_and_follows_the_workbook_rules(tmp_path, monkeypa
     assert len(joined) == len(targets)
     assert (joined["crps_new_minus_old_points"] == joined["crps_new_points"] - joined["crps_old_points"]).all()
     report.write_outputs(folder=tmp_path, run_id="test", raw="synthetic", table=table, flow=flow, issues=issues, joined=joined, targets=targets, posteriors=posteriors, replay_results=results,
-                         draws=1000, tune=1000, chains=4, min_train_days=30, seconds=1.0, command="test", note="")
+                         draws=1000, tune=1000, chains=4, target_accept=0.95, min_train_days=30, seconds=1.0, command="test", note="")
     workbook = read_workbook(tmp_path / "diagnostics.xlsx")
     names = list(workbook)
     assert names[0] == "Specification_Coding" and names[1] == "Denominators_Flow" and names[-2:] == ["Warnings_Limitations", "Artifacts_Provenance"]

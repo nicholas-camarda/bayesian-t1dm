@@ -522,7 +522,7 @@ def power_table(joined: pd.DataFrame, *, simulations: int | None = None, draws: 
 # Command line
 # ---------------------------------------------------------------------------
 
-def run(raw: str | None, output: str | None, *, outcomes: tuple[str, ...], draws: int, tune: int, chains: int, workers: int, reuse: bool, min_train_days: int, command: str, note: str) -> int:
+def run(raw: str | None, output: str | None, *, outcomes: tuple[str, ...], draws: int, tune: int, chains: int, workers: int, reuse: bool, target_accept: float, min_train_days: int, command: str, note: str) -> int:
     from .analysis_data import load_analysis_data
     from .hour_day import build_hour_day_table
     from .paths import ProjectPaths
@@ -554,12 +554,12 @@ def run(raw: str | None, output: str | None, *, outcomes: tuple[str, ...], draws
     posteriors: dict[str, dict[pd.Timestamp, fh.ModelPosterior]] = {}
     joined = []
     for outcome in outcomes:
-        posteriors[outcome] = fh.fit_all_origins(table, cuts, outcome=outcome, draws=draws, tune=tune, chains=chains, workers=workers, store=folder / "posteriors" / outcome if reuse else None)
+        posteriors[outcome] = fh.fit_all_origins(table, cuts, outcome=outcome, draws=draws, tune=tune, chains=chains, workers=workers, store=folder / "posteriors" / outcome if reuse else None, target_accept=target_accept)
         joined.append(join_observed(event_rows(posteriors[outcome], targets, outcome), scores, outcome))
         LOGGER.info("%s: %d changes predicted", outcome, len(joined[-1]))
     joined_frame = pd.concat(joined, ignore_index=True)
     write_outputs(folder=folder, run_id=run_id, raw=raw, table=table, flow=flow, issues=issues, joined=joined_frame, targets=targets, posteriors=posteriors, replay_results=results, draws=draws, tune=tune,
-                  chains=chains, min_train_days=min_train_days, seconds=time.time() - started, command=command, note=note)
+                  chains=chains, target_accept=target_accept, min_train_days=min_train_days, seconds=time.time() - started, command=command, note=note)
     LOGGER.info("replay predictor finished in %.1f s", time.time() - started)
     return 0
 
@@ -572,6 +572,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--draws", type=int, default=3000, help="Posterior draws per chain of each fit (the harness setting)")
     parser.add_argument("--tune", type=int, default=1000)
     parser.add_argument("--chains", type=int, default=4)
+    parser.add_argument("--target-accept", type=float, default=om.TARGET_ACCEPT, help="NUTS target acceptance of every fit")
     parser.add_argument("--workers", type=int, default=4, help="Fits run at the same time")
     parser.add_argument("--min-train-days", type=int, default=MIN_TRAIN_DAYS, help="Fewest days with usable hours before a change for it to be predicted")
     parser.add_argument("--reuse-posteriors", action="store_true", help="Store each fit in the output folder and reuse it when the training data, model code and sampler settings are identical")
@@ -583,7 +584,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"--outcomes must include {PRIMARY_OUTCOME} and only name {OUTCOMES}; got {args.outcomes}")
     command = " ".join(["python -m bayesian_t1dm.replay_predictor", f"--outcomes {args.outcomes}", f"--draws {args.draws}", f"--tune {args.tune}", f"--chains {args.chains}", f"--workers {args.workers}",
                         f"--min-train-days {args.min_train_days}", *(["--reuse-posteriors"] if args.reuse_posteriors else []), *([f'--run-note "{args.run_note}"'] if args.run_note else [])])
-    return run(args.raw, args.output, outcomes=outcomes, draws=args.draws, tune=args.tune, chains=args.chains, workers=args.workers, reuse=args.reuse_posteriors, min_train_days=args.min_train_days,
+    return run(args.raw, args.output, outcomes=outcomes, draws=args.draws, tune=args.tune, chains=args.chains, workers=args.workers, reuse=args.reuse_posteriors, target_accept=args.target_accept, min_train_days=args.min_train_days,
                command=command, note=args.run_note)
 
 

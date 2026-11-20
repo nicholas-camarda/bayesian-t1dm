@@ -454,19 +454,19 @@ def design_fingerprint(design: om.OutcomeDesign) -> str:
     return digest.hexdigest()
 
 
-def model_hash(draws: int, tune: int, chains: int) -> str:
+def model_hash(draws: int, tune: int, chains: int, target_accept: float = om.TARGET_ACCEPT) -> str:
     """Hash of the model code (the source of ``outcomes_model``, which holds the priors, likelihood and sampler constants), the seed and the sampler settings: a stored fit is reused only when it is unchanged."""
-    text = inspect.getsource(om) + f"|{om.SEED}|{om.TARGET_ACCEPT}|{om.MAX_TREEDEPTH}|{draws}|{tune}|{chains}|{DRAWS}"
+    text = inspect.getsource(om) + f"|{om.SEED}|{target_accept}|{om.MAX_TREEDEPTH}|{draws}|{tune}|{chains}|{DRAWS}"
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def fit_origin(table: pd.DataFrame, origin: pd.Timestamp, outcome: str, draws: int, tune: int, chains: int) -> ModelPosterior:
+def fit_origin(table: pd.DataFrame, origin: pd.Timestamp, outcome: str, draws: int, tune: int, chains: int, target_accept: float = om.TARGET_ACCEPT) -> ModelPosterior:
     """Fit the outcomes model to the rows before ``origin``; the sampler gate must pass."""
     from .sampler_health import stack_draws
 
     train_table = table[table["date"] < origin]
     design = om.build_design(train_table, outcome=outcome)
-    idata, diagnostics, timing = om.fit(design, draws=draws, tune=tune, chains=chains)
+    idata, diagnostics, timing = om.fit(design, draws=draws, tune=tune, chains=chains, target_accept=target_accept)
     if not sampler_gate(diagnostics):
         raise RuntimeError(f"The fit before {origin.date()} fails the sampler gate: {diagnostics}")
     pick = om._posterior_sample(idata, DRAWS, SEED + int(origin.strftime("%Y%m%d")))
@@ -476,7 +476,7 @@ def fit_origin(table: pd.DataFrame, origin: pd.Timestamp, outcome: str, draws: i
 
     return ModelPosterior(origin=origin, alpha=take("alpha"), beta=take("beta"), z_hour=take("z_hour"), hour_scale=take("hour_scale"), day_scale=take("day_scale"), log_phi=take("log_phi"),
                           center=design.center.to_numpy(), scale=design.scale.to_numpy(), diagnostics=diagnostics, timing=timing, rows=design.rows, days=len(design.days), fingerprint=design_fingerprint(design),
-                          model_hash=model_hash(draws, tune, chains))
+                          model_hash=model_hash(draws, tune, chains, target_accept))
 
 
 def _fit_worker(arguments: tuple) -> ModelPosterior:
@@ -501,7 +501,7 @@ def load_posterior(path: Path) -> ModelPosterior:
                           fingerprint=meta["fingerprint"], model_hash=meta["model_hash"])
 
 
-def fit_all_origins(table: pd.DataFrame, origins: list[pd.Timestamp], *, outcome: str, draws: int, tune: int, chains: int, workers: int, store: Path | None) -> dict[pd.Timestamp, ModelPosterior]:
+def fit_all_origins(table: pd.DataFrame, origins: list[pd.Timestamp], *, outcome: str, draws: int, tune: int, chains: int, workers: int, store: Path | None, target_accept: float = om.TARGET_ACCEPT) -> dict[pd.Timestamp, ModelPosterior]:
     """Refit the outcomes model at every origin (exact: no state carried over), several origins at once. A stored posterior is reused only when its training data and settings match."""
     posteriors: dict[pd.Timestamp, ModelPosterior] = {}
     pending = []
@@ -510,8 +510,8 @@ def fit_all_origins(table: pd.DataFrame, origins: list[pd.Timestamp], *, outcome
         if path is not None and path.exists():
             stored = load_posterior(path)
             design = om.build_design(table[table["date"] < origin], outcome=outcome)
-            same = (stored.fingerprint == design_fingerprint(design) and stored.model_hash == model_hash(draws, tune, chains)
-                    and (stored.diagnostics.draws, stored.diagnostics.tune, stored.diagnostics.chains) == (draws, tune, chains))
+            same = (stored.fingerprint == design_fingerprint(design) and stored.model_hash == model_hash(draws, tune, chains, target_accept)
+                    and (stored.diagnostics.draws, stored.diagnostics.tune, stored.diagnostics.chains, stored.diagnostics.target_accept) == (draws, tune, chains, target_accept))
             if not same:
                 raise RuntimeError(f"The stored posterior {path} was fitted to different data, model code or sampler settings; remove it to refit")
             posteriors[origin] = stored
@@ -520,7 +520,7 @@ def fit_all_origins(table: pd.DataFrame, origins: list[pd.Timestamp], *, outcome
             pending.append(origin)
     if pending:
         LOGGER.info("fitting %d origins, %d at a time", len(pending), workers)
-        arguments = [(table[table["date"] < origin].copy(), origin, outcome, draws, tune, chains) for origin in pending]
+        arguments = [(table[table["date"] < origin].copy(), origin, outcome, draws, tune, chains, target_accept) for origin in pending]
         failures = []
         with ProcessPoolExecutor(max_workers=workers, mp_context=get_context("spawn")) as pool:
             futures = {pool.submit(_fit_worker, argument): argument[1] for argument in arguments}
