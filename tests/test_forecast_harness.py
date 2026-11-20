@@ -511,3 +511,8 @@ def test_the_run_without_the_model_says_it_was_not_assessed(tmp_path) -> None:
     workbook = read_workbook(tmp_path / "diagnostics.xlsx")
     checks = workbook["Checks"].set_index("check")["status"]
     assert checks["Win test"] == "not assessed" and checks["Sampler gate on every refit"] == "not assessed" and "Model_Fits" not in workbook
+
+
+def test_the_model_hash_changes_with_the_target_acceptance() -> None:
+    assert fh.model_hash(1000, 1000, 4) == fh.model_hash(1000, 1000, 4, fh.om.TARGET_ACCEPT)
+    assert fh.model_hash(1000, 1000, 4) != fh.model_hash(1000, 1000, 4, 0.99)

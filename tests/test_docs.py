@@ -20,6 +20,7 @@ REQUIRED_SECTIONS = (
     "## Hour-day outcomes model",
     "## Data-quality audit (step A)",
     "## Forecast evaluation harness (step 2)",
+    "## Replay as predictor (step 4)",
 )
 
 

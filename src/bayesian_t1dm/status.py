@@ -17,6 +17,7 @@ TOP_LEVEL_ENTRYPOINTS = {
     "latent_meal",
     "outcomes",
     "replay",
+    "replay_predictor",
     "outcomes_model",
     "data_audit",
     "forecast_harness",

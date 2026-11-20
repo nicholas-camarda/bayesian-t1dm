@@ -454,19 +454,19 @@ def design_fingerprint(design: om.OutcomeDesign) -> str:
     return digest.hexdigest()
 
 
-def model_hash(draws: int, tune: int, chains: int) -> str:
+def model_hash(draws: int, tune: int, chains: int, target_accept: float = om.TARGET_ACCEPT) -> str:
     """Hash of the model code (the source of ``outcomes_model``, which holds the priors, likelihood and sampler constants), the seed and the sampler settings: a stored fit is reused only when it is unchanged."""
-    text = inspect.getsource(om) + f"|{om.SEED}|{om.TARGET_ACCEPT}|{om.MAX_TREEDEPTH}|{draws}|{tune}|{chains}|{DRAWS}"
+    text = inspect.getsource(om) + f"|{om.SEED}|{target_accept}|{om.MAX_TREEDEPTH}|{draws}|{tune}|{chains}|{DRAWS}"
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def fit_origin(table: pd.DataFrame, origin: pd.Timestamp, outcome: str, draws: int, tune: int, chains: int) -> ModelPosterior:
+def fit_origin(table: pd.DataFrame, origin: pd.Timestamp, outcome: str, draws: int, tune: int, chains: int, target_accept: float = om.TARGET_ACCEPT) -> ModelPosterior:
     """Fit the outcomes model to the rows before ``origin``; the sampler gate must pass."""
     from .sampler_health import stack_draws
 
     train_table = table[table["date"] < origin]
     design = om.build_design(train_table, outcome=outcome)
-    idata, diagnostics, timing = om.fit(design, draws=draws, tune=tune, chains=chains)
+    idata, diagnostics, timing = om.fit(design, draws=draws, tune=tune, chains=chains, target_accept=target_accept)
     if not sampler_gate(diagnostics):
         raise RuntimeError(f"The fit before {origin.date()} fails the sampler gate: {diagnostics}")
     pick = om._posterior_sample(idata, DRAWS, SEED + int(origin.strftime("%Y%m%d")))
@@ -476,7 +476,7 @@ def fit_origin(table: pd.DataFrame, origin: pd.Timestamp, outcome: str, draws: i
 
     return ModelPosterior(origin=origin, alpha=take("alpha"), beta=take("beta"), z_hour=take("z_hour"), hour_scale=take("hour_scale"), day_scale=take("day_scale"), log_phi=take("log_phi"),
                           center=design.center.to_numpy(), scale=design.scale.to_numpy(), diagnostics=diagnostics, timing=timing, rows=design.rows, days=len(design.days), fingerprint=design_fingerprint(design),
-                          model_hash=model_hash(draws, tune, chains))
+                          model_hash=model_hash(draws, tune, chains, target_accept))
 
 
 def _fit_worker(arguments: tuple) -> ModelPosterior:
@@ -501,7 +501,7 @@ def load_posterior(path: Path) -> ModelPosterior:
                           fingerprint=meta["fingerprint"], model_hash=meta["model_hash"])
 
 
-def fit_all_origins(table: pd.DataFrame, origins: list[pd.Timestamp], *, outcome: str, draws: int, tune: int, chains: int, workers: int, store: Path | None) -> dict[pd.Timestamp, ModelPosterior]:
+def fit_all_origins(table: pd.DataFrame, origins: list[pd.Timestamp], *, outcome: str, draws: int, tune: int, chains: int, workers: int, store: Path | None, target_accept: float = om.TARGET_ACCEPT) -> dict[pd.Timestamp, ModelPosterior]:
     """Refit the outcomes model at every origin (exact: no state carried over), several origins at once. A stored posterior is reused only when its training data and settings match."""
     posteriors: dict[pd.Timestamp, ModelPosterior] = {}
     pending = []
@@ -510,8 +510,8 @@ def fit_all_origins(table: pd.DataFrame, origins: list[pd.Timestamp], *, outcome
         if path is not None and path.exists():
             stored = load_posterior(path)
             design = om.build_design(table[table["date"] < origin], outcome=outcome)
-            same = (stored.fingerprint == design_fingerprint(design) and stored.model_hash == model_hash(draws, tune, chains)
-                    and (stored.diagnostics.draws, stored.diagnostics.tune, stored.diagnostics.chains) == (draws, tune, chains))
+            same = (stored.fingerprint == design_fingerprint(design) and stored.model_hash == model_hash(draws, tune, chains, target_accept)
+                    and (stored.diagnostics.draws, stored.diagnostics.tune, stored.diagnostics.chains, stored.diagnostics.target_accept) == (draws, tune, chains, target_accept))
             if not same:
                 raise RuntimeError(f"The stored posterior {path} was fitted to different data, model code or sampler settings; remove it to refit")
             posteriors[origin] = stored
@@ -520,7 +520,7 @@ def fit_all_origins(table: pd.DataFrame, origins: list[pd.Timestamp], *, outcome
             pending.append(origin)
     if pending:
         LOGGER.info("fitting %d origins, %d at a time", len(pending), workers)
-        arguments = [(table[table["date"] < origin].copy(), origin, outcome, draws, tune, chains) for origin in pending]
+        arguments = [(table[table["date"] < origin].copy(), origin, outcome, draws, tune, chains, target_accept) for origin in pending]
         failures = []
         with ProcessPoolExecutor(max_workers=workers, mp_context=get_context("spawn")) as pool:
             futures = {pool.submit(_fit_worker, argument): argument[1] for argument in arguments}
@@ -563,6 +563,25 @@ def settings_covariates(profile: np.ndarray) -> np.ndarray:
         return np.stack([np.log(profile[..., 0]), np.log(profile[..., 1]), np.log(profile[..., 2]), profile[..., 3] / 10.0], axis=-1)
 
 
+def window_mu(posterior: ModelPosterior, settings: np.ndarray, exposures: np.ndarray, n_valid: np.ndarray, day_noise: np.ndarray) -> np.ndarray:
+    """Expected share of readings in the outcome of each of the 14 x 24 cells (draws x 336) given the model-scale ``settings`` (14 x 24 x 4), ``exposures`` (draws x 14 x 24 x 4) and ``day_noise`` (draws x 14 standard-normal day effects).
+
+    Cells without readings (``n_valid`` of 0) take no settings or exposure; a setting unknown at a cell with readings is an error.
+    """
+    draws = len(posterior.alpha)
+    hours = np.tile(np.arange(HOURS_PER_DAY), WINDOW_DAYS)
+    present = n_valid.reshape(-1) > 0
+    flat_settings = settings.reshape(-1, 4)
+    if not np.isfinite(flat_settings[present]).all():
+        raise NotScored("hour-day model: a setting is unknown at an hour of the window that has readings")
+    centered = np.where(present[:, None], (flat_settings - posterior.center[:4]) / posterior.scale[:4], 0.0)
+    exposure = np.where(present[None, :, None], (exposures.reshape(draws, -1, 4) - posterior.center[4:]) / posterior.scale[4:], 0.0)
+    eta = (posterior.alpha[:, None] + posterior.hour_scale[:, None] * posterior.z_hour[:, hours]
+           + posterior.day_scale[:, None] * day_noise[:, np.repeat(np.arange(WINDOW_DAYS), HOURS_PER_DAY)]
+           + posterior.beta[:, :4] @ centered.T + np.einsum("dpk,dk->dp", exposure, posterior.beta[:, 4:]))
+    return expit(eta)
+
+
 def simulate_window_share(posterior: ModelPosterior, settings: np.ndarray, exposures: np.ndarray, n_valid: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     """Predictive draws of the window's share of readings in the outcome from the hour-day model.
 
@@ -570,18 +589,8 @@ def simulate_window_share(posterior: ModelPosterior, settings: np.ndarray, expos
     realised reading counts. Each draw uses its own posterior draw, a fresh day effect per forecast day, a beta draw of each hour's share and binomial counts.
     """
     draws = len(posterior.alpha)
-    hours = np.tile(np.arange(HOURS_PER_DAY), WINDOW_DAYS)
     counts = n_valid.reshape(-1).astype(int)
-    present = counts > 0
-    flat_settings = settings.reshape(-1, 4)
-    if not np.isfinite(flat_settings[present]).all():
-        raise NotScored("hour-day model: a setting is unknown at an hour of the window that has readings")
-    centered = np.where(present[:, None], (flat_settings - posterior.center[:4]) / posterior.scale[:4], 0.0)
-    exposure = np.where(present[None, :, None], (exposures.reshape(draws, -1, 4) - posterior.center[4:]) / posterior.scale[4:], 0.0)
-    eta = (posterior.alpha[:, None] + posterior.hour_scale[:, None] * posterior.z_hour[:, hours]
-           + posterior.day_scale[:, None] * rng.normal(size=(draws, WINDOW_DAYS))[:, np.repeat(np.arange(WINDOW_DAYS), HOURS_PER_DAY)]
-           + posterior.beta[:, :4] @ centered.T + np.einsum("dpk,dk->dp", exposure, posterior.beta[:, 4:]))
-    mu = expit(eta)
+    mu = window_mu(posterior, settings, exposures, n_valid, rng.normal(size=(draws, WINDOW_DAYS)))
     phi = np.exp(posterior.log_phi)[:, None]
     share = rng.beta(mu * phi, (1.0 - mu) * phi)
     hits = rng.binomial(counts[None, :], share)
