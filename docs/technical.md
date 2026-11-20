@@ -1,19 +1,38 @@
 # Technical Notes
 
+## Contents
+
+- [Goals](#goals)
+- [Design overview](#design-overview)
+- [Breakfast I:C proposals (goal B)](#breakfast-ic-proposals-goal-b)
+- [Lunch and dinner (goal E)](#lunch-and-dinner-goal-e)
+- [Food the pump did not log (goal D1)](#food-the-pump-did-not-log-goal-d1)
+- [Refresh, change record and evaluation (goal C)](#refresh-change-record-and-evaluation-goal-c)
+- [Basal from the controller pattern (goal F)](#basal-from-the-controller-pattern-goal-f)
+- [Problem episodes and responses (goal H)](#problem-episodes-and-responses-goal-h)
+- [The front page and the runtime tree](#the-front-page-and-the-runtime-tree)
+- [Hour-day table and settings in force](#hour-day-table-and-settings-in-force)
+- [Replay of past setting changes (exploratory)](#replay-of-past-setting-changes-exploratory)
+- [Data-quality audit (step A)](#data-quality-audit-step-a)
+- [Hour-day outcomes model](#hour-day-outcomes-model)
+- [Forecast evaluation harness (step 2)](#forecast-evaluation-harness-step-2)
+- [Replay as predictor (step 4)](#replay-as-predictor-step-4)
+- [Outcome metrics (goal A)](#outcome-metrics-goal-a)
+- [Data Flow](#data-flow)
+- [Tandem Source Acquisition](#tandem-source-acquisition)
+- [Bolus calculator settings](#bolus-calculator-settings)
+- [Insulin Action Kernel](#insulin-action-kernel)
+- [Feature Definitions](#feature-definitions)
+- [Retired: 5-minute glucose forecast](#retired-5-minute-glucose-forecast)
+- [Validation](#validation)
+- [Latent Carb Estimator](#latent-carb-estimator)
+- [Output Contract](#output-contract)
+- [Assumptions and Failure Modes](#assumptions-and-failure-modes)
+- [Acquisition and Manifest Design Decisions](#acquisition-and-manifest-design-decisions)
+
 ## Goals
 
-| Goal | Question | Subgoals | Status |
-| --- | --- | --- | --- |
-| A | Where do glucose outcomes stand, and in which hours? | A1 consensus metrics overall; A2 by pump segment; A3 baseline 14 and 90 days | `report-outcomes` |
-| B | Which breakfast I:C change does the evidence support? | B1 pooled estimate per pump setting; B2 agreement checks; B3 proposal and safety rule | breakfast evidence page; proposals next |
-| C | Did an entered change help? | C1 one-command refresh; C2 proposal record; C3 before/after evaluation | planned |
-| D | Can logged food sharpen the carb estimate? | D1 unlogged-meal flags; D2 fat and protein; D3 Bevel as a second measurement | planned |
-| E | Lunch and dinner I:C | E1 per segment evidence; E2 stricter eligibility; E3 proposals | planned |
-| F | Basal from the controller pattern | F1 commanded vs profile rate; F2 lows as a hard stop; F3 proposals | planned |
-| G | Correction factor | G1 correction-only boluses | planned |
-| H | What happened in each long high or low, and how to respond | H1 episode finder; H2 pattern and evidence; H3 repeats by pump segment; H4 playbook | Episodes tab |
-| I | Does the hour-day model forecast better than the last 28 days? | I1 prespecified win test; I2 exploratory comparators | `I_forecast/`, front page |
-| J | Does a past change predict the next change? | J1 replay as predictor (slope, power, settings information) | `J_replay_predictor/`, front page |
+The goals and their lettered subgoals are defined in the table at the top of [`methods.md`](methods.md#goals); this document is the technical reference for how each is implemented.
 
 The goal throughout is more time in 70-180 mg/dL with time below 70 under 4% and below 54 under 1%. A proposal changes one setting by at most 10% and is held 14 days before the next. The system proposes and measures; the person enters the change on the pump.
 
@@ -68,6 +87,8 @@ The **analysis grid** (`analysis_grid_5min.parquet`) holds every 5-minute slot w
 
 **Reproduction on real data.** For the Medium profile's segment starting 07:00 at 7.5 g/U (54 breakfasts to 2026-11-16, estimate 6.5, 90% range 6.0 to 7.1, both logged-food sensitivities agreeing, 0.2% below 70 and 0% below 54 over 07:00-13:00) the rule gives 7.5 to 6.8 by hand and by the code. The setting now running (Main, 7.0 g/U since 2026-11-16) has 1 breakfast, so the current result is "no change proposed: 5 are needed".
 
+How to read it: suppose the pooled effective I:C for a segment is 8 g/U with a 90% interval of 7 to 9, and the pump is set to 10 g/U. The meals behaved as if one unit covered about 8 g, so the setting delivers less insulin than the glucose response asks for, and because 10 lies outside the interval the evidence points the same way across meals, not just on average. If the interval were 7 to 13 the same estimate would say nothing about the setting. How it could fail: the ratio is carbohydrate-equivalent over logged carbohydrate, so a habit of under-counting carbs lowers it exactly as a weak ratio would, and an unlogged snack or an incorrect correction factor is absorbed into the same number; the sensitivity re-pools exist to show whether one such source drives the estimate. The proposal rule is a screen on the interval, not the probability that the setting is wrong.
+
 ## Lunch and dinner (goal E)
 
 A setting governs every meal that falls in its pump segment, so the evidence is pooled by pump segment across meals of the day: the first bolus of 1.5 U or more in the morning (06:00-11:00), afternoon (11:00-17:00) and evening (17:00-24:00) therapy segments each day is a candidate meal (`--meal-segments`, default all three for `propose-breakfast-icr`). Lunch and dinner meet the same eligibility as breakfast, which is stricter than it sounds for later meals: no bolus in the previous 4 hours (the earlier meal's tail), insulin on board under 1 U, glucose 80 to 130 mg/dL before the meal with no steep slope, no exercise (the shared rule) or controller change just before, no unlogged food in the window, and logged carbs. The proposal assesses every segment of the profile now running and proposes the one whose current setting sits furthest outside its evidence interval, one change at a time; while changes already entered are still being evaluated, a proposal is shown as waiting, with what the evidence would otherwise support. Real data, 2026-11-17: the 09:00 segment at 7.0 g/U (181 meals) behaved like 5.8 (5.6-6.1), 15:00 at 6.8 (104 meals) like 5.4 (5.1-5.7), and 19:00 at 6.8 (48 meals) like 5.0 (4.5-5.5), each with the checks agreeing and lows within limits; the rule would support 6.8 to 6.1 at 19:00 first, and today waits for the six changes of November 17 to be judged (first on 2026-12-02). How to read it: an effective I:C well below the programmed one means those meals raised glucose more than the programmed ratio covers. How it could fail: carb counting for dinner is usually less accurate than for breakfast, and slow fat and protein absorption lowers the effective I:C; the ratio found is the one that works with how the carbs are counted, and the sensitivity without high-fat and high-protein meals is the check.
@@ -77,6 +98,8 @@ A setting governs every meal that falls in its pump segment, so the evidence is 
 `meal_flags.py` compares the pump, Bevel (logged food) and the CGM, reading each flag in one direction only. **Food without pump carbs:** a Bevel entry of at least 5 g carbohydrate with no pump carb entry or bolus (0.5 U or more) within 30 minutes. **Possible unlogged food:** a CGM rise of at least 40 mg/dL within an hour that starts with no pump carbs, bolus or Bevel entry from 2.5 hours before to 1 hour after (a logged meal explains a rise for its absorption time). Both mark the 30 minutes before to 3 hours after the event; a breakfast window that overlaps one gets the exclusion reason `unlogged_food_in_window`, is left out of the I:C evidence, and is counted in the exclusion summary. **Bevel missing** (a pump carb entry with no Bevel entry within 30 minutes) is normal, since not every meal is logged in Bevel: it is reported and never read as "no meal", and analyses that need Bevel use only the pump carbs of that meal. On the real data: 47 Bevel entries without pump carbs and 1,062 possible unlogged rises over 2.8 years; of 124 breakfast windows that passed every other check, 14 overlap one (their rise was typically after treating a low or a snack that was never logged). The effective I:C at the earlier 7.0 g/U setting moved from 6.5 (90 breakfasts) to 6.4 (72), range 6.1 to 6.7. How it could fail: a late rise from slow-absorbing food eaten at the breakfast itself looks like a second, unlogged meal and costs a usable breakfast; the cost is a smaller sample, not a bias in one direction.
 
 **Fat and protein (goal D2): tested in simulation, not adopted.** The plan was to lengthen the estimator's absorption-time prior by the logged fat and protein. The simulation harness has a `fat_protein_meals` scenario (0 to 4 fat-protein units, FPU = (9 x fat + 4 x protein) / 100; the Warsaw method's absorption durations of about 3, 4, 5 and 8 hours for 1, 2, 3 and 4 FPU hold back part of the carbohydrate). On the path that sets the effective I:C (logged carbs, vague carb prior) the estimated carbohydrate was already 9% above the truth with no lengthening (7% for meals above 2 FPU), and each added coefficient of 0.1 per FPU on the prior raised it (to 11% at 0.2 and 15% at 0.5; the error spread also grew). On the bolus-prior path of `validate-latent-meal` the scenario shows a bias of -8 g with no pre-bolus delay and +1 g with a 10-minute pre-bolus, so the sign depends on timing rather than on fat and protein. With no setting of the coefficient that improves recovery, the estimator is left as it is; breakfasts high in fat or protein stay in the primary and the existing sensitivity without them remains the check. How it could fail: real absorption of mixed meals that is slower than the simulated shapes would bias the estimate low, and the sensitivity analysis is what would show it.
+
+How to read it: suppose 40 breakfasts were screened and 4 carry a "possible unlogged food" flag. Those 4 are excluded from the I:C evidence and counted in the exclusion summary, so the pooled estimate rests on 36. A "Bevel missing" count only says the second record is absent, never that no meal happened. How it could fail: the rule reads a rise, not food, so slow-absorbing food eaten at the meal can look like a rise with no logged cause, and a flagged window can hide a genuine insulin-sensitivity change; small unlogged snacks under 5 g or rises under 40 mg/dL are not flagged at all.
 
 ## Refresh, change record and evaluation (goal C)
 
@@ -101,6 +124,8 @@ A setting governs every meal that falls in its pump segment, so the evidence is 
 `episodes.py` finds every **high** (glucose above 250 mg/dL for 90 minutes or more) and **low** (below 70 for 15 minutes or more) in the last 120 days, describes what the record shows around each, and names the pattern those facts support. Rules are applied in order and the first match wins; the evidence that triggered it is shown beside it. Highs: *possible infusion-site or insulin problem* (a site change from 30 minutes into the episode to an hour after it ended, a high of 1.5 hours or more, with corrections given or extra controller basal); *meal dosed short of the pump's own ratio* (carbohydrate logged in the 2 hours before, and carbohydrate divided by the pump's recorded I:C needed at least 15% more insulin than was given); *meal dosed as calculated, glucose still rose*; *rise with no logged cause* (an unlogged-food interval); *stacked or late insulin* (glucose fell 120 mg/dL or more within 90 minutes of the end with 2 U or more still active); *persistent high with no meal before it* (3 hours or more); otherwise no pattern. Lows: *during or after exercise* (the episode began during exercise or within 4 hours after it, the shared rule, with a bolus in the 4 hours before); *after corrections without carbohydrate* (1 U or more in the 3 hours before); *meal dosed above the pump's own ratio*; *overnight with no bolus before it*; otherwise no pattern. A pattern is not a diagnosis: it says which explanation the recorded data support.
 
 **Repeats.** A pattern repeats when at least 4 episodes of one kind fall in a pump segment and at least half have that pattern; a repeating meal pattern points at that segment's I:C, a repeating persistent or overnight pattern at its basal, a site or stacking pattern is not a setting. **Playbook.** Each pattern carries what it points at and what to check, with your own numbers where they exist: the share of meal boluses followed by a low within 4 hours when the meal is during exercise or within 4 hours after it (the shared rule), against other meals, each with a Wilson 90% interval over the whole period the workout log covers (so a meal is "not during exercise" only when a workout could have been recorded); and how many long highs ended within an hour after a site change against how often that would happen by chance. Real data, last 120 days: 43 highs and 21 lows; *meal dosed as calculated, glucose still rose* is the most common high (21) and repeats at 09:00 and 15:00, which agrees with the I:C evidence; overnight lows with no bolus repeat at 00:00-05:00 (5 of 6) in the same hours the controller adds extra insulin, so basal needs a closer look before it changes; over 2024-05-25 to 2026-11-16, 556 meals during or within 4 hours after exercise were followed by a low in 11.3% (9.3% to 13.7%) against 8.0% (6.7% to 9.6%) of 934 others; the ranges overlap narrowly, so the page does not flag it, and the direction (more lows after exercise) is the one to watch as data accumulate. How it could fail: the workout log has gaps; site fills are decoded from the whole archive (2024-01 on); the classification reads only recorded insulin and carbohydrate, so unlogged boluses or food appear as no pattern.
+
+How to read it: suppose 8 long highs fall in one pump segment and 5 are labelled "meal dosed short of the pump's own ratio" (for example 60 g logged, an I:C of 10 g/U needing 6 U, and 4 U given). That is a repeating pattern (at least 4 episodes, at least half the same label), which points at the segment's I:C, and the playbook line says what to check. Five of 8 is a prompt to look, not an estimate of anything. How it could fail: the labels are ordered rules over recorded insulin, carbohydrate, site changes and workouts only, so carbohydrate that was eaten but not logged is labelled "rise with no logged cause" and the first matching rule wins even when two causes overlap.
 
 ## The front page and the runtime tree
 

@@ -1,32 +1,24 @@
 # Bayesian T1DM
 
-A personal research workbench that turns Tandem insulin-pump data and Apple Health data into evidence about pump settings. For example: given every breakfast logged on the pump, does glucose respond as if the morning insulin-to-carb (I:C) ratio were right?
+A personal research workbench that turns Tandem insulin-pump data and Apple Health data into two things: a forecast of 14-day time in range (70-180 mg/dL), and a test of what the record can show about changing pump settings. For example: does a Bayesian model of every hour of the record predict the next fortnight's time in range better than the last 28 days do, and do its predicted effects of past setting changes match what followed them?
 
 It is research and decision support, not a medical device; nothing here changes a pump setting.
 
-## Questions it answers
+## Results
 
-| Question | Command | Answer page |
-| --- | --- | --- |
-| Is my morning I:C ratio right? | `research-latent-meal-icr --research-scope full` | `output/latent_meal/latent_meal_review.html` |
-| Which breakfast I:C change does the evidence support? | `propose-breakfast-icr` | `output/proposals/breakfast_proposal.md` |
-| What is the current verdict, and can the record support changing settings? | `refresh --no-collect --no-publish` (`front-page` rewrites only the page) | `runtime/current/index.html` (open this) |
-| Where do I stand and what needs a look? | `refresh --no-collect --no-publish` | `runtime/current/dashboard.html` |
-| Run everything by hand and publish it to the Vault | `refresh` | `outputs/<date>/` in the Project Vault |
-| Where do time in range, lows and highs stand? | `report-outcomes` | `output/outcomes/outcomes_report.html` |
-| Is the Tandem data complete? | `ingest` | `output/source/coverage_review.html` |
-| Do outcomes after past settings changes differ from placebo dates? (exploratory) | `python -m bayesian_t1dm.replay` | `output/replay/replay_figure.png` |
-| How well do the settings in force and the context predict the share of readings in range, by clock hour? | `python -m bayesian_t1dm.outcomes_model` | `output/outcomes_model/outcomes_model_figure.png` |
-| Are the source data complete? | `status` | `output/current_status.html` |
+`refresh` writes a front page (`index.html` in the current run folder) that gives the verdict on each question, the evidence behind it and the data-quality status. Read that page and the generated reports for results; this repository states no run numbers.
 
-Every page opens with the question, a one-sentence answer, how much to trust it and what to do next; figures, tables and the files behind it fold out below. Methods are in [`docs/technical.md`](docs/technical.md); current scientific status is in [`docs/TECHNICAL_LAB_NOTEBOOK.md`](docs/TECHNICAL_LAB_NOTEBOOK.md).
+- Predictive and associational claims only: the record is retrospective and from one person.
+- The hour-day model beats the prespecified last-28-day baseline but ties a plain 365-day mean, so the win comes from long-run level, not from the settings.
+- Effects of settings are not validated: predicted effects of past changes do not track the observed ones, with few isolated changes to test on.
+- Ranked candidate changes are not produced, because that step is gated on a validated settings effect.
 
 ## Requirements
 
-- macOS or Linux with Conda
-- A Tandem Source account (pump data is pulled with [`tconnectsync`](https://github.com/jwoglom/tconnectsync) 3.x)
+- macOS or Linux with Conda (Python 3.11 environment, created from `environment.yml`)
+- A Tandem Source account for pump data (pulled with [`tconnectsync`](https://github.com/jwoglom/tconnectsync) 3.x)
 - Optional: Apple Health exports from the Health Auto Export app (JSON)
-- The Bayesian models run on PyTensor's Numba backend. `environment.yml` sets `PYTENSOR_FLAGS=mode=NUMBA,cxx=`, so the conda environment needs no C compiler; run the models with `conda run -n bt1dm` or an activated `bt1dm` environment. An environment created before this setting needs `conda env update -f environment.yml` and a reactivation; outside conda, export `PYTENSOR_FLAGS=mode=NUMBA,cxx=`
+- The Bayesian models run on PyTensor's Numba backend, set by `environment.yml` (`PYTENSOR_FLAGS=mode=NUMBA,cxx=`); no C compiler is needed. Outside conda, export that variable yourself.
 
 ## Install
 
@@ -38,15 +30,24 @@ conda env create -f environment.yml
 conda activate bt1dm
 ```
 
-Put Tandem credentials in a `.env` file in the repository root (never committed):
+Create a `.env` file in the repository root (never committed) from the template, and fill in your Tandem credentials and time zone:
 
 ```bash
-TANDEM_SOURCE_EMAIL=you@example.com
-TANDEM_SOURCE_PASSWORD=...
-TIMEZONE_NAME=America/New_York
+cp .env.example .env
 ```
 
+Two folders are used; set them in `.env` or the environment if the defaults do not suit you:
+
+| Variable | Holds | Default |
+| --- | --- | --- |
+| `BAYESIAN_T1DM_CLOUD_ROOT` | Raw data, merged dataset, change record, published runs | a `Project Vault` folder under OneDrive |
+| `BAYESIAN_T1DM_RUNTIME_ROOT` | Generated reports and run folders (`output/`, `runs/`, `current/`) | `~/Workspaces/bayesian-t1dm/runtime` |
+
 ## First run
+
+```bash
+bayesian-t1dm --help
+```
 
 ```bash
 bayesian-t1dm backfill --start-date 2024-01-01 --end-date 2026-11-17
@@ -60,48 +61,50 @@ bayesian-t1dm build-dataset
 bayesian-t1dm status
 ```
 
-`backfill` saves Tandem Source responses untouched under `data/raw/tconnectsync/<window>/raw/` and cleaned tables next to them. `build-dataset` merges all Tandem and Apple Health data into one deduplicated, validated dataset; it does work only when a raw file changed (a full rebuild takes under a minute; an unchanged check about a second), and every analysis refuses to run on a dataset older than its raw files.
+`backfill` saves Tandem Source responses untouched under `data/raw/tconnectsync/<window>/raw/` in the cloud root. `build-dataset` merges all Tandem and Apple Health data into one deduplicated, validated dataset; it does work only when a raw file changed, and every analysis refuses to run on a dataset older than its raw files.
 
-## Data
+## Usage
 
-Everything lives in the project folder set by `BAYESIAN_T1DM_CLOUD_ROOT` (the Project Vault by default); generated reports go to `~/Workspaces/bayesian-t1dm/runtime/output/`.
+Commands are `bayesian-t1dm <command>`; the research analyses run as modules (`python -m bayesian_t1dm.<name>`). Each writes under `<runtime root>/output/<folder>/`.
 
-| Path under the project folder | What goes there |
+| Question | Command | Output folder |
+| --- | --- | --- |
+| Run everything and publish a run to the Vault | `refresh` (add `--no-collect --no-publish` to skip the Tandem fetch and the publish) | `runs/<id>/`, copied to `current/` |
+| Rewrite the front page of a run without a refresh | `front-page` | `current/index.html` |
+| Is the record fit to be modelled? | `python -m bayesian_t1dm.data_audit` | `data_audit/` |
+| Does the model forecast 14-day time in range better than the last 28 days? | `python -m bayesian_t1dm.forecast_harness` | `forecast_harness/` |
+| Do the model's predicted effects of past changes match what happened? | `python -m bayesian_t1dm.replay_predictor` | `replay_predictor/` |
+| Do outcomes after past changes differ from placebo dates? (exploratory) | `python -m bayesian_t1dm.replay` | `replay/` |
+| Which hour-day covariates are associated with time in range? | `python -m bayesian_t1dm.outcomes_model` | `outcomes_model/` |
+| Where do time in range, lows and highs stand? | `report-outcomes` | `outcomes/` |
+| Which breakfast I:C change does the evidence support? | `propose-breakfast-icr` | `proposals/` |
+| Is the Tandem data complete? | `status`, `ingest` | `current_status.html`, `source/` |
+
+The harness and replay-predictor fit many Bayesian models and take tens of minutes; the others take seconds to minutes. Methods, goals and how to read each result are in [`docs/methods.md`](docs/methods.md); implementation detail is in [`docs/technical.md`](docs/technical.md); scientific status is in [`docs/TECHNICAL_LAB_NOTEBOOK.md`](docs/TECHNICAL_LAB_NOTEBOOK.md).
+
+Optional inputs under `data/raw/` in the cloud root:
+
+| Path | What goes there |
 | --- | --- |
-| `data/raw/tconnectsync/` | Tandem downloads, one folder per 30-day window (written by `collect` / `backfill`) |
-| `data/raw/health_auto_export/` | Apple Health exports: drop `HealthAutoExport-*.json` files anywhere here |
-| `data/raw/carbs.csv` | Optional hand-kept carb log, `timestamp,carb_grams` in local pump time |
-| `data/raw/context_events.csv` | Days to leave out of meal and basal analyses, `start_date,end_date,reason` (for example a steroid injection) |
-| `data/merged/` | The merged dataset, `validation_report.md` and input fingerprints (written by `build-dataset`) |
-
-Food logged in Apple Health (for example by Bevel, with carbs, protein and fat) is read from the same exports and used only in labelled sensitivity analyses: breakfasts high in fat or protein are set aside, and a combined carb count is rescaled to your pump entries first. The headline I:C stays on the carbs you entered on the pump. Carbs entered in the pump's bolus calculator are read from the pump events, together with the I:C ratio and correction factor the calculator used (recorded by a t:slim; on a Mobi, which records neither, taken from the pump's log of profile edits and switches or recovered from how the bolus was split), so each meal is judged against the setting in force that day. The latent-meal analysis reads your programmed profile from the most recently uploaded pump settings in the Tandem archive; `--therapy-settings file.json` overrides it with this format:
-
-```json
-{
-  "icr_grams_per_unit": {"overnight": 12.0, "morning": 10.0, "afternoon": 11.0, "evening": 9.0},
-  "correction_factor_mgdl_per_unit": {"overnight": 45.0, "morning": 40.0, "afternoon": 45.0, "evening": 40.0},
-  "target_glucose_mgdl": 110.0,
-  "insulin_action_minutes": 300,
-  "carb_absorption_minutes_prior": 180,
-  "max_plausible_meal_carbs": 180
-}
-```
+| `health_auto_export/` | Apple Health exports: drop `HealthAutoExport-*.json` files anywhere here |
+| `carbs.csv` | Hand-kept carb log, `timestamp,carb_grams` in local pump time |
+| `context_events.csv` | Days to leave out of meal and basal analyses, `start_date,end_date,reason` (for example a steroid injection) |
 
 ## Limits
 
-Tandem Source is undocumented and has changed without notice; when collection fails, check for a newer `tconnectsync`. Carbs and I:C cannot be separated from glucose alone, so I:C evidence needs logged carbs. Retrospective personal data support associations, not causal claims; results are for a conversation with a clinician.
+Retrospective personal data support predictive and associational claims, not causal ones; results are for a conversation with a clinician. Tandem Source is undocumented and has changed without notice; when collection fails, check for a newer `tconnectsync`. Carbs and I:C cannot be separated from glucose alone, so I:C evidence needs logged carbs.
 
 ## Development
 
 ```bash
-pytest -q
+python -m pytest -q
 ```
 
 ```bash
-ruff check src tests
+python -m ruff check src tests
 ```
 
-Both run in GitHub Actions on pushes to `main` and on pull requests. Tests use synthetic data only. `bayesian-t1dm validate-latent-meal` checks the carb estimator against simulated meals with known carbohydrate.
+Both run in GitHub Actions on pushes to `main` and on pull requests. Tests use synthetic data only; see [`docs/technical.md`](docs/technical.md#validation) for the validation design.
 
 ## License and contact
 
