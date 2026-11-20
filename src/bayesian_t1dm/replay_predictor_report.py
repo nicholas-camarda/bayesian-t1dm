@@ -111,11 +111,12 @@ def write_figure(joined: pd.DataFrame, information: pd.DataFrame, tracking: pd.D
     title = "Do the model's predicted effects of past settings changes match what happened? Time in range, 14 days after each change"
     note = ("Left: each point is one change; on the dashed line the model's predicted change equals the observed one.\n"
             "The grey band is the range the observed change takes when nothing changed, so points inside it cannot be told from chance.\n"
-            "Right: each row is one change; a dot left of 0 means the settings in force predicted the window better than the same fit with the old settings. Diamonds: mean with 90% interval over clusters of changes (dark: isolated, light: all).")
+            "Right: each row is one change; a dot left of 0 means the settings in force predicted the window better than the same fit with the old settings.\n"
+            "Diamonds: mean with 90% interval over clusters of changes (dark: isolated, light: all).")
     assert_ascii(title, note)
     figure.suptitle(title, fontsize=12, x=0.01, ha="left", y=0.995)
     figure.text(0.01, 0.965, note, fontsize=8.5, ha="left", va="top", color=NEUTRAL_LINE)
-    figure.subplots_adjust(top=0.86, bottom=0.2, left=0.07, right=0.84)
+    figure.subplots_adjust(top=0.85, bottom=0.2, left=0.07, right=0.84)
     paths = []
     for name in FIGURE_FILES:
         path = output / name
@@ -256,9 +257,9 @@ def _label(outcome: str, group: str) -> str:
 
 
 def _three_largest_share(differences: pd.Series, count: int = 3) -> float:
-    """Share of the summed CRPS difference carried by the ``count`` largest differences (NaN when the sum is not positive)."""
-    total = float(differences.sum())
-    return float(differences.nlargest(count).sum() / total) if total > 0 else float("nan")
+    """Share of the summed positive CRPS differences (the changes where the settings in force did worse) carried by the ``count`` largest (NaN when none is positive)."""
+    total = float(differences[differences > 0].sum())
+    return float(differences.nlargest(count).clip(lower=0).sum() / total) if total > 0 else float("nan")
 
 
 def _slope_against_one(row: pd.Series) -> str:
@@ -316,7 +317,7 @@ def verdict_lines(joined: pd.DataFrame, tracking: pd.DataFrame, information: pd.
         (worse if row["lower_5th"] > 0 else better if row["upper_95th"] < 0 else []).append(group)
         part = rp.group_rows(primary, group)
         share = _three_largest_share(part["crps_new_minus_old_points"])
-        carried = f" The three largest of the {len(part)} differences carry {share:.0%} of the summed difference." if np.isfinite(share) else ""
+        carried = f" The three largest of the {len(part)} differences carry {share:.0%} of the summed positive differences (the changes where the settings in force did worse)." if np.isfinite(share) else ""
         lines.append(f"- **Settings information, time in range, {group}.** CRPS with the settings in force {row['mean_crps_new_points']:.2f} points, with the old settings {row['mean_crps_old_points']:.2f}; difference "
                      f"{_interval(row['mean_difference_points'], row['lower_5th'], row['upper_95th'])}. {row['reading'].capitalize()}.{carried}")
     low_power = []
