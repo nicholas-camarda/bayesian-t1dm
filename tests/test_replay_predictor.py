@@ -280,16 +280,16 @@ def test_the_report_reconciles_and_follows_the_workbook_rules(tmp_path, monkeypa
     assert len(joined) == len(targets)
     assert (joined["crps_new_minus_old_points"] == joined["crps_new_points"] - joined["crps_old_points"]).all()
     report.write_outputs(folder=tmp_path, run_id="test", raw="synthetic", table=table, flow=flow, issues=issues, joined=joined, targets=targets, posteriors=posteriors, replay_results=results,
-                         draws=1000, tune=1000, chains=4, target_accept=0.95, min_train_days=30, seconds=1.0, command="test", note="")
+                         draws=1000, tune=1000, chains=4, target_accept=0.95, profile_day_hours=1000, min_train_days=30, seconds=1.0, command="test", note="")
     workbook = read_workbook(tmp_path / "diagnostics.xlsx")
     names = list(workbook)
     assert names[0] == "Specification_Coding" and names[1] == "Denominators_Flow" and names[-2:] == ["Warnings_Limitations", "Artifacts_Provenance"]
-    assert {"Sensitivity", "Power"} <= set(names)
+    assert {"Sensitivity", "Leave_One_Cluster_Out", "Power"} <= set(names)
     for sheet in ("Checks", "Model_Fits"):
         assert set(workbook[sheet]["status"]) <= set(STATUSES)
     assert (tmp_path / "replay_predictor_figure.png").exists() and (tmp_path / "replay_predictor_figure.svg").exists()
     summary = (tmp_path / "replay_predictor_summary.md").read_text(encoding="utf-8")
-    assert "## Verdict" in summary and "percentage points" in summary and "Slope intervals examined" in summary
+    assert "## Verdict" in summary and "percentage points" in summary and "Intervals examined" in summary
     assert summary.isascii()
 
 
@@ -408,13 +408,14 @@ def fake_joined(*, slope: float, crps_gap: float = 0.0, noise: float = 0.5, clus
         frames.append(pd.DataFrame({"outcome": outcome, "event_id": np.arange(clusters), "cluster_id": np.arange(clusters), "isolated": True, "change_date": [f"2025-01-{index + 1:02d}" for index in range(clusters)],
                                     "counted_days": 14, "predicted_change_points": x, "predicted_change_day_before_points": x, "observed_change_points": slope * x + rng.normal(0, noise, clusters),
                                     "inside_credible_interval": True, "inside_noise_range": True, "prior_dominated": False,
-                                    "crps_new_points": 3.0 + crps_gap + rng.normal(0, 0.2, clusters), "crps_old_points": 3.0 + rng.normal(0, 0.2, clusters)}).assign(crps_new_minus_old_points=lambda f: f["crps_new_points"] - f["crps_old_points"]))
+                                    "crps_new_points": 3.0 + crps_gap + rng.normal(0, 0.2, clusters), "crps_old_points": 3.0 + rng.normal(0, 0.2, clusters),
+                                    "observed_window_pct": 60.0 if outcome == "tir" else 0.1, "predictive_new_lower_5th": 40.0 if outcome == "tir" else 0.0, "predictive_new_upper_95th": 80.0 if outcome == "tir" else 0.5}).assign(crps_new_minus_old_points=lambda f: f["crps_new_points"] - f["crps_old_points"]))
     return pd.concat(frames, ignore_index=True)
 
 
 def verdict_for(joined: pd.DataFrame) -> tuple[list[str], str]:
     tracking = rp.tracking_table(joined, draws=500)
-    return report.verdict_lines(joined, tracking, rp.information_table(joined, draws=500), rp.power_table(joined, simulations=20, draws=200), rp.sensitivity_table(joined, draws=200))
+    return report.verdict_lines(joined, tracking, rp.information_table(joined, draws=500), rp.power_table(joined, simulations=20, draws=200), rp.leave_one_cluster_out_table(joined))
 
 
 def test_verdict_says_the_old_settings_predicted_better_when_the_interval_is_above_zero() -> None:
@@ -427,7 +428,7 @@ def test_verdict_says_the_old_settings_predicted_better_when_the_interval_is_abo
 
 def test_verdict_reports_a_slope_interval_below_zero_as_moving_against_the_prediction() -> None:
     bullets, reading = verdict_for(fake_joined(slope=-1.5))
-    assert any(line.strip().startswith("- Below zero: time in range, isolated changes") or "Below zero: time in range, isolated changes" in line for line in bullets)
+    assert any("Slope below zero: time in range, isolated changes" in line for line in bullets)
     assert "moved against the predicted direction" in reading and "Predicted changes line up" not in reading
 
 
@@ -436,7 +437,8 @@ def test_verdict_lists_every_interval_examined_and_the_groups_that_could_not_be_
     joined.loc[joined["outcome"].eq("below54"), "isolated"] = False  # no isolated rows for one outcome
     bullets, _ = verdict_for(joined)
     text = "\n".join(bullets)
-    assert "Slope intervals examined: 6" in text
+    assert "Intervals examined: 12" in text and "6 slope intervals and 6 CRPS-difference intervals" in text
+    assert "time below 54: the observed 14-day share averages 0.10%" in text.lower()
     assert "Not estimated: time below 54, isolated changes" in text
 
 
@@ -471,3 +473,33 @@ def test_a_planted_slope_is_recovered_with_realistic_day_noise_and_the_power_tab
     assert none_row["slope_lower_5th"] < 0 < none_row["slope_upper_95th"]
     assert planted_power["power_true_slope_4"] >= planted_power["power_true_slope_1"] >= planted_power["power_true_slope_0.5"]
     assert planted_power["power_true_slope_4"] > 0.8
+
+
+def test_a_slope_interval_that_excludes_one_is_said_to_rule_out_correct_sizes_with_the_few_clusters_caveat() -> None:
+    bullets, reading = verdict_for(fake_joined(slope=0.0, noise=0.3, clusters=12))
+    assert "excludes 1" in "\n".join(bullets) and "rules out correctly sized predictions" in reading and "too narrow" in reading
+    bullets, reading = verdict_for(fake_joined(slope=1.0, noise=0.3, clusters=12))
+    assert "holds 1" in "\n".join(bullets) and "rules out correctly sized" not in reading
+
+
+def test_leave_one_cluster_out_gives_one_row_per_cluster_and_group_and_the_verdict_reports_the_range() -> None:
+    joined = fake_joined(slope=0.5, clusters=12)
+    table = rp.leave_one_cluster_out_table(joined)
+    assert len(table) == 12 * 2 and table.groupby("group")["changes_left"].min().eq(11).all()
+    manual = joined[joined["cluster_id"] != 3]
+    row = table[(table["group"] == "isolated changes") & (table["left_out_cluster"] == 3)].iloc[0]
+    assert row["slope"] == pytest.approx(rp.slope(manual[["predicted_change_points", "observed_change_points"]].to_numpy()))
+    assert row["mean_crps_difference_points"] == pytest.approx(manual["crps_new_minus_old_points"].mean())
+    bullets, _ = verdict_for(joined)
+    assert any(line.startswith("- **Leave one cluster out, time in range, isolated changes (12 clusters).**") for line in bullets)
+
+
+def test_the_verdict_names_predictive_coverage_below_the_acceptable_range() -> None:
+    joined = fake_joined(slope=0.5)
+    joined["predictive_new_lower_5th"], joined["predictive_new_upper_95th"] = 0.0, 10.0
+    bullets, _ = verdict_for(joined)
+    assert any("Predictive coverage" in line and "under-dispersed" in line for line in bullets)
+
+
+def test_ten_clusters_is_too_few_for_the_cluster_bootstrap() -> None:
+    assert rp.MIN_CLUSTERS == 12

@@ -57,7 +57,7 @@ DRAWS = fh.DRAWS
 BOOTSTRAP_DRAWS = 10_000
 SEED = om.SEED
 INTERVAL = (5.0, 95.0)
-MIN_CLUSTERS = 10
+MIN_CLUSTERS = 12
 SETTING_UNITS = (("icr", "I:C", "g/U"), ("cf", "CF", "mg/dL per U"), ("basal", "basal", "U/h"), ("target", "target", "mg/dL"))
 GROUPS = ("isolated changes", "all changes")
 COVERAGE_RANGE = (0.80, 0.98)
@@ -157,10 +157,8 @@ def plan_targets(table: pd.DataFrame, grid: replay.DayGrid, events: list[replay.
 
     A change is left out, with the reason, when: the replay did not score it; fewer than ``min_train_days`` days with usable hours precede it; a setting is unknown at an affected hour
     before the change, after it, or on a baseline day (the qualifying days of the 28 before it, whose settings the observed change is measured against); no complete day of exposure
-    precedes it; or the setting values at its changed hours are equal before and after it (nothing to test). The frozen profiles and the hour-day table must agree on days without a
-    change (an error otherwise).
+    precedes it; or the setting values at its changed hours are equal before and after it (nothing to test).
     """
-    check_profiles_agree(table, grid, profiles)
     by_day = settings_grid(table)
     scored = set(scores.loc[scores["kind"].eq("change") & scores["predictor"].eq(replay.PRIMARY), "event_id"])
     reasons = replay_issues.set_index("event_id") if len(replay_issues) else pd.DataFrame()
@@ -468,24 +466,39 @@ def information_reading(result: Interval) -> str:
     return "the interval holds zero: the record does not show that the settings in force predict the window better than the old settings"
 
 
-def latest_isolated(frame: pd.DataFrame) -> pd.Series:
-    """The most recent isolated change of one outcome's rows."""
-    return frame[frame["isolated"]].sort_values("change_date").iloc[-1]
-
-
 def sensitivity_table(joined: pd.DataFrame, *, draws: int = BOOTSTRAP_DRAWS) -> pd.DataFrame:
-    """The tracking estimates under three variations: the old arm as the profile the day before the change instead of the baseline days' settings; the latest isolated change left out
-    (isolated group only, time in range); and the changes whose prediction rests on the prior left out."""
+    """The tracking estimates under two variations: the old arm as the profile the day before the change instead of the baseline days' settings, and the changes whose prediction rests on
+    the prior left out."""
     parts = [tracking_table(joined, draws=draws, predicted="predicted_change_day_before_points", variant="predicted against the profile the day before the change")]
-    tir = joined[joined["outcome"].eq(PRIMARY_OUTCOME)]
-    if tir["isolated"].any():
-        latest = latest_isolated(tir)
-        without = tracking_table(tir[tir["event_id"] != latest["event_id"]], draws=draws, variant=f"latest isolated change ({latest['change_date']}) left out")
-        parts.append(without[without["group"].eq("isolated changes")])
     kept = joined[~joined["prior_dominated"]]
     if len(kept) < len(joined):
         parts.append(tracking_table(kept, draws=draws, variant="changes predicted from the prior alone left out"))
     return pd.concat(parts, ignore_index=True)
+
+
+def leave_one_cluster_out_table(joined: pd.DataFrame) -> pd.DataFrame:
+    """For the primary outcome and each group, the slope of observed on predicted change and the mean CRPS difference (new minus old) with each cluster of changes left out in turn.
+
+    Point estimates only: the range shows how far one cluster can move a result, which the bootstrap interval of the whole sample does not.
+    """
+    rows = []
+    frame_outcome = joined[joined["outcome"].eq(PRIMARY_OUTCOME)]
+    for group in GROUPS:
+        frame = group_rows(frame_outcome, group)
+        for cluster in sorted(frame["cluster_id"].unique()):
+            part = frame[frame["cluster_id"] != cluster]
+            dropped = frame[frame["cluster_id"] == cluster]
+            pair = part[["predicted_change_points", "observed_change_points"]].to_numpy()
+            rows.append({"group": group, "left_out_cluster": int(cluster), "left_out_changes": ", ".join(map(str, dropped["change_date"])), "changes_left": len(part),
+                         "slope": slope(pair) if len(part) else float("nan"),
+                         "mean_crps_difference_points": float(part["crps_new_minus_old_points"].mean()) if len(part) else float("nan")})
+    return pd.DataFrame(rows)
+
+
+def predictive_coverage(joined: pd.DataFrame) -> float:
+    """Share of the primary outcome's observed 14-day windows inside the model's 90% predictive interval under the settings in force."""
+    primary = joined[joined["outcome"].eq(PRIMARY_OUTCOME)]
+    return float(((primary["observed_window_pct"] >= primary["predictive_new_lower_5th"]) & (primary["observed_window_pct"] <= primary["predictive_new_upper_95th"])).mean())
 
 
 def power_table(joined: pd.DataFrame, *, simulations: int | None = None, draws: int | None = None, seed: int = SEED) -> pd.DataFrame:
@@ -546,6 +559,7 @@ def run(raw: str | None, output: str | None, *, outcomes: tuple[str, ...], draws
     grid = replay.day_grid(table)
     events = replay.find_events(grid)
     clusters, isolated = replay.cluster_events(events)
+    profile_day_hours = check_profiles_agree(table, grid, profiles)
     targets, flow, issues = plan_targets(table, grid, events, clusters, isolated, scores, results["issues"], profiles, daily, tdd, min_train_days=min_train_days)
     for target in targets:
         check_no_leakage(table, target)
@@ -559,7 +573,7 @@ def run(raw: str | None, output: str | None, *, outcomes: tuple[str, ...], draws
         LOGGER.info("%s: %d changes predicted", outcome, len(joined[-1]))
     joined_frame = pd.concat(joined, ignore_index=True)
     write_outputs(folder=folder, run_id=run_id, raw=raw, table=table, flow=flow, issues=issues, joined=joined_frame, targets=targets, posteriors=posteriors, replay_results=results, draws=draws, tune=tune,
-                  chains=chains, target_accept=target_accept, min_train_days=min_train_days, seconds=time.time() - started, command=command, note=note)
+                  chains=chains, target_accept=target_accept, profile_day_hours=profile_day_hours, min_train_days=min_train_days, seconds=time.time() - started, command=command, note=note)
     LOGGER.info("replay predictor finished in %.1f s", time.time() - started)
     return 0
 
@@ -582,7 +596,7 @@ def main(argv: list[str] | None = None) -> int:
     unknown = sorted(set(outcomes) - set(OUTCOMES))
     if unknown or PRIMARY_OUTCOME not in outcomes:
         raise SystemExit(f"--outcomes must include {PRIMARY_OUTCOME} and only name {OUTCOMES}; got {args.outcomes}")
-    command = " ".join(["python -m bayesian_t1dm.replay_predictor", f"--outcomes {args.outcomes}", f"--draws {args.draws}", f"--tune {args.tune}", f"--chains {args.chains}", f"--workers {args.workers}",
+    command = " ".join(["python -m bayesian_t1dm.replay_predictor", f"--outcomes {args.outcomes}", f"--draws {args.draws}", f"--tune {args.tune}", f"--chains {args.chains}", f"--target-accept {args.target_accept}", f"--workers {args.workers}",
                         f"--min-train-days {args.min_train_days}", *(["--reuse-posteriors"] if args.reuse_posteriors else []), *([f'--run-note "{args.run_note}"'] if args.run_note else [])])
     return run(args.raw, args.output, outcomes=outcomes, draws=args.draws, tune=args.tune, chains=args.chains, workers=args.workers, reuse=args.reuse_posteriors, target_accept=args.target_accept, min_train_days=args.min_train_days,
                command=command, note=args.run_note)

@@ -22,6 +22,7 @@ OUTCOME_LABELS = {"tir": "time in range (70-180 mg/dL)", "below70": "time below 
 OUTCOME_SHORT = {"tir": "time in range", "below70": "time below 70", "below54": "time below 54"}
 SETTING_BETAS = ("log I:C", "log correction factor", "log basal", "target")
 PRIOR_DOMINATED_RATIO = rp.PRIOR_DOMINATED_RATIO
+NEUTRAL_MID = "#8c8c8c"
 
 
 def _interval(estimate: float, lower: float, upper: float, digits: int = 2) -> str:
@@ -67,7 +68,7 @@ def write_figure(joined: pd.DataFrame, information: pd.DataFrame, tracking: pd.D
     if len(primary) and len(isolated_rows) >= 3 and isolated_rows["predicted_change_points"].nunique() > 1:
         fitted = np.polyfit(isolated_rows["predicted_change_points"], isolated_rows["observed_change_points"], 1)
         xs = np.array([-limit, limit])
-        left.plot(xs, np.polyval(fitted, xs), color=GROUP_STYLE["more insulin"].color, linewidth=2.2, zorder=2)
+        left.plot(xs, np.polyval(fitted, xs), color=NEUTRAL_LINE, linewidth=2.6, zorder=2)
     left.set_xlim(-limit, limit)
     left.set_ylim(-limit, limit)
     left.set_aspect("equal", adjustable="box")
@@ -91,7 +92,7 @@ def write_figure(joined: pd.DataFrame, information: pd.DataFrame, tracking: pd.D
             continue
         est = result.loc[group]
         y = base - 1.6 * offset
-        right.errorbar(est["mean_difference_points"], y, xerr=[[est["mean_difference_points"] - est["lower_5th"]], [est["upper_95th"] - est["mean_difference_points"]]], fmt="D", color=GROUP_STYLE["more insulin"].color if offset == 0 else NEUTRAL_LINE,
+        right.errorbar(est["mean_difference_points"], y, xerr=[[est["mean_difference_points"] - est["lower_5th"]], [est["upper_95th"] - est["mean_difference_points"]]], fmt="D", color=NEUTRAL_LINE if offset == 0 else NEUTRAL_MID,
                        capsize=4, linewidth=2.2, markersize=7, zorder=4)
         right.text(right.get_xlim()[1], y, f"  {group.replace(' changes', '')} (n={int(est['changes'])}): {est['mean_difference_points']:+.2f}", fontsize=8, va="center", ha="left", clip_on=False)
     right.set_ylim(base - 3.2, len(frame) - 0.4)
@@ -104,13 +105,13 @@ def write_figure(joined: pd.DataFrame, information: pd.DataFrame, tracking: pd.D
                for name in ("more insulin", "less insulin", "mixed") if name in set(frame["direction"])]
     handles += [Line2D([0], [0], marker="o", color="none", markerfacecolor="white", markeredgecolor=NEUTRAL_LINE, markersize=7, label="Hollow: another change within 14 days"),
                 Line2D([0], [0], color=NEUTRAL_LINE, linestyle="--", linewidth=1.4, label="Predicted = observed"),
-                Line2D([0], [0], color=GROUP_STYLE["more insulin"].color, linewidth=2.2, label="Least-squares line, isolated changes"),
+                Line2D([0], [0], color=NEUTRAL_LINE, linewidth=2.6, label="Least-squares line, isolated changes"),
                 Patch(color=NEUTRAL_BAND, label="Range of the observed change when nothing changed (5th to 95th percentile)")]
     figure.legend(handles=handles, loc="lower center", ncol=3, fontsize=8.5, frameon=False, bbox_to_anchor=(0.5, 0.0))
     title = "Do the model's predicted effects of past settings changes match what happened? Time in range, 14 days after each change"
     note = ("Left: each point is one change; on the dashed line the model's predicted change equals the observed one.\n"
             "The grey band is the range the observed change takes when nothing changed, so points inside it cannot be told from chance.\n"
-            "Right: each row is one change; a dot left of 0 means the settings in force predicted the window better than the same fit with the old settings. Diamonds: mean with 90% interval over clusters of changes.")
+            "Right: each row is one change; a dot left of 0 means the settings in force predicted the window better than the same fit with the old settings. Diamonds: mean with 90% interval over clusters of changes (dark: isolated, light: all).")
     assert_ascii(title, note)
     figure.suptitle(title, fontsize=12, x=0.01, ha="left", y=0.995)
     figure.text(0.01, 0.965, note, fontsize=8.5, ha="left", va="top", color=NEUTRAL_LINE)
@@ -140,7 +141,7 @@ def _specification(outcomes: tuple[str, ...], draws: int, tune: int, chains: int
         ("Predicted change", f"Expected share of readings in the outcome over the post-change window under the profile in force after the change (new, held for the 14 days) minus the expected share under the settings actually in force on each of the replay's baseline days (the qualifying days of the 28 before the change, weighted by their readings), in percentage points. This is the quantity the replay observes: the change's miss from the last-28-day predictor. Same posterior draw, day effects and resampled exposures in both; mean and 5th and 95th percentile over the {rp.DRAWS:,} posterior draws. Positive time in range: more readings in range under the new settings. For below 70 and below 54 a negative value means fewer lows. Sensitivity: the old arm as the profile in force the day before the change (Sensitivity sheet)."),
         ("Exposures", "Carbohydrate of the last 3 h, exercise share, sleep-mode share and site age: whole days resampled from the 28 days before the change, 14 per draw. Reading counts per hour are the realised ones on the counted days (the number of readings is not glucose information)."),
         ("Observed change", "The replay's delta per change: (observed minus last-28-day prediction over the affected hours) minus the mean of the same quantity over the change's 5 matched placebo dates. Units: percentage points. Positive time in range: the 14 days did better than no-change dates do."),
-        ("Tracking statistics", "Least-squares slope and Pearson correlation of observed on predicted change; direction agreement (same sign); inside_credible_interval (the observed change lies in the 90% credible interval of the predicted change, which describes the expected change and not the sampling noise of an observed window, so under-covers by construction); inside_noise_range (the observed change lies within the predicted change plus the 5th to 95th percentile of misses on matched placebo dates, conservative because the observed change subtracts a mean of five placebos). A slope of 1 means the predicted size is right; 0 means the predictions carry no information about what happened."),
+        ("Tracking statistics", "Least-squares slope and Pearson correlation of observed on predicted change; direction agreement (same sign); inside_credible_interval (the observed change lies in the 90% credible interval of the predicted change, which describes the expected change and not the sampling noise of an observed window, so under-covers by construction); inside_noise_range (the observed change lies within the predicted change plus the 5th to 95th percentile of the centred misses on matched placebo dates, widened by the square root of 1.2 because the observed change subtracts a mean of five placebo misses). A slope of 1 means the predicted size is right; 0 means the predictions carry no information about what happened."),
         ("Settings-information test", "CRPS (percentage points) of the 14-day share under the new settings and under the old settings (the profile in force the day before the change, held), same fit and exposures; difference new minus old, paired across changes. Below 0: the settings in force predict what happened better."),
         ("Groups", "Isolated changes (no other change within 14 days; primary) and all changes."),
         ("Intervals", f"90% percentile intervals of {rp.BOOTSTRAP_DRAWS:,} cluster-bootstrap resamples, seed {rp.SEED}."),
@@ -175,8 +176,9 @@ def _model_fits(fits: dict[str, dict], targets: list[rp.EventTarget]) -> pd.Data
     return pd.DataFrame(rows)
 
 
-def _checks(joined: pd.DataFrame, tracking: pd.DataFrame, fits_table: pd.DataFrame, flow: pd.DataFrame, issues: pd.DataFrame, min_train_days: int) -> pd.DataFrame:
+def _checks(joined: pd.DataFrame, tracking: pd.DataFrame, fits_table: pd.DataFrame, flow: pd.DataFrame, issues: pd.DataFrame, min_train_days: int, profile_day_hours: int) -> pd.DataFrame:
     rows = []
+    rows.append(("Pump profile and hour-day table agree on days without a change", f"{profile_day_hours:,} day-hours compared (days the replay can call unchanged: no changed hour and no unknown day-to-day difference); every one agrees, otherwise the run stops", "no concern"))
     rows.append(("Sampler gate on every fit", f"{len(fits_table)} fits; max R-hat {fits_table['r_hat_max'].max():.4f}, min bulk ESS {fits_table['ess_bulk_min'].min():.0f}, min tail ESS {fits_table['ess_tail_min'].min():.0f}, "
                  f"{int(fits_table['divergences'].sum())} divergences (a failed fit fails the run)", "no concern" if (fits_table["status"] == "no concern").all() else "concern"))
     rows.append(("No row on or after the change reaches its fit", "each change's fit is trained on rows dated before its cut, and the cut is on or before the change date (asserted for every change; a unit test plants future rows)", "no concern"))
@@ -193,11 +195,11 @@ def _checks(joined: pd.DataFrame, tracking: pd.DataFrame, fits_table: pd.DataFra
         part = joined[joined["outcome"].eq(rp.PRIMARY_OUTCOME)]
         part = rp.group_rows(part, group)
         clusters = int(part["cluster_id"].nunique())
-        rows.append((f"Clusters behind the interval ({group})", f"{len(part)} changes in {clusters} clusters; fewer than {rp.MIN_CLUSTERS} clusters make a cluster-bootstrap interval unreliable", "no concern" if clusters >= rp.MIN_CLUSTERS else "concern"))
+        rows.append((f"Clusters behind the interval ({group})", f"{len(part)} changes in {clusters} clusters; fewer than {rp.MIN_CLUSTERS} clusters make a percentile cluster-bootstrap interval too narrow", "no concern" if clusters >= rp.MIN_CLUSTERS else "concern"))
     undefined = int(sum(tracking[f"{name}_undefined_resamples"].sum() for name in ("slope", "correlation", "direction_agreement")))
     rows.append(("Bootstrap resamples with an undefined statistic", f"{undefined} undefined resamples over every slope, correlation and agreement interval (a resample whose predicted changes do not vary has no slope)", "no concern" if undefined == 0 else "concern"))
     primary = joined[joined["outcome"].eq(rp.PRIMARY_OUTCOME)]
-    covered = float(((primary["observed_window_pct"] >= primary["predictive_new_lower_5th"]) & (primary["observed_window_pct"] <= primary["predictive_new_upper_95th"])).mean())
+    covered = rp.predictive_coverage(joined)
     rows.append(("Predictive interval coverage under the settings in force (time in range)", f"{covered:.2f} of observed windows fall inside the model's 90% predictive interval (acceptable range {rp.COVERAGE_RANGE[0]:.2f} to {rp.COVERAGE_RANGE[1]:.2f})",
                  "no concern" if rp.COVERAGE_RANGE[0] <= covered <= rp.COVERAGE_RANGE[1] else "concern"))
     left_out = int(flow.set_index("stage")["changes"].iloc[0] - len(primary))
@@ -206,10 +208,10 @@ def _checks(joined: pd.DataFrame, tracking: pd.DataFrame, fits_table: pd.DataFra
     return pd.DataFrame(rows, columns=["check", "result", "status"])
 
 
-def _warnings(note: str, draws: int, tune: int, chains: int) -> pd.DataFrame:
+def _warnings(note: str, draws: int, tune: int, chains: int, target_accept: float) -> pd.DataFrame:
     rows = [
-        ("Few independent changes", "Changes cluster in time (several within weeks of each other) and the isolated set is small, so the slope and its interval rest on a handful of clusters; the cluster bootstrap carries that into the interval and does not remove it. With about a dozen clusters a percentile cluster-bootstrap interval can be narrower than its nominal level."),
-        ("Power", "The Power sheet simulates observed changes as a true slope times the real predicted changes plus noise with the real residual SD; a slope interval that holds zero is as consistent with predictions that carry information as with predictions that carry none when the power to find a true slope of 1 is low."),
+        ("Few independent changes", "Changes cluster in time (several within weeks of each other) and the isolated set is small, so the slope and its interval rest on a handful of clusters; the cluster bootstrap carries that into the interval and does not remove it. With fewer than about a dozen clusters a percentile cluster-bootstrap interval can be narrower than its nominal level."),
+        ("Power", "The Power sheet simulates observed changes as a true slope times the real predicted changes plus noise with the real residual SD; a slope interval that holds zero is as consistent with predictions that carry information as with predictions that carry none when the power to find a true slope of 1 is low. The simulated noise is independent and normal, its SD includes the one outlying change, and the percentile bootstrap is too narrow with few clusters; the numbers are approximate and the narrow interval makes them optimistic."),
         ("Same-hour model", "The model's settings act only within the same clock hour, so its predicted effect in the 4 hours after the changed hours is zero by construction, while the observed change over the affected hours includes those hours."),
         ("Later changes in the window", "The new settings are the profile in force after the change held for the 14 days; a later change inside the window is in the observed change and not in the prediction (changes with another change within 14 days are not isolated)."),
         ("Baseline days", "The replay's last-28-day predictor pools days that can be under earlier settings; the predicted change is measured against the settings actually in force on those days so that it is the same quantity as the observed change. The profile the day before the change is the sensitivity."),
@@ -218,16 +220,16 @@ def _warnings(note: str, draws: int, tune: int, chains: int) -> pd.DataFrame:
         ("Predictions use the settings that happened", "The new settings are the settings in force on each day of the window, which the person chose knowing the recent glucose. The model's coefficients are associations over the whole record, not the effect of changing a setting."),
         ("Shared fits", f"A change within {rp.FIT_SHARE_DAYS} days after the first change of its group uses that group's fit, which is up to {rp.FIT_SHARE_DAYS} days older than the change date; the old settings and exposures are still taken at the change's own date."),
         ("Settings held old", "The old settings are the profile at the last moment of the day before the change, held for the whole window; if an unrelated edit to another setting changed the same profile, it is part of the difference."),
-        ("Sampler settings", f"{chains} chains, {tune} tuning steps, {draws} draws per chain at every cut; every fit passed the gate." + (f" Run note: {note}" if note else "")),
+        ("Sampler settings", f"{chains} chains, {tune} tuning steps, {draws} draws per chain at target acceptance {target_accept} at every cut; every fit passed the gate." + (f" Run note: {note}" if note else "")),
         ("Predictive claim", "A better prediction, or a predicted effect that matches, does not show that changing a setting would change the outcome."),
     ]
     return pd.DataFrame(rows, columns=["limitation", "detail"])
 
 
-def _provenance(*, run_id: str, raw: str, table: pd.DataFrame, files: list[str], seconds: float, draws: int, tune: int, chains: int, command: str) -> pd.DataFrame:
+def _provenance(*, run_id: str, raw: str, table: pd.DataFrame, files: list[str], seconds: float, draws: int, tune: int, chains: int, target_accept: float, command: str) -> pd.DataFrame:
     dirty = not working_tree_is_clean(REPO_ROOT)
     rows = [("run id", run_id), ("commit", current_commit(REPO_ROOT)), ("working tree clean", "no" if dirty else "yes"), ("raw data root", raw), ("record span", f"{table['date'].min().date()} to {table['date'].max().date()}"),
-            ("seed", rp.SEED), ("bootstrap resamples", rp.BOOTSTRAP_DRAWS), ("predictive draws", rp.DRAWS), ("model sampler", f"{chains} chains, {tune} tuning, {draws} draws"), ("command", command),
+            ("seed", rp.SEED), ("bootstrap resamples", rp.BOOTSTRAP_DRAWS), ("predictive draws", rp.DRAWS), ("model sampler", f"{chains} chains, {tune} tuning, {draws} draws, target acceptance {target_accept}"), ("command", command),
             ("wall time (seconds)", round(seconds, 1)), ("files", json.dumps(files))]
     return pd.DataFrame(rows, columns=["item", "value"])
 
@@ -253,7 +255,22 @@ def _label(outcome: str, group: str) -> str:
     return f"{OUTCOME_SHORT[outcome]}, {group}"
 
 
-def verdict_lines(joined: pd.DataFrame, tracking: pd.DataFrame, information: pd.DataFrame, power: pd.DataFrame, sensitivity: pd.DataFrame) -> tuple[list[str], str]:
+def _three_largest_share(differences: pd.Series, count: int = 3) -> float:
+    """Share of the summed CRPS difference carried by the ``count`` largest differences (NaN when the sum is not positive)."""
+    total = float(differences.sum())
+    return float(differences.nlargest(count).sum() / total) if total > 0 else float("nan")
+
+
+def _slope_against_one(row: pd.Series) -> str:
+    """Where 1 (the predicted size is right) lies relative to a slope interval."""
+    if row["slope_upper_95th"] < 1:
+        return "excludes 1"
+    if row["slope_lower_5th"] > 1:
+        return "excludes 1"
+    return "holds 1"
+
+
+def verdict_lines(joined: pd.DataFrame, tracking: pd.DataFrame, information: pd.DataFrame, power: pd.DataFrame, leave_out: pd.DataFrame) -> tuple[list[str], str]:
     """The headline bullets and the reading paragraph, every number and every group named from the tables (nothing about a result is written in advance)."""
     lines: list[str] = []
     estimated = tracking[tracking["slope"].notna()] if "slope" in tracking else tracking.iloc[0:0]
@@ -261,21 +278,35 @@ def verdict_lines(joined: pd.DataFrame, tracking: pd.DataFrame, information: pd.
     above = estimated[estimated["slope_lower_5th"] > 0]
     below = estimated[estimated["slope_upper_95th"] < 0]
     holds = estimated[~estimated.index.isin(above.index) & ~estimated.index.isin(below.index)]
-    lines.append(f"- **Slope intervals examined: {len(tracking)}** (each outcome and group). {len(holds)} hold zero, {len(below)} lie below zero, {len(above)} lie above zero, {len(missing)} could not be estimated.")
+    excludes_one = estimated[(estimated["slope_upper_95th"] < 1) | (estimated["slope_lower_5th"] > 1)]
+    scored = information[information["mean_difference_points"].notna()] if "mean_difference_points" in information else information.iloc[0:0]
+    crps_worse = scored[scored["lower_5th"] > 0]
+    crps_better = scored[scored["upper_95th"] < 0]
+    crps_holds = scored[~scored.index.isin(crps_worse.index) & ~scored.index.isin(crps_better.index)]
+    lines.append(f"- **Intervals examined: {len(tracking) + len(information)}** ({len(tracking)} slope intervals and {len(information)} CRPS-difference intervals, one per outcome and group); no adjustment is made for examining several.")
+    lines.append(f"  - Slope: {len(holds)} hold zero, {len(below)} lie below zero, {len(above)} lie above zero, {len(missing)} could not be estimated; {len(excludes_one)} exclude 1 (the predicted size is right).")
+    lines.append(f"  - CRPS difference (new minus old): {len(crps_holds)} hold zero, {len(crps_worse)} lie above zero (old settings predict better), {len(crps_better)} lie below zero (settings in force predict better), "
+                 f"{len(information) - len(scored)} could not be estimated.")
     for _, row in below.iterrows():
-        lines.append(f"  - Below zero: {_label(row['outcome'], row['group'])} (slope {_interval(row['slope'], row['slope_lower_5th'], row['slope_upper_95th'])}): observed changes moved against the predicted direction.")
+        lines.append(f"  - Slope below zero: {_label(row['outcome'], row['group'])} (slope {_interval(row['slope'], row['slope_lower_5th'], row['slope_upper_95th'])}): observed changes moved against the predicted direction.")
     for _, row in above.iterrows():
-        lines.append(f"  - Above zero: {_label(row['outcome'], row['group'])} (slope {_interval(row['slope'], row['slope_lower_5th'], row['slope_upper_95th'])}).")
+        lines.append(f"  - Slope above zero: {_label(row['outcome'], row['group'])} (slope {_interval(row['slope'], row['slope_lower_5th'], row['slope_upper_95th'])}).")
     for _, row in missing.iterrows():
         lines.append(f"  - Not estimated: {_label(row['outcome'], row['group'])}; {row['reading']}.")
+    for outcome in [name for name in joined["outcome"].unique() if name != rp.PRIMARY_OUTCOME]:
+        share = float(joined.loc[joined["outcome"].eq(outcome), "observed_window_pct"].mean())
+        lines.append(f"  - {OUTCOME_SHORT[outcome].capitalize()}: the observed 14-day share averages {share:.2f}% of readings, so its changes and CRPS differences are a few hundredths of a point and rest on very few readings.")
     for group in rp.GROUPS:
         row = tracking[(tracking["outcome"] == rp.PRIMARY_OUTCOME) & (tracking["group"] == group)]
         if row.empty or pd.isna(row.iloc[0].get("slope")):
             continue
         row = row.iloc[0]
+        against_one = (f" The slope interval {_slope_against_one(row)}: " + ("at the nominal level the record rules out correctly sized predictions (slope 1), but a percentile cluster bootstrap over " + f"{int(row['clusters'])} clusters can be too narrow."
+                       if _slope_against_one(row) == "excludes 1" else "the record does not rule out correctly sized predictions (slope 1)."))
         lines.append(f"- **Time in range, {group} (n = {int(row['changes'])}, {int(row['clusters'])} clusters).** Mean predicted change {row['mean_predicted_points']:+.2f} points, mean observed change minus placebo {row['mean_observed_points']:+.2f}. "
-                     f"{_tracking_sentence(row).capitalize()}. {row['reading'].capitalize()}.")
+                     f"{_tracking_sentence(row).capitalize()}. {row['reading'].capitalize()}.{against_one}")
     worse, better = [], []
+    primary = joined[joined["outcome"].eq(rp.PRIMARY_OUTCOME)]
     for group in rp.GROUPS:
         row = information[(information["outcome"] == rp.PRIMARY_OUTCOME) & (information["group"] == group)]
         if row.empty or pd.isna(row.iloc[0].get("mean_difference_points")):
@@ -283,24 +314,33 @@ def verdict_lines(joined: pd.DataFrame, tracking: pd.DataFrame, information: pd.
             continue
         row = row.iloc[0]
         (worse if row["lower_5th"] > 0 else better if row["upper_95th"] < 0 else []).append(group)
+        part = rp.group_rows(primary, group)
+        share = _three_largest_share(part["crps_new_minus_old_points"])
+        carried = f" The three largest of the {len(part)} differences carry {share:.0%} of the summed difference." if np.isfinite(share) else ""
         lines.append(f"- **Settings information, time in range, {group}.** CRPS with the settings in force {row['mean_crps_new_points']:.2f} points, with the old settings {row['mean_crps_old_points']:.2f}; difference "
-                     f"{_interval(row['mean_difference_points'], row['lower_5th'], row['upper_95th'])}. {row['reading'].capitalize()}.")
+                     f"{_interval(row['mean_difference_points'], row['lower_5th'], row['upper_95th'])}. {row['reading'].capitalize()}.{carried}")
     low_power = []
     for _, row in power.iterrows():
         lines.append(f"- **Power, time in range, {row['group']}.** With the real predicted changes (SD {row['predicted_change_sd_points']:.2f} points) and the real residual noise (SD {row['noise_sd_points']:.2f} points), a true slope of 1 would give a slope interval above zero in "
                      f"{row['power_true_slope_1']:.0%} of simulations (slope 0.5: {row['power_true_slope_0.5']:.0%}; slope 2: {row['power_true_slope_2']:.0%}).")
         if row["power_true_slope_1"] < 0.8:
             low_power.append(row["group"])
-    left_out = sensitivity[sensitivity["variant"].str.startswith("latest isolated")]
-    if len(left_out):
-        tir = joined[joined["outcome"].eq(rp.PRIMARY_OUTCOME)]
-        latest = rp.latest_isolated(tir)
-        row = left_out.iloc[0]
-        full = tracking[(tracking["outcome"] == rp.PRIMARY_OUTCOME) & (tracking["group"] == "isolated changes")]
-        with_it = f"{full.iloc[0]['slope']:+.2f}" if len(full) and pd.notna(full.iloc[0].get("slope")) else "not estimated"
-        without = f"{_interval(row['slope'], row['slope_lower_5th'], row['slope_upper_95th'])}" if pd.notna(row.get("slope")) else "not estimated"
-        lines.append(f"- **Latest isolated change ({latest['change_date']}; {int(latest['counted_days'])} counted days, predicted {latest['predicted_change_points']:+.2f}, observed {latest['observed_change_points']:+.2f} points).** "
-                     f"Time-in-range isolated slope with it {with_it}, without it {without}.")
+    if len(power):
+        lines.append("  - These power numbers are approximate and optimistic in one respect: the noise is simulated as independent and normal with a residual SD that includes the one outlying change, and the percentile bootstrap is too narrow with few clusters, which makes intervals above zero more frequent.")
+    for group in rp.GROUPS:
+        part = leave_out[leave_out["group"].eq(group)].dropna(subset=["slope"])
+        if part.empty:
+            continue
+        low_slope, high_slope = part.loc[part["slope"].idxmin()], part.loc[part["slope"].idxmax()]
+        low_crps, high_crps = part.loc[part["mean_crps_difference_points"].idxmin()], part.loc[part["mean_crps_difference_points"].idxmax()]
+        lines.append(f"- **Leave one cluster out, time in range, {group} ({len(part)} clusters).** Slope ranges from {low_slope['slope']:+.2f} (without {low_slope['left_out_changes']}) to {high_slope['slope']:+.2f} (without {high_slope['left_out_changes']}); "
+                     f"mean CRPS difference from {low_crps['mean_crps_difference_points']:+.2f} (without {low_crps['left_out_changes']}) to {high_crps['mean_crps_difference_points']:+.2f} (without {high_crps['left_out_changes']}).")
+    if {"observed_window_pct", "predictive_new_lower_5th", "predictive_new_upper_95th"} <= set(joined.columns):
+        covered = rp.predictive_coverage(joined)
+        low_cover, high_cover = rp.COVERAGE_RANGE
+        verdict = "inside" if low_cover <= covered <= high_cover else "outside"
+        under = " The model's predictive intervals are too narrow for these windows (under-dispersed), so its CRPS is worse than a calibrated model's would be." if covered < low_cover else ""
+        lines.append(f"- **Predictive coverage, time in range.** {covered:.0%} of the observed 14-day windows fall inside the model's 90% predictive interval ({verdict} the acceptable range {low_cover:.0%} to {high_cover:.0%}).{under}")
     if len(above):
         head = "Predicted changes line up with observed ones (slope interval above zero) for " + "; ".join(_label(r["outcome"], r["group"]) for _, r in above.iterrows())
     else:
@@ -313,17 +353,20 @@ def verdict_lines(joined: pd.DataFrame, tracking: pd.DataFrame, information: pd.
     if better:
         parts.append("for " + " and ".join(better) + " the settings in force predicted the window better than the old settings")
     reading = "; ".join(parts) + "."
+    if len(excludes_one):
+        reading += (" The slope interval excludes 1 for " + "; ".join(_label(r["outcome"], r["group"]) for _, r in excludes_one.iterrows())
+                    + ": at the nominal level the record rules out correctly sized predictions, though a percentile cluster bootstrap over this few clusters can be too narrow.")
     if low_power:
-        reading += (" The test has low power (a true slope of 1 would be found in fewer than 80% of simulations for " + " and ".join(low_power) + "), so a slope interval that holds zero is uninformative about whether the predictions carry real signal; "
+        reading += (" Separately, the test has low power to separate a true slope of 1 from 0 (a true slope of 1 would be found above zero in fewer than 80% of simulations for " + " and ".join(low_power) + "), so a slope interval that holds zero is uninformative about whether the predictions carry real signal; "
                     "it is not evidence that they carry none.")
     return lines, reading
 
 
-def write_summary(path: Path, *, run_id: str, joined: pd.DataFrame, tracking: pd.DataFrame, information: pd.DataFrame, sensitivity: pd.DataFrame, power: pd.DataFrame, flow: pd.DataFrame, fits_table: pd.DataFrame,
-                  outcomes: tuple[str, ...], draws: int, tune: int, chains: int, min_train_days: int, note: str) -> None:
+def write_summary(path: Path, *, run_id: str, joined: pd.DataFrame, tracking: pd.DataFrame, information: pd.DataFrame, sensitivity: pd.DataFrame, leave_out: pd.DataFrame, power: pd.DataFrame, flow: pd.DataFrame, fits_table: pd.DataFrame,
+                  outcomes: tuple[str, ...], draws: int, tune: int, chains: int, target_accept: float, min_train_days: int, note: str) -> None:
     primary = joined[joined["outcome"].eq(rp.PRIMARY_OUTCOME)].sort_values("change_date")
     stage = flow.set_index("stage")["changes"]
-    bullets, reading = verdict_lines(joined, tracking, information, power, sensitivity)
+    bullets, reading = verdict_lines(joined, tracking, information, power, leave_out)
     lines = ["# Replay as predictor: do the model's predicted effects of past settings changes match what happened?", "",
              f"Run `{run_id}`. {len(primary)} of {int(stage.iloc[0])} changes in the record could be predicted ({int(primary['isolated'].sum())} isolated, no other change within 14 days; {primary['cluster_id'].nunique()} clusters of changes). "
              f"Each change's model was fitted only to days before it; effects are for the replay's affected hours on the 14 days after the change, in percentage points.", "", "## Verdict", "", *bullets, "",
@@ -357,7 +400,7 @@ def write_summary(path: Path, *, run_id: str, joined: pd.DataFrame, tracking: pd
     for row in primary.itertuples():
         lines.append(f"| {row.change_date} | {row.change} | {'yes' if row.isolated else 'no'} | {_short(row.predicted_change_points, row.predicted_lower_5th, row.predicted_upper_95th)} | {row.observed_change_points:+.2f} | {row.prediction_basis} |")
     lines += ["", "Details, the per-change rows for every outcome, the power simulation, the sampler record of every fit, the checks and the changes left out are in `diagnostics.xlsx`.", "", "## Run notes", "",
-              f"{len(fits_table)} fits ({chains} chains, {tune} tuning steps, {draws} draws per chain); every fit passed the sampler gate (R-hat below {om.R_HAT_LIMIT}, ESS above {om.ESS_LIMIT}, no divergences). "
+              f"{len(fits_table)} fits ({chains} chains, {tune} tuning steps, {draws} draws per chain, target acceptance {target_accept}); every fit passed the sampler gate (R-hat below {om.R_HAT_LIMIT}, ESS above {om.ESS_LIMIT}, no divergences). "
               f"Changes with fewer than {min_train_days} days of usable training data are left out."]
     if note:
         lines.append(note)
@@ -370,12 +413,13 @@ def write_summary(path: Path, *, run_id: str, joined: pd.DataFrame, tracking: pd
 # ---------------------------------------------------------------------------
 
 def write_outputs(*, folder: Path, run_id: str, raw: str, table: pd.DataFrame, flow: pd.DataFrame, issues: pd.DataFrame, joined: pd.DataFrame, targets: list[rp.EventTarget], posteriors: dict, replay_results: dict,
-                  draws: int, tune: int, chains: int, target_accept: float, min_train_days: int, seconds: float, command: str, note: str) -> None:
+                  draws: int, tune: int, chains: int, target_accept: float, profile_day_hours: int, min_train_days: int, seconds: float, command: str, note: str) -> None:
     folder = Path(folder)
     outcomes = tuple(name for name in rp.OUTCOMES if name in posteriors)
     tracking = rp.tracking_table(joined)
     information = rp.information_table(joined)
     sensitivity = rp.sensitivity_table(joined)
+    leave_out = rp.leave_one_cluster_out_table(joined)
     power = rp.power_table(joined)
     fits_table = _model_fits(posteriors, targets)
     figures = write_figure(joined, information, tracking, replay_results["scores"], folder)
@@ -387,17 +431,18 @@ def write_outputs(*, folder: Path, run_id: str, raw: str, table: pd.DataFrame, f
         "Events": _event_sheet(joined),
         "Tracking": tracking,
         "Sensitivity": sensitivity,
+        "Leave_One_Cluster_Out": leave_out,
         "Settings_Information": information,
         "Power": power,
         "Model_Fits": fits_table,
-        "Checks": _checks(joined, tracking, fits_table, flow, issues, min_train_days),
+        "Checks": _checks(joined, tracking, fits_table, flow, issues, min_train_days, profile_day_hours),
         "Record_Issues": issues,
-        "Warnings_Limitations": _warnings(note, draws, tune, chains),
-        "Artifacts_Provenance": _provenance(run_id=run_id, raw=raw, table=table, files=[*files, "diagnostics.xlsx"], seconds=seconds, draws=draws, tune=tune, chains=chains, command=command),
+        "Warnings_Limitations": _warnings(note, draws, tune, chains, target_accept),
+        "Artifacts_Provenance": _provenance(run_id=run_id, raw=raw, table=table, files=[*files, "diagnostics.xlsx"], seconds=seconds, draws=draws, tune=tune, chains=chains, target_accept=target_accept, command=command),
     }
     path = write_workbook(folder / "diagnostics.xlsx", sheets)
-    write_summary(folder / "replay_predictor_summary.md", run_id=run_id, joined=joined, tracking=tracking, information=information, sensitivity=sensitivity, power=power, flow=flow, fits_table=fits_table,
-                  outcomes=outcomes, draws=draws, tune=tune, chains=chains, min_train_days=min_train_days, note=note)
+    write_summary(folder / "replay_predictor_summary.md", run_id=run_id, joined=joined, tracking=tracking, information=information, sensitivity=sensitivity, leave_out=leave_out, power=power, flow=flow, fits_table=fits_table,
+                  outcomes=outcomes, draws=draws, tune=tune, chains=chains, target_accept=target_accept, min_train_days=min_train_days, note=note)
     reconcile(path, joined, tracking, information, flow, issues, fits_table, power)
 
 
