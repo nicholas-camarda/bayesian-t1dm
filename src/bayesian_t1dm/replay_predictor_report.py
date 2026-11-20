@@ -108,12 +108,13 @@ def write_figure(joined: pd.DataFrame, information: pd.DataFrame, tracking: pd.D
                 Patch(color=NEUTRAL_BAND, label="Range of the observed change when nothing changed (5th to 95th percentile)")]
     figure.legend(handles=handles, loc="lower center", ncol=3, fontsize=8.5, frameon=False, bbox_to_anchor=(0.5, 0.0))
     title = "Do the model's predicted effects of past settings changes match what happened? Time in range, 14 days after each change"
-    note = ("Left: each point is one change; on the dashed line the model's predicted change equals the observed one. The grey band is the range the observed change takes when nothing changed, so points inside it cannot be told from chance.\n"
+    note = ("Left: each point is one change; on the dashed line the model's predicted change equals the observed one.\n"
+            "The grey band is the range the observed change takes when nothing changed, so points inside it cannot be told from chance.\n"
             "Right: each row is one change; a dot left of 0 means the settings in force predicted the window better than the same fit with the old settings. Diamonds: mean with 90% interval over clusters of changes.")
     assert_ascii(title, note)
     figure.suptitle(title, fontsize=12, x=0.01, ha="left", y=0.995)
     figure.text(0.01, 0.965, note, fontsize=8.5, ha="left", va="top", color=NEUTRAL_LINE)
-    figure.subplots_adjust(top=0.88, bottom=0.2, left=0.07, right=0.84)
+    figure.subplots_adjust(top=0.86, bottom=0.2, left=0.07, right=0.84)
     paths = []
     for name in FIGURE_FILES:
         path = output / name
