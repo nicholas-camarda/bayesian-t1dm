@@ -35,6 +35,7 @@ class ProjectPaths:
     output_latent_meal: Path
     output_outcomes: Path
     output_replay: Path
+    output_replay_predictor: Path
     output_outcomes_model: Path
     output_data_audit: Path
     output_forecast_harness: Path
@@ -95,6 +96,7 @@ class ProjectPaths:
             output_latent_meal=runtime_path / "output" / "latent_meal",
             output_outcomes=runtime_path / "output" / "outcomes",
             output_replay=runtime_path / "output" / "replay",
+            output_replay_predictor=runtime_path / "output" / "replay_predictor",
             output_outcomes_model=runtime_path / "output" / "outcomes_model",
             output_data_audit=runtime_path / "output" / "data_audit",
             output_forecast_harness=runtime_path / "output" / "forecast_harness",
@@ -128,6 +130,7 @@ class ProjectPaths:
             self.output_latent_meal,
             self.output_outcomes,
             self.output_replay,
+            self.output_replay_predictor,
             self.output_outcomes_model,
             self.output_data_audit,
             self.output_forecast_harness,
