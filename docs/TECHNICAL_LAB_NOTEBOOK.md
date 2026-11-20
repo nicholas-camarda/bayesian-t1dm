@@ -73,8 +73,7 @@ Each of these changed results; anything computed before the fix should be regene
 | Acquisition and normalization (Tandem, Apple Health) | Runs on real data. A full rebuild takes under a minute and an unchanged check about a second |
 | Merged 5-minute dataset | Runs on real data; validated in `validation_report.md` |
 | Latent meal: breakfast effective I:C | Primary lane. Runs on real data with pump-entered carbs; validated in simulation. Real-data result is in `output/latent_meal/latent_meal_review.html` |
-| Therapy research (overnight basal identifiability) | Runs on real data. Its synthetic "truth recovery" uses frames without meal or insulin dynamics, so it is weaker evidence than the name suggests |
-| 5-minute glucose forecast and its scenario recommendations | Retired 2026-11-19 (tag `pre-forecast-lane-removal-20261119`); see Retired in `docs/technical.md` |
+| 5-minute glucose forecast and its scenario recommendations; the therapy-settings glucose regression (ridge, elastic net, tree boosting, scenario scoring) and the local-level basal model | Retired; see Retired in `docs/technical.md` |
 
 ## Scientific frame and priority cohort
 

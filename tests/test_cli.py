@@ -18,7 +18,7 @@ def _fake_merged(preparation):
 from bayesian_t1dm.acquisition import ExportWindow, NormalizedWindowResult
 from bayesian_t1dm.health_auto_export import ModelDataPreparationResult
 from bayesian_t1dm.quality import DataQualitySummary
-from bayesian_t1dm.therapy_research import TherapyInfraValidationResult, TherapyResearchResult, _synthetic_base_dataset
+from synthetic_dataset import synthetic_base_dataset
 
 
 def _latest_log_dir(runtime_root: Path, command: str) -> Path:
@@ -37,82 +37,6 @@ def _write_tandem_cgm_export(raw_dir: Path, *, start: str = "2025-05-24 00:00:00
     with pd.ExcelWriter(workbook) as writer:
         frame.to_excel(writer, index=False)
     return workbook
-
-
-def _fake_status_research_result() -> TherapyResearchResult:
-    dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
-    research_frame = pd.DataFrame(
-        {
-            "timestamp": pd.date_range("2025-01-01 00:00:00", periods=12, freq="5min"),
-            "therapy_segment": ["overnight"] * 12,
-            "basal_context": [0] * 12,
-            "therapy_stable_epoch": [0] * 12,
-            "glucose": [110.0] * 12,
-            "target_delta": [0.0] * 12,
-            "recent_meal_120m": [1] * 12,
-            "recent_bolus_120m": [1] * 12,
-            "recent_exercise_context": [0] * 12,
-            "closed_loop_confounding_flag": [1] * 12,
-            "missing_cgm": [0] * 12,
-        }
-    )
-    gate = pd.DataFrame(
-        [
-            {
-                "parameter": "basal",
-                "identifiability": "not_identified",
-                "gate_status": "diagnostics_only",
-                "source_quality_status": "good",
-                "direct_meal_rows": 0,
-                "proxy_meal_rows": 12,
-                "basal_context_rows": 0,
-                "correction_context_rows": 12,
-                "closed_loop_confounding_risk": "high",
-                "apple_alignment_status": "credible",
-            }
-        ]
-    )
-    recommendations = pd.DataFrame(
-        [
-            {
-                "parameter": "basal",
-                "segment": "overnight",
-                "status": "suppressed",
-                "proposed_change_percent": None,
-                "expected_direction": "hold",
-                "mean_expected_gain": 0.1,
-                "fold_better_fraction": 0.5,
-                "confidence": "low",
-                "reasons_for": "",
-                "reasons_against": "expected_gain_too_small",
-                "identifiability": "not_identified",
-            }
-        ]
-    )
-    return TherapyResearchResult(
-        prepared_dataset=dataset,
-        research_frame=research_frame,
-        research_gate=gate,
-        feature_registry=pd.DataFrame(),
-        meal_proxy_audit=pd.DataFrame(),
-        model_comparison=pd.DataFrame(),
-        segment_evidence=pd.DataFrame(),
-        recommendations=recommendations,
-        research_gate_markdown="# gate\n",
-        feature_audit_markdown="# audit\n",
-        meal_proxy_audit_markdown="# meal\n",
-        model_comparison_markdown="# model\n",
-        recommendation_markdown="# recs\n",
-        tandem_source_report_markdown="# tandem\n",
-        apple_source_report_markdown="# apple\n",
-        source_numeric_summary=pd.DataFrame(),
-        source_missingness_summary=pd.DataFrame(),
-        segments=tuple(),
-        include_models=("ridge",),
-        meal_proxy_mode="strict",
-        ic_policy="exploratory_only",
-    )
-
 
 
 def _built_raw_tree(tmp_path: Path, workspace_root: Path, fixture_dir: Path) -> Path:
@@ -395,29 +319,6 @@ def test_build_dataset_without_apple_writes_tandem_only_dataset_and_skips_unchan
     else:
         raise AssertionError("expected a stale-dataset error after adding a raw file")
 
-def test_validate_therapy_infra_command_writes_artifacts(tmp_path):
-    workspace_root = tmp_path / "repo"
-    workspace_root.mkdir()
-    report_dir = tmp_path / "reports"
-
-    exit_code = main(
-        [
-            "--root",
-            str(workspace_root),
-            "validate-therapy-infra",
-            "--report-dir",
-            str(report_dir),
-            "--include-models",
-            "ridge,segmented_ridge,tree_boost",
-        ]
-    )
-
-    assert exit_code == 0
-    assert (report_dir / "therapy_infra_validation.md").exists()
-    assert (report_dir / "therapy_synthetic_results.csv").exists()
-    assert (report_dir / "therapy_synthetic_recommendation_audit.md").exists()
-
-
 def test_validate_latent_meal_command_writes_artifacts(tmp_path, capsys):
     workspace_root = tmp_path / "repo"
     workspace_root.mkdir()
@@ -443,53 +344,10 @@ def test_validate_latent_meal_command_writes_artifacts(tmp_path, capsys):
     assert (report_dir / "latent_meal_truth_recovery_meals.csv").exists()
 
 
-def test_review_therapy_evidence_command_writes_report_and_supporting_artifacts(tmp_path, monkeypatch):
-    workspace_root = tmp_path / "repo"
-    workspace_root.mkdir()
-    dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
-    preparation = ModelDataPreparationResult(
-        dataset=dataset,
-        apple_available=True,
-        apple_span_start=pd.Timestamp("2025-01-01 00:00:00"),
-        apple_span_end=pd.Timestamp("2025-01-07 23:55:00"),
-        tandem_span_before_start=pd.Timestamp("2025-01-01 00:00:00"),
-        tandem_span_before_end=pd.Timestamp("2025-01-07 23:55:00"),
-        tandem_span_after_start=pd.Timestamp("2025-01-01 00:00:00"),
-        tandem_span_after_end=pd.Timestamp("2025-01-07 23:55:00"),
-        requested_tandem_start=pd.Timestamp("2025-01-01 00:00:00"),
-        requested_tandem_end=pd.Timestamp("2025-01-07 23:55:00"),
-        overlap_start=pd.Timestamp("2025-01-01 00:00:00"),
-        overlap_end=pd.Timestamp("2025-01-07 23:55:00"),
-        final_dataset_start=pd.Timestamp("2025-01-01 00:00:00"),
-        final_dataset_end=pd.Timestamp("2025-01-07 23:55:00"),
-        final_row_count=len(dataset.frame),
-    )
-    monkeypatch.setattr(cli, "_load_dataset", lambda args, session=None: _fake_merged(preparation))
-
-    report = tmp_path / "therapy_evidence_review.html"
-    exit_code = main(
-        [
-            "--root",
-            str(workspace_root),
-            "review-therapy-evidence",
-            "--report",
-            str(report),
-            "--include-models",
-            "ridge,segmented_ridge,tree_boost",
-        ]
-    )
-
-    assert exit_code == 0
-    assert report.exists()
-    assert (tmp_path / "model_data_preparation.md").exists()
-    assert (tmp_path / "therapy_research_gate.md").exists()
-    assert (tmp_path / "therapy_infra_validation.md").exists()
-
-
 def test_research_latent_meal_icr_command_writes_artifacts_and_review(tmp_path, monkeypatch):
     workspace_root = tmp_path / "repo"
     workspace_root.mkdir()
-    dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
+    dataset = synthetic_base_dataset(apple=True, explicit_carbs=True)
     preparation = ModelDataPreparationResult(
         dataset=dataset,
         apple_available=True,
@@ -572,7 +430,7 @@ def test_research_latent_meal_icr_full_scope_writes_outputs(tmp_path, monkeypatc
         ),
         encoding="utf-8",
     )
-    dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
+    dataset = synthetic_base_dataset(apple=True, explicit_carbs=True)
     preparation = ModelDataPreparationResult(
         dataset=dataset,
         apple_available=True,
@@ -632,7 +490,7 @@ def test_build_latent_meal_fixture_command_writes_fixture_bundle(tmp_path):
     prepared_csv = tmp_path / "prepared_model_data_5min.csv"
     output_dir = tmp_path / "latent_meal_fixture"
     review_html = output_dir / "latent_meal_review.html"
-    dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
+    dataset = synthetic_base_dataset(apple=True, explicit_carbs=True)
     dataset.frame.to_csv(prepared_csv, index=False)
 
     exit_code = main(
@@ -661,7 +519,7 @@ def test_build_latent_meal_fixture_command_writes_fixture_bundle(tmp_path):
     assert review_html.exists()
 
 
-def test_status_command_writes_curated_latest_outputs_and_cache_artifacts(tmp_path, monkeypatch):
+def test_status_command_reports_source_quality_and_writes_cache_artifacts(tmp_path, monkeypatch):
     workspace_root = tmp_path / "repo"
     workspace_root.mkdir()
     cloud_root = tmp_path / "cloud"
@@ -669,7 +527,7 @@ def test_status_command_writes_curated_latest_outputs_and_cache_artifacts(tmp_pa
     monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(cloud_root))
     monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
 
-    dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
+    dataset = synthetic_base_dataset(apple=True, explicit_carbs=True)
     preparation = ModelDataPreparationResult(
         dataset=dataset,
         apple_available=True,
@@ -688,16 +546,6 @@ def test_status_command_writes_curated_latest_outputs_and_cache_artifacts(tmp_pa
         final_row_count=len(dataset.frame),
     )
     monkeypatch.setattr(cli, "_load_dataset", lambda args, session=None: _fake_merged(preparation))
-    monkeypatch.setattr(cli, "run_therapy_research", lambda *args, **kwargs: _fake_status_research_result())
-    monkeypatch.setattr(
-        cli,
-        "validate_therapy_infra",
-        lambda *args, **kwargs: TherapyInfraValidationResult(
-            scenario_results=pd.DataFrame([{"scenario": "x", "passed": True}]),
-            report_markdown="# validation\n",
-            recommendation_audit_markdown="# audit\n",
-        ),
-    )
     output_root = runtime_root / "output"
     output_root.mkdir(parents=True, exist_ok=True)
     (output_root / "old_artifact.md").write_text("old", encoding="utf-8")
@@ -707,19 +555,16 @@ def test_status_command_writes_curated_latest_outputs_and_cache_artifacts(tmp_pa
             "--root",
             str(workspace_root),
             "status",
-            "--include-models",
-            "ridge",
         ]
     )
 
     assert exit_code == 0
     current_payload = json.loads((runtime_root / "cache" / "status" / "current_status.json").read_text(encoding="utf-8"))
     assert current_payload["overall_state"] == "blocked"
+    assert [item["code"] for item in current_payload["primary_blockers"]] == ["degraded_source_quality"]
+    assert "therapy" not in current_payload
     assert (output_root / "current_status.html").exists()
-    assert (output_root / "therapy_review.html").exists()
     assert not (output_root / "old_artifact.md").exists()
-    assert (output_root / "therapy" / "therapy_review.html").exists()
-    assert (output_root / "therapy" / "model_data_preparation.md").exists()
     assert _latest_log_dir(runtime_root, "status").joinpath("events.jsonl").exists()
 
 

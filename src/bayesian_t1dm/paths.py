@@ -32,7 +32,6 @@ class ProjectPaths:
     raw: Path
     processed: Path
     reports: Path
-    output_therapy: Path
     output_latent_meal: Path
     output_outcomes: Path
     output_replay: Path
@@ -93,7 +92,6 @@ class ProjectPaths:
             raw=root_path / "data" / "raw",
             processed=root_path / "data" / "processed",
             reports=runtime_path / "output",
-            output_therapy=runtime_path / "output" / "therapy",
             output_latent_meal=runtime_path / "output" / "latent_meal",
             output_outcomes=runtime_path / "output" / "outcomes",
             output_replay=runtime_path / "output" / "replay",
@@ -127,7 +125,6 @@ class ProjectPaths:
         for path in [
             self.runtime,
             self.reports,
-            self.output_therapy,
             self.output_latent_meal,
             self.output_outcomes,
             self.output_replay,

@@ -2,16 +2,14 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
-from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
 
-import bayesian_t1dm.cli as cli
-from bayesian_t1dm.cli import main
 from bayesian_t1dm.health_auto_export import AnalysisReadyHealthDataset
 from bayesian_t1dm.features import FeatureConfig
+from synthetic_dataset import synthetic_base_dataset
 from bayesian_t1dm.therapy_research import (
     LatentMealTherapySettings,
     build_representative_latent_meal_fixture,
@@ -19,14 +17,10 @@ from bayesian_t1dm.therapy_research import (
     build_latent_meal_tiered_window_registry,
     build_therapy_research_frame,
     extract_latent_meal_therapy_settings_from_tandem_raw,
-    parse_model_list,
     parse_therapy_segments,
     run_latent_meal_icr_research,
-    run_therapy_research,
     write_latent_meal_research_artifacts,
     write_representative_latent_meal_fixture_artifacts,
-    validate_therapy_infra,
-    _synthetic_base_dataset,
 )
 
 
@@ -346,45 +340,8 @@ def test_build_therapy_research_frame_handles_missing_meal_signal_without_markin
     assert research_frame["correction_context"].sum() == 0
 
 
-def test_run_therapy_research_builds_outputs_and_stages_sensitivity_factor():
-    dataset = _build_prepared_dataset(apple=True)
-    result = run_therapy_research(
-        dataset,
-        segments=parse_therapy_segments(),
-        include_models=parse_model_list("ridge,elastic_net,segmented_ridge,tree_boost,ensemble"),
-    )
-
-    assert not result.feature_registry.empty
-    assert {"therapy_context", "apple_measurements"}.issubset(set(result.feature_registry["source_family"]))
-    assert not result.research_gate.empty
-    assert not result.meal_proxy_audit.empty
-    assert not result.model_comparison.empty
-    assert {"basal", "icr", "sensitivity_factor"}.issubset(set(result.model_comparison["task"]))
-    assert not result.recommendations.empty
-    sensitivity_rows = result.recommendations.loc[result.recommendations["parameter"] == "sensitivity factor"]
-    assert not sensitivity_rows.empty
-    assert set(sensitivity_rows["status"]) == {"suppressed"}
-    assert any("predictive and associational" in line for line in result.recommendation_markdown.splitlines())
-    assert "Therapy Research Gate" in result.research_gate_markdown
-    assert "Meal Proxy Audit" in result.meal_proxy_audit_markdown
-
-
-def test_run_therapy_research_without_apple_degrades_cleanly():
-    dataset = _build_prepared_dataset(apple=False)
-    result = run_therapy_research(
-        dataset,
-        segments=parse_therapy_segments(),
-        include_models=parse_model_list("ridge,segmented_ridge,tree_boost"),
-    )
-
-    assert result.prepared_dataset.apple_available is False
-    assert not result.model_comparison.empty
-    assert "apple_measurements" not in set(result.feature_registry["source_family"])
-    assert "therapy_feature_audit" not in result.feature_audit_markdown.lower() or "apple_available: False" in result.feature_audit_markdown
-
-
 def test_run_latent_meal_icr_research_builds_explicit_meal_outputs(tmp_path):
-    dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
+    dataset = synthetic_base_dataset(apple=True, explicit_carbs=True)
 
     result = run_latent_meal_icr_research(
         dataset,
@@ -411,7 +368,7 @@ def test_run_latent_meal_icr_research_builds_explicit_meal_outputs(tmp_path):
 
 
 def test_run_latent_meal_icr_research_returns_honest_empty_or_strict_results():
-    dataset = _synthetic_base_dataset(apple=False, explicit_carbs=False, proxy_only=True)
+    dataset = synthetic_base_dataset(apple=False, explicit_carbs=False, proxy_only=True)
 
     result = run_latent_meal_icr_research(
         dataset,
@@ -547,7 +504,7 @@ def test_latent_carb_estimator_directionality_with_insulin_and_glucose_response(
 
 
 def test_build_representative_latent_meal_fixture_retains_candidate_days_and_selects_background_days(tmp_path):
-    dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
+    dataset = synthetic_base_dataset(apple=True, explicit_carbs=True)
     frame = dataset.frame.copy()
     all_dates = sorted(pd.to_datetime(frame["timestamp"], errors="coerce").dt.normalize().dropna().unique())
     suppressed_dates = set(all_dates[-2:])
@@ -699,49 +656,6 @@ def test_latent_meal_tiered_window_registry_preserves_clean_gate_and_marks_relax
         "rejected",
     ]
     assert tiered.loc[tiered["candidate_id"].eq("bad_cgm"), "hard_exclusion_reasons"].iloc[0] == "poor_cgm_coverage"
-
-
-def test_research_therapy_settings_cli_writes_artifacts(tmp_path, monkeypatch):
-    dataset = _build_prepared_dataset(apple=True)
-    preparation = SimpleNamespace(dataset=dataset)
-    monkeypatch.setattr(cli, "_load_dataset", lambda args, session=None: SimpleNamespace(preparation=preparation, data=SimpleNamespace(nutrition=pd.DataFrame())))
-
-    report_dir = tmp_path / "reports"
-    exit_code = main(
-        [
-            "--root",
-            str(tmp_path),
-            "research-therapy-settings",
-            "--report-dir",
-            str(report_dir),
-            "--include-models",
-            "ridge,elastic_net,segmented_ridge,tree_boost,ensemble",
-        ]
-    )
-
-    assert exit_code == 0
-    assert (report_dir / "therapy_research_gate.md").exists()
-    assert (report_dir / "therapy_feature_audit.md").exists()
-    assert (report_dir / "therapy_feature_registry.csv").exists()
-    assert (report_dir / "meal_proxy_audit.md").exists()
-    assert (report_dir / "therapy_model_comparison.md").exists()
-    assert (report_dir / "therapy_segment_evidence.csv").exists()
-    assert (report_dir / "therapy_recommendation_research.md").exists()
-    assert (report_dir / "tandem_source_report_card.md").exists()
-    assert (report_dir / "apple_source_report_card.md").exists()
-    assert (report_dir / "source_numeric_summary.csv").exists()
-    assert (report_dir / "source_missingness_summary.csv").exists()
-
-    comparison = pd.read_csv(report_dir / "therapy_feature_registry.csv")
-    assert "feature" in comparison.columns
-
-
-def test_validate_therapy_infra_reports_scenarios():
-    result = validate_therapy_infra(include_models=parse_model_list("ridge,segmented_ridge,tree_boost"))
-
-    assert not result.scenario_results.empty
-    assert {"basal_direction", "explicit_icr", "proxy_only_icr", "apple_helpful", "apple_null", "corrupted", "low_identifiability"}.issubset(set(result.scenario_results["scenario"]))
-    assert "Therapy Infrastructure Validation" in result.report_markdown
 
 
 def test_first_meal_window_coverage_counts_rows_missing_from_the_frame():
@@ -900,7 +814,7 @@ def test_settings_come_from_the_newest_window_including_tconnectsync_3_pumper_js
 def test_rows_in_an_excluded_period_never_count_as_clean_basal_time():
     from bayesian_t1dm.therapy_research import ExcludedPeriod, build_therapy_research_frame
 
-    dataset = _synthetic_base_dataset(apple=False, explicit_carbs=True)
+    dataset = synthetic_base_dataset(apple=False, explicit_carbs=True)
     stamps = pd.to_datetime(dataset.frame["timestamp"])
     day = stamps.dt.normalize().iloc[len(stamps) // 2]
     period = ExcludedPeriod(start=day, end=day + pd.Timedelta(days=1) - pd.Timedelta(seconds=1), reason="steroid injection")
@@ -926,11 +840,3 @@ def test_a_first_meal_inside_the_shared_exercise_rule_is_excluded_as_exercise():
     flagged = build_first_meal_clean_window_registry(research_frame, exercise=exercise_intervals(workouts, None))
     row = flagged[flagged["timestamp"].eq(meal)].iloc[0]
     assert row["in_exercise"] == 1 and "exercise" in row["exclusion_reasons"].split("|") and plain["in_exercise"].sum() == 0
-
-
-def test_parse_model_list_rejects_unknown_and_retired_families():
-    from bayesian_t1dm.therapy_research import parse_model_list
-
-    assert parse_model_list(None) == ("ridge", "elastic_net", "segmented_ridge", "tree_boost", "ensemble")
-    with pytest.raises(ValueError, match="Unsupported model family: bayesian"):
-        parse_model_list("ridge,bayesian")

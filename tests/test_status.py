@@ -7,8 +7,7 @@ import pandas as pd
 from bayesian_t1dm.features import FeatureConfig
 from bayesian_t1dm.health_auto_export import AnalysisReadyHealthDataset, ModelDataPreparationResult
 from bayesian_t1dm.paths import ProjectPaths
-from bayesian_t1dm.status import cleanup_legacy_top_level_output, derive_current_status, finalize_status_logs, publish_html_entrypoint, reset_output_directory, write_status_json
-from bayesian_t1dm.therapy_research import TherapyResearchResult
+from bayesian_t1dm.status import cleanup_legacy_top_level_output, derive_current_status, finalize_status_logs, reset_output_directory, write_status_json
 
 
 def _dataset(*, apple: bool = True) -> AnalysisReadyHealthDataset:
@@ -58,193 +57,21 @@ def _preparation(dataset: AnalysisReadyHealthDataset) -> ModelDataPreparationRes
     )
 
 
-def _research_result(
-    *,
-    overnight_clean_rows: int,
-    overnight_nights: int,
-    stable_epochs: int,
-    confounding: str,
-    direct_meal_rows: int,
-    proxy_meal_rows: int,
-    recommendation_status: str,
-) -> TherapyResearchResult:
-    rows = []
-    for index in range(max(overnight_clean_rows, 1)):
-        rows.append(
-            {
-                "timestamp": pd.Timestamp("2025-01-01 00:00:00") + pd.Timedelta(minutes=5 * index),
-                "therapy_segment": "overnight",
-                "basal_context": 1 if index < overnight_clean_rows else 0,
-                "therapy_stable_epoch": index % max(stable_epochs, 1),
-                "glucose": 110.0,
-                "target_delta": 0.0,
-                "recent_meal_120m": 0,
-                "recent_bolus_120m": 0,
-                "recent_exercise_context": 0,
-                "closed_loop_confounding_flag": 1 if confounding == "high" else 0,
-                "missing_cgm": 0,
-            }
-        )
-    research_frame = pd.DataFrame(rows)
-    if not research_frame.empty and overnight_nights > 1:
-        day_offsets = [index % overnight_nights for index in range(len(research_frame))]
-        research_frame["timestamp"] = [pd.Timestamp("2025-01-01 00:00:00") + pd.Timedelta(days=offset, minutes=5 * idx) for idx, offset in enumerate(day_offsets)]
-    gate = pd.DataFrame(
-        [
-            {
-                "parameter": "basal",
-                "identifiability": "directly_observed" if overnight_clean_rows >= 96 else "not_identified",
-                "gate_status": "research_enabled" if overnight_clean_rows >= 96 else "diagnostics_only",
-                "source_quality_status": "good",
-                "direct_meal_rows": direct_meal_rows,
-                "proxy_meal_rows": proxy_meal_rows,
-                "basal_context_rows": overnight_clean_rows,
-                "correction_context_rows": 96,
-                "closed_loop_confounding_risk": confounding,
-                "apple_alignment_status": "credible",
-            },
-            {
-                "parameter": "I/C ratio",
-                "identifiability": "directly_observed" if direct_meal_rows >= 48 else "not_identified",
-                "gate_status": "research_enabled" if direct_meal_rows >= 48 else "diagnostics_only",
-                "source_quality_status": "good",
-                "direct_meal_rows": direct_meal_rows,
-                "proxy_meal_rows": proxy_meal_rows,
-                "basal_context_rows": overnight_clean_rows,
-                "correction_context_rows": 96,
-                "closed_loop_confounding_risk": confounding,
-                "apple_alignment_status": "credible",
-            },
-        ]
-    )
-    recommendations = pd.DataFrame(
-        [
-            {
-                "parameter": "basal",
-                "segment": "overnight",
-                "status": recommendation_status,
-                "proposed_change_percent": 5.0 if recommendation_status == "candidate" else None,
-                "expected_direction": "increase" if recommendation_status == "candidate" else "hold",
-                "mean_expected_gain": 6.0 if recommendation_status == "candidate" else 0.5,
-                "fold_better_fraction": 0.9 if recommendation_status == "candidate" else 0.55,
-                "confidence": "high" if recommendation_status == "candidate" else "low",
-                "reasons_for": "",
-                "reasons_against": "" if recommendation_status == "candidate" else "expected_gain_too_small",
-                "identifiability": "directly_observed",
-            }
-        ]
-    )
-    dataset = _dataset()
-    return TherapyResearchResult(
-        prepared_dataset=dataset,
-        research_frame=research_frame,
-        research_gate=gate,
-        feature_registry=pd.DataFrame(),
-        meal_proxy_audit=pd.DataFrame(),
-        model_comparison=pd.DataFrame(),
-        segment_evidence=pd.DataFrame(),
-        recommendations=recommendations,
-        research_gate_markdown="# gate\n",
-        feature_audit_markdown="# audit\n",
-        meal_proxy_audit_markdown="# meal\n",
-        model_comparison_markdown="# model\n",
-        recommendation_markdown="# recs\n",
-        tandem_source_report_markdown="# tandem\n",
-        apple_source_report_markdown="# apple\n",
-        source_numeric_summary=pd.DataFrame(),
-        source_missingness_summary=pd.DataFrame(),
-        segments=tuple(),
-        include_models=("ridge",),
-        meal_proxy_mode="strict",
-        ic_policy="exploratory_only",
-    )
-
-
 def _data_quality(status: str = "good") -> dict[str, object]:
     return {"status": status, "incomplete_window_count": 0 if status == "good" else 2}
 
 
-def test_derive_current_status_marks_candidate_as_recommendation_ready():
-    dataset = _dataset()
-    payload = derive_current_status(
-        preparation=_preparation(dataset),
-        research_result=_research_result(
-            overnight_clean_rows=96,
-            overnight_nights=4,
-            stable_epochs=3,
-            confounding="moderate",
-            direct_meal_rows=60,
-            proxy_meal_rows=0,
-            recommendation_status="candidate",
-        ),
-        data_quality=_data_quality(),
-        run_id="run123",
-    )
+def test_a_complete_source_is_data_ready_and_says_nothing_about_settings():
+    payload = derive_current_status(preparation=_preparation(_dataset()), data_quality=_data_quality(), run_id="run123")
 
-    assert payload["overall_state"] == "recommendation_ready"
+    assert payload["overall_state"] == "data_ready"
     assert payload["primary_blockers"] == []
+    assert "therapy" not in payload
+    assert payload["data_prep"]["final_row_count"] == 96
 
 
-def test_derive_current_status_marks_stable_case_as_no_change_supported():
-    dataset = _dataset()
-    payload = derive_current_status(
-        preparation=_preparation(dataset),
-        research_result=_research_result(
-            overnight_clean_rows=96,
-            overnight_nights=4,
-            stable_epochs=3,
-            confounding="moderate",
-            direct_meal_rows=60,
-            proxy_meal_rows=0,
-            recommendation_status="suppressed",
-        ),
-        data_quality=_data_quality(),
-        run_id="run123",
-    )
-
-    assert payload["overall_state"] == "no_change_supported"
-    assert payload["primary_blockers"] == []
-
-
-def test_derive_current_status_marks_overnight_or_confounding_case_as_blocked():
-    dataset = _dataset()
-    payload = derive_current_status(
-        preparation=_preparation(dataset),
-        research_result=_research_result(
-            overnight_clean_rows=12,
-            overnight_nights=1,
-            stable_epochs=1,
-            confounding="high",
-            direct_meal_rows=0,
-            proxy_meal_rows=10,
-            recommendation_status="suppressed",
-        ),
-        data_quality=_data_quality("degraded"),
-        run_id="run123",
-    )
-
-    codes = {item["code"] for item in payload["primary_blockers"]}
-    assert payload["overall_state"] == "blocked"
-    assert "insufficient_clean_overnight_windows" in codes
-    assert "high_closed_loop_confounding" in codes
-
-
-def test_degraded_source_quality_blocks_an_otherwise_ready_status():
-    dataset = _dataset()
-    payload = derive_current_status(
-        preparation=_preparation(dataset),
-        research_result=_research_result(
-            overnight_clean_rows=96,
-            overnight_nights=4,
-            stable_epochs=3,
-            confounding="moderate",
-            direct_meal_rows=60,
-            proxy_meal_rows=0,
-            recommendation_status="candidate",
-        ),
-        data_quality=_data_quality("degraded"),
-        run_id="run123",
-    )
+def test_degraded_source_quality_blocks_the_status():
+    payload = derive_current_status(preparation=_preparation(_dataset()), data_quality=_data_quality("degraded"), run_id="run123")
 
     assert payload["overall_state"] == "blocked"
     assert [item["code"] for item in payload["primary_blockers"]] == ["degraded_source_quality"]
@@ -273,11 +100,6 @@ def test_output_cleanup_moves_top_level_clutter_into_runtime_archive(tmp_path):
     (log_dir / "events.jsonl").write_text("{}\n", encoding="utf-8")
     assert finalize_status_logs(paths, log_dir) == log_dir
 
-    source_html = paths.output_therapy / "therapy_review.html"
-    source_html.write_text("<html>therapy</html>", encoding="utf-8")
-    published = publish_html_entrypoint(source_html, paths.reports / "therapy_review.html")
-    assert published.read_text(encoding="utf-8") == "<html>therapy</html>"
-
 
 def test_output_cleanup_migrates_legacy_output_logs_into_runtime_logs(tmp_path):
     repo_root = tmp_path / "repo"
@@ -299,7 +121,7 @@ def test_output_cleanup_migrates_legacy_output_logs_into_runtime_logs(tmp_path):
 
 
 def test_reset_output_directory_replaces_stale_contents(tmp_path):
-    directory = tmp_path / "output" / "therapy"
+    directory = tmp_path / "output" / "stale"
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "stale.md").write_text("stale", encoding="utf-8")
 

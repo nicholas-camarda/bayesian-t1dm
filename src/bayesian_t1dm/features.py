@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import re
 from typing import Sequence
 
 import numpy as np
@@ -9,7 +8,7 @@ import pandas as pd
 
 from .context_rules import CGM_MAX_MGDL, CGM_MIN_MGDL
 from .ingest import IngestedData
-from .insulin import expand_bolus_series_to_grid, expand_bolus_to_grid
+from .insulin import expand_bolus_to_grid
 from .pump_profiles import PROFILE_SETTING_COLUMNS
 
 
@@ -327,26 +326,6 @@ def _add_carb_interactions(df: pd.DataFrame) -> pd.DataFrame:
         out["carb_bolus_interaction_60m"] = out["carb_roll_sum_60m"] * out["bolus_units"]
     if "carb_roll_sum_60m" in out.columns and "iob_units" in out.columns:
         out["carb_iob_interaction_60m"] = out["carb_roll_sum_60m"] * out["iob_units"]
-    return out
-
-
-def recompute_scenario_features(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if out.empty:
-        return out
-    if "bolus_units" in out.columns:
-        exposure = expand_bolus_series_to_grid(out[["timestamp", "bolus_units"]], duration_minutes=300, step_minutes=5)
-        if "insulin_activity_units" in out.columns and "insulin_activity_units" in exposure.columns:
-            out["insulin_activity_units"] = exposure["insulin_activity_units"].to_numpy()
-        if "iob_units" in out.columns and "iob_units" in exposure.columns:
-            out["iob_units"] = exposure["iob_units"].to_numpy()
-    for column in list(out.columns):
-        match = re.fullmatch(r"iob_roll_sum_(\d+)m", column)
-        if match and "iob_units" in out.columns:
-            window = int(match.group(1))
-            periods = max(int(window / 5), 1)
-            out[column] = out["iob_units"].rolling(periods, min_periods=1).sum()
-    out = _add_carb_interactions(out)
     return out
 
 

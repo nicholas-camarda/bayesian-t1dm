@@ -118,7 +118,6 @@ class Verdict:
     explanation: str = ""
 
 
-FORECAST_REQUIRED_IMPROVEMENT = 0.10
 SAMPLER_RHAT_MAX = 1.01
 SAMPLER_ESS_PER_CHAIN = 100  # Vehtari et al. (2021): bulk ESS of at least 100 per chain
 
@@ -497,77 +496,3 @@ def histogram(values: Sequence[float], *, bin_width: float, guide: float | None,
     return _svg(width, height, x_label, parts)
 
 
-def time_series(
-    timestamps: Sequence[object],
-    series: Sequence[tuple[str, Sequence[float | None], str, bool]],
-    *,
-    band: tuple[Sequence[float | None], Sequence[float | None], str] | None = None,
-    y_label: str,
-    reference_lines: Sequence[tuple[float, str]] = (),
-) -> str:
-    """Lines over time on one y axis. ``series`` entries are (name, values, color, dashed)."""
-    import pandas as pd
-
-    ts = pd.to_datetime(pd.Series(list(timestamps)), errors="coerce")
-    if ts.dropna().empty:
-        return "<p class='caption'>No time points to plot.</p>"
-    all_values = [v for _, values, _, _ in series for v in values if v is not None and math.isfinite(v)]
-    if band is not None:
-        all_values += [v for v in list(band[0]) + list(band[1]) if v is not None and math.isfinite(v)]
-    all_values += [value for value, _ in reference_lines]
-    lo, hi = min(all_values), max(all_values)
-    pad = max((hi - lo) * 0.08, 5)
-    lo, hi = lo - pad, hi + pad
-    width, height, left, bottom = 760, 260, 48, 36
-    t0, t1 = ts.min(), ts.max()
-    seconds = [(t - t0).total_seconds() if pd.notna(t) else None for t in ts]
-    span = max((t1 - t0).total_seconds(), 1.0)
-    sx = _Scale(0, span, left, width - 12)
-    sy = _Scale(lo, hi, height - bottom, 12)
-    parts: list[str] = []
-    for tick in _nice_ticks(lo, hi, 5):
-        parts.append(f"<line class='grid' x1='{left}' x2='{width - 12}' y1='{sy(tick):.1f}' y2='{sy(tick):.1f}' />")
-        parts.append(_text(left - 6, sy(tick) + 4, _tick_label(tick), anchor="end"))
-    for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
-        stamp = t0 + pd.Timedelta(seconds=span * fraction)
-        anchor = "start" if fraction == 0 else "end" if fraction == 1 else "middle"
-        parts.append(_text(sx(span * fraction), height - bottom + 16, stamp.strftime("%b %d %H:%M"), anchor=anchor, size=11))
-    parts.append(_text(12, (height - bottom) / 2, y_label, anchor="middle", rotate=True, size=11))
-
-    steps = sorted(b - a for a, b in zip(seconds, seconds[1:]) if a is not None and b is not None and b > a)
-    max_step = 3 * steps[len(steps) // 2] if steps else float("inf")
-
-    def path(values: Sequence[float | None]) -> str:
-        # Break the line at missing values and at time gaps, so separate nights are not joined.
-        segments: list[str] = []
-        current: list[str] = []
-        previous_x: float | None = None
-        for x, v in zip(seconds, values):
-            gap = previous_x is not None and x is not None and x - previous_x > max_step
-            if x is None or v is None or not math.isfinite(v) or gap:
-                if current:
-                    segments.append("M" + " L".join(current))
-                    current = []
-                if x is None or v is None or not math.isfinite(v):
-                    previous_x = x
-                    continue
-            current.append(f"{sx(x):.1f},{sy(v):.1f}")
-            previous_x = x
-        if current:
-            segments.append("M" + " L".join(current))
-        return " ".join(segments)
-
-    if band is not None:
-        lower, upper, color = band
-        top_pts = [(x, u) for x, u in zip(seconds, upper) if x is not None and u is not None and math.isfinite(u)]
-        bot_pts = [(x, l) for x, l in zip(seconds, lower) if x is not None and l is not None and math.isfinite(l)]
-        if top_pts and bot_pts:
-            poly = " ".join(f"{sx(x):.1f},{sy(v):.1f}" for x, v in top_pts) + " " + " ".join(f"{sx(x):.1f},{sy(v):.1f}" for x, v in reversed(bot_pts))
-            parts.append(f"<polygon points='{poly}' fill='{color}' opacity='0.18' />")
-    for value, label in reference_lines:
-        parts.append(f"<line x1='{left}' x2='{width - 12}' y1='{sy(value):.1f}' y2='{sy(value):.1f}' stroke='{REFERENCE}' stroke-width='1.5' stroke-dasharray='8 5' />")
-        parts.append(_text(width - 14, sy(value) - 4, label, anchor="end", size=11))
-    for name, values, color, dashed in series:
-        dash = " stroke-dasharray='8 5'" if dashed else ""
-        parts.append(f"<path d='{path(values)}' fill='none' stroke='{color}' stroke-width='2'{dash}><title>{esc(name)}</title></path>")
-    return _svg(width, height, y_label, parts)
