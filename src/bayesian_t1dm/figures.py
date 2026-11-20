@@ -55,33 +55,43 @@ CHANGE_SET_STYLE = {
 
 @dataclass(frozen=True)
 class StatusStyle:
-    """A diagnostic status or a verdict as it is drawn: the text, the glyph and the color. Color is never the only signal.
+    """A diagnostic status or a verdict as it is drawn: the text, the glyph and the colors. Color is never the only signal.
 
-    ``outline`` marks the states that must not look like a pass (a check that was not run, a result that is not available): a dashed
-    outline and no fill. The text colors are the dark JCO shades, which keep a contrast of at least 4.5 to 1 on a white page.
+    ``color`` is the JCO color of the outline; ``ink`` is the darker shade of it used for the text, chosen so the text keeps a contrast of at
+    least 4.5 to 1 on the chip's own tinted background (a test checks this). ``outline`` marks the states that must not look like a pass (a
+    check that was not run, a result that is not available): a dashed outline and no fill.
     """
 
     label: str
     glyph: str
     color: str
     outline: bool = False
+    ink: str = ""
 
+    @property
+    def text(self) -> str:
+        return self.ink or self.color
+
+
+# Darker shades of JCO[0] and JCO[6] for text on a tinted chip.
+INK_BLUE = "#00579A"
+INK_GOLD = "#6E5A00"
 
 # Diagnostic statuses (the four a workbook may hold): "not assessed" is dashed and hollow so it never looks like "no concern".
 STATUS_STYLE = {
-    "no concern": StatusStyle("No concern", "+", JCO[0]),
+    "no concern": StatusStyle("No concern", "+", JCO[0], ink=INK_BLUE),
     "concern": StatusStyle("Concern", "!", JCO[8]),
-    "not assessed": StatusStyle("Not assessed", "?", JCO[6], outline=True),
+    "not assessed": StatusStyle("Not assessed", "?", JCO[6], outline=True, ink=INK_GOLD),
     "not applicable": StatusStyle("Not applicable", "-", JCO[7]),
 }
 
 # The win-test verdict, whether the record validates the settings effects, and the state of a result that is not there.
 VERDICT_STYLE = {
-    "win": StatusStyle("Win", "+", JCO[0]),
-    "tie": StatusStyle("Tie", "=", JCO[6]),
+    "win": StatusStyle("Win", "+", JCO[0], ink=INK_BLUE),
+    "tie": StatusStyle("Tie", "=", JCO[6], ink=INK_GOLD),
     "loss": StatusStyle("Loss", "-", JCO[8]),
     "missing": StatusStyle("Not available", "?", JCO[7], outline=True),
-    "shown": StatusStyle("Shown", "+", JCO[0]),
+    "shown": StatusStyle("Shown", "+", JCO[0], ink=INK_BLUE),
     "not shown": StatusStyle("Not shown", "-", JCO[8]),
 }
 

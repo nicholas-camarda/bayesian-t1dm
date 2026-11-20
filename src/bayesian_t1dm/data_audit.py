@@ -23,6 +23,8 @@ import numpy as np
 import pandas as pd
 from scipy.stats import kendalltau
 
+from .formatting import format_p
+
 from .hour_day import GLUCOSE_COLUMNS, HOURS_PER_DAY, LOCAL_ZONE, SLOTS_PER_HOUR
 from .outcomes import READING_MINUTES, READINGS_PER_DAY, MIN_DAY_COVERAGE
 from .pump_profiles import UNKNOWN_REASONS, pump_key
@@ -1062,15 +1064,17 @@ def stationarity(table: pd.DataFrame) -> pd.DataFrame:
     fortnights = fortnight_series(table)
     latest = fortnights.iloc[-1]
     earlier = fortnights.iloc[:-1]
-    rank = 100 * float((earlier["tir_pct"] < latest["tir_pct"]).mean())
+    below = int((earlier["tir_pct"] < latest["tir_pct"]).sum())
+    standing = (f"lower than all {len(earlier)} earlier fortnights" if below == 0 else f"higher than all {len(earlier)} earlier fortnights" if below == len(earlier)
+                else f"higher than {below} of {len(earlier)} earlier fortnights")
     low, high = np.percentile(earlier["tir_pct"], [5, 95])
     previous = fortnights.iloc[-2] if len(fortnights) > 1 else latest
     return _frame([
-        _row("Trend in monthly time in range", "hour-day table", "Kendall tau of monthly time in range against month; median pairwise slope (points per month)", f"tau {tau:.2f} (p {p:.2f}); slope {slope:+.2f} points/month over {len(months)} months",
+        _row("Trend in monthly time in range", "hour-day table", "Kendall tau of monthly time in range against month; median pairwise slope (points per month)", f"slope {slope:+.2f} points/month over {len(months)} months; Kendall tau {tau:.2f} ({format_p(p)})",
              "|tau| below 0.3", "no concern" if abs(tau) < 0.3 else "concern", "no steady drift in the monthly level" if abs(tau) < 0.3 else "the monthly level drifts in one direction"),
         _row("Day-to-day dependence of time in range", "hour-day table", "autocorrelation of daily time in range at lags 1, 7 and 14 days", ", ".join(f"lag {k}: {v:.2f}" for k, v in acf.items()), "lag 14 below 0.2: day effects can be taken as independent two weeks apart",
              "no concern" if acf[WINDOW_DAYS] < 0.2 else "concern", "days two weeks apart are nearly independent" if acf[WINDOW_DAYS] < 0.2 else "days two weeks apart still resemble each other: independent day effects overstate the information in the record"),
-        _row("Latest fortnight against earlier fortnights", "hour-day table", "time in range of the last 14 days; rank among earlier fortnights", f"{latest['tir_pct']:.1f}% (previous fortnight {previous['tir_pct']:.1f}%); higher than {rank:.0f}% of {len(earlier)} earlier fortnights (their 5th to 95th percentile {low:.1f} to {high:.1f}%)",
+        _row("Latest fortnight against earlier fortnights", "hour-day table", "time in range of the last 14 days; rank among earlier fortnights", f"{latest['tir_pct']:.1f}% (previous fortnight {previous['tir_pct']:.1f}%); {standing} (their 5th to 95th percentile {low:.1f} to {high:.1f}%)",
              "inside the earlier 5th to 95th percentile", "no concern" if low <= latest["tir_pct"] <= high else "concern",
              "the latest fortnight looks like earlier ones" if low <= latest["tir_pct"] <= high else "the latest fortnight is outside the range of earlier fortnights: a recent regime that the earlier record may not describe"),
         _row("Spread of 14-day time in range", "hour-day table", "standard deviation and range of fortnightly time in range (points)", f"{earlier['tir_pct'].std():.1f} (range {earlier['tir_pct'].min():.1f} to {earlier['tir_pct'].max():.1f}) over {len(earlier)} fortnights", "none", "not applicable", "the noise a 14-day aggregate has even without a change of settings"),

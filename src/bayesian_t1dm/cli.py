@@ -386,7 +386,7 @@ def _dispatch_command(
         if not run_dir.is_dir():
             raise FileNotFoundError(f"{run_dir} is not a run folder; run refresh first or pass --run-dir")
         with session.stage("front_page.write", run_dir=str(run_dir)):
-            print(f"Front page: {write_front_page(paths, run_dir)}")
+            print(f"Front page: {write_front_page(run_dir)}")
         return 0
 
     if args.command == "propose-breakfast-icr":
@@ -697,7 +697,7 @@ def _run_refresh(args, paths: ProjectPaths, parser) -> int:
             print(f"Refresh stopped: {name} exited with {code}. Nothing was published.")
             return code or 1
     assemble_run(paths.reports, paths.cloud_raw, run_dir, record_path=paths.cloud_root / "data" / "records" / "setting_proposals.csv")
-    write_front_page(paths, run_dir)
+    write_front_page(run_dir)
     write_result_flow(run_dir, paths.cloud_raw)
     record["status"] = "complete"
     record["finished"] = f"{pd.Timestamp.now():%Y-%m-%dT%H:%M:%S}"
