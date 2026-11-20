@@ -26,3 +26,8 @@ AGENTS.md
 CLAUDE.md
 
 .specs/
+
+# Generated runs and anything patient-level
+runtime/
+*.xlsx
+*.parquet
