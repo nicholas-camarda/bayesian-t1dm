@@ -30,7 +30,6 @@ from .health_auto_export import (
     screen_health_features,
     write_health_screening_report,
     write_model_data_preparation_report,
-    ModelDataPreparationResult,
 )
 from .latent_meal_validation import run_effective_icr_recovery, run_latent_meal_truth_recovery, write_latent_meal_recovery_artifacts
 from .dataset import MergedDataset, build_merged_dataset, load_merged_dataset, merged_dir
@@ -50,22 +49,17 @@ from .records import evaluate_open, load_records, register_proposal, save_record
 from .proposals import propose_breakfast_icr, proposal_markdown, segment_ends_from_parts, segment_markdown, segment_summary
 from .paths import ProjectPaths
 from .report import build_coverage_summary, write_coverage_markdown
-from .review import write_coverage_review_html, write_current_status_html, write_latent_meal_review_html, write_therapy_evidence_review_html
+from .review import write_coverage_review_html, write_current_status_html, write_latent_meal_review_html
 from .status import cleanup_legacy_top_level_output, derive_current_status, finalize_status_logs, reset_output_directory, write_status_json
 from .therapy_research import (
     load_excluded_periods,
     build_representative_latent_meal_fixture,
     extract_latent_meal_therapy_settings_from_tandem_raw,
     load_latent_meal_therapy_settings,
-    parse_model_list,
     parse_therapy_segments,
     run_latent_meal_icr_research,
-    run_therapy_research,
-    validate_therapy_infra,
     write_latent_meal_research_artifacts,
     write_representative_latent_meal_fixture_artifacts,
-    write_therapy_infra_validation_artifacts,
-    write_therapy_research_artifacts,
 )
 
 
@@ -129,16 +123,6 @@ def build_parser() -> argparse.ArgumentParser:
     screen_health.add_argument("--report", default=None)
     screen_health.add_argument("--scores", default=None)
 
-    research_therapy = add_command("research-therapy-settings", "Run research-grade therapy setting analysis on prepared Tandem and Apple Health data")
-    research_therapy.add_argument("--raw", default=None)
-    research_therapy.add_argument("--segments", default=None, help="Comma-separated day segments like overnight=00:00-06:00,morning=06:00-11:00")
-    research_therapy.add_argument("--include-models", default=None, help="Comma-separated model families such as ridge,elastic_net,segmented_ridge,tree_boost,ensemble")
-    research_therapy.add_argument("--report-dir", default=None)
-    research_therapy.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
-    research_therapy.add_argument("--ic-policy", choices=["exploratory_only", "conservative", "off"], default="exploratory_only")
-    research_therapy.add_argument("--write-source-report-cards", action=argparse.BooleanOptionalAction, default=True)
-    research_therapy.add_argument("--write-research-gate", action=argparse.BooleanOptionalAction, default=True)
-
     latent_meal = add_command("research-latent-meal-icr", "Run an experimental latent meal and I/C research workflow")
     latent_meal.add_argument("--raw", default=None)
     latent_meal.add_argument("--segments", default=None, help="Comma-separated day segments like overnight=00:00-06:00,morning=06:00-11:00")
@@ -159,33 +143,14 @@ def build_parser() -> argparse.ArgumentParser:
     latent_fixture.add_argument("--seed", type=int, default=17)
     latent_fixture.add_argument("--horizon", type=int, default=30)
 
-    validate_therapy = add_command("validate-therapy-infra", "Run synthetic truth-recovery validation for the therapy research infrastructure")
-    validate_therapy.add_argument("--report-dir", default=None)
-    validate_therapy.add_argument("--include-models", default=None, help="Comma-separated model families such as ridge,segmented_ridge,tree_boost,ensemble")
-    validate_therapy.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
-    validate_therapy.add_argument("--ic-policy", choices=["exploratory_only", "conservative", "off"], default="exploratory_only")
-
     validate_latent = add_command("validate-latent-meal", "Run synthetic truth-recovery validation for the latent carb estimators")
     validate_latent.add_argument("--report-dir", default=None)
     validate_latent.add_argument("--meals", type=int, default=200, help="Simulated meals per scenario")
     validate_latent.add_argument("--seed", type=int, default=20260403)
     validate_latent.add_argument("--icr-cohorts", type=int, default=40, help="Simulated 20-meal cohorts per true I:C for the logged-meal recovery check; 0 skips it")
 
-    review_therapy = add_command("review-therapy-evidence", "Build a therapy evidence report focused on identifiability and overnight basal evidence")
-    review_therapy.add_argument("--raw", default=None)
-    review_therapy.add_argument("--report", default=None)
-    review_therapy.add_argument("--segments", default=None)
-    review_therapy.add_argument("--include-models", default=None)
-    review_therapy.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
-    review_therapy.add_argument("--ic-policy", choices=["exploratory_only", "conservative", "off"], default="exploratory_only")
-
     status = add_command("status", "Run the primary end-to-end status workflow and publish the latest dashboards")
     status.add_argument("--raw", default=None)
-    status.add_argument("--segments", default=None)
-    status.add_argument("--include-models", default=None)
-    status.add_argument("--meal-proxy-mode", choices=["strict", "broad", "off"], default="strict")
-    status.add_argument("--ic-policy", choices=["exploratory_only", "conservative", "off"], default="exploratory_only")
-
     collect = add_command("collect", "Fetch one Tandem Source window through tconnectsync")
     collect.add_argument("--start-date", default=None, help="Requested window start date (YYYY-MM-DD)")
     collect.add_argument("--end-date", default=None, help="Requested window end date (YYYY-MM-DD)")
@@ -218,59 +183,6 @@ def _session_stage(session: LoggingSession | None, stage: str, **fields: object)
 def _load_dataset(args, session: LoggingSession | None = None) -> MergedDataset:
     with _session_stage(session, "dataset.load", raw=args.raw):
         return load_merged_dataset(args.raw)
-
-
-def _run_therapy_analysis(
-    *,
-    args,
-    merged: MergedDataset,
-    session: LoggingSession | None = None,
-    research_stage: str = "therapy.research",
-    validation_stage: str = "therapy.validation",
-    include_validation: bool = True,
-):
-    preparation = merged.preparation
-    with _session_stage(session, research_stage):
-        research_result = run_therapy_research(
-            preparation.dataset,
-            segments=parse_therapy_segments(args.segments),
-            include_models=parse_model_list(args.include_models),
-            meal_proxy_mode=args.meal_proxy_mode,
-            ic_policy=args.ic_policy,
-            excluded_periods=load_excluded_periods(args.raw),
-        )
-    validation_result = None
-    if include_validation:
-        with _session_stage(session, validation_stage):
-            validation_result = validate_therapy_infra(
-                meal_proxy_mode=args.meal_proxy_mode,
-                ic_policy=args.ic_policy,
-                include_models=parse_model_list("ridge,segmented_ridge,tree_boost,ensemble"),
-            )
-    return preparation, research_result, validation_result
-
-
-def _write_therapy_outputs(
-    *,
-    preparation: ModelDataPreparationResult,
-    research_result,
-    validation_result,
-    supporting_dir: Path,
-    review_path: Path,
-    artifact_href_prefix: str,
-) -> None:
-    supporting_dir.mkdir(parents=True, exist_ok=True)
-    write_model_data_preparation_report(preparation, supporting_dir / "model_data_preparation.md")
-    write_therapy_research_artifacts(research_result, supporting_dir)
-    write_therapy_infra_validation_artifacts(validation_result, supporting_dir)
-    write_therapy_evidence_review_html(
-        preparation,
-        research_result,
-        review_path,
-        validation_result=validation_result,
-        artifact_root=supporting_dir,
-        artifact_href_prefix=artifact_href_prefix,
-    )
 
 
 def _run_latent_meal_analysis(
@@ -398,17 +310,13 @@ def _prepare_runtime_output(paths: ProjectPaths, *directories: str | Path) -> No
 
 
 def _apply_command_defaults(args: argparse.Namespace, paths: ProjectPaths) -> None:
-    if args.command in {"ingest", "screen-health-features", "build-dataset", "research-therapy-settings", "research-latent-meal-icr", "review-therapy-evidence", "status", "report-outcomes", "propose-breakfast-icr"}:
+    if args.command in {"ingest", "screen-health-features", "build-dataset", "research-latent-meal-icr", "status", "report-outcomes", "propose-breakfast-icr"}:
         args.raw = args.raw or str(paths.cloud_raw)
         if args.command == "ingest":
             args.report = args.report or str(paths.output_source / "coverage.md")
-        elif args.command == "research-therapy-settings":
-            args.report_dir = args.report_dir or str(paths.output_therapy)
         elif args.command == "research-latent-meal-icr":
             args.report_dir = args.report_dir or str(paths.output_latent_meal)
             args.review_html = args.review_html or str(Path(args.report_dir) / "latent_meal_review.html")
-        elif args.command == "review-therapy-evidence":
-            args.report = args.report or str(paths.output_therapy / "therapy_review.html")
         elif args.command == "report-outcomes":
             args.report_dir = args.report_dir or str(paths.output_outcomes)
         elif args.command == "propose-breakfast-icr":
@@ -421,8 +329,6 @@ def _apply_command_defaults(args: argparse.Namespace, paths: ProjectPaths) -> No
     if args.command == "build-latent-meal-fixture":
         args.output_dir = args.output_dir or str(paths.output_fixture)
         args.review_html = args.review_html or str(Path(args.output_dir) / "latent_meal_review.html")
-    if args.command == "validate-therapy-infra":
-        args.report_dir = args.report_dir or str(paths.output_therapy / "validation")
     if args.command == "validate-latent-meal":
         args.report_dir = args.report_dir or str(paths.output_latent_meal / "validation")
     if args.command == "normalize-raw":
@@ -538,19 +444,6 @@ def _dispatch_command(
         print(f"Validation report: {merged_dir(args.raw) / 'validation_report.md'}")
         return 0
 
-    if args.command == "research-therapy-settings":
-        preparation, result, _ = _run_therapy_analysis(args=args, merged=_load_dataset(args, session), session=session, include_validation=False)
-        if _path_matches(args.report_dir, paths.output_therapy):
-            _prepare_runtime_output(paths, paths.output_therapy)  # only after the analysis succeeded: a failure leaves the last output
-        with session.stage("therapy.write_artifacts", report_dir=args.report_dir):
-            write_therapy_research_artifacts(
-                result,
-                args.report_dir,
-                write_source_report_cards=args.write_source_report_cards,
-                write_research_gate=args.write_research_gate,
-            )
-        return 0
-
     if args.command == "research-latent-meal-icr":
         _, result = _run_latent_meal_analysis(args=args, paths=paths, session=session)
         if _path_matches(args.report_dir, paths.output_latent_meal):
@@ -580,19 +473,6 @@ def _dispatch_command(
             )
         return 0
 
-    if args.command == "validate-therapy-infra":
-        if _path_matches(args.report_dir, paths.output_therapy / "validation"):
-            cleanup_legacy_top_level_output(paths)
-            reset_output_directory(args.report_dir)
-        with session.stage("therapy.validate_infra", report_dir=args.report_dir):
-            result = validate_therapy_infra(
-                meal_proxy_mode=args.meal_proxy_mode,
-                ic_policy=args.ic_policy,
-                include_models=parse_model_list(args.include_models or "ridge,segmented_ridge,tree_boost,ensemble"),
-            )
-            write_therapy_infra_validation_artifacts(result, args.report_dir)
-        return 0
-
     if args.command == "validate-latent-meal":
         with session.stage("latent_meal.validate_estimators", report_dir=args.report_dir, meals=args.meals, seed=args.seed):
             recovery = run_latent_meal_truth_recovery(n_meals_per_scenario=args.meals, seed=args.seed)
@@ -601,83 +481,25 @@ def _dispatch_command(
         print(f"Latent meal truth recovery: {'pass' if recovery.passed() else 'FAIL'} -> {recovery_paths['report']}")
         return 0 if recovery.passed() else 1
 
-    if args.command == "review-therapy-evidence":
-        report_path = Path(args.report)
-        report_dir = report_path.parent
-        publish_latest = _path_matches(report_path, paths.output_therapy / "therapy_review.html")
-        preparation, research_result, validation_result = _run_therapy_analysis(args=args, merged=_load_dataset(args, session), session=session)
-        if publish_latest:
-            _prepare_runtime_output(paths, paths.output_therapy)
-        with session.stage("therapy.write_review", report_path=args.report):
-            _write_therapy_outputs(
-                preparation=preparation,
-                research_result=research_result,
-                validation_result=validation_result,
-                supporting_dir=report_dir,
-                review_path=report_path,
-                artifact_href_prefix="",
-            )
-            if publish_latest:
-                write_therapy_evidence_review_html(
-                    preparation,
-                    research_result,
-                    paths.reports / "therapy_review.html",
-                    validation_result=validation_result,
-                    artifact_root=report_dir,
-                    artifact_href_prefix="therapy/",
-                )
-        return 0
-
     if args.command == "status":
         merged = _load_dataset(args, session)
-        preparation, research_result, validation_result = _run_therapy_analysis(
-            args=args,
-            merged=merged,
-            session=session,
-            research_stage="status.therapy_research",
-            validation_stage="status.therapy_validation",
-        )
         with session.stage("status.initialize", output_root=str(paths.reports)):
-            _prepare_runtime_output(paths, paths.output_therapy)  # only after the analysis succeeded
-        with session.stage("status.write_therapy_bundle", therapy_root=str(paths.output_therapy)):
-            _write_therapy_outputs(
-                preparation=preparation,
-                research_result=research_result,
-                validation_result=validation_result,
-                supporting_dir=paths.output_therapy,
-                review_path=paths.output_therapy / "therapy_review.html",
-                artifact_href_prefix="",
-            )
-            write_therapy_evidence_review_html(
-                preparation,
-                research_result,
-                paths.reports / "therapy_review.html",
-                validation_result=validation_result,
-                artifact_root=paths.output_therapy,
-                artifact_href_prefix="therapy/",
-            )
+            _prepare_runtime_output(paths)
         with session.stage("status.write_status", output_root=str(paths.reports)):
             top_level_status_html = paths.reports / "current_status.html"
             cached_status_json = paths.cache_status / "current_status.json"
             artifact_paths = {
                 "current_status_html": str(top_level_status_html),
                 "current_status_json": str(cached_status_json),
-                "therapy_review_html": str(paths.reports / "therapy_review.html"),
-                "therapy_dir": str(paths.output_therapy),
                 "merged_dataset_dir": str(merged_dir(args.raw)),
             }
             payload = derive_current_status(
-                preparation=preparation,
-                research_result=research_result,
+                preparation=merged.preparation,
                 data_quality=dataclasses.asdict(merged.data_quality),
                 run_id=session.context.run_id,
                 artifact_paths=artifact_paths,
             )
-            write_current_status_html(
-                payload,
-                top_level_status_html,
-                therapy_href="therapy_review.html",
-            )
+            write_current_status_html(payload, top_level_status_html)
             write_status_json(payload, cached_status_json)
         return 0
 

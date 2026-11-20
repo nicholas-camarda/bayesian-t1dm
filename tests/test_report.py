@@ -4,12 +4,10 @@ import json
 
 import pandas as pd
 
-from bayesian_t1dm.health_auto_export import ModelDataPreparationResult
 from bayesian_t1dm.ingest import TandemCoverage
 from bayesian_t1dm.quality import DataQualitySummary
 from bayesian_t1dm.report import build_coverage_summary, write_coverage_markdown
-from bayesian_t1dm.review import write_coverage_review_html, write_therapy_evidence_review_html
-from bayesian_t1dm.therapy_research import _synthetic_base_dataset, parse_model_list, parse_therapy_segments, run_therapy_research, validate_therapy_infra
+from bayesian_t1dm.review import write_coverage_review_html, write_current_status_html
 
 
 def test_write_coverage_markdown_lists_data_quality_and_review_links(tmp_path):
@@ -110,41 +108,24 @@ def test_coverage_review_html_emits_expected_sections(tmp_path, assert_answer_fi
     assert_answer_first_page(text)
 
 
-def test_write_therapy_evidence_review_html_emits_expected_sections(tmp_path, assert_answer_first_page):
-    dataset = _synthetic_base_dataset(apple=True, explicit_carbs=True)
-    preparation = ModelDataPreparationResult(
-        dataset=dataset,
-        apple_available=True,
-        apple_span_start=pd.Timestamp("2025-01-01 00:00:00"),
-        apple_span_end=pd.Timestamp("2025-01-07 23:55:00"),
-        tandem_span_before_start=pd.Timestamp("2025-01-01 00:00:00"),
-        tandem_span_before_end=pd.Timestamp("2025-01-07 23:55:00"),
-        tandem_span_after_start=pd.Timestamp("2025-01-01 00:00:00"),
-        tandem_span_after_end=pd.Timestamp("2025-01-07 23:55:00"),
-        requested_tandem_start=pd.Timestamp("2025-01-01 00:00:00"),
-        requested_tandem_end=pd.Timestamp("2025-01-07 23:55:00"),
-        overlap_start=pd.Timestamp("2025-01-01 00:00:00"),
-        overlap_end=pd.Timestamp("2025-01-07 23:55:00"),
-        final_dataset_start=pd.Timestamp("2025-01-01 00:00:00"),
-        final_dataset_end=pd.Timestamp("2025-01-07 23:55:00"),
-        final_row_count=len(dataset.frame),
-    )
-    research_result = run_therapy_research(
-        dataset,
-        segments=parse_therapy_segments(),
-        include_models=parse_model_list("ridge,segmented_ridge,tree_boost"),
-    )
-    validation_result = validate_therapy_infra(include_models=parse_model_list("ridge,segmented_ridge,tree_boost"))
+def test_current_status_html_answers_whether_the_source_data_are_complete(tmp_path, assert_answer_first_page):
+    payload = {
+        "overall_state": "blocked",
+        "headline": "The source data are degraded.",
+        "summary": "Incomplete or degraded source windows must be repaired before the analyses are read.",
+        "primary_blockers": [{"code": "degraded_source_quality", "label": "Degraded source quality", "detail": "Source quality status is degraded."}],
+        "next_actions": ["Repair incomplete or degraded source windows, then rebuild the dataset."],
+        "source_quality": {"data_quality_status": "degraded", "incomplete_window_count": 2},
+        "data_prep": {"final_row_count": 2016, "apple_available": True, "overlap_start": "2025-01-01", "overlap_end": "2025-01-07"},
+        "run_id": "run123",
+    }
 
-    out_path = write_therapy_evidence_review_html(preparation, research_result, tmp_path / "therapy_evidence_review.html", validation_result=validation_result)
-    text = out_path.read_text(encoding="utf-8")
+    text = write_current_status_html(payload, tmp_path / "current_status.html").read_text(encoding="utf-8")
 
-    assert "Is there enough data to judge my overnight basal?" in text
-    assert "clean nights" in text
-    assert "Files behind this page" in text
-    assert "behaved correctly in" in text
+    assert "Are the source data complete?" in text
+    assert "Degraded source quality" in text
+    assert "incomplete source windows" in text
     assert_answer_first_page(text)
-
 
 
 def test_icr_verdict_reports_direction_and_setting():

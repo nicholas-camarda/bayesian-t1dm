@@ -6,18 +6,14 @@ from pathlib import Path
 import shutil
 from typing import Any
 
-import pandas as pd
 
 from .health_auto_export import ModelDataPreparationResult
 from .paths import ProjectPaths
 from .report import _to_jsonable
-from .therapy_research import TherapyResearchResult, summarize_overnight_basal_evidence
 
 
 TOP_LEVEL_ENTRYPOINTS = {
     "current_status.html",
-    "therapy_review.html",
-    "therapy",
     "latent_meal",
     "outcomes",
     "replay",
@@ -124,134 +120,27 @@ def _source_quality_blockers(data_quality: dict[str, Any]) -> tuple[list[dict[st
     }
 
 
-def _therapy_blockers(research_result: TherapyResearchResult, overnight_summary: dict[str, Any]) -> tuple[list[dict[str, str]], dict[str, Any], list[dict[str, Any]]]:
-    blockers: list[dict[str, str]] = []
-    gate = research_result.research_gate.copy()
-    recommendations = research_result.recommendations.copy()
-    basal_candidates = recommendations.loc[
-        recommendations["parameter"].astype(str).eq("basal") & recommendations["status"].astype(str).eq("candidate")
-    ].copy()
-    if str(overnight_summary.get("status")) == "blocked":
-        blockers.append(
-            {
-                "code": "insufficient_clean_overnight_windows",
-                "label": "Insufficient clean overnight windows",
-                "detail": "There are not enough clean overnight rows to identify basal reliably.",
-            }
-        )
-    if not gate.empty and gate["closed_loop_confounding_risk"].astype(str).eq("high").any():
-        blockers.append(
-            {
-                "code": "high_closed_loop_confounding",
-                "label": "High closed-loop confounding",
-                "detail": "The current overnight evidence is heavily confounded by closed-loop behavior or proxy meal signal.",
-            }
-        )
-    if not gate.empty and gate["source_quality_status"].astype(str).isin({"degraded", "failed", "broken"}).any():
-        blockers.append(
-            {
-                "code": "degraded_source_quality",
-                "label": "Degraded source quality",
-                "detail": "Therapy research flagged source-quality issues in the prepared dataset.",
-            }
-        )
-    if not gate.empty:
-        icr_rows = gate.loc[gate["parameter"].astype(str).eq("I/C ratio")]
-        if not icr_rows.empty:
-            direct_meal_rows = int(icr_rows.iloc[0].get("direct_meal_rows", 0) or 0)
-            proxy_meal_rows = int(icr_rows.iloc[0].get("proxy_meal_rows", 0) or 0)
-            if direct_meal_rows == 0 and proxy_meal_rows < 48:
-                blockers.append(
-                    {
-                        "code": "insufficient_carb_or_meal_signal",
-                        "label": "Insufficient carb or meal signal",
-                        "detail": "Meal evidence is too weak to cleanly evaluate meal-linked settings.",
-                    }
-                )
-    recommendation_rows = [
-        {
-            "parameter": str(row.parameter),
-            "segment": str(row.segment),
-            "status": str(row.status),
-            "proposed_change_percent": None if pd.isna(row.proposed_change_percent) else float(row.proposed_change_percent),
-            "expected_direction": str(row.expected_direction),
-            "mean_expected_gain": None if pd.isna(row.mean_expected_gain) else float(row.mean_expected_gain),
-            "fold_better_fraction": None if pd.isna(row.fold_better_fraction) else float(row.fold_better_fraction),
-            "confidence": str(row.confidence),
-            "reasons_against": str(row.reasons_against or ""),
-            "identifiability": str(getattr(row, "identifiability", "")),
-        }
-        for row in recommendations.itertuples(index=False)
-    ]
-    therapy_summary = {
-        "overnight": {
-            key: _to_jsonable(value)
-            for key, value in overnight_summary.items()
-        },
-        "gate": [
-            {
-                "parameter": str(row.parameter),
-                "identifiability": str(row.identifiability),
-                "gate_status": str(row.gate_status),
-                "source_quality_status": str(row.source_quality_status),
-                "closed_loop_confounding_risk": str(row.closed_loop_confounding_risk),
-                "apple_alignment_status": str(row.apple_alignment_status),
-            }
-            for row in gate.itertuples(index=False)
-        ],
-        "recommendations": recommendation_rows,
-        "candidate_count": int(len(basal_candidates)),
-    }
-    return blockers, therapy_summary, recommendation_rows
-
-
 def derive_current_status(
     *,
     preparation: ModelDataPreparationResult,
-    research_result: TherapyResearchResult,
     data_quality: dict[str, Any],
     run_id: str,
     generated_at: str | None = None,
     artifact_paths: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    """State of the data behind the analyses: source quality and the prepared dataset. It says nothing about settings."""
     generated_at = generated_at or _utc_timestamp()
-    overnight_summary, _ = summarize_overnight_basal_evidence(research_result)
-    therapy_blockers, therapy_summary, recommendation_rows = _therapy_blockers(research_result, overnight_summary)
-    source_blockers, source_details = _source_quality_blockers(data_quality)
-    primary_blockers = therapy_blockers + [blocker for blocker in source_blockers if blocker["code"] not in {item["code"] for item in therapy_blockers}]
-
-    candidates = [row for row in recommendation_rows if row["status"] == "candidate"]
-    if candidates and not primary_blockers:
-        overall_state = "recommendation_ready"
-        headline = "A therapy-setting change is recommendation-ready."
-        summary = "The current therapy evidence supports at least one candidate change without an active blocker."
-        next_actions = [
-            "Review the candidate change details in the therapy dashboard.",
-        ]
-    elif not primary_blockers:
-        overall_state = "no_change_supported"
-        headline = "No change is currently justified."
-        summary = "The current evidence does not support a meaningful therapy-setting change right now."
-        next_actions = [
-            "Continue monitoring with the current settings unless new evidence changes the signal.",
-            "Re-run status after materially new data arrive or after a deliberate settings change.",
-        ]
-    else:
+    primary_blockers, source_details = _source_quality_blockers(data_quality)
+    if primary_blockers:
         overall_state = "blocked"
-        headline = "The system is blocked from making a trustworthy therapy decision."
-        summary = "Important evidence or validation gates are still failing, so the current run is diagnostics-only."
-        next_actions = []
-        for blocker in primary_blockers:
-            if blocker["code"] == "insufficient_clean_overnight_windows":
-                next_actions.append("Collect more clean overnight windows with fewer recent meals, boluses, and exercise confounders.")
-            elif blocker["code"] == "high_closed_loop_confounding":
-                next_actions.append("Inspect overnight closed-loop and proxy meal activity before trusting basal conclusions.")
-            elif blocker["code"] == "degraded_source_quality":
-                next_actions.append("Repair incomplete or degraded source windows before interpreting recommendations.")
-            elif blocker["code"] == "insufficient_carb_or_meal_signal":
-                next_actions.append("Capture stronger meal evidence before evaluating meal-linked settings.")
-        if not next_actions:
-            next_actions.append("Review the supporting artifacts and resolve the listed blockers before acting.")
+        headline = "The source data are degraded."
+        summary = "Incomplete or degraded source windows must be repaired before the analyses are read."
+        next_actions = ["Repair incomplete or degraded source windows, then rebuild the dataset."]
+    else:
+        overall_state = "data_ready"
+        headline = "The source data are complete."
+        summary = "No source-quality blocker is open; the analyses can be read against this dataset."
+        next_actions = ["Run refresh after materially new data arrive."]
 
     return {
         "overall_state": overall_state,
@@ -259,7 +148,6 @@ def derive_current_status(
         "summary": summary,
         "primary_blockers": primary_blockers,
         "next_actions": next_actions,
-        "therapy": therapy_summary,
         "source_quality": source_details,
         "data_prep": {
             "mode": preparation.dataset.mode,
@@ -283,14 +171,6 @@ def write_status_json(payload: dict[str, Any], path: str | Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(_to_jsonable(payload), indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return path
-
-
-def publish_html_entrypoint(source: str | Path, destination: str | Path) -> Path:
-    source = Path(source)
-    destination = Path(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, destination)
-    return destination
 
 
 def finalize_status_logs(paths: ProjectPaths, log_run_dir: Path | None) -> Path | None:

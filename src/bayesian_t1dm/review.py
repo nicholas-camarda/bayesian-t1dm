@@ -16,13 +16,9 @@ from typing import Any
 import pandas as pd
 
 from . import report_page as rp
-from .health_auto_export import ModelDataPreparationResult
-from .therapy_research import HIGH_FAT_GRAMS, HIGH_PROTEIN_GRAMS, LOGGED_FOOD_MATCH_MINUTES, LatentMealResearchResult, TherapyInfraValidationResult, TherapyResearchResult, summarize_overnight_basal_evidence
+from .therapy_research import HIGH_FAT_GRAMS, HIGH_PROTEIN_GRAMS, LOGGED_FOOD_MATCH_MINUTES, LatentMealResearchResult
 
 FIT_ERROR_GUIDE_MGDL = 10.0
-FORECAST_INTERVAL_PERCENT = 80
-FORECAST_COVERAGE_RANGE = (0.70, 0.90)
-TRACE_CLIP_MGDL = (20.0, 450.0)
 
 
 def _write(path: str | Path, text: str) -> Path:
@@ -153,164 +149,6 @@ def write_coverage_review_html(summary: dict[str, Any], quality_rows: pd.DataFra
 
 # ---------------------------------------------------------------------------
 # Forecast validation
-# ---------------------------------------------------------------------------
-
-def _completeness_phrase(data_quality: dict[str, Any]) -> str:
-    incomplete = int(data_quality.get("incomplete_window_count") or 0)
-    status = str(data_quality.get("status") or "")
-    if status == "good":
-        return "all download windows complete"
-    return f"{incomplete} download windows have gaps or other problems"
-
-
-def _overnight_figure(research_result: TherapyResearchResult) -> str:
-    frame = research_result.research_frame
-    if frame.empty or "therapy_segment" not in frame:
-        return ""
-    frame = frame.loc[frame["therapy_segment"].astype(str).eq("overnight")].copy()
-    frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce")
-    frame = frame.dropna(subset=["timestamp"]).tail(288)
-    if frame.empty:
-        return ""
-    figure = rp.time_series(
-        frame["timestamp"].tolist(),
-        [("glucose", pd.to_numeric(frame["glucose"], errors="coerce").tolist(), rp.PRIMARY, False)],
-        y_label="glucose (mg/dL)",
-        reference_lines=[(180.0, "180"), (70.0, "70")],
-    )
-    nights = int(frame["timestamp"].dt.normalize().nunique())
-    return figure + rp.caption(
-        f"The last {len(frame) * 5 / 60:.0f} hours of overnight CGM in the analysis, spread over {nights} nights; daytime is left out, so the line breaks between nights. "
-        "Dashed lines mark 70 and 180 mg/dL."
-    )
-
-
-def write_therapy_evidence_review_html(
-    preparation: ModelDataPreparationResult,
-    research_result: TherapyResearchResult,
-    path: str | Path,
-    *,
-    validation_result: TherapyInfraValidationResult | None = None,
-    artifact_root: str | Path | None = None,
-    artifact_href_prefix: str = "",
-) -> Path:
-    path = Path(path)
-    root = Path(artifact_root) if artifact_root is not None else path.parent
-    overnight, exclusions = summarize_overnight_basal_evidence(research_result)
-    recommendations = research_result.recommendations
-    candidates = recommendations.loc[recommendations["status"].astype(str).eq("candidate")] if not recommendations.empty else recommendations
-    clean_nights = int(overnight.get("clean_nights") or 0)
-    clean_hours = int(overnight.get("clean_rows") or 0) * 5 / 60
-
-    status_code = str(overnight.get("status"))
-    if status_code == "identifiable":
-        status, label = "good", "Enough clean overnight data"
-        headline = f"<b>{clean_nights} nights</b> have enough quiet overnight time to judge basal ({rp.fmt(clean_hours, 0)} hours in all)."
-    elif status_code == "weakly_identifiable":
-        status, label = "warn", "Limited clean overnight data"
-        headline = f"<b>Only {clean_nights} nights</b> have quiet overnight time ({rp.fmt(clean_hours, 0)} hours). Any conclusion about basal is weak."
-    else:
-        status, label = "bad", "Not enough clean overnight data"
-        headline = f"<b>Overnight basal can't be judged yet:</b> {rp.esc(rp.plain(overnight.get('reason')))}."
-    if not candidates.empty:
-        lead = candidates.iloc[0]
-        explanation = (
-            f"The strongest signal: {rp.esc(lead['parameter'])} ({rp.esc(lead['segment'])}) "
-            f"{rp.esc(rp.plain(lead['expected_direction']))} by about {rp.fmt(lead['proposed_change_percent'], 0)}%, "
-            f"{rp.esc(rp.plain(lead['confidence']))} confidence. This is research evidence, not a setting change."
-        )
-    else:
-        explanation = "No setting changes are suggested."
-
-    gate_rows = []
-    if not research_result.research_gate.empty:
-        for row in research_result.research_gate.itertuples(index=False):
-            gate_rows.append((rp.esc(rp.plain(row.parameter)), rp.esc(rp.plain(row.identifiability)), rp.esc(rp.plain(row.gate_status)), rp.esc(rp.plain(row.closed_loop_confounding_risk))))
-
-    validation_line = ""
-    if validation_result is not None and not validation_result.scenario_results.empty:
-        passed = int(validation_result.scenario_results["passed"].sum())
-        total = int(len(validation_result.scenario_results))
-        validation_line = f"On simulated data with known answers, the method behaved correctly in {passed} of {total} scenarios."
-
-    body = [
-        rp.verdict(status, label, headline, explanation),
-        rp.tiles(
-            [
-                (rp.fmt(clean_nights, 0), f"clean nights (of {rp.fmt(overnight.get('overnight_nights'), 0)})"),
-                (rp.fmt(clean_hours, 0), "clean overnight hours"),
-                (rp.fmt(overnight.get("mean_glucose"), 0, suffix=" mg/dL"), "average glucose in clean stretches"),
-            ]
-        ),
-        rp.section(
-            "How much should I trust this?",
-            rp.bullets(
-                [
-                    "A night counts as clean when there was no meal, bolus, exercise or Control-IQ adjustment in the previous 2 hours and CGM was working.",
-                    f"Clean data span {rp.fmt(overnight.get('stable_epochs'), 0)} periods with unchanged pump settings." if overnight.get("stable_epochs") else "",
-                    validation_line,
-                    f"Data: {rp.esc(_date_span(preparation.final_dataset_start, preparation.final_dataset_end))}; Apple Health {'included' if preparation.apple_available else 'not included'}.",
-                ]
-            ),
-        ),
-        rp.details(
-            "Details: why overnight time was excluded",
-            rp.bar_list(
-                [(rp.plain(row.reason), float(row.count) * 5 / 60) for row in exclusions.itertuples(index=False) if row.count],
-                value_format="{:,.0f} h",
-            )
-            + rp.caption("Hours of overnight data excluded for each reason. One stretch can have several reasons.")
-            if not exclusions.empty and pd.to_numeric(exclusions["count"], errors="coerce").fillna(0).gt(0).any()
-            else "<p>No overnight time was excluded.</p>",
-        ),
-        rp.details("Details: recent overnight glucose", _overnight_figure(research_result) or "<p>No overnight data.</p>"),
-        rp.details("Details: what can be estimated for each setting", rp.table(["setting", "can it be estimated?", "status", "Control-IQ interference"], gate_rows)),
-        rp.details(
-            "Files behind this page",
-            _files(
-                root,
-                artifact_href_prefix,
-                [
-                    ("model_data_preparation.md", "how the 5-minute dataset was built"),
-                    ("therapy_research_gate.md", "which settings can be estimated"),
-                    ("therapy_feature_audit.md", "inputs used by the models"),
-                    ("therapy_model_comparison.md", "how the candidate models compare"),
-                    ("therapy_segment_evidence.csv", "evidence for each time-of-day segment"),
-                    ("therapy_recommendation_research.md", "research-only setting signals"),
-                    ("tandem_source_report_card.md", "Tandem data quality"),
-                    ("apple_source_report_card.md", "Apple Health data quality"),
-                ]
-                + (
-                    [
-                        ("therapy_infra_validation.md", "simulation checks of the method"),
-                        ("therapy_synthetic_results.csv", "results of each simulation scenario"),
-                    ]
-                    if validation_result is not None
-                    else []
-                ),
-            ),
-        ),
-        rp.glossary(
-            [
-                ("Basal", "Background insulin delivered continuously by the pump."),
-                ("Clean overnight time", "Overnight periods with no meal, bolus, exercise or Control-IQ adjustment in the previous 2 hours and working CGM."),
-                ("Stable settings period", "A stretch of time in which the programmed pump settings did not change."),
-            ]
-        ),
-    ]
-    return _write(
-        path,
-        rp.page(
-            title="Overnight Basal Evidence",
-            question="Is there enough data to judge my overnight basal?",
-            subtitle=f"{rp.esc(_date_span(preparation.final_dataset_start, preparation.final_dataset_end))}. {_generated()}",
-            body=body,
-        ),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Latent meal / breakfast I:C
 # ---------------------------------------------------------------------------
 
 
@@ -647,20 +485,11 @@ def write_latent_meal_review_html(
 # ---------------------------------------------------------------------------
 
 
-def write_current_status_html(
-    payload: dict[str, Any],
-    path: str | Path,
-    *,
-    therapy_href: str,
-) -> Path:
+def write_current_status_html(payload: dict[str, Any], path: str | Path) -> Path:
     state = str(payload.get("overall_state") or "blocked")
-    status, label = {
-        "recommendation_ready": ("good", "A setting change is supported"),
-        "no_change_supported": ("info", "No change supported"),
-    }.get(state, ("bad", "Blocked"))
+    status, label = ("good", "Source data complete") if state == "data_ready" else ("bad", "Blocked")
     data_prep = payload.get("data_prep") or {}
     source_quality = payload.get("source_quality") or {}
-    overnight = (payload.get("therapy") or {}).get("overnight") or {}
     blockers = [
         f"<b>{rp.esc(item.get('label') or rp.plain(item.get('code')))}</b>: {rp.esc(item.get('detail') or '')}"
         for item in payload.get("primary_blockers") or []
@@ -670,20 +499,11 @@ def write_current_status_html(
         rp.tiles(
             [
                 (rp.fmt(data_prep.get("final_row_count"), 0), "5-minute rows in the dataset"),
-                (rp.fmt(overnight.get("clean_nights"), 0), "clean nights for basal"),
                 (rp.fmt(source_quality.get("incomplete_window_count"), 0), "incomplete source windows"),
             ]
         ),
-        rp.section("What is blocking a recommendation", rp.bullets(blockers) or "<p>Nothing is blocking.</p>"),
+        rp.section("What is blocking", rp.bullets(blockers) or "<p>Nothing is blocking.</p>"),
         rp.section("What to do next", rp.bullets(rp.esc(item) for item in payload.get("next_actions") or []) or "<p>No next actions recorded.</p>"),
-        rp.section(
-            "Detailed reports",
-            rp.bullets(
-                [
-                    f"<a href='{rp.esc(therapy_href)}'>Overnight basal evidence</a>",
-                ]
-            ),
-        ),
         rp.details(
             "Details: data",
             rp.table(
@@ -699,8 +519,8 @@ def write_current_status_html(
     return _write(
         path,
         rp.page(
-            title="Project Status",
-            question="Where do things stand?",
+            title="Data Status",
+            question="Are the source data complete?",
             subtitle=f"Run {rp.esc(payload.get('run_id') or 'unknown')}. {_generated()}",
             body=body,
         ),
