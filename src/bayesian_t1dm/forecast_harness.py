@@ -563,6 +563,25 @@ def settings_covariates(profile: np.ndarray) -> np.ndarray:
         return np.stack([np.log(profile[..., 0]), np.log(profile[..., 1]), np.log(profile[..., 2]), profile[..., 3] / 10.0], axis=-1)
 
 
+def window_mu(posterior: ModelPosterior, settings: np.ndarray, exposures: np.ndarray, n_valid: np.ndarray, day_noise: np.ndarray) -> np.ndarray:
+    """Expected share of readings in the outcome of each of the 14 x 24 cells (draws x 336) given the model-scale ``settings`` (14 x 24 x 4), ``exposures`` (draws x 14 x 24 x 4) and ``day_noise`` (draws x 14 standard-normal day effects).
+
+    Cells without readings (``n_valid`` of 0) take no settings or exposure; a setting unknown at a cell with readings is an error.
+    """
+    draws = len(posterior.alpha)
+    hours = np.tile(np.arange(HOURS_PER_DAY), WINDOW_DAYS)
+    present = n_valid.reshape(-1) > 0
+    flat_settings = settings.reshape(-1, 4)
+    if not np.isfinite(flat_settings[present]).all():
+        raise NotScored("hour-day model: a setting is unknown at an hour of the window that has readings")
+    centered = np.where(present[:, None], (flat_settings - posterior.center[:4]) / posterior.scale[:4], 0.0)
+    exposure = np.where(present[None, :, None], (exposures.reshape(draws, -1, 4) - posterior.center[4:]) / posterior.scale[4:], 0.0)
+    eta = (posterior.alpha[:, None] + posterior.hour_scale[:, None] * posterior.z_hour[:, hours]
+           + posterior.day_scale[:, None] * day_noise[:, np.repeat(np.arange(WINDOW_DAYS), HOURS_PER_DAY)]
+           + posterior.beta[:, :4] @ centered.T + np.einsum("dpk,dk->dp", exposure, posterior.beta[:, 4:]))
+    return expit(eta)
+
+
 def simulate_window_share(posterior: ModelPosterior, settings: np.ndarray, exposures: np.ndarray, n_valid: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     """Predictive draws of the window's share of readings in the outcome from the hour-day model.
 
@@ -570,18 +589,8 @@ def simulate_window_share(posterior: ModelPosterior, settings: np.ndarray, expos
     realised reading counts. Each draw uses its own posterior draw, a fresh day effect per forecast day, a beta draw of each hour's share and binomial counts.
     """
     draws = len(posterior.alpha)
-    hours = np.tile(np.arange(HOURS_PER_DAY), WINDOW_DAYS)
     counts = n_valid.reshape(-1).astype(int)
-    present = counts > 0
-    flat_settings = settings.reshape(-1, 4)
-    if not np.isfinite(flat_settings[present]).all():
-        raise NotScored("hour-day model: a setting is unknown at an hour of the window that has readings")
-    centered = np.where(present[:, None], (flat_settings - posterior.center[:4]) / posterior.scale[:4], 0.0)
-    exposure = np.where(present[None, :, None], (exposures.reshape(draws, -1, 4) - posterior.center[4:]) / posterior.scale[4:], 0.0)
-    eta = (posterior.alpha[:, None] + posterior.hour_scale[:, None] * posterior.z_hour[:, hours]
-           + posterior.day_scale[:, None] * rng.normal(size=(draws, WINDOW_DAYS))[:, np.repeat(np.arange(WINDOW_DAYS), HOURS_PER_DAY)]
-           + posterior.beta[:, :4] @ centered.T + np.einsum("dpk,dk->dp", exposure, posterior.beta[:, 4:]))
-    mu = expit(eta)
+    mu = window_mu(posterior, settings, exposures, n_valid, rng.normal(size=(draws, WINDOW_DAYS)))
     phi = np.exp(posterior.log_phi)[:, None]
     share = rng.beta(mu * phi, (1.0 - mu) * phi)
     hits = rng.binomial(counts[None, :], share)

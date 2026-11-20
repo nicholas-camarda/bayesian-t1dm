@@ -38,7 +38,6 @@ from typing import Callable
 
 import numpy as np
 import pandas as pd
-from scipy.special import expit
 
 from . import forecast_harness as fh
 from . import outcomes_model as om
@@ -62,7 +61,11 @@ MIN_CLUSTERS = 10
 SETTING_UNITS = (("icr", "I:C", "g/U"), ("cf", "CF", "mg/dL per U"), ("basal", "basal", "U/h"), ("target", "target", "mg/dL"))
 GROUPS = ("isolated changes", "all changes")
 COVERAGE_RANGE = (0.80, 0.98)
-SETTING_PRIOR_SD = 0.5
+SETTING_PRIOR_SD = 0.5  # the prior SD of every beta in outcomes_model.build_model (a test checks the model source still says so)
+PRIOR_DOMINATED_RATIO = 0.8
+POWER_SLOPES = (0.5, 1.0, 2.0, 4.0)
+POWER_SIMULATIONS = 300
+POWER_BOOTSTRAP_DRAWS = 1000
 
 
 class NotPredicted(Exception):
@@ -77,9 +80,11 @@ class NotPredicted(Exception):
 class EventTarget:
     """One replay change as the model sees it.
 
-    ``counts`` (14 x 24) are the valid readings of the replay's counted days in the affected hours (zero elsewhere); ``old`` (24 x 4) is the settings profile in
-    force before the change and ``new`` (14 x 24 x 4) the settings in force on each day of the window (icr, cf, basal, target; NaN where unknown); ``pool`` is
-    the days x 24 x 4 exposure pool known at the change date; ``cut`` is the first day the fit may not see.
+    ``counts`` (14 x 24) are the valid readings of the replay's counted days in the affected hours (zero elsewhere). ``old`` (24 x 4) is the settings profile in force at the last
+    moment of the day before the change and ``new`` (14 x 24 x 4) the profile in force after it (the profile at the last moment of the change's last day, held for every day of the
+    window; icr, cf, basal, target). ``baseline`` (days x 24 x 4) holds the settings actually in force on each of the replay's baseline days (the qualifying days of the 28 before
+    the change) and ``baseline_weights`` their readings in the affected hours: the replay's last-28-day predictor is built from those days. ``pool`` is the days x 24 x 4 exposure pool
+    known at the change date, ``moved`` marks the settings (icr, cf, basal, target) the change alters at its changed hours, and ``cut`` is the first day the fit may not see.
     """
 
     event_id: int
@@ -95,35 +100,67 @@ class EventTarget:
     counts: np.ndarray
     old: np.ndarray
     new: np.ndarray
+    baseline: np.ndarray
+    baseline_weights: np.ndarray
     pool: np.ndarray
+    moved: np.ndarray
     observed: dict[str, float]
     cut: pd.Timestamp
 
 
 def describe_change(old: np.ndarray, new: np.ndarray, hours: np.ndarray) -> str:
-    """The change in the units the pump uses, as the mean over the clock hours of ``hours`` where that setting differs (``old`` and ``new`` are 24 x 4 profiles)."""
+    """The change in the units the pump uses, as the mean over the clock hours of ``hours`` where that setting differs (``old`` and ``new`` are known 24 x 4 profiles at ``hours``)."""
+    if not (np.isfinite(old[hours]).all() and np.isfinite(new[hours]).all()):
+        raise ValueError("A setting is unknown at an hour being described")
     parts = []
     for index, (_, label, unit) in enumerate(SETTING_UNITS):
-        differs = hours & ~(np.abs(new[:, index] - old[:, index]) < fh.NO_SETTINGS_CHANGE)
-        before, after = old[differs, index], new[differs, index]
+        differs = hours & (np.abs(new[:, index] - old[:, index]) >= fh.NO_SETTINGS_CHANGE)
         if not differs.any():
             continue
-        if not (np.isfinite(before).all() and np.isfinite(after).all()):
-            continue
-        if np.abs(after - before).max() < fh.NO_SETTINGS_CHANGE:
-            continue
         digits = {"basal": 3, "I:C": 2, "CF": 2}.get(label, 1)
-        parts.append(f"{label} {before.mean():.{digits}f} to {after.mean():.{digits}f} {unit}")
-    return "; ".join(parts) if parts else "differs only on later days of the window"
+        parts.append(f"{label} {old[differs, index].mean():.{digits}f} to {new[differs, index].mean():.{digits}f} {unit}")
+    return "; ".join(parts) if parts else "no setting value differs"
+
+
+def settings_grid(table: pd.DataFrame) -> np.ndarray:
+    """The settings of every day and clock hour (days x 24 x 4: icr, cf, basal, target) of a complete hour-day table, NaN where the archive cannot show them at all twelve moments."""
+    values = table[list(fh.SETTING_COLUMNS)].to_numpy(dtype=float).copy()
+    values[(table["settings_known_slots"] != fh.SLOTS_PER_HOUR).to_numpy()] = np.nan
+    return values.reshape(-1, HOURS_PER_DAY, 4)
+
+
+def check_profiles_agree(table: pd.DataFrame, grid: replay.DayGrid, profiles: fh.SettingsProfiles) -> int:
+    """The profile frozen from the pump's history at the start of each day must equal the hour-day table's settings on every day without a changed hour; returns how many day-hours were compared.
+
+    The change's old and new settings come from the frozen profiles and the baseline settings from the table. A day without a change where they disagree means the two readings of the
+    pump's settings differ, which is an error and not a difference to be predicted.
+    """
+    table_settings = settings_grid(table)
+    frozen = profiles.values
+    dates = pd.DatetimeIndex(sorted(table["date"].unique()))
+    if not frozen.shape[0] == table_settings.shape[0] == len(dates) or not (profiles.dates == dates).all():
+        raise AssertionError("The frozen profiles and the hour-day table do not cover the same days")
+    quiet = ~grid.changed.any(axis=1)
+    quiet[0] = False
+    both = np.isfinite(frozen) & np.isfinite(table_settings) & quiet[:, None, None]
+    worst = np.abs(np.where(both, frozen - table_settings, 0.0))
+    if (worst >= fh.NO_SETTINGS_CHANGE).any():
+        days = int((worst >= fh.NO_SETTINGS_CHANGE).any(axis=(1, 2)).sum())
+        raise AssertionError(f"The frozen profile and the hour-day table disagree on {days} days without a change (largest difference {worst.max():.4g})")
+    return int(both.sum() // 4)
 
 
 def plan_targets(table: pd.DataFrame, grid: replay.DayGrid, events: list[replay.Event], clusters: dict[int, int], isolated: set[int], scores: pd.DataFrame, replay_issues: pd.DataFrame,
                  profiles: fh.SettingsProfiles, daily: pd.DataFrame, tdd: pd.Series, *, min_train_days: int = MIN_TRAIN_DAYS) -> tuple[list[EventTarget], pd.DataFrame, pd.DataFrame]:
     """Every replay change that can be predicted (with the fit cut it will use), the flow of changes through the stages, and the record issues of those left out.
 
-    A change is left out, with the reason, when the replay did not score it, when fewer than ``min_train_days`` days with usable hours precede it, when a setting is unknown
-    at an hour the replay counted (before or after the change), or when no complete day of exposure precedes it.
+    A change is left out, with the reason, when: the replay did not score it; fewer than ``min_train_days`` days with usable hours precede it; a setting is unknown at an affected hour
+    before the change, after it, or on a baseline day (the qualifying days of the 28 before it, whose settings the observed change is measured against); no complete day of exposure
+    precedes it; or the setting values at its changed hours are equal before and after it (nothing to test). The frozen profiles and the hour-day table must agree on days without a
+    change (an error otherwise).
     """
+    check_profiles_agree(table, grid, profiles)
+    by_day = settings_grid(table)
     scored = set(scores.loc[scores["kind"].eq("change") & scores["predictor"].eq(replay.PRIMARY), "event_id"])
     reasons = replay_issues.set_index("event_id") if len(replay_issues) else pd.DataFrame()
     usable_dates = np.sort(table.loc[om.usable_rows(table), "date"].unique())
@@ -149,14 +186,19 @@ def plan_targets(table: pd.DataFrame, grid: replay.DayGrid, events: list[replay.
         positions, _ = replay._window(grid, start, start + replay.AFTER_DAYS, event.affected_hours)
         counts = np.zeros((WINDOW_DAYS, HOURS_PER_DAY))
         counts[positions - start] = grid.counts["n_valid"][positions] * event.affected_hours[None, :]
+        baseline_days, baseline_counts = replay._window(grid, event.first - replay.BEFORE_DAYS, event.first, event.affected_hours)
+        baseline = by_day[baseline_days]
         known = fh.known_at(date, PRIMARY_OUTCOME, table, daily, tdd, profiles)
         old = known.profiles.at(date)
-        new = fh.window_for(table, window_start).actual_settings
+        after = profiles.at(window_start)
+        affected = event.affected_hours
         try:
-            if not np.isfinite(old[event.affected_hours]).all():
-                raise NotPredicted(("settings before the change are unknown at an affected hour", "hours unknown before", int((~np.isfinite(old[event.affected_hours]).all(axis=1)).sum())))
-            if not np.isfinite(new[counts > 0]).all():
-                raise NotPredicted(("settings after the change are unknown at an affected hour the replay counted", "cells unknown after", int((~np.isfinite(new[counts > 0]).all(axis=1)).sum())))
+            if not np.isfinite(old[affected]).all():
+                raise NotPredicted(("settings before the change are unknown at an affected hour", "hours unknown before", int((~np.isfinite(old[affected]).all(axis=1)).sum())))
+            if not np.isfinite(after[affected]).all():
+                raise NotPredicted(("settings after the change are unknown at an affected hour", "hours unknown after", int((~np.isfinite(after[affected]).all(axis=1)).sum())))
+            if not np.isfinite(baseline[:, affected]).all():
+                raise NotPredicted(("settings are unknown at an affected hour on a baseline day (the 28 days before the change)", "baseline day-hours unknown", int((~np.isfinite(baseline[:, affected]).all(axis=2)).sum())))
             try:
                 pool = fh.exposure_pool(known)
             except fh.NotScored as problem:
@@ -166,16 +208,16 @@ def plan_targets(table: pd.DataFrame, grid: replay.DayGrid, events: list[replay.
             issues.append({**identity, "step": "settings known and exposures available", "reason": reason, "field": field, "value": value})
             continue
         stage["with settings known and exposures available"] += 1
-        counted = counts > 0
-        if np.abs(new[counted] - np.broadcast_to(old, new.shape)[counted]).max() < fh.NO_SETTINGS_CHANGE:
-            issues.append({**identity, "step": "different setting values", "reason": "the setting values in the counted hours are the same before and after (only a segment start time moved), so the predicted change is exactly zero and the change has no setting to test",
-                           "field": "largest difference in a setting value", "value": 0.0})
+        moved = (np.abs(after[event.changed_hours] - old[event.changed_hours]) >= fh.NO_SETTINGS_CHANGE).any(axis=0)
+        if not moved.any():
+            issues.append({**identity, "step": "different setting values", "reason": "the setting values at the changed hours are equal before and after the change, so the predicted change is exactly zero and there is no setting to test",
+                           "field": "largest difference in a setting value at the changed hours", "value": 0.0})
             continue
         stage["with different setting values before and after"] += 1
         observed, n_days = replay.observe(grid, event.first, event.span, event.affected_hours)
-        after_old = profiles.at(window_start)
         targets.append(EventTarget(event.event_id, date, window_start, clusters[event.event_id], event.event_id in isolated, event.direction, event.settings,
-                                   describe_change(old, after_old, event.affected_hours), n_days, training_days, counts, old, new, pool, observed, date))
+                                   describe_change(old, after, np.asarray(event.changed_hours) & (np.abs(after - old) >= fh.NO_SETTINGS_CHANGE).any(axis=1)), n_days, training_days, counts, old,
+                                   np.broadcast_to(after, (WINDOW_DAYS, HOURS_PER_DAY, 4)).copy(), baseline, baseline_counts["n_valid"].astype(float), pool, moved, observed, date))
     flow = pd.DataFrame(list(stage.items()), columns=["stage", "changes"])
     return assign_cuts(targets), flow, pd.DataFrame(issues, columns=["event_id", "change_date", "change_days", "step", "reason", "field", "value"])
 
@@ -203,67 +245,58 @@ def check_no_leakage(table: pd.DataFrame, target: EventTarget) -> pd.DataFrame:
 # Prediction
 # ---------------------------------------------------------------------------
 
-def linear_predictor(posterior: fh.ModelPosterior, settings: np.ndarray, exposures: np.ndarray, counts: np.ndarray, day_noise: np.ndarray) -> np.ndarray:
-    """The model's linear predictor (draws x 336 cells of 14 days x 24 hours) for the model-scale ``settings`` (14 x 24 x 4), exposures (draws x 14 x 24 x 4) and day effects (draws x 14).
-
-    Cells without readings are not used and take no settings or exposure.
-    """
-    draws = len(posterior.alpha)
-    hours = np.tile(np.arange(HOURS_PER_DAY), WINDOW_DAYS)
-    present = counts.reshape(-1) > 0
-    flat = settings.reshape(-1, 4)
-    if not np.isfinite(flat[present]).all():
-        raise NotPredicted(("a setting is unknown at an hour with readings", "cells", int((~np.isfinite(flat[present]).all(axis=1)).sum())))
-    centered = np.where(present[:, None], (flat - posterior.center[:4]) / posterior.scale[:4], 0.0)
-    exposure = np.where(present[None, :, None], (exposures.reshape(draws, -1, 4) - posterior.center[4:]) / posterior.scale[4:], 0.0)
-    return (posterior.alpha[:, None] + posterior.hour_scale[:, None] * posterior.z_hour[:, hours] + posterior.day_scale[:, None] * day_noise[:, np.repeat(np.arange(WINDOW_DAYS), HOURS_PER_DAY)]
-            + posterior.beta[:, :4] @ centered.T + np.einsum("dpk,dk->dp", exposure, posterior.beta[:, 4:]))
-
-
-def simulate_share(mu: np.ndarray, log_phi: np.ndarray, counts: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Predictive draws of the aggregate share: a beta draw of each cell's share and binomial counts at the realised number of readings."""
-    phi = np.exp(log_phi)[:, None]
-    flat = counts.reshape(-1).astype(int)
-    hits = rng.binomial(flat[None, :], rng.beta(mu * phi, (1.0 - mu) * phi))
-    return hits.sum(axis=1) / flat.sum()
-
-
 def predict_event(posterior: fh.ModelPosterior, target: EventTarget, seed: int) -> dict[str, np.ndarray]:
-    """Expected and simulated aggregate share of the window under the new settings and under the old, one posterior draw at a time.
+    """Expected share of the post-change window under three settings, and predictive draws under two, one posterior draw at a time.
 
-    The two settings share the posterior draw, the day effects and the resampled exposures, so the expected change is the settings' contribution alone.
+    ``expected_new``: the profile in force after the change. ``expected_baseline``: the settings actually in force on each baseline day (the days the replay's last-28-day predictor pools),
+    averaged with the readings of each day as weight; the observed change is measured against that baseline, so ``expected_new - expected_baseline`` is the quantity the replay observes.
+    ``expected_old``: the profile in force the day before the change held for the window (sensitivity). All three share the posterior draw, day effects and resampled exposures.
+    ``simulated_new`` and ``simulated_old`` are beta-binomial predictive draws of the share (new and old settings, same seed) for the CRPS comparison.
     """
     rng = np.random.default_rng(seed)
     draws = len(posterior.alpha)
     exposures = target.pool[rng.integers(0, len(target.pool), size=(draws, WINDOW_DAYS))]
     day_noise = rng.normal(size=(draws, WINDOW_DAYS))
-    old = np.broadcast_to(target.old, (WINDOW_DAYS, HOURS_PER_DAY, 4))
     weights = target.counts.reshape(-1) / target.counts.sum()
-    result: dict[str, np.ndarray] = {}
+
+    def expected(profile: np.ndarray) -> np.ndarray:
+        return fh.window_mu(posterior, fh.settings_covariates(np.broadcast_to(profile, (WINDOW_DAYS, HOURS_PER_DAY, 4))), exposures, target.counts, day_noise) @ weights
+
+    old = np.broadcast_to(target.old, (WINDOW_DAYS, HOURS_PER_DAY, 4))
+    day_weights = target.baseline_weights / target.baseline_weights.sum()
+    result: dict[str, np.ndarray] = {"expected_new": expected(target.new[0]), "expected_old": expected(target.old),
+                                     "expected_baseline": sum(weight * expected(profile) for weight, profile in zip(day_weights, target.baseline))}
     for name, profile in (("new", target.new), ("old", old)):
-        mu = expit(linear_predictor(posterior, fh.settings_covariates(profile), exposures, target.counts, day_noise))
-        result[f"expected_{name}"] = mu @ weights
-        result[f"simulated_{name}"] = simulate_share(mu, posterior.log_phi, target.counts, np.random.default_rng([seed, 1]))
+        result[f"simulated_{name}"] = fh.simulate_window_share(posterior, fh.settings_covariates(profile), exposures, target.counts, np.random.default_rng([seed, 1]))
     return result
 
 
+def moved_prior_ratio(posterior: fh.ModelPosterior, moved: np.ndarray) -> float:
+    """Largest posterior SD over prior SD among the settings a change moves: near 1 means the fit has learnt nothing about that setting's coefficient and the prediction rests on the prior."""
+    return float((posterior.beta[:, :4].std(axis=0) / SETTING_PRIOR_SD)[moved].max())
+
+
 def event_rows(posteriors: dict[pd.Timestamp, fh.ModelPosterior], targets: list[EventTarget], outcome: str) -> pd.DataFrame:
-    """One row per change for ``outcome``: predicted change (percentage points, mean and 90% credible interval), the two expected shares, the observed share, and the CRPS under the new and old settings."""
+    """One row per change for ``outcome``: predicted change (percentage points, mean and 90% credible interval) against the baseline days' settings, the same against the day-before profile,
+    the observed window, and the CRPS under the new and the old (day-before) settings."""
     rows = []
     for target in targets:
         posterior = posteriors[target.cut]
         check_posterior_precedes(posterior, target)
         draws = predict_event(posterior, target, seed=int(np.random.default_rng([SEED, target.event_id, OUTCOMES.index(outcome)]).integers(2**31)))
-        change = 100.0 * (draws["expected_new"] - draws["expected_old"])
+        change = 100.0 * (draws["expected_new"] - draws["expected_baseline"])
+        frozen = 100.0 * (draws["expected_new"] - draws["expected_old"])
         low, high = np.percentile(change, INTERVAL)
         observed = target.observed[outcome] / 100.0
         crps_new, crps_old = crps_points(draws["simulated_new"], observed), crps_points(draws["simulated_old"], observed)
         new_low, new_high = np.percentile(draws["simulated_new"], INTERVAL)
+        ratio = moved_prior_ratio(posterior, target.moved)
         rows.append({
             "event_id": target.event_id, "change_date": target.event_date.date(), "cluster_id": target.cluster_id, "isolated": target.isolated, "direction": target.direction,
             "change": target.description, "outcome": outcome, "fit_cut": target.cut.date(), "training_days": target.training_days, "counted_days": target.counted_days,
-            "predicted_change_points": float(change.mean()), "predicted_lower_5th": float(low), "predicted_upper_95th": float(high),
-            "expected_new_pct": 100.0 * float(draws["expected_new"].mean()), "expected_old_pct": 100.0 * float(draws["expected_old"].mean()),
+            "predicted_change_points": float(change.mean()), "predicted_lower_5th": float(low), "predicted_upper_95th": float(high), "predicted_change_day_before_points": float(frozen.mean()),
+            "prior_sd_ratio_moved_settings": ratio, "prediction_basis": "prior only" if ratio >= PRIOR_DOMINATED_RATIO else "data and prior", "prior_dominated": bool(ratio >= PRIOR_DOMINATED_RATIO),
+            "expected_new_pct": 100.0 * float(draws["expected_new"].mean()), "expected_baseline_pct": 100.0 * float(draws["expected_baseline"].mean()),
             "observed_window_pct": target.observed[outcome], "predictive_new_lower_5th": 100.0 * float(new_low), "predictive_new_upper_95th": 100.0 * float(new_high),
             "crps_new_points": crps_new, "crps_old_points": crps_old, "crps_new_minus_old_points": crps_new - crps_old,
         })
@@ -281,23 +314,27 @@ def check_posterior_precedes(posterior: fh.ModelPosterior, target: EventTarget) 
 # ---------------------------------------------------------------------------
 
 def observed_changes(scores: pd.DataFrame, outcome: str) -> pd.DataFrame:
-    """The replay's observed change minus placebo change per event (percentage points), and the 5th and 95th percentiles of the misses on matched placebo dates (the no-change spread)."""
+    """The replay's observed change minus placebo change per event (percentage points), and the noise range of such a change when nothing changed.
+
+    The observed change is the change's miss minus the mean of its 5 matched placebo misses, so with no effect its variance is 1 + 1/5 times that of one miss. The range is the 5th and 95th
+    percentiles of the placebo misses centred on their mean and widened by the square root of 1.2.
+    """
     contrast = replay._contrasts(scores, replay.PRIMARY, "matched placebo", outcome)
-    placebo = scores[scores["predictor"].eq(replay.PRIMARY) & scores["kind"].eq("matched placebo")][f"{outcome}_residual"]
-    low, high = np.percentile(placebo, INTERVAL)
+    placebo = scores[scores["predictor"].eq(replay.PRIMARY) & scores["kind"].eq("matched placebo")][f"{outcome}_residual"].to_numpy()
+    low, high = np.percentile(placebo - placebo.mean(), INTERVAL) * np.sqrt(1.0 + 1.0 / replay.PLACEBOS_PER_EVENT)
     out = contrast[["contrast"]].rename(columns={"contrast": "observed_change_points"}).reset_index()
-    out["placebo_spread_lower_5th"], out["placebo_spread_upper_95th"] = float(low), float(high)
+    out["no_change_noise_lower_5th"], out["no_change_noise_upper_95th"] = float(low), float(high)
     return out
 
 
 def join_observed(rows: pd.DataFrame, scores: pd.DataFrame, outcome: str) -> pd.DataFrame:
-    """The event rows with the replay's observed change, and whether the predicted change's credible interval and the placebo-widened interval hold it."""
+    """The event rows with the replay's observed change, and whether the predicted change's credible interval and the predicted change plus the no-change noise range hold it."""
     merged = rows.merge(observed_changes(scores, outcome), on="event_id", how="left", validate="one_to_one")
     if merged["observed_change_points"].isna().any():
         raise RuntimeError("A predicted change has no observed change in the replay")
     merged["inside_credible_interval"] = (merged["observed_change_points"] >= merged["predicted_lower_5th"]) & (merged["observed_change_points"] <= merged["predicted_upper_95th"])
-    merged["inside_placebo_widened_interval"] = ((merged["observed_change_points"] >= merged["predicted_change_points"] + merged["placebo_spread_lower_5th"])
-                                                  & (merged["observed_change_points"] <= merged["predicted_change_points"] + merged["placebo_spread_upper_95th"]))
+    merged["inside_noise_range"] = ((merged["observed_change_points"] >= merged["predicted_change_points"] + merged["no_change_noise_lower_5th"])
+                                    & (merged["observed_change_points"] <= merged["predicted_change_points"] + merged["no_change_noise_upper_95th"]))
     merged["direction_agrees"] = np.sign(merged["predicted_change_points"]) == np.sign(merged["observed_change_points"])
     return merged
 
@@ -364,23 +401,28 @@ def group_rows(frame: pd.DataFrame, group: str) -> pd.DataFrame:
     return frame[frame["isolated"]] if group == "isolated changes" else frame
 
 
-def tracking_table(joined: pd.DataFrame, *, draws: int = BOOTSTRAP_DRAWS) -> pd.DataFrame:
-    """Per outcome and group: how the predicted changes line up with the observed ones (slope, correlation, direction agreement, interval coverage), each with a cluster-bootstrap interval."""
+def tracking_table(joined: pd.DataFrame, *, draws: int = BOOTSTRAP_DRAWS, predicted: str = "predicted_change_points", variant: str = "primary") -> pd.DataFrame:
+    """Per outcome and group: how the predicted changes line up with the observed ones (slope, correlation, direction agreement, interval coverage), each with a cluster-bootstrap interval.
+
+    A group with fewer than 3 changes or fewer than 2 clusters gets a row that says it was not estimated and why.
+    """
     rows = []
     for outcome, frame_outcome in joined.groupby("outcome", sort=False):
         for group in GROUPS:
             frame = group_rows(frame_outcome, group)
+            row = {"variant": variant, "outcome": outcome, "group": group, "changes": len(frame), "clusters": int(frame["cluster_id"].nunique())}
             if len(frame) < 3 or frame["cluster_id"].nunique() < 2:
+                row["reading"] = f"not estimated: {len(frame)} changes in {row['clusters']} clusters (at least 3 changes in 2 clusters are needed)"
+                rows.append(row)
                 continue
-            pair = frame[["predicted_change_points", "observed_change_points"]].to_numpy()
+            pair = frame[[predicted, "observed_change_points"]].to_numpy()
             clusters = frame["cluster_id"].to_numpy()
-            row = {"outcome": outcome, "group": group, "changes": len(frame), "clusters": int(frame["cluster_id"].nunique()),
-                   "mean_predicted_points": float(frame["predicted_change_points"].mean()), "mean_observed_points": float(frame["observed_change_points"].mean())}
+            row.update({"mean_predicted_points": float(frame[predicted].mean()), "mean_observed_points": float(frame["observed_change_points"].mean())})
             for name, statistic in (("slope", slope), ("correlation", correlation), ("direction_agreement", agreement)):
                 result = cluster_bootstrap(pair, clusters, statistic, draws=draws)
                 row.update({name: result.estimate, f"{name}_lower_5th": result.lower, f"{name}_upper_95th": result.upper, f"{name}_undefined_resamples": result.undefined})
             row["inside_credible_interval"] = float(frame["inside_credible_interval"].mean())
-            row["inside_placebo_widened_interval"] = float(frame["inside_placebo_widened_interval"].mean())
+            row["inside_noise_range"] = float(frame["inside_noise_range"].mean())
             row["reading"] = tracking_reading(row)
             rows.append(row)
     return pd.DataFrame(rows)
@@ -394,7 +436,7 @@ def tracking_reading(row: dict[str, object]) -> str:
     if low > 0:
         return "the slope interval is above zero: observed changes rise with the predicted ones"
     if high < 0:
-        return "the slope interval is below zero: observed changes move against the predicted ones"
+        return "the slope interval is below zero: observed changes moved against the predicted ones"
     return "the slope interval holds zero: the record does not show that the predicted changes track what happened"
 
 
@@ -404,12 +446,15 @@ def information_table(joined: pd.DataFrame, *, draws: int = BOOTSTRAP_DRAWS) -> 
     for outcome, frame_outcome in joined.groupby("outcome", sort=False):
         for group in GROUPS:
             frame = group_rows(frame_outcome, group)
-            if len(frame) < 3 or frame["cluster_id"].nunique() < 2:
+            row = {"outcome": outcome, "group": group, "changes": len(frame), "clusters": int(frame["cluster_id"].nunique())}
+            if len(frame) < 3 or row["clusters"] < 2:
+                row["reading"] = f"not estimated: {len(frame)} changes in {row['clusters']} clusters (at least 3 changes in 2 clusters are needed)"
+                rows.append(row)
                 continue
             result = cluster_bootstrap(frame[["crps_new_minus_old_points"]].to_numpy(), frame["cluster_id"].to_numpy(), column_mean, draws=draws)
-            rows.append({"outcome": outcome, "group": group, "changes": len(frame), "clusters": result.clusters, "mean_crps_new_points": float(frame["crps_new_points"].mean()),
-                         "mean_crps_old_points": float(frame["crps_old_points"].mean()), "mean_difference_points": result.estimate, "lower_5th": result.lower, "upper_95th": result.upper,
-                         "share_changes_new_better": float((frame["crps_new_minus_old_points"] < 0).mean()), "reading": information_reading(result)})
+            row.update({"mean_crps_new_points": float(frame["crps_new_points"].mean()), "mean_crps_old_points": float(frame["crps_old_points"].mean()), "mean_difference_points": result.estimate,
+                        "lower_5th": result.lower, "upper_95th": result.upper, "share_changes_new_better": float((frame["crps_new_minus_old_points"] < 0).mean()), "reading": information_reading(result)})
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -420,6 +465,56 @@ def information_reading(result: Interval) -> str:
     if result.lower > 0:
         return "the interval is above zero: the old settings predict the window better than the settings in force"
     return "the interval holds zero: the record does not show that the settings in force predict the window better than the old settings"
+
+
+def latest_isolated(frame: pd.DataFrame) -> pd.Series:
+    """The most recent isolated change of one outcome's rows."""
+    return frame[frame["isolated"]].sort_values("change_date").iloc[-1]
+
+
+def sensitivity_table(joined: pd.DataFrame, *, draws: int = BOOTSTRAP_DRAWS) -> pd.DataFrame:
+    """The tracking estimates under three variations: the old arm as the profile the day before the change instead of the baseline days' settings; the latest isolated change left out
+    (isolated group only, time in range); and the changes whose prediction rests on the prior left out."""
+    parts = [tracking_table(joined, draws=draws, predicted="predicted_change_day_before_points", variant="predicted against the profile the day before the change")]
+    tir = joined[joined["outcome"].eq(PRIMARY_OUTCOME)]
+    if tir["isolated"].any():
+        latest = latest_isolated(tir)
+        without = tracking_table(tir[tir["event_id"] != latest["event_id"]], draws=draws, variant=f"latest isolated change ({latest['change_date']}) left out")
+        parts.append(without[without["group"].eq("isolated changes")])
+    kept = joined[~joined["prior_dominated"]]
+    if len(kept) < len(joined):
+        parts.append(tracking_table(kept, draws=draws, variant="changes predicted from the prior alone left out"))
+    return pd.concat(parts, ignore_index=True)
+
+
+def power_table(joined: pd.DataFrame, *, simulations: int | None = None, draws: int | None = None, seed: int = SEED) -> pd.DataFrame:
+    """Power of the slope interval to find a true slope: simulate observed changes as ``slope`` times the real predicted changes plus normal noise with the real residual SD of the observed changes, keep the real clusters, and count how often the 90% cluster-bootstrap interval lies above zero.
+
+    For the primary outcome, per group, for true slopes of ``POWER_SLOPES`` (1 = the predicted sizes are right).
+    """
+    simulations = POWER_SIMULATIONS if simulations is None else simulations
+    draws = POWER_BOOTSTRAP_DRAWS if draws is None else draws
+    rows = []
+    for outcome, frame_outcome in joined[joined["outcome"].eq(PRIMARY_OUTCOME)].groupby("outcome", sort=False):
+        for group in GROUPS:
+            frame = group_rows(frame_outcome, group)
+            if len(frame) < 3 or frame["cluster_id"].nunique() < 2 or frame["predicted_change_points"].nunique() < 2:
+                continue
+            x = frame["predicted_change_points"].to_numpy()
+            y = frame["observed_change_points"].to_numpy()
+            fit = np.polyfit(x, y, 1)
+            noise = float(np.std(y - np.polyval(fit, x), ddof=2))
+            clusters = frame["cluster_id"].to_numpy()
+            rng = np.random.default_rng(seed)
+            row = {"outcome": outcome, "group": group, "changes": len(frame), "clusters": int(frame["cluster_id"].nunique()), "predicted_change_sd_points": float(x.std(ddof=1)), "noise_sd_points": noise}
+            for true_slope in POWER_SLOPES:
+                hits = 0
+                for _ in range(simulations):
+                    simulated = true_slope * x + rng.normal(0.0, noise, len(x))
+                    hits += int(cluster_bootstrap(np.column_stack([x, simulated]), clusters, slope, draws=draws, seed=int(rng.integers(2**31))).lower > 0)
+                row[f"power_true_slope_{true_slope:g}"] = hits / simulations
+            rows.append(row)
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
