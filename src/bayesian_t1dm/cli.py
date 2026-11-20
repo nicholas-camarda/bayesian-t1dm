@@ -149,7 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate_latent.add_argument("--seed", type=int, default=20260403)
     validate_latent.add_argument("--icr-cohorts", type=int, default=40, help="Simulated 20-meal cohorts per true I:C for the logged-meal recovery check; 0 skips it")
 
-    status = add_command("status", "Run the primary end-to-end status workflow and publish the latest dashboards")
+    status = add_command("status", "Report whether the source data windows are complete")
     status.add_argument("--raw", default=None)
     collect = add_command("collect", "Fetch one Tandem Source window through tconnectsync")
     collect.add_argument("--start-date", default=None, help="Requested window start date (YYYY-MM-DD)")

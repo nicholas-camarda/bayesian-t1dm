@@ -139,7 +139,7 @@ def derive_current_status(
     else:
         overall_state = "data_ready"
         headline = "The source data are complete."
-        summary = "No source-quality blocker is open; the analyses can be read against this dataset."
+        summary = "No source-window blocker is open."
         next_actions = ["Run refresh after materially new data arrive."]
 
     return {
