@@ -43,6 +43,7 @@ from .dashboard_page import render_dashboard
 from .changes import EVALUATION_DAYS, SETTING_FIELDS, detect_setting_changes
 from .outcomes import day_part_table
 from .result_flow import write_result_flow
+from .front_page_page import write_front_page
 from .layout import activate_current, assemble_run
 from .publish import current_commit, publish_run, working_tree_is_clean
 from .records import evaluate_open, load_records, register_proposal, save_records, sync_with_pump
@@ -117,6 +118,9 @@ def build_parser() -> argparse.ArgumentParser:
     refresh.add_argument("--collect", action=argparse.BooleanOptionalAction, default=True, help="Fetch the latest 30 days from Tandem Source first")
     refresh.add_argument("--record", action=argparse.BooleanOptionalAction, default=True, help="Write evaluated changes and eligible proposals to the durable record")
     refresh.add_argument("--publish", action=argparse.BooleanOptionalAction, default=True)
+
+    front = add_command("front-page", "Rewrite the front page (index.html) of a run folder from the research outputs, without a refresh")
+    front.add_argument("--run-dir", default=None, help="Run folder to write into; defaults to runtime/current")
 
     screen_health = add_command("screen-health-features", "Screen imported Apple Health context features against Tandem glucose targets")
     screen_health.add_argument("--raw", default=None)
@@ -376,6 +380,14 @@ def _dispatch_command(
 
     if args.command == "refresh":
         return _run_refresh(args, paths, parser)
+
+    if args.command == "front-page":
+        run_dir = Path(args.run_dir) if args.run_dir else paths.current
+        if not run_dir.is_dir():
+            raise FileNotFoundError(f"{run_dir} is not a run folder; run refresh first or pass --run-dir")
+        with session.stage("front_page.write", run_dir=str(run_dir)):
+            print(f"Front page: {write_front_page(run_dir)}")
+        return 0
 
     if args.command == "propose-breakfast-icr":
         merged = _load_dataset(args, session)
@@ -685,6 +697,7 @@ def _run_refresh(args, paths: ProjectPaths, parser) -> int:
             print(f"Refresh stopped: {name} exited with {code}. Nothing was published.")
             return code or 1
     assemble_run(paths.reports, paths.cloud_raw, run_dir, record_path=paths.cloud_root / "data" / "records" / "setting_proposals.csv")
+    write_front_page(run_dir)
     write_result_flow(run_dir, paths.cloud_raw)
     record["status"] = "complete"
     record["finished"] = f"{pd.Timestamp.now():%Y-%m-%dT%H:%M:%S}"

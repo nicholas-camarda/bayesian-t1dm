@@ -46,6 +46,60 @@ PREDICTOR_STYLE = {
 }
 
 
+# The two sets of changes the replay-as-predictor test is run on: one color, label, marker and line type in every figure and on the front page.
+CHANGE_SET_STYLE = {
+    "isolated changes": GroupStyle("Isolated changes", JCO[0], "o", "-"),
+    "all changes": GroupStyle("All changes", JCO[3], "s", "--"),
+}
+
+
+@dataclass(frozen=True)
+class StatusStyle:
+    """A diagnostic status or a verdict as it is drawn: the text, the glyph and the colors. Color is never the only signal.
+
+    ``color`` is the JCO color of the outline; ``ink`` is the darker shade of it used for the text, chosen so the text keeps a contrast of at
+    least 4.5 to 1 on the chip's own tinted background (a test checks this). ``outline`` marks the states that must not look like a pass (a
+    check that was not run, a result that is not available): a dashed outline and no fill.
+    """
+
+    label: str
+    glyph: str
+    color: str
+    outline: bool = False
+    ink: str = ""
+
+    @property
+    def text(self) -> str:
+        return self.ink or self.color
+
+
+# Darker shades of JCO[0] and JCO[6] for text on a tinted chip.
+INK_BLUE = "#00579A"
+INK_GOLD = "#6E5A00"
+
+# Diagnostic statuses (the four a workbook may hold): "not assessed" is dashed and hollow so it never looks like "no concern".
+STATUS_STYLE = {
+    "no concern": StatusStyle("No concern", "+", JCO[0], ink=INK_BLUE),
+    "concern": StatusStyle("Concern", "!", JCO[8]),
+    "not assessed": StatusStyle("Not assessed", "?", JCO[6], outline=True, ink=INK_GOLD),
+    "not applicable": StatusStyle("Not applicable", "-", JCO[7]),
+}
+
+# The win-test verdict, whether the record validates the settings effects, and the state of a result that is not there.
+VERDICT_STYLE = {
+    "win": StatusStyle("Win", "+", JCO[0], ink=INK_BLUE),
+    "tie": StatusStyle("Tie", "=", JCO[6], ink=INK_GOLD),
+    "loss": StatusStyle("Loss", "-", JCO[8]),
+    "missing": StatusStyle("Not available", "?", JCO[7], outline=True),
+    "shown": StatusStyle("Shown", "+", JCO[0], ink=INK_BLUE),
+    "not shown": StatusStyle("Not shown", "-", JCO[8]),
+}
+
+# Outcomes of the outcomes model, named the same everywhere they are listed.
+OUTCOME_LABEL = {"tir": "Time in range (70-180 mg/dL)", "below70": "Time below 70 mg/dL", "below54": "Time below 54 mg/dL"}
+OUTCOME_SHORT = {"tir": "time in range", "below70": "time below 70", "below54": "time below 54"}
+
+
 # The pump behind each stretch of the record, in order: the same label and color in every figure.
 PUMP_STYLE = {
     "first pump": GroupStyle("First pump", JCO[0], "o", "-"),
