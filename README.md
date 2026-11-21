@@ -73,6 +73,7 @@ Commands are `bayesian-t1dm <command>`; the research analyses run as modules (`p
 | Rewrite the front page of a run without a refresh | `front-page` | `current/index.html` |
 | Is the record fit to be modelled? | `python -m bayesian_t1dm.data_audit` | `data_audit/` |
 | Does the model forecast 14-day time in range better than the last 28 days? | `python -m bayesian_t1dm.forecast_harness` | `forecast_harness/` |
+| How did the last day and week go, what has gone with my glucose, and are my settings performing? | `python -m bayesian_t1dm.readout_report` (page also copied to the Vault `readout/` folder) | `readout/` |
 | Do the model's predicted effects of past changes match what happened? | `python -m bayesian_t1dm.replay_predictor` | `replay_predictor/` |
 | Do outcomes after past changes differ from placebo dates? (exploratory) | `python -m bayesian_t1dm.replay` | `replay/` |
 | Which hour-day covariates are associated with time in range? | `python -m bayesian_t1dm.outcomes_model` | `outcomes_model/` |

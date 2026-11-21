@@ -28,6 +28,7 @@ REQUIRED_SECTIONS = (
     "## Data-quality audit (step A)",
     "## Forecast evaluation harness (step 2)",
     "## Replay as predictor (step 4)",
+    "## Personal readout (goal K)",
 )
 
 
@@ -41,7 +42,7 @@ def test_every_analysis_is_documented_in_the_methods_document():
 def test_goal_table_lists_every_lettered_goal():
     """The goals and lettered subgoals are defined once, at the top of methods.md."""
     text = METHODS.read_text(encoding="utf-8")
-    for letter in "ABCDEFGHIJ":
+    for letter in "ABCDEFGHIJK":
         assert re.search(rf"^\| {letter} \|.*\b{letter}1\b", text, flags=re.MULTILINE), f"goal {letter} or its first subgoal is missing"
     assert text.index("## Goals") < text.index("## Data processing") < text.index("## Statistical methods")
 

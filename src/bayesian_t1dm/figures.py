@@ -112,6 +112,17 @@ REASON_COLORS = dict(zip(UNKNOWN_REASONS, _NOT_PUMP))
 UNKNOWN_SETTINGS_COLOR = _NOT_PUMP[0]
 
 
+# The personal readout's context marks on a day's glucose trace: one color each, the same on every day.
+READOUT_STYLE = {
+    "glucose": GroupStyle("Glucose", NEUTRAL_LINE, "", "-"),
+    "range": GroupStyle("Target range 70-180 mg/dL", "#20854E", "", "-"),
+    "sleep": GroupStyle("Sleep", JCO[4], "", "-"),
+    "workout": GroupStyle("Workout", JCO[1], "", "-"),
+    "carbs": GroupStyle("Carbs entered", JCO[3], "^", ""),
+    "site": GroupStyle("Site change", JCO[2], "|", "--"),
+    "estimate": GroupStyle("Estimate with 90% interval", JCO[0], "o", "-"),
+}
+
 def assert_ascii(*texts: str) -> None:
     """Raise when a figure label holds a character outside ASCII (it may not render in every font)."""
     for text in texts:
