@@ -60,12 +60,6 @@ def test_withholding_gives_a_negative_share_and_context_days_are_excluded():
     assert daily["date"].dt.day.tolist() == [1, 3] and daily["excess_fraction"].round(3).tolist() == [-0.5, -0.5]
 
 
-def test_summary_reports_the_spread_across_days():
-    daily = pd.DataFrame({"part": "00:00-05:00", "excess_fraction": [0.0, 0.2, 0.4, 0.6], "mean_glucose": 140.0, "time_in_range_pct": 80.0, "sleep_share": 1.0})
-    summary = controller.controller_summary(daily).iloc[0]
-    assert summary["days"] == 4 and summary["median_excess_fraction"] == pytest.approx(0.3) and summary["sd_between_days"] > 0
-
-
 def _days(fractions, hours=5.0, rate=0.7, glucose=150.0, below_70=0.5, part="00:00-05:00", start="2026-06-01"):
     fractions = np.asarray(fractions, dtype=float)
     hours = np.broadcast_to(np.asarray(hours, dtype=float), fractions.shape)

@@ -34,7 +34,7 @@ def test_project_paths_ensure_creates_runtime_paths_without_creating_cloud_paths
 
     assert paths.reports == tmp_path / "runtime" / "output"
     assert paths.cloud_raw == tmp_path / "cloud" / "data" / "raw"
-    assert paths.cloud_output == tmp_path / "cloud" / "output"
+    assert paths.cloud_readout == tmp_path / "cloud" / "readout"
     assert paths.reports.exists()
     assert not paths.cloud_root.exists()
 

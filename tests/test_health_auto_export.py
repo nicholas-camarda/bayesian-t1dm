@@ -492,94 +492,6 @@ def test_workout_recency_flags_use_elapsed_time_across_timestamp_gaps():
     assert int(row_1901["recent_workout_12h"]) == 0
 
 
-def test_screen_health_features_command_writes_scores_and_report(tmp_path, monkeypatch):
-    workspace_root = tmp_path / "repo"
-    workspace_root.mkdir()
-    cloud_root = tmp_path / "cloud"
-    runtime_root = tmp_path / "runtime"
-    monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(cloud_root))
-    monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
-
-    raw_root = cloud_root / "data" / "raw"
-    raw_root.mkdir(parents=True, exist_ok=True)
-    _write_tandem_cgm_export(raw_root)
-    _write_health_auto_export_bundle(
-        raw_root / "health_auto_export" / "HealthAutoExport_20260331133020",
-        json_name="HealthAutoExport-2025-05-24-2025-05-24.json",
-        payload=_build_health_auto_export_payload(),
-    )
-    _build_dataset(workspace_root, raw_root)
-
-    report = tmp_path / "health_feature_screening.md"
-    scores = tmp_path / "health_feature_scores.csv"
-    exit_code = main(
-        [
-            "--root",
-            str(workspace_root),
-            "screen-health-features",
-            "--raw",
-            str(raw_root),
-            "--report",
-            str(report),
-            "--scores",
-            str(scores),
-        ]
-    )
-
-    assert exit_code == 0
-    assert report.exists()
-    assert scores.exists()
-
-    score_frame = pd.read_csv(scores)
-    assert not score_frame.empty
-    assert "health_activity_value" in set(score_frame["feature"])
-    assert "prior_night_total_sleep_hours" in set(score_frame["feature"])
-
-    text = report.read_text(encoding="utf-8")
-    assert "status: completed" in text
-    assert "baseline_rmse_mean" in text
-    assert "augmented_rmse_mean" in text
-
-
-def test_screen_health_features_without_apple_skips_cleanly(tmp_path, monkeypatch):
-    workspace_root = tmp_path / "repo"
-    workspace_root.mkdir()
-    cloud_root = tmp_path / "cloud"
-    runtime_root = tmp_path / "runtime"
-    monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(cloud_root))
-    monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
-
-    raw_root = cloud_root / "data" / "raw"
-    raw_root.mkdir(parents=True, exist_ok=True)
-    _write_tandem_cgm_export(raw_root)
-    _build_dataset(workspace_root, raw_root)
-
-    report = tmp_path / "health_feature_screening.md"
-    scores = tmp_path / "health_feature_scores.csv"
-    exit_code = main(
-        [
-            "--root",
-            str(workspace_root),
-            "screen-health-features",
-            "--raw",
-            str(raw_root),
-            "--report",
-            str(report),
-            "--scores",
-            str(scores),
-        ]
-    )
-
-    assert exit_code == 0
-    assert report.exists()
-    assert scores.exists()
-    score_frame = pd.read_csv(scores)
-    assert score_frame.empty
-    text = report.read_text(encoding="utf-8")
-    assert "status: skipped" in text
-    assert "Apple Health not available; screening skipped." in text
-
-
 def test_build_dataset_with_apple_builds_enriched_dataset_and_reports(tmp_path, monkeypatch):
     workspace_root = tmp_path / "repo"
     workspace_root.mkdir()
@@ -597,10 +509,10 @@ def test_build_dataset_with_apple_builds_enriched_dataset_and_reports(tmp_path, 
     prepared = pd.read_parquet(merged / "prepared_model_data_5min.parquet")
     assert "health_activity_value" in prepared.columns
     assert "prior_night_total_sleep_hours" in prepared.columns
-    text = (runtime_root / "output" / "prepare" / "model_data_preparation.md").read_text(encoding="utf-8")
-    assert "- mode: apple_enriched" in text
-    assert "- apple_available: True" in text
-    assert "- overlap_start: 2025-05-24 00:00:00" in text
+    manifest = json.loads((merged / "dataset.json").read_text(encoding="utf-8"))
+    assert manifest["dataset"]["mode"] == "apple_enriched"
+    assert manifest["dataset"]["apple_available"] is True
+    assert str(manifest["spans"]["overlap_start"]).startswith("2025-05-24")
     validation = (merged / "validation_report.md").read_text(encoding="utf-8")
     assert "Apple Health: 2 export files (2 distinct" in validation
 

@@ -9,7 +9,7 @@ from bayesian_t1dm.latent_meal_trajectory import (
     absorbed_fraction,
     estimate_carbs_from_trajectory,
 )
-from bayesian_t1dm.latent_meal_validation import (
+from latent_meal_validation import (
     DEFAULT_SCENARIOS,
     MealSimulationScenario,
     _insulin_absorbed_fraction,

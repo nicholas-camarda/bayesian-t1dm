@@ -13,8 +13,6 @@ from bayesian_t1dm.ingest import (
     load_tandem_exports,
     summarize_coverage,
     summarize_export_manifest,
-    summarize_tandem_raw_dir,
-    summarize_tandem_raw_source,
 )
 
 
@@ -67,23 +65,6 @@ def test_load_tandem_exports_prefers_dense_egv_over_sparse_bg(tmp_path):
     assert data.cgm.loc[data.cgm["bg"].notna(), "glucose"].tolist() == [100, 105]
 
 
-def test_summarize_tandem_raw_source_ignores_summary_only_value_table(tmp_path):
-    summary_path = tmp_path / "tandem_daily_timeline.csv"
-    frame = pd.DataFrame(
-        {
-            "timestamp": pd.date_range("2023-02-01", periods=7, freq="D"),
-            "value": [1, 2, 3, 4, 5, 6, 7],
-        }
-    )
-    frame.to_csv(summary_path, index=False)
-
-    report = summarize_tandem_raw_source(summary_path)
-
-    assert report["cgm_rows"] == 0
-    assert not report["has_dense_cgm_stream"]
-    assert report["recognized_glucose_columns"] == ()
-
-
 def _write_dense_therapy_events_workbook(tmp_path: Path) -> Path:
     workbook = tmp_path / "therapy_events_2023-02.xlsx"
     timestamps = pd.date_range("2023-02-04 00:00:00", periods=1488, freq="5min")
@@ -102,29 +83,6 @@ def _write_dense_therapy_events_workbook(tmp_path: Path) -> Path:
     with pd.ExcelWriter(workbook) as writer:
         frame.to_excel(writer, index=False)
     return workbook
-
-
-def test_summarize_tandem_raw_source_reports_dense_egv_stream(tmp_path):
-    workbook = _write_dense_therapy_events_workbook(tmp_path)
-    report = summarize_tandem_raw_source(workbook)
-
-    assert report["cgm_rows"] == 1488
-    assert report["has_dense_cgm_stream"]
-    assert report["median_spacing_minutes"] == pytest.approx(5.0)
-    assert "egv_estimatedGlucoseValue" in report["recognized_glucose_columns"]
-
-
-def test_load_tandem_exports_raw_subtree_recovers_dense_cgm(tmp_path):
-    workbook = _write_dense_therapy_events_workbook(tmp_path)
-    data = load_tandem_exports(tmp_path)
-    summary = summarize_tandem_raw_dir(tmp_path)
-
-    therapy = summary.loc[summary["source_file"] == workbook.name].iloc[0]
-
-    assert data.cgm.shape[0] > 1000
-    assert therapy["has_dense_cgm_stream"]
-    assert therapy["cgm_rows"] == 1488
-    assert therapy["median_spacing_minutes"] == pytest.approx(5.0)
 
 
 def test_parse_datetime_mixed_tz_and_naive_normalizes_to_local(monkeypatch):

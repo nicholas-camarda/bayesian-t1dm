@@ -67,24 +67,3 @@ def test_low_limits():
     assert not outcomes.passes_low_limits({"time_below_70_pct": 1.0, "time_below_54_pct": float("nan")})
 
 
-def test_baseline_windows_end_before_as_of():
-    cgm = pd.concat([_day("2026-01-01", [100.0] * 288), _day("2026-01-02", [300.0] * 288)], ignore_index=True)
-    table = outcomes.baseline_table(cgm, as_of=pd.Timestamp("2026-01-02"), windows_days=(14,))
-    assert table.iloc[0]["days"] == 1 and table.iloc[0]["time_in_range_pct"] == pytest.approx(100.0)
-
-
-def test_page_names_where_highs_and_lows_concentrate():
-    from bayesian_t1dm.outcomes_report import outcomes_page
-
-    parts = outcomes.day_parts_from_starts([0, 12 * 60])
-    values = [100.0] * 144 + [300.0] * 144
-    cgm = _day("2026-01-01", values)
-    as_of = pd.Timestamp("2026-01-02")
-    page = outcomes_page(
-        outcomes.baseline_table(cgm, as_of=as_of, windows_days=(14,)),
-        outcomes.day_part_table(cgm, parts, as_of=as_of, days=14),
-        as_of=as_of,
-        source="test pump",
-    )
-    assert "Highs concentrate most in 12:00-00:00 (100.0% above 180)" in page
-    assert "within limits" in page and "test pump" in page

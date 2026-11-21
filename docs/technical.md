@@ -1,655 +1,173 @@
-# Technical Notes
+# Technical reference
+
+How each step of the pipeline works, in the order the data move through it: download, normalization, the merged dataset, the settings in force, the shared definitions, the I:C and basal evidence, and the readout. [`methods.md`](methods.md) states the goal and the methods in brief; this document gives the rules, parameters and failure modes. Run numbers live in the generated readout and its diagnostics workbook, not here.
 
 ## Contents
 
-- [Goals](#goals)
-- [Design overview](#design-overview)
-- [Breakfast I:C proposals (goal B)](#breakfast-ic-proposals-goal-b)
-- [Lunch and dinner (goal E)](#lunch-and-dinner-goal-e)
-- [Food the pump did not log (goal D1)](#food-the-pump-did-not-log-goal-d1)
-- [Refresh, change record and evaluation (goal C)](#refresh-change-record-and-evaluation-goal-c)
-- [Basal from the controller pattern (goal F)](#basal-from-the-controller-pattern-goal-f)
-- [Problem episodes and responses (goal H)](#problem-episodes-and-responses-goal-h)
-- [The front page and the runtime tree](#the-front-page-and-the-runtime-tree)
-- [Hour-day table and settings in force](#hour-day-table-and-settings-in-force)
-- [Replay of past setting changes (exploratory)](#replay-of-past-setting-changes-exploratory)
-- [Data-quality audit (step A)](#data-quality-audit-step-a)
-- [Hour-day outcomes model](#hour-day-outcomes-model)
-- [Forecast evaluation harness (step 2)](#forecast-evaluation-harness-step-2)
-- [Replay as predictor (step 4)](#replay-as-predictor-step-4)
-- [Personal readout (goal K)](#personal-readout-goal-k)
-- [Outcome metrics (goal A)](#outcome-metrics-goal-a)
-- [Data Flow](#data-flow)
-- [Tandem Source Acquisition](#tandem-source-acquisition)
-- [Bolus calculator settings](#bolus-calculator-settings)
-- [Insulin Action Kernel](#insulin-action-kernel)
-- [Feature Definitions](#feature-definitions)
-- [Retired: 5-minute glucose forecast](#retired-5-minute-glucose-forecast)
-- [Validation](#validation)
-- [Latent Carb Estimator](#latent-carb-estimator)
-- [Output Contract](#output-contract)
-- [Assumptions and Failure Modes](#assumptions-and-failure-modes)
-- [Acquisition and Manifest Design Decisions](#acquisition-and-manifest-design-decisions)
+- [Pipeline at a glance](#pipeline-at-a-glance)
+- [Download from Tandem Source](#download-from-tandem-source)
+- [Normalization and timestamps](#normalization-and-timestamps)
+- [Merged dataset](#merged-dataset)
+- [Settings in force](#settings-in-force)
+- [Shared definitions](#shared-definitions)
+- [Outcome metrics](#outcome-metrics)
+- [Insulin action kernel](#insulin-action-kernel)
+- [Effective I:C from meals](#effective-ic-from-meals)
+- [Basal from the controller pattern](#basal-from-the-controller-pattern)
+- [Personal readout](#personal-readout)
+- [Assumptions and failure modes](#assumptions-and-failure-modes)
 
-## Goals
+## Pipeline at a glance
 
-The goals and their lettered subgoals are defined in the table at the top of [`methods.md`](methods.md#goals); this document is the technical reference for how each is implemented.
+| Step | Command | Reads | Writes |
+| --- | --- | --- | --- |
+| Download | `collect` (one window, at most 30 days), `backfill` (a range), `fetch-profile-edits` | Tandem Source through tconnectsync | raw responses and normalized tables under `<cloud root>/data/raw/tconnectsync/<window>/`, `tandem_export_manifest.csv` |
+| Normalize | `normalize-raw` (by hand; `build-dataset` does it for changed windows) | archived raw responses | `normalized/*.csv`, `window_manifest.csv` |
+| Build | `build-dataset` | every raw file (Tandem, Apple Health exports, carb logs, `context_events.csv`) | `<cloud root>/data/merged/` with `validation_report.md` |
+| Readout | `readout` | the merged dataset | `runtime/output/readout/` (page, workbook, CSVs), page copied to `<cloud root>/readout/readout.html` |
+| All of it | `refresh` | | collect, build-dataset, readout in order, stopping at the first failure |
 
-The goal throughout is more time in 70-180 mg/dL with time below 70 under 4% and below 54 under 1%. A proposal changes one setting by at most 10% and is held 14 days before the next. The system proposes and measures; the person enters the change on the pump.
+Every command logs to `runtime/logs/<command>/<run>/events.jsonl`. The cloud root is the Project Vault folder (`BAYESIAN_T1DM_CLOUD_ROOT`), the runtime root holds generated work (`BAYESIAN_T1DM_RUNTIME_ROOT`); both default as in [`paths.py`](../src/bayesian_t1dm/paths.py).
 
-## Design overview
+## Download from Tandem Source
 
-How the pieces fit, and the method behind each. Every analysis follows the same shape: *describe what the record shows, estimate with its uncertainty, apply a written rule, and judge the result afterwards.* The person always enters changes on the pump; nothing here is a prescription.
+Tandem Source is the source of truth for pump data: the Mobi app uploads to it and `tconnectsync` queries it directly (API first; there is no browser path). Credentials come from `.env` or the environment only: `TANDEM_SOURCE_EMAIL`, `TANDEM_SOURCE_PASSWORD`, `TANDEM_SOURCE_REGION` (non-US accounts), `TIMEZONE_NAME`, and a pump serial when the account has more than one pump.
 
-**Data layer.** Tandem Source (the pump's own event log, decoded; CGM, boluses, carbs, basal delivery, profile edits, controller modes, site changes), Apple Health (workouts, sleep, Bevel's food log), `context_events.csv` (illness, steroids, travel) and hand-kept carb logs. Every raw file is fingerprinted; `build-dataset` rebuilds only what changed. Times are pump local time. Glucose, insulin and carbs sit on a 5-minute grid; carb times keep their exact moment where the lookup needs it (profile at the moment of a meal). Every analysis reads the data through one loader, described next.
+Each window keeps the raw API responses untouched under `raw/` and writes normalized CGM, bolus, basal and activity tables beside them. The acquisition manifest (`tandem_export_manifest.csv`) records, per window: the requested and observed first and last timestamps, the observed duration, `coverage_fraction`, raw payload hashes and sizes, the time zone and pump identity of the request, and `completeness_reasons` (`starts_late`, `ends_early`, `internal_gap`, `duplicates`, `overlap`, `missing_kind`). CGM coverage within a window (`cgm_slot_coverage`, `cgm_gaps_ge_2h`) is reported as data quality and does not make a window incomplete.
 
-| Goal | Question | Estimator | Uncertainty | Written rule | Checked by | Main weakness |
-| --- | --- | --- | --- | --- | --- | --- |
-| A | where do I stand | consensus CGM metrics, day-coverage rule, percentile profile by time of day | none needed (descriptive) | low limits 4% / 1%, time in range 70% | unit tests on known series | descriptive only |
-| B, E | does a meal behave like the pump's I:C | per-meal grid posterior over carbohydrate and absorption shape from the glucose trace, given insulin action and the controller's basal deviation, with a vague carb prior; sensitivity ratio = carb-equivalent / logged carbs; pooled per pump segment and setting by random effects (DerSimonian-Laird heterogeneity, Hartung-Knapp variance, t interval) | 90% interval | proposal only if the setting is outside the interval, every check agrees, low limits hold for added insulin, step at most 10% | simulation harness with known carbs (9 scenarios), five re-pools (tiers, clean, no correction, no high fat/protein, with Bevel) | assumes the correction factor is right; carb-counting bias is absorbed into the ratio; intervals are not probabilities of "too weak" |
-| C | did a change help | before versus after, 14 days each side, hours of the segment plus 4 | day-level bootstrap 90% interval | judged only when 14 after-days are in; one change open at a time | tests on synthetic series | before/after in one person is associational; several changes together are confounded |
-| D | can logged food sharpen the estimate | rule-based flags (Bevel food with no pump carbs, rises with no logged cause) | counts | flagged windows are excluded and counted | tests; real-data reread | rises from slow food at the meal look unlogged |
-| F | is basal too low or high | controller's commanded minus programmed rate over clean time, pooled by hours across days and compared with the current programmed rate | day-resampling interval and "chance the rule is met" | 25% or more for at least half the clean time, glucose above 120, lows within limits | tests; real-data reread | clean time is scarce (see below); sleep-mode target is higher than daytime |
-| H | what happened in each long high or low | ordered rules over insulin, carbs, corrections, site changes, workouts, unlogged food; repeats per pump segment | Wilson 90% intervals for rates | a repeating pattern points at that segment's I:C or basal | tests; real-data reread | rules, not a fitted model; sees only recorded insulin and carbs |
+The pump's profile edits (event 68) are not in tconnectsync's default event list, so the collector asks for them by name and writes `pump_profile_edits_<pump>_<device>.json` for every window; `fetch-profile-edits` adds that file to windows archived before this was done, without rewriting anything else.
 
-**Methods behind them.** *Grid Bayesian posterior* for carbohydrate per meal (the only place Bayes' rule is used today). *Random-effects pooling* with Hartung-Knapp variance across meals, so real meal-to-meal variability widens the interval. *Day-level bootstrap* wherever days are the unit (basal, change evaluation). *Wilson intervals* for rates. *Theil-Sen plus least squares* to recover the correction factor from calculator records. *Profile replay* of the pump's own edit events. *Ordered rules* for classification. *Simulation* with known truth to test an estimator before it is trusted (carbs recovered, fat/protein absorption).
+How to read it: a window with `ends_early` stopped before its requested end (the pump had not synced the last hours); the next `collect` fills it. How it could fail: Tandem Source can change undocumented endpoints, which shows up as a failed collect or a window with `missing_kind`, never as silently shorter data.
 
-**What is not yet probabilistic.** The I:C and basal answers are intervals and a bootstrap share, not posterior probabilities, and each segment is estimated on its own. The planned model reports "probability the current setting is too weak/too low" with its interval, shares information between neighbouring segments and meals (partial pooling), and uses the nuisance factors as predictors instead of throwing time away.
+## Normalization and timestamps
 
-**Why so little time was clean, and the change.** The first basal rule set aside 63% of all time in the last 90 days: any carbohydrate entry of any size (365 of 3,680 are under 15 g), any bolus of 0.5 U or more (1,991 pump boluses are 0.5 to 1.0 U, almost all Control-IQ's own automatic corrections, the behaviour being measured), each for a fixed 4 hours, plus 14 days around a steroid injection listed in `context_events.csv`. The primary rule now counts only meals (carbohydrate of 15 g or more, or a bolus of 1 U or more) and sizes the window: 2 hours below 20 g (or below 2 U), 3 hours below 40 g (below 4 U), 4 hours above. Clean hours in the last 90 days rose from 67 to 182 (09:00-15:00) and from 51 to 148 (15:00-19:00). The strict rule stays as a check. The first comparison (09:00-15:00 reading -27% under the strict rule and +4% under the primary) mixed two things: the windows differed (56 against 28 days) and the earlier run measured against a reference rate of 0.60 U/h where the segment's current programmed rate is 0.71. With the window and the reference held fixed, the rule matters only where meals intrude: overnight (+43% primary, +45% strict at 28 days) and 05:00-09:00 agree, while at 09:00-15:00 both rules say the controller commands less than programmed (primary -18%, -24% and -21% at 28, 56 and 90 days; strict -39% at 56 and -33% at 90) and the strict rule is more extreme, which is what removing the hours after small corrections would do. The size of the selection effect is therefore about 15 points at 09:00-15:00, not a change of sign. 21:00-00:00 is unstable: +66% (56 days) and +53% (90 days) under the primary rule against +5% under the strict rule at 90 days on 22 clean hours, so it is not reported as a finding.
+`build-dataset` rebuilds `normalized/*.csv` and `window_manifest.csv` from the archived raw responses for every window whose raw files changed, without refetching; `normalize-raw` does the same by hand for one window or all of them and refreshes the manifest.
 
-**One loader, one set of definitions.** `analysis_data.load_analysis_data` reads the merged dataset once and hands every analysis the same pieces: the valid Tandem CGM readings, the 5-minute analysis grid, the pump's profile history (replayed once), the latest pump and its active profile, one moment at which both the time-of-day bins and the settings are read (the last day the profile edits are visible), Control-IQ mode changes and site fills for the whole record, the unlogged-food intervals, the exercise intervals and the context-event days. `context_rules` states the shared definitions once:
+- Timestamps are stored as time-zone-naive local wall-clock times in `TIMEZONE_NAME`. A value with a UTC offset is converted; a value without one is already local; a value that is present but not ISO 8601 stops the build instead of dropping the row.
+- A CGM reading's time is the sensor's measurement time on the pump clock (`egvTimeStamp`), not the time the pump received it. Example: a reading measured at 01:58 on the night clocks go forward and received at 03:01 is stored at 01:58.
+- CGM rows come only from sensor-reading events; readings backfilled after a signal dropout keep their measurement time.
+- Apple Health times keep the wall-clock time the phone recorded.
 
-- *CGM validity*: Tandem CGM readings from 40 to 400 mg/dL count; a reading of 0 or below 40 is a sensor artifact. Apple Health blood glucose is not a sensor stream and is not used for glucose metrics.
-- *Exercise*: a workout of 10 minutes or more (walks included) from its start until 4 hours after its end, and exercise mode on the pump from its start until 4 hours after it ends. Meal eligibility (goal E and B), the controller's clean time (F) and the episode patterns (H) all use this one rule.
-- *Analysis day*: a time-of-day bin that wraps midnight belongs to the date it started, so the early hours of 21:00-04:00 count with the evening before.
-- *Pump serial*: one string form (`pump_key`), so `1453346.0` and `1453346` are the same pump everywhere.
+How it could fail: a pump whose clock was not yet set logs events in 2020; events outside the span the archive covers for that pump are dropped when the dataset is built.
 
-The **analysis grid** (`analysis_grid_5min.parquet`) holds every 5-minute slot with observed glucose (empty where there is none, with a flag where the forecasting frame carries the last value forward), boluses, carbohydrate, IOB and the calculator's carb ratio. The forecasting frame (`prepared_model_data_5min.parquet`) drops slots with no future glucose to forecast; on the real record that is 4,692 slots holding 94 boluses and 63 carb entries, which the grid keeps. **Modes and site changes** are decoded when the dataset is built from the binary archive (2024-01 on, by tconnectsync's own event classes) and the JSON logs (2026-04-23 on), with the dates the archive covers per pump; an event stamped outside that span (a pump whose clock was not yet set logs 2020-01-15) is dropped. How to read it: if two analyses disagree about a number they both report, the loader is the first place to look, because it is the only place either reads from. How it could fail: a rule changed in `context_rules` changes every analysis at once, which is the point and also why a change there should be followed by a rebuild and a rerun.
+## Merged dataset
 
-## Breakfast I:C proposals (goal B)
+`build-dataset` fingerprints every raw input with SHA-256 (a file whose size and modification time match the previous build keeps its recorded hash) and does work only when a fingerprint changed, `--force` is given or `DATASET_VERSION` in [`dataset.py`](../src/bayesian_t1dm/dataset.py) was bumped. It then normalizes the changed Tandem windows, reads Tandem once, adds every Apple Health export (`data/raw/health_auto_export/HealthAutoExport-*.json`; the newest export wins where two overlap), and writes to `<cloud root>/data/merged/`:
 
-1. Identify an eligible logged meal and the pump segment and settings in force.
-2. Compare its glucose trace with traces predicted across carbohydrate amounts and absorption times, accounting for insulin action and within-meal correlation.
-3. Divide the meal's estimated carbohydrate equivalent by its entered grams and pool log ratios within the same settings period. The per-meal grid yields a posterior. The pooled effective I:C has a 90% Hartung–Knapp confidence interval.
-4. Read the estimate alongside sensitivity checks, observed low-glucose limits and the change record before interpreting proposal eligibility.
+- `tables/*.parquet`: CGM, bolus, carbohydrate, basal delivery, Apple Health measurements (heart rate, resting heart rate, HRV, respiratory rate, steps, weight), sleep, workouts and logged food, each deduplicated;
+- `tables/pump_profile_events.parquet` and the decoded Control-IQ mode changes and site fills;
+- `analysis_grid_5min.parquet`: every 5-minute slot with observed glucose (empty where there is none), boluses, carbohydrate, insulin on board and the calculator's carb ratio;
+- `prepared_model_data_5min.parquet`: the 5-minute frame the meal estimator reads, with Apple Health context joined where available;
+- `dataset.json` (input fingerprints, spans, row counts, the build's commit) and `validation_report.md` (inputs, spans, completeness and plausibility checks).
 
-`bayesian-t1dm propose-breakfast-icr` writes `runtime/output/proposals/breakfast_proposal.md` and `.csv`.
+Every analysis loads the dataset with `load_merged_dataset`, which refuses to return data whose raw inputs changed since the build. Two hand-kept inputs live in the raw folder: `context_events.csv` (`start_date,end_date,reason`: days such as illness or a steroid injection that analyses leave out) and an optional carb log (`carbs.csv` or `carb_log.csv` with `timestamp,carb_grams`, the one table accepted outside a `normalized/` folder).
 
-**What the page leads with.** A table with one row per pump segment of the profile now running (segments are never merged: each has its own I:C, CF and basal). For each: the settings it holds now, glucose over its own hours (time in range, below 70, below 54, above 180) for the last 90 days with the last 14 in brackets, a one-line reading (meeting the 70% target; below it with lows within limits; or lows over a limit, so no added insulin), how many breakfasts have been eaten at the current I:C (of the 5 needed), and what breakfasts at the earlier I:C say. A setting changed recently has few breakfasts at the new value; the table then shows the earlier setting's evidence beside it and says whether it supports the change.
+How to read it: when the readout and the validation report disagree about a span or a count, the validation report describes what went in and is the first place to look. How it could fail: a rule changed in code without a `DATASET_VERSION` bump leaves an old dataset in place; the version bump forces the rebuild.
 
-**Settings periods.** Breakfasts are pooled by pump segment: the segment of the pump's own profile that covers the breakfast's time of day (`profile_segment_start_minutes`, from the profile history while edits are visible and from the segments as last seen afterwards). Within one pump, profile and pump segment, a period is a run of breakfasts with the same I:C and CF (CF rounded to 1 mg/dL/U). A stay on another profile in between does not split a period; an edit to this profile's own setting does. Each breakfast is compared with its own setting, so the estimate is the I:C that breakfasts at that setting behaved like.
+## Settings in force
 
-**Historical basal and settings.** For every usable postmeal slot, programmed basal is integrated over the same logged delivery time, splitting at changes to the active profile or its programmed rate. The difference from delivered insulin contributes to the meal trajectory. The proposal evidence requires observable historical basal and an I:C and correction factor supported by the historical settings records or the meal calculator. The dated I:C support table reports meals excluded for either requirement. The retrospective comparison command retains the earlier median-basal method as a reference.
+The I:C, correction factor, basal rate and target in force at any moment come from replaying the pump's own profile events ([`pump_profiles.py`](../src/bayesian_t1dm/pump_profiles.py)).
 
-**Checks.** Every period is re-pooled three more ways: without the looser tiers (baseline drift and exploratory windows dropped), on clean reference breakfasts alone, and without breakfasts whose calculator recorded a correction bolus (a missing record counts as none). The two logged-food (Bevel) sensitivities are existing analyses. A check with fewer than 5 breakfasts is reported as not assessable and does not block.
+**Profile history.** `LID_IDP_TD_SEG` (event 68) gives one time-of-day segment of a profile after a change (start time, basal, correction factor, target, I:C); `LID_IDP` (event 69) records a profile being created, copied, deleted or activated. Tandem Source stores each 4-byte word of the record in reverse byte order; once that is undone the layout is pumpX2's, with the I:C as a 16-bit value in mg/U. A segment record with modification type 1 deletes the segment, 0 inserts one at its index, and any other value sets the segment at its index; a copy starts from the source profile's segments at that moment. Replaying the events gives, for any moment, the active profile and the segment covering that time of day. A carb entry keeps the exact moment the pump recorded (`event_time`) beside its 5-minute slot, and the profile is read at that moment, so an edit made inside a slot applies only to the meals after it.
 
-**Rule.** A proposal needs: at least 5 breakfasts at the current setting; the programmed I:C outside the primary 90% interval; every assessable check on the same side of the programmed value as the primary; and, when it adds insulin (a smaller g/U), time below 70 under 4% and below 54 under 1% over the segment's hours plus the 4 hours after, in the last 90 days (a change that removes insulin needs no such condition). The step is the smaller of 10% of the current value and the distance to the estimate, rounded to 0.1 g/U, toward the estimate. Only the segment covering most breakfasts of the last 90 days on the pump and profile now running is proposed for. How to read it: with a current I:C of 7.5 and an estimate of 6.5 (90% range 6.0 to 7.1), all checks agreeing and no lows, the proposal is 6.8: 10% of 7.5 is 0.75, less than the distance 1.0. How it could fail: carb-counting bias is absorbed into the estimate, so it is the ratio that works with how the carbs are counted; a correction factor that is wrong shifts every estimate the same way.
+**A profile's last slot.** A profile created before the archive shows its slots one edit at a time, so the archive alone cannot say whether another slot follows the last one seen. The pump logs the rate the active profile calls for about every five minutes (event 279). The last slot is taken to run to midnight over a stretch in which it keeps its start, rate and index when at least 12 of those records from 23:00 on equal the slot's rate in 95% or more of cases; otherwise its hours stay unknown. How it could fail: a hidden slot with the same basal rate would go unnoticed by the rate log.
 
-**Reproduction on real data.** For the Medium profile's segment starting 07:00 at 7.5 g/U (54 breakfasts to 2026-11-16, estimate 6.5, 90% range 6.0 to 7.1, both logged-food sensitivities agreeing, 0.2% below 70 and 0% below 54 over 07:00-13:00) the rule gives 7.5 to 6.8 by hand and by the code. The setting now running (Main, 7.0 g/U since 2026-11-16) has 1 breakfast, so the current result is "no change proposed: 5 are needed".
+**The bolus calculator's own settings.** Each meal is also compared with the I:C and correction factor its bolus calculator used. The t:slim records them; the Mobi records zeros, and they are recovered from the food and correction portions of the bolus: I:C = carbohydrate / food portion, rounded to 0.1 g/U, only when the calculator did not fold a below-target correction or insulin on board into the food portion; the correction factor and target from a Theil-Sen line through correction + insulin on board against glucose, refit by least squares on the meals within 5% of it. For each meal the I:C and correction factor come from the first available of: the calculator (recorded or recovered), the profile history, the recovered correction factor, the nearest meal in the same unbroken stretch on one pump and profile, the programmed profile. Example: 35 g with a food portion of 4.67 U and a 0.38 U correction gives 35 / 4.67 = 7.49, so 7.5 g/U.
 
-How to read it: suppose the pooled effective I:C for a segment is 8 g/U with a 90% interval of 7 to 9, and the pump is set to 10 g/U. The meals behaved as if one unit covered about 8 g, so the setting delivers less insulin than the glucose response asks for, and because 10 lies outside the interval the evidence points the same way across meals, not just on average. If the interval were 7 to 13 the same estimate would say nothing about the setting. How it could fail: the ratio is carbohydrate-equivalent over logged carbohydrate, so a habit of under-counting carbs lowers it exactly as a weak ratio would, and an unlogged snack or an incorrect correction factor is absorbed into the same number; the sensitivity re-pools exist to show whether one such source drives the estimate. The proposal rule is a screen on the interval, not the probability that the setting is wrong.
+How to read it: pick a meal, read the pump's profile screen at that moment, and the settings attached to the meal should match it. How it could fail: a setting changed and changed back between two meals, after the visible profile history ends, would be missed.
 
-## Lunch and dinner (goal E)
+## Shared definitions
 
-A setting governs every meal that falls in its pump segment, so the evidence is pooled by pump segment across meals of the day: the first bolus of 1.5 U or more in the morning (06:00-11:00), afternoon (11:00-17:00) and evening (17:00-24:00) therapy segments each day is a candidate meal (`--meal-segments`, default all three for `propose-breakfast-icr`). Lunch and dinner meet the same eligibility as breakfast, which is stricter than it sounds for later meals: no bolus in the previous 4 hours (the earlier meal's tail), insulin on board under 1 U, glucose 80 to 130 mg/dL before the meal with no steep slope, no exercise (the shared rule) or controller change just before, no unlogged food in the window, and logged carbs. The proposal assesses every segment of the profile now running and proposes the one whose current setting sits furthest outside its evidence interval, one change at a time; while changes already entered are still being evaluated, a proposal is shown as waiting, with what the evidence would otherwise support. Real data, 2026-11-17: the 09:00 segment at 7.0 g/U (181 meals) behaved like 5.8 (5.6-6.1), 15:00 at 6.8 (104 meals) like 5.4 (5.1-5.7), and 19:00 at 6.8 (48 meals) like 5.0 (4.5-5.5), each with the checks agreeing and lows within limits; the rule would support 6.8 to 6.1 at 19:00 first, and today waits for the six changes of November 17 to be judged (first on 2026-12-02). How to read it: an effective I:C well below the programmed one means those meals raised glucose more than the programmed ratio covers. How it could fail: carb counting for dinner is usually less accurate than for breakfast, and slow fat and protein absorption lowers the effective I:C; the ratio found is the one that works with how the carbs are counted, and the sensitivity without high-fat and high-protein meals is the check.
+`analysis_data.load_analysis_data` reads the merged dataset once and gives every analysis the same pieces: valid CGM, the 5-minute grid, the replayed profile history, the latest pump and its active profile, one moment at which the time-of-day segments and settings are read (the last day the profile edits are visible), Control-IQ modes and site fills, unlogged-food intervals, exercise intervals and context-event days. [`context_rules.py`](../src/bayesian_t1dm/context_rules.py) states the shared rules once:
 
-## Food the pump did not log (goal D1)
+- *CGM validity*: Tandem readings from 40 to 400 mg/dL count. Apple Health blood glucose is not used.
+- *Exercise*: a workout of 10 minutes or more (walks included), from its start until 4 hours after its end, and exercise mode on the pump from its start until 4 hours after it ends.
+- *Analysis day*: a time-of-day segment that wraps midnight belongs to the date it started.
 
-`meal_flags.py` compares the pump, Bevel (logged food) and the CGM, reading each flag in one direction only. **Food without pump carbs:** a Bevel entry of at least 5 g carbohydrate with no pump carb entry or bolus (0.5 U or more) within 30 minutes. **Possible unlogged food:** a CGM rise of at least 40 mg/dL within an hour that starts with no pump carbs, bolus or Bevel entry from 2.5 hours before to 1 hour after (a logged meal explains a rise for its absorption time). Both mark the 30 minutes before to 3 hours after the event; a breakfast window that overlaps one gets the exclusion reason `unlogged_food_in_window`, is left out of the I:C evidence, and is counted in the exclusion summary. **Bevel missing** (a pump carb entry with no Bevel entry within 30 minutes) is normal, since not every meal is logged in Bevel: it is reported and never read as "no meal", and analyses that need Bevel use only the pump carbs of that meal. On the real data: 47 Bevel entries without pump carbs and 1,062 possible unlogged rises over 2.8 years; of 124 breakfast windows that passed every other check, 14 overlap one (their rise was typically after treating a low or a snack that was never logged). The effective I:C at the earlier 7.0 g/U setting moved from 6.5 (90 breakfasts) to 6.4 (72), range 6.1 to 6.7. How it could fail: a late rise from slow-absorbing food eaten at the breakfast itself looks like a second, unlogged meal and costs a usable breakfast; the cost is a smaller sample, not a bias in one direction.
+**Food the pump did not log** ([`meal_flags.py`](../src/bayesian_t1dm/meal_flags.py)). *Food without pump carbs*: a logged-food entry of at least 5 g carbohydrate with no pump carb entry or bolus of 0.5 U or more within 30 minutes. *Possible unlogged food*: a CGM rise of at least 40 mg/dL within an hour with no pump carbs, bolus or logged food from 2.5 hours before to 1 hour after. Both mark 30 minutes before to 3 hours after the event; meal windows and clean basal time that overlap one are left out. How it could fail: slow food eaten at a logged meal can produce a late rise that looks unlogged; the cost is a smaller sample, not a bias in one direction.
 
-**Fat and protein (goal D2): tested in simulation, not adopted.** The plan was to lengthen the estimator's absorption-time prior by the logged fat and protein. The simulation harness has a `fat_protein_meals` scenario (0 to 4 fat-protein units, FPU = (9 x fat + 4 x protein) / 100; the Warsaw method's absorption durations of about 3, 4, 5 and 8 hours for 1, 2, 3 and 4 FPU hold back part of the carbohydrate). On the path that sets the effective I:C (logged carbs, vague carb prior) the estimated carbohydrate was already 9% above the truth with no lengthening (7% for meals above 2 FPU), and each added coefficient of 0.1 per FPU on the prior raised it (to 11% at 0.2 and 15% at 0.5; the error spread also grew). On the bolus-prior path of `validate-latent-meal` the scenario shows a bias of -8 g with no pre-bolus delay and +1 g with a 10-minute pre-bolus, so the sign depends on timing rather than on fat and protein. With no setting of the coefficient that improves recovery, the estimator is left as it is; breakfasts high in fat or protein stay in the primary and the existing sensitivity without them remains the check. How it could fail: real absorption of mixed meals that is slower than the simulated shapes would bias the estimate low, and the sensitivity analysis is what would show it.
+## Outcome metrics
 
-How to read it: suppose 40 breakfasts were screened and 4 carry a "possible unlogged food" flag. Those 4 are excluded from the I:C evidence and counted in the exclusion summary, so the pooled estimate rests on 36. A "Bevel missing" count only says the second record is absent, never that no meal happened. How it could fail: the rule reads a rise, not food, so slow-absorbing food eaten at the meal can look like a rise with no logged cause, and a flagged window can hide a genuine insulin-sensitivity change; small unlogged snacks under 5 g or rises under 40 mg/dL are not flagged at all.
+Consensus CGM metrics ([`outcomes.py`](../src/bayesian_t1dm/outcomes.py)): time in range 70-180 mg/dL, below 70 and 54, above 180 and 250, mean glucose, coefficient of variation and the glucose management indicator (3.31 + 0.02392 x mean). Readings are one per 5-minute slot; a day (or a part of a day) counts only with at least 70% of its expected readings. Targets: time in range above 70%, below 70 under 4%, below 54 under 1%. Time-of-day segments are the segments of the profile the latest pump runs. How to read it: a segment with time below 70 of 4% or more is over a low limit and gets no suggestion that adds insulin. How it could fail: a profile edited since the last download leaves the segments one edit behind until the next `fetch-profile-edits` and `build-dataset`.
 
-## Refresh, change record and evaluation (goal C)
+## Insulin action kernel
 
-**Refresh.** `bayesian-t1dm refresh` runs by hand, in order: `collect` (latest 30 days from Tandem Source, including segment edits), `build-dataset`, `report-outcomes`, `propose-breakfast-icr --record`. Apple Health arrives by manual export into the raw tree before the run. It writes a run folder `runtime/output/refresh/<date>_<commit>/` with a `run_record.json` (commit, whether the working tree was clean, each step's exit code, status) and then publishes it to the Project Vault `outputs/<date>/` byte-identical with `MANIFEST.sha256`. It refuses to publish a run that is incomplete, started from a dirty working tree, or whose tree has changed since, and it never overwrites an earlier publish. `--no-collect` skips the Tandem download, `--no-publish` skips the external copy. `--no-record` renders the status of setting changes and leaves the durable register untouched.
-
-**Change record.** `data/records/setting_proposals.csv` in the Vault has one row per changed value. A proposal enters as `proposed`; when the pump's profile history shows the proposed value on the same segment it becomes `entered`; once its evaluation has run it is `evaluated`. A change the person made on the pump without a proposal is recorded as `origin = person` and evaluated the same way; only the profile now running is tracked, and each row shows how many other changes fell within 24 hours (they confound each other). One change is open at a time: a new proposal is not recorded while another is proposed or entered. The previous file is copied to `records/archive/` before every rewrite. Changes are read from the pump's own segment edits: a value is a change only when it differs from what the same segment held, so re-logged segments are not.
-
-**Evaluation.** For each entered change: the 14 days before the change's day against the 14 days after it, over the segment's hours plus 4 hours, once all 14 after-days have been observed (until then the record says how many have). The measure is the mean of daily time in range, 70-180 mg/dL; the difference carries a day-level bootstrap 90% interval (4,000 resamples of days within each side, fixed seed), with time below 70 and below 54 reported against their 4% and 1% limits after the change. A day counts with at least 70% of its readings for those hours; days in `context_events.csv` are left out; at least 7 days per side are needed. How to read it: "in range 61.0% -> 68.5% (difference +7.5, 90% interval +2.1 to +12.9)" says the days after were higher by about 7 points and the interval excludes zero; the lows must still be within their limits. Before-versus-after in one person is associational: weather, illness, and other settings changed in the same days move it too, which is why the other changes within 24 hours are listed.
-
-## Basal from the controller pattern (goal F)
-
-**Data.** The controller's commanded rate (U/h) every ~5 minutes for the whole record from January 2024: the merged `basal` table holds it for the binary archive and the newer downloads alike, and equals event 279's `commandedRate` exactly where both exist (checked on 8,228 records, maximum difference 0). The programmed rate of the segment in force comes from the profile history replayed from the pump's own edit events. Control-IQ user modes (exercise, sleep) and site changes are decoded for the whole record (the binary archive from 2024-01, the JSON logs from 2026-04-23); Apple Health workouts of 10 minutes or more (walks included) add the exercise the pump was not told about.
-
-**Clean time.** The controller's behaviour reflects basal need only when something else is not driving it. Time is set aside for: 2, 3 or 4 hours after a meal by its size (carbohydrate of 15 g or more, or a bolus of 1 U or more with no carbohydrate entered; below 20 g or 2 U is 2 hours, below 40 g or 4 U is 3 hours); exercise (the shared rule: a workout of 10 minutes or more, or exercise mode, until 4 hours after it); an unlogged-food interval (`meal_flags`); and days in `context_events.csv`. Carbohydrate entries under 15 g and the pump's small automatic corrections do not set a window (the corrections are the behaviour being measured). A day-segment counts with at least an hour of clean time. The earlier **strict** rule (4 hours after any carbohydrate or any bolus of 0.5 U or more) is kept as a check.
-
-**Signal.** For each pump segment, over the last 28 calendar days (widening to 56, then 90, when too little clean time, and saying so), each day's commanded rate is compared with the segment's *current* programmed rate, weighted by clean hours. The rule chosen with the person (2026-11-18): the controller commanded 25% or more above the current rate for at least half of the clean time, mean glucose over it is above 120 mg/dL (the top of the sleep-mode target), and time below 70 and below 54 are within their limits is "basal likely too low"; the mirror case is "too high"; under 10 days or 14 clean hours gives no signal. The pooled extra insulin, the share of clean time at 25% or more, and the chance the rule is met come from resampling days (2,000 draws, fixed seed). How to read it: "+43% (14% to 71%)" is the controller delivering 1.43 times the programmed rate on average over the clean hours, with the range from resampling days.
-
-**Clean time over the whole record** (at least an hour a day): overnight 885 days and 3,374 hours; 05:00-09:00 806 days and 2,251 hours; 09:00-15:00 578 days and 1,383 hours; 15:00-19:00 396 days and 876 hours; 21:00-00:00 140 days and 259 hours; 19:00-21:00 66 days and 104 hours (dinner leaves little clean time); counted under the shared exercise rule, dataset version 14, and they change when a rule or the data change. **Real data, to 2026-11-17:** overnight +43% (14% to 71%), rule met in 91% of resamples, "basal likely too low" and stable across rules and windows (+30% at 56 days, +36% at 90); 05:00-09:00 and 15:00-19:00 no pattern; 09:00-15:00 the controller commands about 20% less than the programmed 0.71 U/h (-18% to -24%), below the 25% line so no signal; 19:00-21:00 too little clean time recently. How it could fail: the reference rate matters (the same commanded rates read very differently against 0.60 and 0.71 U/h); the commanded rate reflects the controller's own target logic, and sleep mode has a narrower treatment range than daytime (112.5-120 mg/dL against 112.5-160) and no automatic correction boluses; 28-day windows are noisy where clean time is thin.
-
-## Problem episodes and responses (goal H)
-
-`episodes.py` finds every **high** (glucose above 250 mg/dL for 90 minutes or more) and **low** (below 70 for 15 minutes or more) in the last 120 days, describes what the record shows around each, and names the pattern those facts support. Rules are applied in order and the first match wins; the evidence that triggered it is shown beside it. Highs: *possible infusion-site or insulin problem* (a site change from 30 minutes into the episode to an hour after it ended, a high of 1.5 hours or more, with corrections given or extra controller basal); *meal dosed short of the pump's own ratio* (carbohydrate logged in the 2 hours before, and carbohydrate divided by the pump's recorded I:C needed at least 15% more insulin than was given); *meal dosed as calculated, glucose still rose*; *rise with no logged cause* (an unlogged-food interval); *stacked or late insulin* (glucose fell 120 mg/dL or more within 90 minutes of the end with 2 U or more still active); *persistent high with no meal before it* (3 hours or more); otherwise no pattern. Lows: *during or after exercise* (the episode began during exercise or within 4 hours after it, the shared rule, with a bolus in the 4 hours before); *after corrections without carbohydrate* (1 U or more in the 3 hours before); *meal dosed above the pump's own ratio*; *overnight with no bolus before it*; otherwise no pattern. A pattern is not a diagnosis: it says which explanation the recorded data support.
-
-**Repeats.** A pattern repeats when at least 4 episodes of one kind fall in a pump segment and at least half have that pattern; a repeating meal pattern points at that segment's I:C, a repeating persistent or overnight pattern at its basal, a site or stacking pattern is not a setting. **Playbook.** Each pattern carries what it points at and what to check, with your own numbers where they exist: the share of meal boluses followed by a low within 4 hours when the meal is during exercise or within 4 hours after it (the shared rule), against other meals, each with a Wilson 90% interval over the whole period the workout log covers (so a meal is "not during exercise" only when a workout could have been recorded); and how many long highs ended within an hour after a site change against how often that would happen by chance. Real data, last 120 days: 43 highs and 21 lows; *meal dosed as calculated, glucose still rose* is the most common high (21) and repeats at 09:00 and 15:00, which agrees with the I:C evidence; overnight lows with no bolus repeat at 00:00-05:00 (5 of 6) in the same hours the controller adds extra insulin, so basal needs a closer look before it changes; over 2024-05-25 to 2026-11-16, 556 meals during or within 4 hours after exercise were followed by a low in 11.3% (9.3% to 13.7%) against 8.0% (6.7% to 9.6%) of 934 others; the ranges overlap narrowly, so the page does not flag it, and the direction (more lows after exercise) is the one to watch as data accumulate. How it could fail: the workout log has gaps; site fills are decoded from the whole archive (2024-01 on); the classification reads only recorded insulin and carbohydrate, so unlogged boluses or food appear as no pattern.
-
-How to read it: suppose 8 long highs fall in one pump segment and 5 are labelled "meal dosed short of the pump's own ratio" (for example 60 g logged, an I:C of 10 g/U needing 6 U, and 4 U given). That is a repeating pattern (at least 4 episodes, at least half the same label), which points at the segment's I:C, and the playbook line says what to check. Five of 8 is a prompt to look, not an estimate of anything. How it could fail: the labels are ordered rules over recorded insulin, carbohydrate, site changes and workouts only, so carbohydrate that was eaten but not logged is labelled "rise with no logged cause" and the first matching rule wins even when two causes overlap.
-
-## The front page and the runtime tree
-
-`refresh` builds `runtime/current/index.html` (`front_page.py` reads, `front_page_page.py` writes; `front-page [--run-dir DIR]` rewrites it in a run folder without a refresh). It is one self-contained HTML file with no script, no network and no library, and it is the one place to read the result. Nothing on it is typed by hand: it is built from the run folder's own copies, `I_forecast/supporting/diagnostics.xlsx`, `J_replay_predictor/supporting/diagnostics.xlsx`, `00_General/diagnostics.xlsx` and `B_icr/icr_proposal.md`, so the page and the files beside it always come from the same run. The header gives the run id, the commit and whether the working tree was clean. A slope or power the run could not estimate prints as "not estimated" or "power not assessed", never as a reading. A source that was never written becomes a stated gap ("not available", with the path and the command that writes it), never a fill; a source that exists but lacks a sheet, a column or a named check, or whose verdict disagrees with its own interval, stops the refresh.
-
-**Order.** The goal in two lines and the evidence run IDs; three answers at a glance, each a status chip and one sentence that links to its section; then the sections in order.
-
-1. *Does the model forecast better than the last 28 days?* The prespecified win test (hour-day model minus last-28-day CRPS, 90% block-bootstrap interval; the origin, window and resample counts are read from the workbook) with its verdict (win when the whole interval is below zero, loss when it is above, otherwise tie), then a chart of every predictor's paired difference from the last 28 days, then the exploratory comparators (365-day mean, all-history mean, settings pinned), stated as chosen after seeing the results and not gating, with the sentence the comparisons support.
-2. *Can the record show what a settings change would do?* The replay-as-predictor result: how many past changes could be predicted, the slope of observed on predicted change with its 90% interval for each outcome and set of changes, the power to find a true slope of 1, and whether the settings in force predicted the window better than the old settings. Ranked setting changes are shown as "not shown" unless the primary slope interval (time in range, isolated changes) lies above zero; when the test has under 80% power, a slope interval that holds zero is called uninformative, not evidence of no effect.
-3. *Is the record fit to be modelled?* Counts of audit checks by status, the checks not assessed, and the named checks for unknown settings hours, clocks, covariates not known at the forecast origin and the latest fortnight against the earlier record.
-
-Below the verdict: the breakfast I:C proposal in its own words (the meal-level analysis, labelled as separate from sections 1 and 2), a link to the glucose dashboard, and a table of every goal folder with its files and diagnostics workbooks (a file that was not written is listed as such, not linked).
-
-**Design rules in the code.** Status chips (`figures.STATUS_STYLE`, `VERDICT_STYLE`) carry a glyph and a word as well as a color; "not assessed" and "not available" are dashed and hollow so they never look like a pass. Predictors keep their `figures.PREDICTOR_STYLE` color, label, marker and line type, and the two sets of changes their `CHANGE_SET_STYLE`, in every chart. Charts are HTML and CSS (real text, no fixed scale), so labels never shrink on a phone: rows stack above their tracks under 620 px, and tables become one card per row. Each chart has a one-line how-to-read and a caption with its denominators; each number is printed once (the verdict sentence, or a table) and the prose cites it; effect sizes and intervals come first. Folders `I_forecast/` and `J_replay_predictor/` hold the forecast and replay-as-predictor outputs; their letters are provisional until the goals table assigns them (G is the correction factor).
-
-**The glucose dashboard (`dashboard.html`).** One self-contained page (no network, no libraries; light and dark) with tabs, written by `propose-breakfast-icr`. **Today** opens with the consensus numbers and a short list of what needs a look, safest first (lows over a limit, then settings the evidence says to change, then what to watch), each with a button to the chart behind it. **Glucose** shows a typical day (median, middle half and middle 80% by time of day, with segment boundaries), time in range per pump segment, day by day with a 14-day average, and when long highs and lows start. **Episodes** lists the long highs and lows with their patterns and a trace for each. **Meals (I:C)** is a forest plot per pump segment of the I:C the meals behaved like with its 90% range against the pump setting (rows with fewer than 10 meals are faded; the number after the dates is the meal count). **Basal** shows what Control-IQ did against the programmed rate. **Changes** has the proposal, its checks and every setting change. **About** says how to read each part. The list of what needs a look is built by `dashboard.find_problem_areas` from the same numbers the tabs show; a setting changed since its last meals is reported as a change that fits (or does not clearly fit) the evidence.
-
-`runtime/` is organised so that only `current/` needs opening: `current/` and each `runs/<date>_<commit>/` hold `index.html`, `dashboard.html` and one folder per goal (`A_outcomes/`, `B_icr/`, `C_changes/`, `F_basal/`, `H_episodes/`, `I_forecast/`, `J_replay_predictor/`, `00_General/`), each with a `supporting/` folder for diagnostics. `output/` holds the working folders individual commands write to; a refresh gathers what matters from there (`layout.py`). Superseded files are moved to `archive/` with a manifest, never deleted.
-
-## Hour-day table and settings in force
-
-`hour_day.build_hour_day_table` makes one row per clock hour of every day from the first to the last CGM day (about 25,000 rows for 2024-01 to 2026-11). A time-of-day segment is a run of clock hours, so a model of this grain can be rolled up to any segment layout, including layouts that do not exist yet; the segment-day is a reporting roll-up (`rollup_segment_days`), not the unit of analysis. An hour is assigned to the segment that holds its half-past minute, a segment that wraps midnight takes its after-midnight hours from the previous date, and the number of hours that straddle a segment boundary is reported.
-
-Each row holds the readings in the hour (`n_valid` at most 12, one per 5-minute slot; `n_in_range`, `n_below_70`, `n_below_54`, `n_above_180`), the I:C, correction factor, basal rate and target in force, and context: carbohydrate and bolus in the hour, carbohydrate in this hour and the three before, share of the hour inside an exercise interval, share in pump sleep mode, share inside an Apple Health sleep period, days since the last cannula fill, and flags for a day listed in `context_events.csv` and for a clock-change day. Clock hours are the pump's local wall-clock hours: the hour that does not exist on the spring-forward day has no readings, and on the fall-back day the repeated hour's readings are kept once.
-
-**Settings in force.** An hour's setting is the mean over its twelve 5-minute moments of the value the pump's active profile held at that moment, read by `ProfileHistory.values_at` (the same exact-time replay the controller analysis uses): an edit at 09:07 gives hour 9 two moments of the old value and ten of the new. A moment the archive cannot show (a slot of a profile that predates the archive and was not yet seen, a time outside the span where the pump's edits are visible) is not counted, and `settings_known_slots` says how many of the twelve were. Whether the settings *changed* is read from the moments, not the hour means: a moment differs from the same moment of the previous day on the same pump. Comparing hour means would count the mixed hour a second time the next day. A change made at 09:07 therefore marks hours 9-23 on that day and hours 0-9 the next day, which is when the hours that had already passed first run the new value.
-
-How to read it: pick any day and hour, compare its settings columns with the pump's profile screen at that moment, and its counts with the CGM readings of that hour. How it could fail: an hour straddling an edit holds a blend of two settings, flagged by `settings_mixed`; a pump swap resets the comparison (settings are not compared across pumps), so a real change on the day the pump changes is invisible; a profile slot the archive never showed leaves its hours unknown.
-
-## Replay of past setting changes (exploratory)
-
-`python -m bayesian_t1dm.replay` finds every change in the settings in force (a changed hour in the hour-day table; consecutive days form one event), and for each asks what a predictor that sees only the days before it expects over the affected hours (the changed hours and the 4 after) for the next 14 days, and what happened. The same is done for five *matched* placebo dates per change (no change within 14 days either way, within 90 days of the same time of year in any year, the same data sufficiency, the closest pre-change time in range) and five random ones. A day counts when at least 70% of the expected readings in those hours are present, context-event days are left out, and a change needs 14 of the 28 days before and 7 of the 14 days after.
-
-The predictors resample days: the last 28 days (primary, the baseline named for the goal) or the last 90 days with weights halving every 28 days. Each draws as many days as the observed window has and pools their readings. A predictor is any function `(history, n_days, rng) -> draws` of the days before the event, so the outcomes model plugs into the same replay.
-
-**Estimand.** For each outcome (time in range, time below 70, time below 54, mean glucose) `delta` is the mean over changes of (observed minus predicted) minus the mean over each change's matched placebo dates of the same quantity, in percentage points (mg/dL for mean glucose). The predictors do not use the settings, so `delta` measures how far the 14 days after a change sit from the pre-change level, over and above how far a no-change date sits from its own pre-level; regression to the mean and season are in the placebo, not in `delta`. Intervals are 90% percentile intervals from a bootstrap that resamples clusters of changes within 14 days of each other, with their placebos. Direction agreement counts, for changes whose settings move insulin one way, whether mean glucose moved down after more insulin (up after less) and time below 70 moved up after more insulin (down after less), against the same share on the placebos. This is an association in one person's record and says nothing about the cause.
-
-How to read it: if `delta` for time in range is +3 (90% interval +1 to +5), the 14 days after changes did 3 points better, relative to the pre-change level, than no-change dates do; an interval that includes 0 says the record does not separate changes from ordinary drift. With about a dozen estimates in the table, one or two intervals will exclude 0 by chance, so a lone interval that excludes 0 is a lead, not a finding. How it could fail: the baselines under-cover (the 90% interval holds about 75% of placebo dates, because day-to-day outcomes are correlated), so single-change residuals look more extreme than they are, which is why only the change-minus-placebo difference is interpreted; and several settings changing together cannot be told apart.
-
-The run writes `replay_summary.csv` (the estimates), `replay_scores.csv` (one row per change and placebo date and predictor), `replay_calibration.csv`, `replay_figure.png` / `.svg`, a log with the run ID, and `diagnostics.xlsx` (specification, flow from the changed days to the scored changes, checks with statuses, the changes left out with the reason, limitations, provenance). It fails when a stage of the flow has no changes left.
-
-## Data-quality audit (step A)
-
-`python -m bayesian_t1dm.data_audit` checks the record that the hour-day table and the outcomes model rest on, and writes `runtime/output/data_audit/`: `diagnostics.xlsx`, a generated `data_audit_summary.md`, three figures, and a log with the run ID. The checks themselves are pure functions of the loaded analysis data and the hour-day table (`data_audit`); `data_audit_report` reads the pump's event log, assembles the sheets, reads the workbook back and fails when its flow differs from `hour_day_flow` or when `Record_Issues` does not account for the hours the flow says were lost.
-
-Every check row has a statistic, a result, a rule, a status (no concern, concern, not assessed, not applicable) and a reason; a check that could not be run is "not assessed", never "no concern". The sheets cover coverage of each data stream; CGM quality (active time per 14-day window, gap lengths, duplicates, values outside the sensor's range, flat runs, compression lows, sensor sessions); pumps and clock (the break in outcomes at a pump change judged against the steps between other adjacent 28-day blocks, pump clock changes from the pump's own event sequence, each netted over the time-changed, date-changed and new-day events written together, with the days spent on a clock away from home read from the running sum of those shifts, and the local clock changes the pump never followed); the settings reconstruction (why each hour with readings has unknown settings, by pump, clock hour and month; the pump calculator's I:C, correction factor and target at each meal against `values_at`; the pump-logged basal rate of the active profile against `values_at`; the replay's setting-change events against the raw edits and activations); meals and insulin; missingness and stationarity; and a leakage table.
-
-**Why settings are unknown.** `ProfileHistory.unknown_reasons` returns, for each moment `values_at` cannot show, the first reason that applies (no visible span, outside it, before the first activation, the active profile never seen, before the profile's first record, before a known segment start, the next slot unseen, the last slot's profile not whole). The reasons partition the unknown moments exactly; a test fixes that.
-
-**Composition test.** Hours with unknown settings are not a random subset: they cluster in some clock hours and some months. The test standardises the time in range of known-settings hours to the unknown hours' mix of clock hour and calendar quarter (direct standardisation, weights from the unknown hours' readings), on the days the model uses, and compares it with the unknown hours' time in range. Unknown hours in a cell with no known hours are left out of both sides. The 90% intervals resample the same days for both sides; a cell with no known reading in a resample is missing from that resample, not 0%. If the standardised gap includes 0, dropping unknown hours changes which hours of the day and year are modelled, not necessarily their level.
-
-How to read it: a check with status "concern" names the rule it broke and what that implies for the analysis. A calculator or basal check below 99% agreement says the hour-day table's settings are wrong at those moments, not unknown. The basal-log comparison is partly circular for a profile's last slot, whose end the same logged rates confirm, so the calculator comparison is the independent one. A leakage row marked concern says the column is not known at the forecast origin and is used by the model or to drop rows. How it could fail: agreement checks compare the reconstruction only where it is known, so a profile history that is wrong in a place with no logged calculator value goes unseen; the break check cannot separate a pump change from a change in the person on the same date; clock jumps are measured between consecutive pump events, which is accurate to the minutes between two events.
-
-## Hour-day outcomes model
-
-`python -m bayesian_t1dm.outcomes_model` fits one model to every usable row of the hour-day table. A row is usable when the hour has at least one reading, all twelve of its 5-minute moments have a known setting (`settings_known_slots`), the day is not a context-event day and every covariate is present. For hour `i` of day `d`, the count `y_i` of readings in the outcome (time in range, below 70 or below 54, one model per outcome) out of `n_i` valid readings is beta-binomial, because readings inside an hour are correlated and a binomial would be over-confident:
+Insulin exposure uses a fixed-duration action curve ([`insulin.py`](../src/bayesian_t1dm/insulin.py)) with dose $D$, minutes since the dose $t$, duration $t_d = 300$ and peak $t_p = 75$:
 
 $$
-y_i \sim \mathrm{BetaBinomial}\left(n_i,\ \mu_i \phi,\ (1-\mu_i)\phi\right), \qquad
-\mathrm{logit}\,\mu_i = \alpha + \sigma_h z^{h}_{\mathrm{hour}(i)} + \sigma_d z^{d}_{d(i)} + x_i^{\top}\beta
+\tau = \frac{t_p (1 - t_p / t_d)}{1 - 2 t_p / t_d}, \qquad a = \frac{2 \tau}{t_d}, \qquad S = \frac{1}{1 - a + (1 + a)e^{-t_d / \tau}}
 $$
-
-`z^h` (24 clock-hour effects, constrained to sum to zero so they cannot trade off with `alpha`) and `z^d` (one effect per day) are standard normal and scaled by `sigma_h` and `sigma_d` (non-centered). There is no slow drift term: a random-walk level over weeks or over 28-day blocks did not sample reliably, because its scale is not identified beside the day effects (divergent transitions and effective sample sizes below 400 at every setting tried)). A smooth drift (a Hilbert-space Gaussian process on calendar time, 40 basis functions, length scale about 4 months) was fitted as a sensitivity analysis: its fitted level stays within a few tenths of a logit unit and every coefficient moves by 0.012 or less (log-odds per standard deviation), so slow drift in the person's level does not explain the associations, but it also does not sample cleanly (divergences), so it is not part of the model. The covariates `x_i` are the settings in force (log I:C, log correction factor, log basal rate, target per 10 mg/dL) and context (log of 1 plus carbohydrate in this and the three previous hours, share of the hour in exercise, share in sleep mode, days since the last cannula fill capped at 5). They are standardized with the mean and standard deviation of the training rows, so `beta` is the change in the log odds of an in-outcome reading per standard deviation of the covariate, and a held-out period is standardized with the training values. Bolus, insulin on board and delivered basal are left out: they lie on the path from the settings to glucose, and including them would hide what the settings do.
-
-Priors: `alpha` is centered on the typical share of the outcome (70% in range, 3% below 70, 0.5% below 54) with scale 1 on the logit scale; `beta` Normal(0, 0.5); `sigma_h` half-normal(1), `sigma_d` half-normal(0.5); `log(phi)` Normal(0, 1.5).
-
-**What it supports.** Predictions: given the settings and context of a day, the model returns a distribution of each hour's counts and so of the day's share of readings in the outcome (`predict_day_shares`, summing over the day's hours), with a new day effect drawn for a day it has not seen. That is a predictive, associational statement. With clock-hour and day effects in the model, a setting's `beta` is identified from how that setting's changes over time line up with the outcome in the same clock hour, and settings and context often change together, so a coefficient is not the effect of changing that setting.
-
-**Before the fit.** Variance inflation factors of the covariates, raw and after removing each clock hour's mean (the within-hour value is the one that matters once hour effects are in the model); a value of 10 or more, or a covariate that does not vary within clock hours (no within-hour value), stops the run. A prior predictive check draws 200 data sets from the priors and reports the overall share of readings in the outcome (5th to 95th percentile).
-
-**After the fit.** The 24-hour check compares, for each clock hour, the observed share of readings in the outcome with the 5th to 95th percentile of simulated counts from the posterior (in-sample); it reports how many hours fall inside, and a sign test on how many observed shares sit above the median (a one-sided pattern means the model misses the overall level even when every hour is inside its interval). The rolling-origin check refits on the days before each of the last four fortnights and scores the next 14 days' daily share (CRPS and 90% interval coverage) against a baseline that draws one day at random from the 28 days before the origin and ignores the settings; the model sees each held-out day's settings and context, the baseline does not. A fortnight with no usable day is not scored and is listed with the reason.
-
-**Sampler gate.** NUTS with 4 chains of 1,000 tuning steps and 2,000 draws (the maximum R-hat over about 1,250 parameters, mostly day effects, is noisy at 1,000 draws and can land just above 1.01 by chance), target acceptance 0.95, maximum tree depth 10 (0.9 leaves divergences when the outcome is rare, as for readings below 54, where the hour scale is weakly identified). The fit is used only when R-hat is below 1.01, bulk and tail effective sample sizes are above 400 for every parameter and there are no divergences; otherwise the run writes its diagnostics and fails. Compile time and sampling time are logged separately.
-
-How to read it: if `beta` for log I:C is -0.10 (90% interval -0.16 to -0.04), hours with a one-standard-deviation higher log I:C (weaker meal insulin) had about 10% lower odds of a reading in range, holding clock hour, day and the other covariates fixed. How it could fail: a setting that changed only a few times is estimated from a few episodes, so its interval is wide and its sign can be set by whatever else changed then; and a slow trend in the person's level (no drift term) that coincides with a setting change can load on that setting. The beta-binomial likelihood does not preserve the mean the way a binomial with a logit link does, so the fitted share of readings in the outcome runs slightly below the observed share (about half a percentage point overall, up to 2 points in some clock hours); a binomial would match the overall share exactly but treats the readings of an hour as independent, which they are not. The sign test of the 24-hour check reports this.
-
-## Forecast evaluation harness (step 2)
-
-`python -m bayesian_t1dm.forecast_harness` scores predictors of the next 14 days' share of readings in range (or below 70, or below 54) at weekly origins, and writes `runtime/output/forecast_harness/`: `diagnostics.xlsx`, a generated `forecast_harness_summary.md`, one figure, the per-origin scores and a log with the run ID. `--skip-model` scores the baselines and the ridge only (the power check, which uses no model); `--reuse-posteriors` stores each origin's fit and reuses it only when the training data, the model code (a hash of `outcomes_model.py` and the sampler settings) and the draw settings are identical; a mismatch is an error. `--score-model-development` also refits and scores the model at the development origins (reported as development only). The default is 3,000 draws per chain: 2,000 draws gave a gate miss (R-hat just above 1.01) at one origin.
-
-**Origins and target.** Origin `t0` is the first forecast day; a predictor sees only rows dated before `t0` (the harness cuts every source at `t0` and asserts it). Evaluation origins are `L - 13 - 7k` for `k = 0..51`, where `L` is the last CGM day, so the last window ends on `L`; development origins (every second week of 2025) are for model choices and never for the win test. A window with under 70% of its 4,032 possible readings is not scored and is listed. The target is the sum of readings in the outcome over the sum of valid readings of all 14 days: context-event days and hours with unknown settings stay in, because a day is excluded after its outcome is known.
-
-**What is known at the origin.** All glucose, delivered insulin, the calendar, and the settings profile in force at 23:55 of the day before, read at each clock hour's twelve moments and repeated over the window ("frozen"). Carbohydrate, exercise, sleep mode, site age and context events inside the window are not known. The number of windows in which the pump's settings really change is reported (the frozen forecast is wrong there by construction); the "planned settings" variant of the model feeds the settings actually in force, is reported and never gates.
-
-**Predictors.** Baselines: last 28 days (prespecified; the reference), last 14 days, and recency-weighted (day weights halve every 14 days, over 90 days). The point is the readings-weighted share over the lookback. The spread is the baseline's own past errors: at every earlier daily origin `s` whose window ended before `t0`, `e_s = logit(observed_s) - logit(point_s)`, and the predictive draws are `expit(logit(point_t0) + e)` with `e` resampled (4,000 draws). A baseline is therefore calibrated to its own misses, so a win cannot come from the baseline's spread being wrong. The ridge comparator regresses `logit(observed)` on the logit share of the last 7, 14, 28 and 90 days, the frozen settings relative to the trailing 28-day total daily dose (mean log of I:C x dose, mean log of correction factor x dose, log of basal over dose) and month, with the penalty chosen by blocked 5-fold cross-validation in time (windows within 13 days of a test fold are left out of that fold's fit); its spread is the last 120 out-of-fold residuals. The current hour-day model is refitted on the rows before every origin; each predictive draw takes one posterior draw, resamples 14 whole days of exposures from the 28 days before `t0` (joint within a day), and simulates beta-binomial counts hour by hour with the realised number of readings per hour (the count of readings is not glucose information). Every refit must pass the sampler gate or the run fails. Variants sharing the fit, none gating: planned settings, every setting pinned at the training centre (the settings terms drop out, so the model's level is all its training history), and the trailing 28-day mean reading counts in place of the realised counts. Two exploratory comparators were added after the first results to show what the model's level is worth: the mean of the last 365 days and the mean of all earlier history. The ridge penalty's cross-validation leaves out of each fold's fit the windows within 13 days before the fold and within 13 + 90 days after it, because their features look back into the fold's outcomes.
-
-**Win test.** CRPS of the draws, in percentage points (`replay.crps` times 100). The difference `d_k` is candidate minus last-28-day CRPS at origin `k`. The mean of `d` gets a circular block bootstrap over the scored origins in time order (block of 4 origins, 10,000 resamples, seed 20261119; blocks 2 and 8 as sensitivity) and a 90% percentile interval. The candidate wins only if the upper bound is below 0; an interval holding 0 is a tie and an interval above 0 a loss, and the workbook marks a tie or loss "concern". The same rule judges the rolling-origin check of the outcomes model (block of 14 days). Only the model against last 28 days at block 4 gates; blocks 2 and 8 and every other comparison are reported with status "not applicable" (they do not gate). A win by this rule shows that the forecast is better than last 28 days; it does not show that the settings carry forecasting information (compare the pinned variant and the longer means). Also reported: the model against the other predictors, mean CRPS, mean absolute error of the median, 90% interval coverage, the PIT histogram and the share of origins better than last 28 days.
-
-**Power check.** Half the width of the 90% interval of last-14-day minus last-28-day CRPS is the smallest mean difference the origins can separate from 0. It comes from two similar baselines, so a model whose CRPS differs more from the reference at each origin has a wider interval than this.
-
-How to read it: a mean difference of -0.50 (90% interval -0.90 to -0.10) says the candidate's predictive distribution is about half a percentage point closer to the realised 14-day share and that the origins are enough to separate this from chance; -0.50 (-1.10 to +0.20) is a tie, the origins cannot rank the two. How it could fail: weekly windows overlap by 7 days, so 52 origins hold about 13 independent blocks and the interval can be too narrow if dependence extends past the block; the frozen profile is wrong in windows with a real settings change; baseline spreads come from heavily overlapping earlier windows; a lower CRPS is a better forecast, not evidence that changing a setting would change the outcome.
-
-## Replay as predictor (step 4)
-
-`python -m bayesian_t1dm.replay_predictor` asks of every past change in the settings in force that the replay scored: did the outcomes model, fitted only to the days before the change, predict the change in the 14 days after it? It writes `runtime/output/replay_predictor/`: `diagnostics.xlsx`, a generated `replay_predictor_summary.md`, one figure, the per-change rows and a log with the run ID. `--outcomes` picks time in range (always), time below 70 and time below 54; `--reuse-posteriors` stores each fit and reuses it only when the training data, the model code and the draw settings are identical; the sampler is the harness's (4 chains, 1,000 tuning steps, 3,000 draws) with the target acceptance a run setting, `--target-accept` (default 0.95, the model's own; raised for a run whose fits show divergences, uniformly for every fit and recorded in the run's provenance), and every fit must pass the sampler gate or the run fails.
-
-**What is predicted.** For a change, the outcome is the share of valid readings in range (below 70, below 54) over the replay's affected hours (the changed clock hours and the 4 after) on the 14 days after the change, pooled over the days the replay counted. The model gives the expected share of that window under two settings: the profile in force after the change (new: the profile at the end of the change's last day, held for the 14 days) and the settings actually in force on each of the replay's baseline days (the qualifying days of the 28 before the change, weighted by their readings in the affected hours). The observed change is measured against the last-28-day predictor, which pools exactly those days, so predicting against their settings makes the predicted and observed changes the same quantity; a change that reverses an edit made 10 days earlier has both settings in its baseline. Both arms use the same posterior draw, the same day effects and the same resampled exposures (14 whole days drawn from the 28 days before the change), so the difference is the settings' contribution alone. The predicted change is new minus baseline in percentage points with the 5th and 95th percentile over the posterior draws. A sensitivity uses the profile in force the day before the change as the old arm.
-
-**What is known at the change.** The fit uses only rows dated before the change's first day. A change within 14 days after the first change of its group reuses that change's fit; the old settings, baseline settings and exposures are always read at the change's own date. The code asserts that no row on or after the change reaches its fit, and a test plants future rows and checks that nothing the prediction reads moves. The new settings are the change under test, not an input known in advance; a later change inside the window is in the observed change and not in the prediction. The reading counts per hour are the realised ones on the counted days, as in the harness. The profile the pump's history gives for each day and the hour-day table's settings must agree on every day without a change (otherwise the run stops). A change is left out, with the reason in the workbook's record issues, when the replay did not score it, fewer than 90 days with usable hours precede it (the model has 24 hour effects, 8 covariates and a day effect to learn), a setting is unknown at an affected hour before the change, after it or on a baseline day, no complete day of exposure precedes it, or the setting values at its changed hours are equal before and after (the predicted change is exactly zero and there is no setting to test).
-
-**Comparison with what happened.** The observed change is the replay's `delta` for that change: its miss from the last-28-day predictor minus the mean miss on its five matched no-change dates, over the same affected hours, in percentage points. For each outcome and group (isolated changes, the primary group: no other change within 14 days; and all changes) the run reports the least-squares slope of observed on predicted change, the Pearson correlation, the share of changes whose predicted and observed changes have the same sign, and how often the observed change lies inside the 90% credible interval of the predicted change and inside the predicted change plus the range the observed change takes when nothing changed (the 5th to 95th percentile of placebo misses centred on their mean and widened by the square root of 1.2, because the observed change subtracts a mean of five placebo misses). The credible interval describes the expected change, not the sampling noise of one observed window, so it under-covers by construction. Intervals are 90% percentile intervals of a cluster bootstrap (10,000 resamples) that resamples whole clusters of changes within 14 days of each other. A group with fewer than 3 changes is listed as not estimated. Sensitivities: the old arm as the profile the day before the change; changes predicted from the prior alone left out. Each cluster of changes is also left out in turn, giving the range of the slope and of the mean CRPS difference over the leave-one-cluster-out estimates, which shows how far one cluster moves a result. Every slope and CRPS-difference interval of every outcome and group is reported and counted (no adjustment is made for the number examined); a slope interval that excludes 1 says the record rules out correctly sized predictions at the nominal level, which with few clusters is a weaker claim because a percentile cluster bootstrap can be too narrow. The model's 90% predictive intervals are checked for coverage of the observed windows; coverage below the acceptable range means they are too narrow (under-dispersed) for these windows. The model's settings act only within the same clock hour, so its predicted effect in the 4 hours after the changed hours is zero by construction, while the observed change includes them.
-
-**Prior-only predictions.** For each change, the posterior SD over the prior SD of the coefficients of the settings it moves is read from its fit; a ratio of 0.8 or more means the record had not informed that coefficient (for example a setting that did not vary in the training days) and the prediction rests on the prior. Those changes are marked "prior only", flagged in the checks, and left out in one sensitivity.
-
-**Power.** Observed changes are simulated as a true slope times the real predicted changes plus normal noise with the real residual SD, keeping the real clusters, and the share of simulations whose slope interval lies above zero is reported for true slopes of 0.5, 1, 2 and 4 (1 means the predicted sizes are right). With low power, a slope interval that holds zero is uninformative about whether the predictions carry signal. The simulation draws independent normal noise with the residual SD (which includes any outlying change) and uses the percentile cluster bootstrap, which is too narrow with few clusters, so its power is approximate and optimistic in that respect.
-
-**Settings-information test.** For each change, the CRPS (percentage points) of the window's share under the new settings and under the old settings (the profile the day before the change, held), with the same fit and exposures. The paired difference new minus old is averaged over changes with the same cluster bootstrap; below 0 means the settings in force predict what happened better than the old settings.
-
-**Specification.** Slope of observed on predicted change: percentage points observed per percentage point predicted. Contrast direction: new minus baseline; for time below 70 and 54 a negative predicted change means fewer lows.
-
-How to read it: suppose the model predicts that a lower I:C raises time in range by 2 points in one change and lowers it by 1 in another, and the observed changes (after subtracting no-change dates) are +3 and -1. A slope near 1 with an interval that excludes 0 says the predicted sizes line up with what happened; a slope interval that holds 0 says the record does not show that the predictions carry information, which is not the same as showing they carry none unless the power to find a true slope of 1 is high. A CRPS difference of -0.5 (90% interval -0.9 to -0.1) says the settings in force predicted the window about half a point better than the old settings; an interval above 0 says the old settings predicted it better; one holding 0 does not tell them apart. How it could fail: changes cluster in time and the isolated set is small, so the cluster bootstrap rests on few clusters and can be narrower than its nominal level; the observed change is one person's few hours over 14 days; the person chose the settings knowing the recent glucose, so a match is an association and does not show that changing a setting changes the outcome; a single recent change with few counted days can move a slope estimated from about ten changes.
-
-## Personal readout (goal K)
-
-`python -m bayesian_t1dm.readout_report` writes `runtime/output/readout/`: `readout.html` (one self-contained page drawn for a phone), `diagnostics.xlsx`, the driver effects and the settings check as CSV, and a log with the run ID. When both models pass the sampler gate the page is copied to `<cloud root>/readout/readout.html`, so it opens from the OneDrive app; a failed gate fails the run and nothing is copied.
-
-**Day table.** One row per calendar day (`readout.daily_table`): the consensus glucose metrics (a day counts with 70% of its readings), bolus, delivered basal and carbohydrate from the pump, and the context before the day. Sleep is the night that ended on the morning of the day, one record per night from the first device in a fixed order (Oura, then Apple Watch). Resting heart rate and HRV are daily means; each is compared with the median and robust spread (median absolute deviation x 1.4826) of the previous 28 days on the same device, with at least 10 such days, so a change of ring or watch is not read as a change in the person. Site age is the time since the last cannula fill at midnight. Insulin and carbohydrate are compared with the median of the previous 28 days.
-
-**Drivers.** Fixed before any fit (`readout.DRIVERS`): sleep under 6 hours the night before; low recovery the day before (resting heart rate more than one spread above, or HRV more than one spread below, baseline); at least 200 kcal of workout active energy the day before, and two days before; 10 g or more of carbohydrate entered at or after 21:00 the evening before; an infusion site 3 or more days old at midnight (its fourth day or later). A day enters the model when it counts, is not a context-event day, has site changes observed and has every driver measured; the flow and each left-out day are in the workbook. A driver needs 15 modelled days with it and 15 without to be estimated.
-
-**Model.** For time in range and, separately, time below 70: readings in the outcome on day `d` ~ BetaBinomial(`n_d`, `mu_d * phi`, `(1 - mu_d) * phi`), `logit(mu_d) = alpha + month effect + weekend + sum_k beta_k * driver_k(d)`. The month effect is partially pooled (half-normal scale, prior 0.5), so a driver is compared with days of the same month and slow change in settings, season and habits does not load onto it. Each `beta_k` has a Normal(0, 0.5) prior on the logit scale, which holds effects with little support near zero. The reported effect is the average marginal effect: over the modelled days, the mean difference in the predicted share of the day with the driver set to yes and to no, in percentage points, with a 90% posterior interval and the probability that it is above zero. 4 chains of 1,000 draws after 1,000 tuning steps; the shared sampler gate (R-hat under 1.01, bulk and tail effective sample size over 400, no divergences) applies to both fits.
-
-**Settings check.** Basal reuses the controller signal of goal F, I:C reuses the effective I:C of goals B and E (clean first meals of the day), each read for the segment the pump holds now. Basal "needs more insulin" when the controller signal says the basal is likely too low; I:C "needs more insulin" when the 90% interval of the effective I:C lies below the ratio set now (carbohydrate needs more insulin than the setting gives), and "needs less" in the mirror case. A suggestion is one step of 10% or 20%, the step nearer the gap, and none that adds insulin is shown in a segment whose lows over the last 90 days are over a consensus limit.
-
-**Page.** Rings for the latest full day (time in range; insulin against the 28-day median; a recovery score, 100 x the normal percentile of (HRV z minus resting-heart-rate z) / sqrt(2), 50 being a usual day), the context of that day with how days like it have gone, this week's pooled time in range against the 10th to 90th percentile of 7-day stretches in the 90 days before, the driver effects, the settings check, setting changes of the last 90 days with the before/after check of goal C, and the last seven days as glucose traces with sleep, workouts, carbohydrate entries and site changes marked.
-
-How to read it: a driver at -3.0 points (90% interval -5.5 to -0.5) says days after it had about 3 percentage points less of the day in range (roughly 45 minutes) than days of the same month without it, and the interval excludes no difference; -1.0 (-4.0 to +2.0) is no clear link. How it could fail: a driver can travel with something unmeasured (an illness behind both a high resting heart rate and high glucose); a driver that is rare in the record has a wide interval however large its effect; thresholds were chosen once and a different cut-off could tell a different story; devices measure sleep and HRV differently, which per-device baselines handle for the recovery driver but not for the absolute sleep threshold.
-
-## Outcome metrics (goal A)
-
-`bayesian-t1dm report-outcomes` writes `runtime/output/outcomes/outcomes_report.html` and CSV tables. Metrics follow the international consensus on CGM: time in range 70-180 mg/dL; time below 70 and 54; time above 180 and 250; mean glucose; coefficient of variation; glucose management indicator (3.31 + 0.02392 x mean). A day counts only when it holds at least 70% of its readings (for a part of the day, 70% of that part's readings). Readings are one per 5-minute slot. Time-of-day bins are the segments of the profile the latest pump runs, as last visible in its profile history. How to read it: a row whose time below 70 is 4% or more, or below 54 is 1% or more, is over a low limit and is not a candidate for more insulin in those hours. How it could fail: a profile edited since the last download leaves the bins one edit behind until the next `fetch-profile-edits`.
-
-## Data Flow
-
-The active pipeline is:
-
-1. Tandem Mobi syncs to Tandem Source through the mobile app
-2. `tconnectsync` logs in to Tandem Source and queries API windows directly
-3. raw API responses are archived under `~/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm/data/raw/tconnectsync/<window_id>/raw/`
-4. normalized CGM, bolus, basal, and activity tables are written beside the raw responses
-5. optional Health Auto Export JSON files are read directly from anywhere under `data/raw/health_auto_export/`
-6. `build-dataset` fingerprints every raw input (SHA-256), and only when one changed: normalizes changed Tandem windows in parallel, reads Tandem once, adds every Apple Health export JSON (byte-identical copies once, newest export wins where they overlap), builds the 5-minute dataset and writes it with `validation_report.md` to `data/merged/`. Analyses load that dataset and refuse to run if a raw file changed since the build.
-7. a file whose size and modification time match the previous build keeps its recorded hash instead of being read again, so the staleness check takes about a second; any file whose modification time changed is re-hashed, so a sync that touches a file without changing it does not trigger a rebuild. A first build, `--force` or a change of `DATASET_VERSION` in the code re-normalizes every window
-8. a per-window Tandem manifest records coverage, hashes, timestamps, and pump identity
-9. a Tandem 5-minute feature frame is built
-10. canonical Apple Health context is merged onto Tandem feature-frame timestamps when available to create the final prepared dataset
-11. derived insulin exposure and IOB
-12. lagged, rolling, and calendar features
-
-## Tandem Source Acquisition
-
-The implementation assumes Tandem Source is the authoritative cloud system for the Mobi data. The active pipeline now uses `tconnectsync` as an API adapter.
-
-Operational assumptions:
-
-- the Mobi app is already linked to Tandem Source
-- Tandem Source uploads are complete enough to support API windows
-- raw API payload archives are saved to the cloud side-project folder before modeling
-- credentials are loaded from a local `.env` or shell environment only
-- `TCONNECT_REGION` or `TANDEM_SOURCE_REGION` should be set for non-US accounts
-- manual CSV exports can be added as supplemental raw inputs
-
-Recommended environment variables:
-
-- `TANDEM_SOURCE_EMAIL` or `TCONNECT_EMAIL`
-- `TANDEM_SOURCE_PASSWORD` or `TCONNECT_PASSWORD`
-- `TANDEM_SOURCE_REGION` or `TCONNECT_REGION`
-- `TIMEZONE_NAME`
-- `TANDEM_SOURCE_PUMP_SERIAL`, `TANDEM_PUMP_SERIAL`, or `PUMP_SERIAL_NUMBER` when required
-
-Storage convention:
-
-- code: `~/Workspaces/bayesian-t1dm/source`
-- runtime outputs, scratch space, and intermediate artifacts: `~/Workspaces/bayesian-t1dm/runtime`
-- cloud project home: `~/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm`
-- scraped/raw acquisition data: `~/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm/data/raw`
-- final published outputs: `~/Library/CloudStorage/OneDrive-Personal/Project Vault/Personal Projects/bayesian-t1dm/output`
-- default working summaries: `~/Workspaces/bayesian-t1dm/runtime/output`
-
-Raw discovery rules:
-
-- active Tandem ingest excludes deprecated `archive data/` content from generic raw discovery
-- canonical Apple Health loading reads only `data/raw/health_auto_export/...`
-- `data/raw/health_auto_export/` holds Apple Health exports as dropped (`HealthAutoExport-*.json`); the raw JSON is read directly, nothing is copied
-
-The acquisition manifest captures:
-
-- source file name or raw artifact path
-- endpoint family
-- requested window start and end dates
-- observed first and last timestamps in the downloaded file
-- number of rows parsed from the file
-- whether the window appears complete
-- raw payload hashes and file sizes
-- timezone and pump identity used for the request
-
-This is the gating artifact for downstream modeling. If the manifest shows incomplete coverage, the forecast and recommendation outputs should be treated as provisional.
-
-The downstream ingest manifest, which is derived after normalization, still checks for gaps, overlaps, duplicates, and out-of-order windows across the parsed tables.
-
-### Raw Repair and Canonical Timestamp Contract
-
-`build-dataset` rebuilds `normalized/*.csv` and `window_manifest.csv` from the archived raw responses itself, without refetching. `bayesian-t1dm normalize-raw` does the same for one window or all windows by hand and then refreshes `tandem_export_manifest.csv`.
-
-Normalized CSV contract:
-
-- timestamps are stored as timezone-naive local wall-clock timestamps in `TIMEZONE_NAME`
-- a value with a UTC offset is converted to `TIMEZONE_NAME`; a value without one is already local time; a value that is present but not ISO 8601 stops the build with an error rather than dropping the row
-- a CGM reading's time is the sensor's measurement time on the pump clock, stored without an offset. Example: a reading measured at 01:58 on the day clocks jump forward and received at 03:01 is stored at 01:58. Attaching the receipt's offset (EDT) to the measurement (EST) would have moved it an hour
-- Apple Health times keep the wall-clock time the phone recorded and drop its offset
-
-## Bolus calculator settings
-
-Each breakfast is compared with the I:C ratio and correction factor (CF) the bolus calculator used for it.
-
-- **t:slim** records the ratio on `LID_BOLUS_REQUESTED_MSG1` (in milligrams per unit) and the CF and target on `LID_BOLUS_REQUESTED_MSG2`.
-- **Mobi** (boluses from the phone app) records all three as 0. `LID_BOLUS_REQUESTED_MSG3` records the food and correction portions of the bolus, which are enough to recover them.
-
-**I:C.** The food portion is carbs / I:C, so I:C = carbs / food portion, rounded to the pump's 0.1 g/U steps. That holds only while the calculator has not folded a below-target correction or insulin on board into the food portion, which is the case when the bolus includes a positive correction or glucose was at or above the recorded target. On 1,405 t:slim meals that record the ratio, the recovered value matched in all 1,082 meals meeting that condition; in the other 323 the food portion was reduced and no ratio is recovered.
-
-Example: 35 g with a food portion of 4.67 U and a 0.38 U correction gives 35 / 4.67 = 7.49, so 7.5 g/U. The same 35 g at glucose 95 with no correction may have had 0.3 U taken off the food portion (glucose below a 110 target with CF 50), which would read as 8.0 g/U; that meal gets no recovered ratio.
-
-**CF and target.** The calculator's correction is (glucose - target) / CF - insulin on board. Within a run of breakfasts on one pump with one I:C, correction + insulin on board is therefore a straight line in glucose with slope 1 / CF and intercept -target / CF. Over breakfasts with a correction of at least 0.3 U (smaller ones are too coarsely rounded), a Theil-Sen fit finds the majority setting, and a least-squares refit of the breakfasts within 5% of it gives the run's CF and target; the refit keeps a few breakfasts with another CF from pulling the estimate. A breakfast whose own (glucose - target) / (correction + insulin on board) is more than 5% from the run's CF keeps its own value, because a setting changed within the run. On t:slim groups with a recorded CF and target, the fit recovers both to within 0.1 mg/dL/U and 0.1 mg/dL.
-
-Example: on the Mobi from June 2026, 41 morning corrections fit CF 60.0 and target 110.1 with no residual above 0.01 U.
-
-**Pump profile history.** The pump logs every profile edit and switch: `LID_IDP_TD_SEG` (event 68) gives one time-of-day segment of a profile after a change, with its start time, basal, CF, target and I:C, and `LID_IDP` (event 69) records a profile being created, copied, deleted or activated. tconnectsync does not decode either; `pump_profiles.py` reads them from the archived raw events. Tandem Source stores each 4-byte word of the pump's record in reverse byte order, and once that is undone the layout is pumpX2's, except that the I:C is a 16-bit value in mg/U. Replaying the events in order gives, for any moment, the active profile and the segment covering that time of day. The `modificationType` of a segment record is 1 when the segment is deleted (a copied profile is trimmed by deleting segments one at a time), 0 when a segment is created (inserted at its index, pushing the later segments down; a create past the end of a profile the archive saw created is an error, like a delete past the end), and otherwise leaves the segment at its index with the logged values; a copy starts from the source profile's segments at the copy time, and a delete clears the profile. A profile the archive never saw created may have segments it never logged, so the segment after the last one seen is unknown. Compared with the carb ratio recorded by the t:slim's own calculator, the replay agrees for the entries that have both (the data-quality audit reports the agreement for each setting). How it could fail: a modification code with another meaning in a pump firmware the archive does not show would place a segment at the wrong index.
-
-**A profile's last slot.** A profile created before the archive shows its slots one edit at a time, so the archive alone cannot say whether another slot follows the last one seen. The pump also logs, about every five minutes (event 279), the basal rate the active profile calls for. `ProfileHistory` treats the last slot as running to midnight over a stretch of history in which that slot keeps its start, rate and index, when at least 12 of the pump's records from 23:00 on, at or after the slot's start, equal the slot's rate in 95% or more of cases. A slot added or removed after it, a copy into the profile, or a delete of a slot the archive never saw ends the stretch, and a stretch without enough agreeing records stays unknown. How to read it: if a profile's last slot starts at 21:00 with 0.9 U/h, and the logged profile rate from 23:00 to midnight is 0.9 U/h in nearly every record, the slot runs to midnight and its values are known for 21:00-24:00; the calculator's recorded I:C, CF and target at meals in that window should equal the slot's. How it could fail: a hidden slot that starts at 23:30 with the same basal rate would go unnoticed by the rate log, and only a different I:C, CF or target at the calculator would reveal it. The counts for the real record are in the generated data-audit report.
-
-Event 68 reaches the archive two ways: the binary event files of windows collected with tconnectsync 2.x (to April 22, 2026 for the Mobi), and `pump_profile_edits_<pump>_<device>.json`, which the collector writes for every window by asking Tandem Source for event code 68 by name (the server's default event list leaves it out, and the pump-logs JSON of tconnectsync 3.x carries profile switches, event 69, without segment edits). `fetch-profile-edits` adds those files to windows already archived without rewriting anything in them. A pump's visible span runs over the first unbroken run of windows with either source; for the Mobi it now reaches the day of the last download, so a profile's values are known at every meal. With the 2026 edits, the replay agrees with the carb ratio recorded or recovered by the calculator for 2,333 of 2,336 entries (99.9%). Each carb entry keeps the moment the pump recorded (`event_time`) beside its 5-minute grid slot (`timestamp`), and the profile is read at `event_time`, so an edit made inside a slot applies to the meals after it and not to those before it (this changed the settings of 9 of about 3,680 entries). Glucose, insulin on board and basal stay on the 5-minute grid: across a 5-minute step CGM changes by a median 3 mg/dL (90th percentile 11), so reading the grid slot instead of the exact moment costs about 1.5 mg/dL at the median; basal is a step function that is held, not interpolated, and insulin on board is computed from exact bolus times. `build-dataset` writes the decoded events to `tables/pump_profile_events.parquet` and the visible span per pump to the validation report. Example from the data: on 2026-11-17 at 09:29 the Main profile's 05:00 and 09:00 segments went from 7.0 to 6.5 g/U and the 21:00 segment from 7.0 to 6.8; a 07:30 breakfast that morning was dosed at 7.0, and the 11:50 meal at 6.5.
-
-**Precedence.** For each breakfast, the I:C and CF each come from the first of: the bolus calculator (recorded, or the I:C recovered from the food portion); the profile history; the CF recovered from the corrections; the nearest breakfast in the same unbroken stretch on one pump, profile and edit visibility (a switch to another profile and back starts a new stretch); the programmed profile. The source shown is the weakest one used. On Mobi breakfasts between August 2025 and April 2026, the recovered I:C and CF agreed with the profile history in all 44 breakfasts that had both. Carried values were the weak point: 36 of 115 carried CFs disagreed with the history, because carrying crossed profile switches.
-
-Example: on the Mobi, Main at 07:00 is 7.0 g/U with CF 65, and Medium is 8.0 g/U with CF 60 and target 120. A breakfast at 07:30 on September 12, 2025, after Medium was activated on September 10, uses Medium's values. A breakfast in June 2026, after the binary archive ends, uses its own recovered I:C and CF, or those of nearby June breakfasts on Medium. It does not use the 8.0 last seen in 2025, because Medium was later changed to 7.5 without the edit appearing in the download.
-
-**Breakfasts with nothing usable** (no correction and glucose below target, no visible profile history, or a hand-logged meal) take the setting of the nearest earlier breakfast on the same pump and profile, or the nearest later one, so they do not start a settings period of their own. A value missing for every breakfast on that pump and profile comes from the programmed profile, and only that value is replaced. A settings period is a run of breakfasts with the same I:C and CF. How it could fail: a setting changed and changed back between two usable breakfasts, after the visible history ends, would be missed. With breakfasts most days, that window is about a day.
-
-Per-window manifest fields now include:
-
-- `requested_start`, `requested_end`
-- `observed_first_timestamp`, `observed_last_timestamp`
-- `observed_duration_days`
-- `coverage_fraction`
-- `completeness_reasons`
-
-Standard completeness reason codes:
-
-- `starts_late`
-- `ends_early`
-- `internal_gap`
-- `duplicates`
-- `overlap`
-- `missing_kind`
-
-Incomplete windows remain usable for review, but they are not recommendation-eligible by default.
-
-## Insulin Action Kernel
-
-We approximate insulin exposure using a fixed-duration action curve inspired by LoopKit-style insulin dynamics.
-
-Let:
-
-- $D$ = bolus dose in units
-- $t$ = minutes since bolus completion
-- $t_d$ = duration of action in minutes
-- $t_p$ = peak time in minutes
-- $\tau$ = decay constant
-- $a$ = rise-time factor
-- $S$ = scale factor
-
-The implementation uses:
-
-$$
-\tau = \frac{t_p (1 - t_p / t_d)}{1 - 2 t_p / t_d}
-$$
-
-$$
-a = \frac{2 \tau}{t_d}
-$$
-
-$$
-S = \frac{1}{1 - a + (1 + a)e^{-t_d / \tau}}
-$$
-
-Insulin activity:
 
 $$
 IA(t) = D \cdot \frac{S}{\tau^2} \cdot t \cdot \left(1 - \frac{t}{t_d}\right) e^{-t/\tau}
 $$
 
-Insulin on board:
-
 $$
 IOB(t) = D \cdot \left[1 - S(1-a)\left(\left(\frac{t^2}{\tau t_d (1-a)} - \frac{t}{\tau} - 1\right)e^{-t/\tau} + 1\right)\right]
 $$
 
-The default configuration uses $t_d = 300$ minutes and $t_p = 75$ minutes.
+How it could fail: a real insulin curve that peaks later or lasts longer than 5 hours shifts every meal's insulin accounting the same way.
 
-## Feature Definitions
+## Effective I:C from meals
 
-The canonical analysis grid is 5 minutes.
+The question: do meals in a pump segment behave like the I:C that segment holds?
 
-Key features:
+**Meals.** The first bolus of 1.5 U or more in each of the morning (06:00-11:00), afternoon (11:00-17:00) and evening (17:00-24:00) windows of a day is a candidate. It is eligible with logged carbohydrate, no bolus in the previous 4 hours, insulin on board under 1 U, glucose 80 to 130 mg/dL before the meal without a steep slope, no exercise, no controller change just before, no unlogged food in the window and no context-event day. Each eligible meal is placed in the pump segment that covers its time of day.
 
-- current CGM glucose at time $t$
-- lagged CGM values at 5, 10, 15, 30, and 60 minutes
-- rolling CGM means
-- bolus units in the current 5-minute bin
-- insulin activity and IOB derived from bolus expansion
-- basal rate carried forward across the current bin
-- activity summary variables
-- CGM missingness and gap indicators
-- across a CGM gap the model-facing `glucose` column carries the last reading forward (`FeatureConfig.cgm_fill_method = "locf"`). Linear interpolation (`"linear"`) is available for retrospective plots but must not be used for forecasting: a gap row would be filled using the reading at the far end of the gap, which is often its own target. `glucose_observed` is never filled.
-- carb and meal-derived features when carbohydrate records are available
-- calendar features: sine/cosine hour-of-day, sine/cosine day-of-week, weekend indicator
-
-Target:
-
-- $y_{t+h}$, the glucose value $h$ minutes into the future
-
-Default horizon:
-
-- $h = 30$ minutes
-
-## Retired: 5-minute glucose forecast
-
-The 30-minute-ahead Bayesian glucose regression, its scenario scoring of setting changes and the forecast report (`run`, `forecast_review.html`) were removed on 2026-11-19. The regression described what happens to glucose a half-hour from now given the last few hours of readings; it could not support claims about changing a setting, because its insulin coefficients are associations in closed-loop data, not effects of a setting. On the real record (59,000 rows by 82 features per fold) the first fold ran for more than 25 minutes without finishing: the lag and rolling features are strongly collinear and the sampler saturated its tree depth. Setting-change evidence now comes from the hour-day outcomes model and the replay of past changes (see Planned). The last commit with the forecast lane is tagged `pre-forecast-lane-removal-20261119`.
-
-The therapy-settings glucose regression was removed with it (commands `research-therapy-settings`, `validate-therapy-infra` and `review-therapy-evidence`): ridge, elastic-net, segmented, tree-boosted and ensemble models of the next glucose change, their scenario scoring of basal and I:C changes, the overnight-basal evidence page and the synthetic truth-recovery suite that tested them. It had the same limit: a predictive fit on closed-loop data cannot say what a setting change would do. A failed model fit was recorded as a row and the run went on; a failed analysis now fails the run. The local-level basal model (`basal_model.py`) and its walk-forward scoring were removed as well; the forecast evaluation harness is where the outcomes model is compared with simpler baselines. Kept: the sampler-health helper (`sampler_health.py`: R-hat, effective sample size, divergences and tree depth, used by the outcomes model and the harness), `walk_forward_splits` (used by `screen-health-features`), the 5-minute feature frame, and the meal, window and latent-carb code in `therapy_research.py` that `propose-breakfast-icr`, `research-latent-meal-icr`, `build-latent-meal-fixture` and `validate-latent-meal` use. The last commit with the therapy-settings regression and the basal model is tagged `pre-therapy-lane-removal-20261119`.
-
-## Validation
-
-Validation is intentionally time-aware.
-
-Recommended checks:
-
-- chronological (walk-forward) splits instead of random train/test splits
-- calibration of posterior predictive intervals
-- posterior predictive checks
-
-Operational notes:
-
-Canonical research loop:
-
-1. `bayesian-t1dm build-dataset` to normalize and merge any new raw data into `data/merged/` (about a second when nothing changed, under a minute for a full rebuild).
-2. `bayesian-t1dm research-latent-meal-icr --research-scope foundation` to inspect honest meal-truth semantics and first-meal clean-window readiness.
-3. `bayesian-t1dm research-latent-meal-icr --research-scope full` only after the foundation cohort is actually ready for latent fitting.
-4. `bayesian-t1dm status` when you want to know whether the source data are complete.
-
-Artifact reading order:
-
-1. `current_status.html` for the state of the source data.
-2. `output/latent_meal/` and `output/fixture/` for the scientific priority lane.
-
-If the latent-meal foundation cohort is blocked or empty, debug cohort quality, source truth, and freshness first. Do not treat that as a model-fitting failure.
-
-Step-by-step behavior:
-
-1. `normalize-raw` rebuilds normalized Tandem tables from archived `tconnectsync` raw payloads by hand; `build-dataset` does this itself for changed windows.
-2. `build-dataset` merges Tandem and Apple Health into one deduplicated 5-minute dataset when raw inputs change, and writes `validation_report.md` (inputs, spans, row counts, completeness and plausibility checks).
-3. `research-latent-meal-icr --research-scope foundation` audits meal-truth semantics, builds the first-meal clean-window cohort, and tells you whether the accepted cohort is ready for Phase C. This is the main scientific checkpoint.
-4. `research-latent-meal-icr --research-scope full` runs the constrained first-meal latent-response approximation on accepted windows only and writes research-only posterior, confidence, and model-comparison artifacts.
-5. `status` writes `current_status.html` and `current_status.json`: whether the source windows are complete and what the prepared dataset covers. It says nothing about settings.
-6. `screen-health-features` consumes the prepared dataset and skips cleanly when Apple Health is absent.
-
-Workflow crosswalk:
-
-| Step | Question | Main artifact(s) | Main code path(s) | Interpretation |
-| --- | --- | --- | --- | --- |
-| `normalize-raw` | Did we correctly rebuild normalized Tandem windows? | `normalize_raw_summary.md` | `src/bayesian_t1dm/acquisition.py::normalize_tconnectsync_archive` | Confirms raw-to-normalized reconstruction before modeling. |
-| `build-dataset` | What data went in, and is the merged dataset valid? | `data/merged/validation_report.md`, `data/merged/dataset.json`, `output/prepare/model_data_preparation.md` | `src/bayesian_t1dm/dataset.py::build_merged_dataset` |
-| `research-latent-meal-icr --research-scope foundation` | Is the first-meal cohort ready for Phase C? | `output/latent_meal/latent_meal_research_gate.md`, `output/latent_meal/first_meal_clean_window_audit.md` | `src/bayesian_t1dm/therapy_research.py::run_latent_meal_icr_research` | Main scientific checkpoint for latent-meal readiness. |
-| `research-latent-meal-icr --research-scope full` | Does the accepted first-meal cohort support useful latent meal fitting yet? | `output/latent_meal/latent_meal_fit_summary.md`, `output/latent_meal/latent_meal_posterior_meals.csv`, `output/latent_meal/latent_meal_model_comparison.md` | `src/bayesian_t1dm/therapy_research.py::run_latent_meal_icr_research` | Research-only constrained latent-response fit on accepted windows. |
-| `validate-latent-meal` | Does the latent carb estimator recover known truth in simulation? | `output/latent_meal/validation/latent_meal_truth_recovery.md` | `src/bayesian_t1dm/latent_meal_validation.py::run_latent_meal_truth_recovery` | Simulated meals with known carbs; scores bolus-implied, the old peak/AUC heuristic, and the trajectory estimator. Exits non-zero if the trajectory estimator stops beating bolus x I:C. |
-| `status` | Are the source data complete? | `current_status.html`, `current_status.json` | `src/bayesian_t1dm/status.py::derive_current_status` | Source-quality blockers and dataset coverage; no statement about settings. |
-
-## Latent Carb Estimator
-
-Code: `src/bayesian_t1dm/latent_meal_trajectory.py`, called from `therapy_research.py::_latent_carb_posterior_for_window`.
-
-For an accepted first-meal window, with $t$ in minutes after the bolus, the forward model is
+**Per meal.** With $t$ in minutes after the bolus, the forward model ([`latent_meal_trajectory.py`](../src/bayesian_t1dm/latent_meal_trajectory.py)) is
 
 $$
 G(t) = G_0 + b_0 + b_1 t + \frac{\text{CF}}{\text{ICR}}\, C \, A(t - \delta;\, a, m) - \text{CF}\,(1 + d)\, U(t) + \varepsilon(t)
 $$
 
-- $C$ = meal carbohydrate (grams), the quantity of interest
-- $A$ = fraction of the meal absorbed, a gamma CDF with shape $a \in \{1.5, 2.5, 4, 7\}$ and mean absorption time $m$ (35 to 170 min); $\delta \in \{0, 10, 20\}$ min is the delay between bolus and carbohydrate appearance
-- $U(t)$ = units of insulin absorbed since the anchor. The bolus part is reconstructed from the frame as $\text{IOB}(0) + \text{boluses after } 0 - \text{IOB}(t)$, so later boluses and insulin already on board are included. Closed-loop basal is added on top: delivery above or below the scheduled rate is pushed through the same action curve (negative when basal was suspended). The schedule is not in the frame, so it is estimated as the median delivery at the same time of day over the surrounding 43 days
-- CF, ICR = programmed correction factor and I:C ratio for the segment
-- $b_0, b_1, d$ = baseline offset (SD 5 mg/dL), linear drift (SD 8 mg/dL/h) and relative correction-factor error (SD 0.15). They have zero-mean Gaussian priors and are integrated out in closed form
-- $\varepsilon$ = AR(1) noise, SD 8 mg/dL, correlation 0.7 per 5 minutes
+$C$ is the carbohydrate-equivalent; $A$ is a gamma absorption curve (shape 1.5 to 7, mean 35 to 170 minutes) with a 0 to 20 minute delay $\delta$; $U(t)$ is the insulin absorbed since the bolus, including insulin already on board, later boluses and basal delivered above or below the scheduled rate (the schedule is the median delivery at that time of day over the surrounding 43 days); $b_0$, $b_1$ and $d$ are baseline offset, drift and correction-factor error, integrated out; $\varepsilon$ is AR(1) noise. The posterior over $(C, a, m, \delta)$ is evaluated on a grid with a deliberately vague prior on $C$ (SD at least 60 g).
 
-The prior on $C$ is centred on bolus x ICR with SD $\max(20, 0.5 \times \text{mean})$ grams (tighter when a carb entry was logged). The posterior over $(C, a, m, \delta)$ is evaluated on a grid. Analysis tiers scale every noise and nuisance SD by the tier's uncertainty multiplier.
+**Pooling.** Each meal gives $\log r_i = \log(\hat{C}_i / S_i)$, the carbohydrate-equivalent over the logged grams, with $\text{sd} \approx \text{sd}(\hat{C}_i)/\hat{C}_i$. Within a pump segment and settings period (a run of meals with the same I:C and correction factor), meals are pooled by DerSimonian-Laird random effects with a Hartung-Knapp 90% interval, so meal-to-meal variability widens the result. The effective I:C is the programmed I:C divided by the pooled $r$; at least 5 meals are needed.
 
-Per-meal outputs include `estimator` (`trajectory` or `summary_heuristic`), `prior_contraction` ($1 - \text{posterior var}/\text{prior var}$: how much the trace told us beyond the bolus) and `trajectory_fit_rmse_mgdl`.
+**Checked in simulation.** The test suite simulates meals with known carbohydrate under misspecified absorption, pre-bolus timing, drift, noisy CGM and logging error, and checks that the trajectory estimator beats bolus x I:C, that cohorts of 20 logged meals recover a true I:C of 8, 10 and 12.5 g/U to within 6% on average with 90% intervals covering the truth in at least 70% of cohorts, that a setting 20% off is flagged in at least 90% of cohorts, and that a correct setting is flagged in at most 25%.
 
-What it cannot do:
+How to read it: a pooled effective I:C of 8 g/U (90% interval 7 to 9) under a setting of 10 g/U says meals raised glucose as if one unit covered about 8 g, so the setting gives less insulin than meals ask for; an interval of 7 to 13 would say nothing about the setting. How it could fail: glucose identifies carbohydrate times CF / ICR, so habitually under-counted carbohydrate lowers the estimate exactly as a weak ratio would; a wrong correction factor shifts every estimate by about the same percentage; slow fat and protein absorption after the 3-hour window is invisible.
 
-- Glucose identifies $C \cdot \text{CF}/\text{ICR}$, not $C$. The estimate is a carb-equivalent under the programmed settings. Carb-counting error and a wrong I:C ratio are not separable from a single meal without carb truth.
-- Carbohydrate absorbed after the 180-minute window is invisible, so slow high-fat meals are biased low.
-- Basal modulation is counted relative to an inferred schedule. If the controller modulates basal at the same time on most days, the inferred schedule absorbs it and the modulation goes uncounted.
+## Basal from the controller pattern
 
-The older estimator (peak and AUC summaries with fixed response constants) is retained as a fallback for windows whose trace or insulin columns are unusable, and is flagged `summary_heuristic_estimator`.
+The question: does Control-IQ keep working against the programmed basal at the same hours ([`controller.py`](../src/bayesian_t1dm/controller.py))?
 
-### Synthetic truth recovery
+**Data.** The commanded rate every ~5 minutes for the whole record (it equals event 279's `commandedRate` where both exist) against the programmed rate of the segment in force from the profile history.
 
-`bayesian-t1dm validate-latent-meal` simulates meals with known carbohydrate, each bolused for a mis-counted amount, and scores each estimator's posterior median against truth. With 200 meals per scenario and the default seed:
+**Clean time.** Time is left out for 2, 3 or 4 hours after a meal by its size (carbohydrate of 15 g or more, or a bolus of 1 U or more; under 20 g or 2 U is 2 hours, under 40 g or 4 U is 3 hours), for exercise (the shared rule), unlogged-food intervals and context-event days. Small carbohydrate entries and the pump's own automatic corrections do not set a window; the corrections are the behaviour being measured. A day-segment counts with at least an hour of clean time.
 
-| scenario | bolus x ICR MAE (g) | heuristic MAE / 90% coverage | trajectory MAE / 90% coverage |
-| --- | ---: | ---: | ---: |
-| matched assumptions | 17.2 | 13.8 / 0.66 | 3.9 / 0.99 |
-| long-tail absorption | 17.2 | 17.7 / 0.55 | 2.5 / 1.00 |
-| biphasic absorption | 17.2 | 17.5 / 0.55 | 17.8 / 0.71 |
-| pre-bolus timing | 16.0 | 11.7 / 0.72 | 4.4 / 1.00 |
-| wrong settings (15%) | 17.2 | 15.5 / 0.57 | 7.9 / 0.91 |
-| baseline drift | 19.5 | 14.9 / 0.62 | 6.2 / 0.98 |
-| closed-loop basal | 17.2 | 13.5 / 0.66 | 4.2 / 1.00 |
-| everything at once | 16.8 | 15.5 / 0.55 | 9.1 / 0.91 |
+**Signal.** For each segment, over the last 28 days (widening to 56, then 90, when clean time is short), each day's commanded insulin is compared with the segment's *current* programmed rate, weighted by clean hours. "Basal likely too low": the controller commanded 25% or more above the rate for at least half of the clean time, mean glucose over it is above 120 mg/dL, and time below 70 and 54 are within their limits; "too high" is the mirror case; under 10 days or 14 clean hours gives no signal. The pooled extra delivery and its 90% range come from resampling days (2,000 draws, fixed seed).
 
-The simulator is linear and has no exercise and no sensor lag; its closed-loop controller is a simple threshold rule, not Control-IQ. These numbers say the estimator is internally sound and robust to the listed misspecifications; they do not say it is accurate on real meals.
+How to read it: "+43% (+14% to +71%)" means the controller delivered 1.43 times the programmed rate over the clean hours. How it could fail: the reference rate matters (the same commanded rates read differently against two programmed rates); sleep mode has a narrower treatment range than daytime; 28-day windows are noisy where clean time is thin, which is why the window widens and says so.
 
-### Effective I:C from logged meals
+## Personal readout
 
-Code: `latent_meal_trajectory.py::observe_carb_sensitivity`, `pool_effective_icr`; wired in `therapy_research.py::_effective_icr_evidence`.
+`bayesian-t1dm readout` ([`readout_report.py`](../src/bayesian_t1dm/readout_report.py)) writes `runtime/output/readout/`: `readout.html` (one self-contained page drawn for a phone), `diagnostics.xlsx`, the driver effects and the settings check as CSV, and a run record `readout_run_<run id>.log`. When both models pass the sampler gate the page is copied to `<cloud root>/readout/readout.html`; a failed gate fails the run and nothing is copied.
 
-When an accepted window carries a logged carb count $S_i$, the ambiguity above disappears for that meal. The trajectory estimator is re-run with a deliberately vague carb prior (SD at least 60 g) to get the carb-equivalent $\hat{C}_i$ the trace supports, and the meal contributes
+**Day table** ([`readout.py`](../src/bayesian_t1dm/readout.py)). One row per calendar day: the consensus glucose metrics, bolus, delivered basal and carbohydrate from the pump, and the context before the day. Sleep is the night that ended on the morning of the day, one record per night from the first device in a fixed order (Oura, then Apple Watch). Resting heart rate and HRV are daily means, each compared with the median and robust spread (median absolute deviation x 1.4826) of the previous 28 days on the same device, with at least 10 such days, so a change of ring or watch is not read as a change in the person. Workout energy is 0 on a day a wearable recorded without a workout and unknown on a day nothing was recording. Site age is the time since the last cannula fill at midnight. Insulin and carbohydrate are compared with the median of the previous 28 days (unknown when that median is zero).
+
+**Drivers.** Fixed before any fit: sleep under 6 hours the night before; low recovery the day before (resting heart rate more than one spread above, or HRV more than one spread below, its baseline); at least 200 kcal of workout active energy the day before, and two days before; 10 g or more of carbohydrate entered at or after 21:00 the evening before; an infusion site 3 or more days old at midnight (its fourth day or later). A day enters the model when it counts, is not a context-event day, has site changes observed and has every driver measured. A driver needs 15 modelled days with it and 15 without; with none estimable the run stops with a message.
+
+**Model** ([`readout_model.py`](../src/bayesian_t1dm/readout_model.py)). For time in range and, separately, time below 70:
 
 $$
-\log r_i = \log\left(\hat{C}_i / S_i\right), \qquad \text{sd}(\log r_i) \approx \text{sd}(\hat{C}_i)/\hat{C}_i
+y_d \sim \text{BetaBinomial}(n_d,\ \mu_d \phi,\ (1 - \mu_d)\phi), \qquad \text{logit}(\mu_d) = \alpha + \text{month}_d + \gamma\,\text{weekend}_d + \sum_k \beta_k x_{dk}
 $$
 
-$r_i > 1$ means glucose rose more per logged gram than CF / ICR predicts. Meals in a segment are pooled with a DerSimonian-Laird random-effects model (between-meal variance $\tau^2$) and a Hartung-Knapp $t$ interval, so genuine meal-to-meal variability widens the result. The effective ratio is
+The month effect is partially pooled (half-normal scale, prior 0.5), so a driver is compared with days of the same month and slow change in settings, season and habits does not load onto it. Each $\beta_k$ has a Normal(0, 0.5) prior on the logit scale. The reported effect is the average marginal effect: over the modelled days, the mean difference in the predicted share of the day with the driver set to yes and to no, in percentage points, with a 90% posterior interval. Sampling: 4 chains of 1,000 draws after 1,000 tuning steps; the sampler gate (R-hat under 1.01, bulk and tail effective sample size over 400, no divergences) applies to both fits.
 
-$$
-\text{ICR}_{\text{effective}} = \text{ICR}_{\text{programmed}} / r
-$$
+**Settings check** ([`readout_settings.py`](../src/bayesian_t1dm/readout_settings.py)). For each segment of the profile running now: basal from the controller signal and I:C from the effective I:C, each compared with the value the segment holds now. Statuses: fits; needs more insulin; needs less insulin; held (the evidence points to more insulin but lows over the last 90 days are over a limit); not enough data. A suggestion is one step of 10% or 20%, the step nearer the gap (more insulin: basal up, I:C down). Setting changes of the last 90 days on the running profile are listed with a 14-day before/after comparison of time in range over the segment's hours ([`changes.py`](../src/bayesian_t1dm/changes.py)), with a day-resampling 90% interval, once 14 days have passed.
 
-At least 5 usable logged meals are required; below that the status is `insufficient_logged_meals`. The estimate assumes the programmed correction factor is right: a correction factor that is off by x% moves the I:C estimate by about x%.
+**Page** ([`readout_page.py`](../src/bayesian_t1dm/readout_page.py)). Rings for the latest full day (time in range, colored by whether it meets 70%; insulin against the 28-day median; recovery the day before, 100 x the normal percentile of (HRV z minus resting-heart-rate z) / sqrt(2), 50 being a usual day), the context of that day with how days like it have gone, this week's pooled time in range against the 10th to 90th percentile of 7-day stretches in the 90 days before, the driver effects, the settings check, recent changes, and the last seven days as glucose traces with sleep, workouts, carbohydrate entries and site changes marked. Colors per mark are defined once in [`figures.py`](../src/bayesian_t1dm/figures.py).
 
-Carb logs enter the pipeline as a `carbs.csv` (or `carb_log.csv`) with `timestamp,carb_grams` columns anywhere in the raw data tree; this hand-kept file is the one table accepted outside a `normalized/` directory. Entries from 20 minutes before to 30 minutes after the first-meal bolus are summed as that meal's logged carbs.
+**Workbook.** `Specification_Coding`, `Denominators_Flow`, `Driver_Counts`, `Driver_Effects`, `Sampler_Health`, `Settings_Check`, `Basal_Signal`, `ICR_By_Segment`, `Recent_Changes`, `Record_Issues` (each left-out day and why; reconciled with the flow), `Warnings_Limitations`, `Artifacts_Provenance`. The workbook is read back and its effects and flow checked against the fit before the page is copied.
 
-Synthetic recovery (`validate-latent-meal`, 40 cohorts of 20 logged meals, programmed I:C 10, with long-tail absorption, pre-bolus timing, drift, noisy CGM and 10% logging error):
+How to read it: a driver at -3.0 points (90% interval -5.5 to -0.5) says days after it had about 3 percentage points less of the day in range (roughly 45 minutes) than days of the same month without it; -1.0 (-4.0 to +2.0) is no clear link. How it could fail: a driver can travel with something unmeasured (an illness behind both a high resting heart rate and high glucose); a rare driver has a wide interval however large its effect; thresholds were chosen once and another cut-off could tell a different story; devices measure sleep and HRV differently, which per-device baselines handle for recovery but not for the absolute sleep threshold.
 
-| true I:C | mean estimate | SD across cohorts | 90% coverage | flagged as different |
-| ---: | ---: | ---: | ---: | ---: |
-| 8.0 | 7.99 | 0.25 | 0.90 | 1.00 |
-| 10.0 | 9.87 | 0.34 | 0.95 | 0.05 |
-| 12.5 | 12.16 | 0.49 | 0.95 | 1.00 |
+## Assumptions and failure modes
 
-## Output Contract
-
-The coverage report (`output/source/coverage.md`, with `coverage_review.html` beside it) from `ingest` includes:
-
-- `coverage` with row counts, first and last timestamp and window completeness
-- `data_quality` with `good`, `degraded`, or `broken` source status
-- `review_artifacts` pointing at the runtime HTML review pages
-
-Sampler diagnostics (`sampler_health.FitDiagnostics`) include:
-
-- `draws`, `tune`, `chains`, `target_accept`, `max_treedepth`
-- `wall_time_seconds`
-- `divergences`
-- `max_tree_depth_observed`
-- `max_tree_depth_hits`
-- `rhat_max`, `ess_bulk_min` and `ess_tail_min`, each taken as the worst value over every parameter; a fit whose convergence cannot be assessed raises instead of reporting a number
-
-In addition to markdown and JSON summaries, the active pipeline writes self-contained interactive HTML review artifacts:
-
-- `current_status.html` from `status`
-- `coverage_review.html` from `ingest`
-
-These are the visual inspection surfaces for the source data; the analysis pages are on the front page (`runtime/current/index.html`).
-
-Apple Health-specific working artifacts:
-
-- `build-dataset` writes the merged tables, `prepared_model_data_5min.parquet`, `dataset.json` (input fingerprints, spans, row counts) and `validation_report.md` under `data/merged/`
-- `build-dataset` also writes `model_data_preparation.md` under `output/prepare/` when it rebuilds
-- CGM rows come only from sensor-reading events (`LID_CGM_DATA_*`), timed by the sensor's measurement time (`egvTimeStamp`); the pump's receipt time lags it for readings backfilled after a signal dropout
-- window completeness covers the download only (`missing_kind`, `starts_late`, `ends_early`); `cgm_slot_coverage` and `cgm_gaps_ge_2h` are reported per window as data quality
-- logged food from Apple Health (`carbohydrates`, `protein`, `total_fat`, one row per entry time) is matched to each breakfast within 30 minutes. It never replaces the pump-entered carbs: the effective I:C is rerun (a) without breakfasts with at least 20 g fat or 25 g protein and (b) with each meal's carbs as the geometric mean of the pump entry and the logged-food carbs divided by their median ratio over all meals that have both
-- `context_events.csv` in the raw folder lists date ranges (`start_date,end_date,reason`) left out of the meal and overnight-basal analyses
-- `screen-health-features` writes `health_feature_screening.md` under `output/prepare/` and `health_feature_scores.csv` under `cache/prepare/`
-- `research-latent-meal-icr` writes foundation or full-scope latent-meal artifacts under `output/latent_meal/`
-- `build-latent-meal-fixture` writes the fixture audit bundle under `output/fixture/` and the reduced prepared dataset under `cache/latent_meal/`
-
-## Assumptions and Failure Modes
-
-Assumptions:
-
-- Tandem export timestamps are trustworthy after normalization
-- a 5-hour insulin action approximation is acceptable as a first-order model
-- API payloads are stable enough to support windowed backfill
-
-Known failure modes:
-
-- missing export files or partial history
-- sparse meal logging
-- basal schedule changes not captured in the chosen export
-- poor calibration if the insulin action kernel is badly misspecified
-- silent API drift if Tandem changes undocumented endpoints
-
-## Acquisition and Manifest Design Decisions
-
-- Tandem Source cloud sync is treated as the source of truth because it is the supported path for Mobi uploads.
-- The pipeline is API-first because `tconnectsync` can query Tandem Source directly.
-- Manual CSV exports are still accepted as supplemental raw inputs.
-- There is no supported Playwright/browser fallback in the active acquisition path; the browser code has been retired.
-- A raw acquisition manifest is required so export completeness is checked before modeling rather than after the fact.
-- Coverage completeness is defined on the acquisition manifest, while cross-file gap checks live in the normalized ingest manifest.
-- Deprecated `archive data/` content is intentionally excluded from active Tandem ingest because it may contain legacy Apple Health exports and non-tabular ECG CSVs that are not part of the modeling contract.
-- Canonical Apple Health loading is scoped to `data/raw/health_auto_export/...`; the `apple_health_data/` directory is a source pool for import, not a direct modeling input.
-
-### Tracing dashboard results
-
-Each dated refresh writes `00_General/source_to_result.csv`. The dates describe the input to the named check or the eligible reporting window. Read the count in its stated unit. An interval for a settings period uses meals with an estimable trajectory. A basal result uses eligible hours within qualifying segment-days. A high or low contributes one classified episode. A change stays in the register while it accumulates follow-up.
-
-| Result | Source and eligibility | Dated output |
-| --- | --- | --- |
-| Prior-night duration | Apple Health sleep records with a completed end time and duration. Each grid row uses the last completed night within 36 hours. The source table counts overlapping in-bed flags separately. | Merged prepared dataset and general source-to-result table |
-| A, glucose outcomes | One valid Tandem CGM reading per five-minute slot on days meeting the coverage criterion. | A_outcomes/supporting |
-| B/E, effective I:C | First eligible meal of each meal segment, with entered carbohydrate, settings evidence and a usable glucose trajectory. D flags potential unlogged food in the window. | B_icr/supporting |
-| C, setting changes | Entered changes grouped by status. Follow-up uses the affected hours and excludes recorded context days. | C_changes |
-| F, controller activity | Paired programmed and commanded basal over eligible intervals. Compare size-scaled and strict meal exclusions. Count qualifying segment-days and clean hours. | F_basal/supporting |
-| H, prolonged glucose excursions | Eligible CGM sequences that meet episode thresholds, classified with available pump and context evidence. | H_episodes |
+- Tandem Source is complete for the windows downloaded; an incomplete window is named in the manifest.
+- Normalized timestamps are local wall-clock time; a wrong `TIMEZONE_NAME` shifts pump and Apple Health data against each other by hours.
+- A 5-hour insulin action curve is a first-order approximation.
+- Control-IQ changes basal all the time, so the I:C and basal evidence and every driver effect are observational.
+- Apple Health exports are only as complete as the wearable was worn and the export was run; the readout treats days with nothing recording as unknown, not as zero.

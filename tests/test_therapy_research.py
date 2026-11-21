@@ -12,15 +12,12 @@ from bayesian_t1dm.features import FeatureConfig
 from synthetic_dataset import synthetic_base_dataset
 from bayesian_t1dm.therapy_research import (
     LatentMealTherapySettings,
-    build_representative_latent_meal_fixture,
     build_first_meal_clean_window_registry,
     build_latent_meal_tiered_window_registry,
     build_therapy_research_frame,
     extract_latent_meal_therapy_settings_from_tandem_raw,
     parse_therapy_segments,
     run_latent_meal_icr_research,
-    write_latent_meal_research_artifacts,
-    write_representative_latent_meal_fixture_artifacts,
 )
 
 
@@ -359,13 +356,6 @@ def test_run_latent_meal_icr_research_builds_explicit_meal_outputs(tmp_path):
     assert "Meal Truth Semantics Report" in result.meal_truth_semantics_report_markdown
     assert "Which Breakfasts Were Used" in result.meal_window_audit_markdown
 
-    paths = write_latent_meal_research_artifacts(result, tmp_path / "latent")
-    assert paths["research_gate"].exists()
-    assert paths["meal_truth_semantics_report"].exists()
-    assert paths["meal_event_registry"].exists()
-    assert paths["first_meal_clean_window_registry"].exists()
-    assert paths["first_meal_exclusion_summary"].exists()
-
 
 def test_run_latent_meal_icr_research_returns_honest_empty_or_strict_results():
     dataset = synthetic_base_dataset(apple=False, explicit_carbs=False, proxy_only=True)
@@ -473,10 +463,10 @@ def test_extract_latent_meal_therapy_settings_from_tandem_pump_metadata(tmp_path
 
 def _with_physical_iob(dataset: AnalysisReadyHealthDataset) -> AnalysisReadyHealthDataset:
     """Recompute IOB from the bolus column so insulin bookkeeping is self-consistent."""
-    from bayesian_t1dm.insulin import expand_bolus_series_to_grid
+    from bayesian_t1dm.insulin import expand_bolus_to_grid
 
     frame = dataset.frame.copy()
-    exposure = expand_bolus_series_to_grid(frame[["timestamp", "bolus_units"]])
+    exposure = expand_bolus_to_grid(frame[["timestamp", "bolus_units"]], frame[["timestamp"]])
     frame["iob_units"] = exposure["iob_units"].to_numpy()
     frame["insulin_activity_units"] = exposure["insulin_activity_units"].to_numpy()
     return replace(dataset, frame=frame)
@@ -501,67 +491,6 @@ def test_latent_carb_estimator_directionality_with_insulin_and_glucose_response(
 
     assert more_insulin_median > base_median
     assert larger_response_median > base_median
-
-
-def test_build_representative_latent_meal_fixture_retains_candidate_days_and_selects_background_days(tmp_path):
-    dataset = synthetic_base_dataset(apple=True, explicit_carbs=True)
-    frame = dataset.frame.copy()
-    all_dates = sorted(pd.to_datetime(frame["timestamp"], errors="coerce").dt.normalize().dropna().unique())
-    suppressed_dates = set(all_dates[-2:])
-    timestamp_series = pd.to_datetime(frame["timestamp"], errors="coerce")
-    morning_mask = (
-        timestamp_series.dt.normalize().isin(suppressed_dates)
-        & (((timestamp_series.dt.hour * 60) + timestamp_series.dt.minute) >= 360)
-        & (((timestamp_series.dt.hour * 60) + timestamp_series.dt.minute) < 660)
-    )
-    frame.loc[morning_mask, "meal_event"] = 0.0
-    frame.loc[morning_mask, "carb_grams"] = 0.0
-    frame.loc[morning_mask, "bolus_units"] = 0.0
-    frame["carb_roll_sum_60m"] = frame["carb_grams"].rolling(12, min_periods=1).sum()
-    frame["carb_roll_sum_120m"] = frame["carb_grams"].rolling(24, min_periods=1).sum()
-    frame["minutes_since_last_meal"] = (
-        frame["timestamp"] - frame["timestamp"].where(frame["meal_event"].gt(0)).ffill()
-    ).dt.total_seconds().div(60.0).fillna(1e6)
-    frame["insulin_activity_units"] = frame["bolus_units"].rolling(12, min_periods=1).sum() / 6.0
-    frame["iob_units"] = frame["bolus_units"].rolling(24, min_periods=1).sum()
-    frame["iob_roll_sum_60m"] = frame["iob_units"].rolling(12, min_periods=1).sum()
-    frame["iob_roll_sum_120m"] = frame["iob_units"].rolling(24, min_periods=1).sum()
-    frame["carb_bolus_interaction_60m"] = frame["carb_roll_sum_60m"] * frame["bolus_units"]
-    frame["carb_iob_interaction_60m"] = frame["carb_roll_sum_60m"] * frame["iob_units"]
-    dataset = AnalysisReadyHealthDataset(
-        frame=frame,
-        feature_columns=dataset.feature_columns,
-        tandem_feature_columns=dataset.tandem_feature_columns,
-        health_feature_columns=dataset.health_feature_columns,
-        target_column=dataset.target_column,
-        horizon_minutes=dataset.horizon_minutes,
-        config=dataset.config,
-        mode=dataset.mode,
-        apple_available=dataset.apple_available,
-        explicit_carb_source_available=dataset.explicit_carb_source_available,
-    )
-
-    fixture = build_representative_latent_meal_fixture(
-        dataset,
-        segments=parse_therapy_segments(),
-        meal_proxy_mode="strict",
-        background_days=2,
-        seed=11,
-    )
-
-    source_candidate_days = int(pd.to_datetime(fixture.source_result.meal_windows["date"], errors="coerce").nunique())
-    fixture_candidate_days = int(pd.to_datetime(fixture.fixture_result.meal_windows["date"], errors="coerce").nunique())
-    background_selected = int(fixture.selected_day_manifest["selection_type"].astype(str).eq("background").sum())
-
-    assert source_candidate_days == fixture_candidate_days
-    assert background_selected == 2
-    assert "candidate_day_retention: 1.000" in fixture.summary_markdown
-
-    paths = write_representative_latent_meal_fixture_artifacts(fixture, tmp_path / "fixture")
-    assert paths["prepared_model_data"].exists()
-    assert paths["fixture_summary"].exists()
-    assert paths["selected_day_manifest"].exists()
-    assert paths["research_gate"].exists()
 
 
 def test_first_meal_registry_ignores_implausible_workout_flags_and_schedule_change_only():
@@ -721,7 +650,7 @@ def test_scheduled_basal_is_nan_without_enough_comparable_days():
 
 
 def test_window_trajectory_counts_bolus_decay_and_basal_above_schedule():
-    from bayesian_t1dm.insulin import expand_bolus_series_to_grid
+    from bayesian_t1dm.insulin import expand_bolus_to_grid
     from bayesian_t1dm.latent_meal_trajectory import absorbed_units_from_deliveries
     from bayesian_t1dm.therapy_research import _first_meal_window_trajectories
 
@@ -729,7 +658,7 @@ def test_window_trajectory_counts_bolus_decay_and_basal_above_schedule():
     meal_time = pd.Timestamp("2025-03-05 08:00")
     timestamps = frame["timestamp"]
     frame.loc[timestamps.eq(meal_time), "bolus_units"] = 4.0
-    frame["iob_units"] = expand_bolus_series_to_grid(frame[["timestamp", "bolus_units"]])["iob_units"].to_numpy()
+    frame["iob_units"] = expand_bolus_to_grid(frame[["timestamp", "bolus_units"]], frame[["timestamp"]])["iob_units"].to_numpy()
     window_metrics = pd.DataFrame({"meal_id": ["m1"], "timestamp": [meal_time]})
 
     bolus_only = _first_meal_window_trajectories(frame, window_metrics)["m1"]
