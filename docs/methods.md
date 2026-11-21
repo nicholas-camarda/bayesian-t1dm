@@ -25,12 +25,13 @@ The aim is more time in 70-180 mg/dL with time below 70 under 4% and below 54 un
 | H | What happened in each long high or low, and how to respond | H1 episode finder; H2 pattern and evidence; H3 repeats by pump segment; H4 playbook | `propose-breakfast-icr` | `H_episodes/` |
 | I | Does the hour-day model forecast 14-day time in range better than the last 28 days? | I1 prespecified win test; I2 exploratory comparators | `python -m bayesian_t1dm.forecast_harness` | `I_forecast/` |
 | J | Do the model's predicted effects of past setting changes match what happened? | J1 replay as predictor (slope, power, settings information) | `python -m bayesian_t1dm.replay_predictor` | `J_replay_predictor/` |
+| K | How did the last day and week go, what has gone with glucose, and are the settings performing? | K1 daily rings and context; K2 drivers of next-day time in range and time below 70; K3 settings check (basal, I:C); K4 recent changes | `python -m bayesian_t1dm.readout_report` | `runtime/output/readout/`, page copied to the Vault `readout/` |
 
 The shared record checks sit in `00_General/` (the data-quality audit, `python -m bayesian_t1dm.data_audit`, and the dataset validation report). The exploratory replay of past changes (`python -m bayesian_t1dm.replay`) and the hour-day outcomes model (`python -m bayesian_t1dm.outcomes_model`) are the building blocks of goals I and J.
 
 ## Data processing
 
-Sources are Tandem Source (the pump's own event log: CGM, boluses, carbohydrate entries, basal delivery, profile edits, Control-IQ modes, site changes), Apple Health (workouts, sleep, Bevel's food log), `context_events.csv` (days to leave out) and an optional hand-kept carb log. Every raw file is fingerprinted and `build-dataset` rebuilds only what changed. Details are in [Design overview](technical.md#design-overview), [Data Flow](technical.md#data-flow) and [Tandem Source Acquisition](technical.md#tandem-source-acquisition).
+Sources are Tandem Source (the pump's own event log: CGM, boluses, carbohydrate entries, basal delivery, profile edits, Control-IQ modes, site changes), Apple Health (workouts, sleep, resting heart rate, heart rate variability, Bevel's food log), `context_events.csv` (days to leave out) and an optional hand-kept carb log. Every raw file is fingerprinted and `build-dataset` rebuilds only what changed. Details are in [Design overview](technical.md#design-overview), [Data Flow](technical.md#data-flow) and [Tandem Source Acquisition](technical.md#tandem-source-acquisition).
 
 - **Clock.** All times are local pump time (`TIMEZONE_NAME`); glucose, insulin and carbohydrate sit on a 5-minute grid.
 - **Glucose validity.** Tandem CGM readings from 40 to 400 mg/dL count; a day counts when at least 70% of its readings are present.
@@ -55,6 +56,7 @@ Each analysis follows the same shape: describe what the record shows, estimate w
 | Replay | Replay of each past settings change against five matched no-change dates | `delta`, observed minus predicted minus placebo, in percentage points with a bootstrap 90% interval | [Replay of past setting changes](technical.md#replay-of-past-setting-changes-exploratory) |
 | I | Weekly origins over the last year; CRPS of the 14-day aggregate share against the last-28-day baseline; paired block bootstrap | Win only if the 90% interval of the mean CRPS difference (model minus baseline) lies entirely below zero | [Forecast evaluation harness](technical.md#forecast-evaluation-harness-step-2) |
 | J | The model fitted before each change predicts the change under new and old settings; slope of observed on predicted change, settings-information CRPS difference, power simulation | Slope in percentage points per percentage point, cluster bootstrap 90% interval | [Replay as predictor](technical.md#replay-as-predictor-step-4) |
+| K | Beta-binomial regression of each day's readings in range (and below 70) on the prespecified drivers measured before the day, with a partially pooled month effect and a weekend term | Average marginal effect of each driver in percentage points of the day with a 90% posterior interval; within-person association | [Personal readout](technical.md#personal-readout-goal-k) |
 
 The win rule of goal I is fixed before any fit and the verdict is one of win, tie or lose: a lower mean CRPS whose interval spans zero is a tie. A tie against a comparator means the data do not separate the two; it does not show the model carries no information.
 

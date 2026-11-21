@@ -40,6 +40,7 @@ class ProjectPaths:
     output_data_audit: Path
     output_forecast_harness: Path
     output_proposals: Path
+    output_readout: Path
     current: Path
     runs: Path
     output_fixture: Path
@@ -60,6 +61,7 @@ class ProjectPaths:
     cloud_raw: Path
     cloud_output: Path
     cloud_archive: Path
+    cloud_readout: Path
 
     @classmethod
     def from_root(
@@ -101,6 +103,7 @@ class ProjectPaths:
             output_data_audit=runtime_path / "output" / "data_audit",
             output_forecast_harness=runtime_path / "output" / "forecast_harness",
             output_proposals=runtime_path / "output" / "proposals",
+            output_readout=runtime_path / "output" / "readout",
             current=runtime_path / "current",
             runs=runtime_path / "runs",
             output_fixture=runtime_path / "output" / "fixture",
@@ -121,6 +124,7 @@ class ProjectPaths:
             cloud_raw=cloud_path / "data" / "raw",
             cloud_output=cloud_path / "output",
             cloud_archive=cloud_path / "archive",
+            cloud_readout=cloud_path / "readout",
         )
 
     def ensure(self) -> "ProjectPaths":
@@ -135,6 +139,7 @@ class ProjectPaths:
             self.output_data_audit,
             self.output_forecast_harness,
             self.output_proposals,
+            self.output_readout,
             self.runs,
             self.output_fixture,
             self.output_source,

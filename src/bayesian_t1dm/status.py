@@ -22,6 +22,7 @@ TOP_LEVEL_ENTRYPOINTS = {
     "data_audit",
     "forecast_harness",
     "proposals",
+    "readout",
     "refresh",
     "fixture",
     "source",
