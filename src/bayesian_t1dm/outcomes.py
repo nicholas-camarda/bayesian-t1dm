@@ -176,15 +176,6 @@ def pooled_metrics(cgm: pd.DataFrame, *, start: pd.Timestamp, end: pd.Timestamp,
     return row
 
 
-def baseline_table(cgm: pd.DataFrame, *, as_of: pd.Timestamp, windows_days: Sequence[int] = (14, 90)) -> pd.DataFrame:
-    """Whole-day metrics for the last ``windows_days`` days before ``as_of`` (exclusive)."""
-    rows = []
-    for days in windows_days:
-        row = pooled_metrics(cgm, start=as_of - pd.Timedelta(days=days), end=as_of)
-        rows.append({"window": f"last {days} days", **row})
-    return pd.DataFrame(rows)
-
-
 def day_part_table(cgm: pd.DataFrame, parts: Sequence[DayPart], *, as_of: pd.Timestamp, days: int = 90) -> pd.DataFrame:
     """Metrics per time-of-day bin over the last ``days`` days, to show where lows and highs concentrate."""
     rows = []

@@ -27,8 +27,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .insulin import insulin_action_curve
-from .latent_meal_trajectory import (
+from bayesian_t1dm.insulin import insulin_action_curve
+from bayesian_t1dm.latent_meal_trajectory import (
     MealWindowTrajectory,
     absorbed_fraction,
     absorbed_units_from_deliveries,
@@ -234,7 +234,7 @@ def run_latent_meal_truth_recovery(
     scenarios: tuple[MealSimulationScenario, ...] = DEFAULT_SCENARIOS,
 ) -> LatentMealRecoveryResult:
     # Imported here: therapy_research imports the trajectory module, and this harness sits on top of both.
-    from .therapy_research import LatentMealTherapySettings, _latent_carb_posterior_for_window
+    from bayesian_t1dm.therapy_research import LatentMealTherapySettings, _latent_carb_posterior_for_window
 
     if n_meals_per_scenario <= 0:
         raise ValueError("n_meals_per_scenario must be positive")

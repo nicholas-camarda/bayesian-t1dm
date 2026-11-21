@@ -5,10 +5,9 @@ import pytest
 from bayesian_t1dm.features import FeatureConfig, build_feature_frame
 from bayesian_t1dm.ingest import build_export_manifest, load_tandem_exports, summarize_coverage
 from bayesian_t1dm.quality import assess_data_quality
-from bayesian_t1dm.report import build_coverage_summary
 
 
-def test_realistic_14d_fixture_supports_integration_pipeline(monkeypatch, tandem_realistic_fixture_dir, tmp_path):
+def test_realistic_14d_fixture_supports_integration_pipeline(monkeypatch, tandem_realistic_fixture_dir):
     monkeypatch.setenv("TIMEZONE_NAME", "America/New_York")
 
     data = load_tandem_exports(tandem_realistic_fixture_dir)
@@ -28,13 +27,4 @@ def test_realistic_14d_fixture_supports_integration_pipeline(monkeypatch, tandem
 
     data_quality, _ = assess_data_quality(tandem_realistic_fixture_dir, export_manifest=build_export_manifest(data))
 
-    summary = build_coverage_summary(
-        coverage=coverage,
-        data_quality=data_quality,
-        review_artifacts={"coverage_review_html": str(tmp_path / "coverage_review.html")},
-    )
-
-    assert summary["coverage"]["cgm_rows"] > 3000
-    assert summary["data_quality"]["status"] in {"good", "degraded"}
-
-
+    assert data_quality.status in {"good", "degraded"}

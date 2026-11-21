@@ -228,22 +228,6 @@ def daily_controller_pattern(
     return result
 
 
-def controller_summary(daily: pd.DataFrame) -> pd.DataFrame:
-    """Per segment: how many clean days, and the distribution of the controller's extra insulin across them."""
-    rows = []
-    for part, group in daily.groupby("part", sort=False):
-        fraction = group["excess_fraction"]
-        rows.append(
-            {
-                "part": part, "days": int(len(group)), "median_excess_fraction": float(fraction.median()),
-                "p25": float(fraction.quantile(0.25)), "p75": float(fraction.quantile(0.75)), "sd_between_days": float(fraction.std(ddof=1)) if len(group) > 1 else np.nan,
-                "mean_glucose": float(group["mean_glucose"].mean()), "time_in_range_pct": float(group["time_in_range_pct"].mean()),
-                "sleep_share": float(group["sleep_share"].mean()),
-            }
-        )
-    return pd.DataFrame(rows)
-
-
 # The written rule for turning the pattern into a basal signal (chosen with the person, 2026-11-18).
 SIGNAL_EXTRA_FRACTION = 0.25  # X: the controller runs this far above (or below) the profile
 SIGNAL_SHARE_OF_TIME = 0.50   # Y: for at least this share of the recent clean time

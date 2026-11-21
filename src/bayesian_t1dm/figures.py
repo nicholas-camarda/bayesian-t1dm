@@ -124,9 +124,3 @@ READOUT_STYLE = {
     "estimate": GroupStyle("Estimate with 90% interval", JCO[0], "o", "-"),
 }
 
-def assert_ascii(*texts: str) -> None:
-    """Raise when a figure label holds a character outside ASCII (it may not render in every font)."""
-    for text in texts:
-        if not str(text).isascii():
-            raise ValueError(f"Figure text must be ASCII: {text!r}")
-

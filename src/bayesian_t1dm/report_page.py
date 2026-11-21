@@ -240,26 +240,8 @@ def verdict(status: str, label: str, headline: str, explanation: str = "", figur
     )
 
 
-def tiles(items: Iterable[tuple[str, str]]) -> str:
-    cells = "".join(f"<div class='tile'><div class='n'>{value}</div><div class='l'>{label}</div></div>" for value, label in items)
-    return f"<div class='tiles'>{cells}</div>"
-
-
-def section(title: str, body: str) -> str:
-    return f"<h2>{esc(title)}</h2>{body}"
-
-
-def bullets(items: Iterable[str]) -> str:
-    rendered = "".join(f"<li>{item}</li>" for item in items if item)
-    return f"<ul>{rendered}</ul>" if rendered else ""
-
-
 def details(summary: str, body: str, *, open_: bool = False) -> str:
     return f"<details{' open' if open_ else ''}><summary>{esc(summary)}</summary>{body}</details>"
-
-
-def caption(text: str) -> str:
-    return f"<p class='caption'>{text}</p>"
 
 
 def table(headers: Sequence[str], rows: Iterable[Sequence[object]], *, numeric: Sequence[int] = ()) -> str:
@@ -272,10 +254,6 @@ def table(headers: Sequence[str], rows: Iterable[Sequence[object]], *, numeric: 
     if not body_rows:
         return "<p class='caption'>No rows.</p>"
     return f"<div class='scroll'><table><thead><tr>{head}</tr></thead><tbody>{''.join(body_rows)}</tbody></table></div>"
-
-
-def glossary(pairs: Iterable[tuple[str, str]]) -> str:
-    return details("Glossary", table(["term", "meaning"], [(f"<b>{esc(term)}</b>", meaning) for term, meaning in pairs]))
 
 
 def legend(items: Iterable[tuple[str, str, object]]) -> str:
@@ -291,57 +269,9 @@ def legend(items: Iterable[tuple[str, str, object]]) -> str:
     return f"<div class='legend'>{''.join(spans)}</div>"
 
 
-def file_links(entries: Iterable[tuple[str, str, bool]]) -> str:
-    """List of (filename, description, exists) linking to companion files."""
-    rows = []
-    for name, description, exists in entries:
-        link = f"<a href='{esc(name)}'>{esc(name)}</a>" if exists else f"{esc(name)} (not written)"
-        rows.append((link, esc(description)))
-    return table(["file", "what it holds"], rows)
-
-
 # ---------------------------------------------------------------------------
 # SVG charts. Coordinates are in viewBox units; width scales to the container.
 # ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class _Scale:
-    lo: float
-    hi: float
-    a: float
-    b: float
-
-    def __call__(self, value: float) -> float:
-        if self.hi == self.lo:
-            return (self.a + self.b) / 2
-        return self.a + (value - self.lo) / (self.hi - self.lo) * (self.b - self.a)
-
-
-def _nice_ticks(lo: float, hi: float, count: int = 5) -> list[float]:
-    if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
-        return [lo]
-    raw = (hi - lo) / max(count, 1)
-    magnitude = 10 ** math.floor(math.log10(raw))
-    step = min((m * magnitude for m in (1, 2, 2.5, 5, 10) if m * magnitude >= raw), default=raw)
-    start = math.ceil(lo / step) * step
-    ticks = []
-    value = start
-    while value <= hi + 1e-9:
-        ticks.append(round(value, 10))
-        value += step
-    return ticks
-
-
-def _tick_label(value: float) -> str:
-    return f"{value:g}"
-
-
-def _svg(width: int, height: int, label: str, parts: Iterable[str]) -> str:
-    return (
-        f"<svg viewBox='0 0 {width} {height}' width='100%' role='img' aria-label='{esc(label)}' "
-        f"style='max-width:{width}px;display:block'>{''.join(parts)}</svg>"
-    )
 
 
 def _text(x: float, y: float, value: str, *, anchor: str = "start", ink: bool = False, size: int | None = None, weight: int | None = None, rotate: bool = False) -> str:
@@ -358,141 +288,5 @@ def _text(x: float, y: float, value: str, *, anchor: str = "start", ink: bool = 
     if rotate:
         attrs += f" transform='rotate(-90 {x:.1f} {y:.1f})'"
     return f"<text {attrs}>{esc(value)}</text>"
-
-
-def interval_chart(
-    *,
-    estimate: float,
-    lower: float,
-    upper: float,
-    reference: float | None,
-    reference_label: str,
-    axis_label: str,
-    value_label: str,
-) -> str:
-    """One estimate with its 90% range on a horizontal axis, against a reference value."""
-    values = [estimate, lower, upper] + ([reference] if reference is not None else [])
-    span = max(values) - min(values)
-    lo = math.floor(min(values) - max(span * 0.4, 0.5))
-    hi = math.ceil(max(values) + max(span * 0.4, 0.5))
-    width, height, x0, x1 = 560, 132, 30, 540
-    sx = _Scale(lo, hi, x0, x1)
-    band_y, axis_y = 46, 96
-    parts: list[str] = [f"<line class='grid' x1='{x0}' x2='{x1}' y1='{axis_y}' y2='{axis_y}' />"]
-    for tick in _nice_ticks(lo, hi, 5):
-        parts.append(f"<line class='grid' x1='{sx(tick):.1f}' x2='{sx(tick):.1f}' y1='{axis_y}' y2='{axis_y + 5}' />")
-        parts.append(_text(sx(tick), axis_y + 19, _tick_label(tick), anchor="middle"))
-    parts.append(_text((x0 + x1) / 2, height - 2, axis_label, anchor="middle", size=11))
-    # 90% range band and estimate; nothing is drawn across the band.
-    parts.append(
-        f"<rect x='{sx(lower):.1f}' y='{band_y - 8}' width='{max(sx(upper) - sx(lower), 2):.1f}' height='16' rx='5' fill='{PRIMARY}' opacity='0.35'>"
-        f"<title>90% range {esc(value_label)}</title></rect>"
-    )
-    parts.append(f"<line x1='{sx(lower):.1f}' x2='{sx(upper):.1f}' y1='{band_y}' y2='{band_y}' stroke='{PRIMARY}' stroke-width='3' />")
-    parts.append(f"<circle cx='{sx(estimate):.1f}' cy='{band_y}' r='8' fill='{PRIMARY}' class='halo' stroke-width='2.5'><title>{esc(value_label)}</title></circle>")
-    parts.append(_text(sx(estimate), band_y - 16, value_label, anchor="middle", ink=True, weight=650, size=14))
-    # Reference (pump setting): a dashed stub between the band and the axis, labelled beside it.
-    if reference is not None:
-        rx = sx(reference)
-        parts.append(f"<line x1='{rx:.1f}' x2='{rx:.1f}' y1='{band_y + 14}' y2='{axis_y}' stroke='{REFERENCE}' stroke-width='2.5' stroke-dasharray='6 4' />")
-        parts.append(f"<path d='M{rx - 6:.1f},{axis_y - 1} L{rx + 6:.1f},{axis_y - 1} L{rx:.1f},{axis_y - 9} Z' fill='{REFERENCE}' />")
-        anchor = "end" if rx > (x0 + x1) / 2 else "start"
-        parts.append(_text(rx + (-8 if anchor == "end" else 8), band_y + 34, reference_label, anchor=anchor, ink=True, size=13))
-    return _svg(width, height, f"{value_label}; {reference_label}", parts)
-
-
-@dataclass(frozen=True)
-class ScatterPoint:
-    x: float
-    y: float
-    lower: float | None
-    upper: float | None
-    strong: bool
-    tooltip: str
-
-
-def scatter_with_ranges(points: Sequence[ScatterPoint], *, x_label: str, y_label: str, identity_label: str) -> str:
-    """Dots with vertical 90% ranges and a dashed y = x line. Same scale on both axes."""
-    if not points:
-        return "<p class='caption'>No points to plot.</p>"
-    top = max(max(p.x for p in points), max(p.y for p in points))
-    top = max(10.0, math.ceil(top * 1.1 / 10) * 10)
-    size, margin = 420, 52
-    sx = _Scale(0, top, margin, size - 16)
-    sy = _Scale(0, top, size - margin, 16)
-    parts: list[str] = []
-    for tick in _nice_ticks(0, top, 4):
-        parts.append(f"<line class='grid' x1='{sx(0):.1f}' x2='{sx(top):.1f}' y1='{sy(tick):.1f}' y2='{sy(tick):.1f}' />")
-        parts.append(f"<line class='grid' x1='{sx(tick):.1f}' x2='{sx(tick):.1f}' y1='{sy(0):.1f}' y2='{sy(top):.1f}' />")
-        parts.append(_text(sx(tick), size - margin + 16, _tick_label(tick), anchor="middle"))
-        parts.append(_text(margin - 8, sy(tick) + 4, _tick_label(tick), anchor="end"))
-    parts.append(f"<line x1='{sx(0):.1f}' y1='{sy(0):.1f}' x2='{sx(top):.1f}' y2='{sy(top):.1f}' stroke='{REFERENCE}' stroke-width='2' stroke-dasharray='8 5' />")
-    parts.append(_text(sx(top * 0.72), sy(top * 0.6), identity_label, size=11))
-    parts.append(_text((size + margin) / 2, size - 10, x_label, anchor="middle"))
-    parts.append(_text(16, (size - margin) / 2, y_label, anchor="middle", rotate=True))
-    for point in sorted(points, key=lambda p: p.strong):
-        color = PRIMARY if point.strong else SECONDARY
-        if point.lower is not None and point.upper is not None:
-            parts.append(
-                f"<line x1='{sx(point.x):.1f}' x2='{sx(point.x):.1f}' y1='{sy(min(point.upper, top)):.1f}' y2='{sy(max(point.lower, 0)):.1f}' "
-                f"stroke='{color}' stroke-width='1.5' opacity='0.5' />"
-            )
-        # Strong evidence: filled dot. Weaker evidence: hollow ring, so the two differ by shape as well as color.
-        marker = (
-            f"r='5.5' fill='{color}' class='halo' stroke-width='2'"
-            if point.strong
-            else f"r='4.5' class='hollow' stroke='{color}' stroke-width='2'"
-        )
-        parts.append(f"<circle cx='{sx(point.x):.1f}' cy='{sy(min(point.y, top)):.1f}' {marker}><title>{esc(point.tooltip)}</title></circle>")
-    return _svg(size, size, f"{y_label} against {x_label}", parts)
-
-
-def bar_list(rows: Sequence[tuple[str, float]], *, color: str = PRIMARY, value_format: str = "{:,.0f}", max_value: float | None = None) -> str:
-    """Horizontal bars with the label on the right, sorted as given."""
-    if not rows:
-        return "<p class='caption'>Nothing to show.</p>"
-    width, row_h = 640, 30
-    label_w = 300
-    top = max_value if max_value is not None else max(value for _, value in rows) or 1.0
-    height = row_h * len(rows) + 6
-    parts: list[str] = []
-    for i, (label, value) in enumerate(rows):
-        bar = max((value / top) * (width - label_w - 60), 3) if value > 0 else 0
-        y = i * row_h + 4
-        if bar:
-            parts.append(f"<rect x='0' y='{y}' width='{bar:.1f}' height='{row_h - 10}' rx='4' fill='{color}'><title>{esc(label)}: {esc(value_format.format(value))}</title></rect>")
-        parts.append(_text(bar + 8, y + 15, value_format.format(value), ink=True, weight=600))
-        parts.append(_text(bar + 58, y + 15, label))
-    return _svg(width, height, "bar chart", parts)
-
-
-def histogram(values: Sequence[float], *, bin_width: float, guide: float | None, guide_label: str, x_label: str) -> str:
-    clean = [v for v in values if v is not None and math.isfinite(v)]
-    if not clean:
-        return "<p class='caption'>No values to plot.</p>"
-    top = max(max(clean), guide or 0) + bin_width
-    edges = [i * bin_width for i in range(int(math.ceil(top / bin_width)) + 1)]
-    counts = [sum(1 for v in clean if edges[i] <= v < edges[i + 1]) for i in range(len(edges) - 1)]
-    width, height, margin = 480, 220, 40
-    sx = _Scale(0, edges[-1], margin, width - 12)
-    sy = _Scale(0, max(counts) or 1, height - margin, 26)
-    parts: list[str] = []
-    for tick in _nice_ticks(0, max(counts) or 1, 4):
-        if float(tick).is_integer():
-            parts.append(f"<line class='grid' x1='{margin}' x2='{width - 12}' y1='{sy(tick):.1f}' y2='{sy(tick):.1f}' />")
-            parts.append(_text(margin - 6, sy(tick) + 4, _tick_label(tick), anchor="end"))
-    for i, count in enumerate(counts):
-        if count:
-            parts.append(
-                f"<rect x='{sx(edges[i]) + 1:.1f}' y='{sy(count):.1f}' width='{sx(edges[i + 1]) - sx(edges[i]) - 2:.1f}' height='{sy(0) - sy(count):.1f}' rx='3' fill='{PRIMARY}'>"
-                f"<title>{count} between {edges[i]:g} and {edges[i + 1]:g}</title></rect>"
-            )
-    for edge in edges:
-        parts.append(_text(sx(edge), height - margin + 16, _tick_label(edge), anchor="middle"))
-    if guide is not None:
-        parts.append(f"<line x1='{sx(guide):.1f}' x2='{sx(guide):.1f}' y1='14' y2='{sy(0):.1f}' stroke='{REFERENCE}' stroke-width='2' stroke-dasharray='8 5' />")
-        parts.append(_text(sx(guide) + 6, 18, guide_label, ink=True, size=11))
-    parts.append(_text((width + margin) / 2, height - 6, x_label, anchor="middle", size=11))
-    return _svg(width, height, x_label, parts)
 
 

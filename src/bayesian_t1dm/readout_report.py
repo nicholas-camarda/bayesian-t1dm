@@ -1,13 +1,12 @@
 """Build the personal readout: day table, drivers model, settings check, page and diagnostics workbook.
 
-Run with ``python -m bayesian_t1dm.readout_report``. Writes ``readout.html``, ``diagnostics.xlsx`` and the result tables
+Run with ``bayesian-t1dm readout``. Writes ``readout.html``, ``diagnostics.xlsx`` and the result tables
 to ``runtime/output/readout/`` and copies the page to ``<Project Vault>/readout/readout.html`` so it opens from the
 OneDrive app. The workbook carries a ``Record_Issues`` sheet (dates of left-out days) and stays out of Git.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import shutil
@@ -22,7 +21,7 @@ from . import readout as ro
 from . import readout_model as rm
 from . import readout_settings as rs
 from .diagnostics_workbook import read_workbook, write_workbook
-from .publish import current_commit, working_tree_is_clean
+from .provenance import current_commit, working_tree_is_clean
 from .readout_page import TRACE_DAYS, Readout, render
 from .sampler_health import ESS_LIMIT, R_HAT_LIMIT
 
@@ -148,11 +147,13 @@ def reconcile(path: Path, fits: dict[str, rm.DriverFit], flow: pd.DataFrame, kep
         raise ValueError("Workbook flow does not end at the modelled days.")
 
 
-def run(raw: str | None, output: str | None, *, draws: int, tune: int, chains: int, command: str) -> int:
+def run(raw: str | None, output: str | None, *, root: Path) -> int:
+    """Build the readout from the merged dataset; returns 0, or raises when a step fails (nothing is copied to the Vault)."""
     from .analysis_data import load_analysis_data
     from .paths import ProjectPaths
 
-    paths = ProjectPaths.from_root(Path.cwd())
+    paths = ProjectPaths.from_root(root)
+    command = "bayesian-t1dm readout"
     raw = raw or str(paths.cloud_raw)
     folder = Path(output or paths.output_readout)
     folder.mkdir(parents=True, exist_ok=True)
@@ -167,7 +168,7 @@ def run(raw: str | None, output: str | None, *, draws: int, tune: int, chains: i
     kept, flow = ro.model_days(days)
     flow = pd.DataFrame(flow)
     LOGGER.info("day flow\n%s", flow.to_string(index=False))
-    fits = rm.fit_all(kept, draws=draws, tune=tune, chains=chains)
+    fits = rm.fit_all(kept)
     for outcome, fit in fits.items():
         LOGGER.info("%s: %d days, sampler %s\n%s", outcome, fit.days, "passed" if fit.usable else "FAILED", fit.effects.to_string(index=False))
     settings, evidence = rs.settings_check(analysis, raw, as_of=as_of)
@@ -209,19 +210,3 @@ def run(raw: str | None, output: str | None, *, draws: int, tune: int, chains: i
     shutil.copy2(page, paths.cloud_readout / "readout.html")
     LOGGER.info("readout written to %s and %s in %.1f s", page, paths.cloud_readout / "readout.html", time.time() - started)
     return 0
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--raw", default=None, help="Raw data root (default: the Project Vault data/raw)")
-    parser.add_argument("--output", default=None, help="Output folder (default: runtime/output/readout)")
-    parser.add_argument("--draws", type=int, default=rm.DRAWS)
-    parser.add_argument("--tune", type=int, default=rm.TUNE)
-    parser.add_argument("--chains", type=int, default=rm.CHAINS)
-    args = parser.parse_args(argv)
-    command = f"python -m bayesian_t1dm.readout_report --draws {args.draws} --tune {args.tune} --chains {args.chains}"
-    return run(args.raw, args.output, draws=args.draws, tune=args.tune, chains=args.chains, command=command)
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

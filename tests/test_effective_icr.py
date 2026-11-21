@@ -18,18 +18,16 @@ from bayesian_t1dm.latent_meal_trajectory import (
     observe_carb_sensitivity,
     pool_effective_icr,
 )
-from bayesian_t1dm.latent_meal_validation import (
+from latent_meal_validation import (
     _insulin_absorbed_fraction,
     render_effective_icr_recovery_markdown,
     run_effective_icr_recovery,
 )
-from bayesian_t1dm.review import write_latent_meal_review_html
 from bayesian_t1dm.therapy_research import (
     AGREEMENT_CHECKS,
     LatentMealTherapySettings,
     parse_therapy_segments,
     run_latent_meal_icr_research,
-    write_latent_meal_research_artifacts,
 )
 
 PROGRAMMED_ICR = 10.0
@@ -188,7 +186,7 @@ def _run_full(data: IngestedData, excluded_periods=()):
         )
 
 
-def test_pipeline_recovers_effective_icr_from_logged_breakfasts(tmp_path, assert_answer_first_page):
+def test_pipeline_recovers_effective_icr_from_logged_breakfasts():
     true_icr = 8.0
     result = _run_full(_simulated_breakfast_data(days=14, true_icr=true_icr, log_carbs=True))
 
@@ -203,21 +201,9 @@ def test_pipeline_recovers_effective_icr_from_logged_breakfasts(tmp_path, assert
     assert morning["effective_icr"] == pytest.approx(true_icr, rel=0.08)
     assert morning["effective_icr_lower_90"] <= true_icr <= morning["effective_icr_upper_90"]
 
-    paths = write_latent_meal_research_artifacts(result, tmp_path / "latent")
-    assert paths["effective_icr_evidence"].exists()
-    report = paths["latent_carb_estimator_report"].read_text(encoding="utf-8")
-    assert "## Effective I:C From Logged Meals" in report
-    assert "Carbs raise glucose more than the setting assumes" in report
-
-    review = write_latent_meal_review_html(result, tmp_path / "latent" / "latent_meal_review.html").read_text(encoding="utf-8")
-    assert "Is my morning I:C ratio right?" in review
-    assert "Carbs raise glucose more than the setting assumes" in review
-    assert f"Your pump is set to {morning['programmed_icr']:.1f}" in review
-    assert "<svg" in review and "carbs implied by your glucose" in review
-    assert_answer_first_page(review)
 
 
-def test_pipeline_says_icr_is_unassessable_without_logged_carbs(tmp_path, assert_answer_first_page):
+def test_pipeline_says_icr_is_unassessable_without_logged_carbs():
     result = _run_full(_simulated_breakfast_data(days=8, true_icr=8.0, log_carbs=False))
 
     evidence = result.effective_icr_evidence
@@ -229,21 +215,14 @@ def test_pipeline_says_icr_is_unassessable_without_logged_carbs(tmp_path, assert
     estimates = result.latent_carb_estimates
     assert (estimates["latent_carb_median"] > estimates["bolus_implied_carbs"]).mean() > 0.8
 
-    paths = write_latent_meal_research_artifacts(result, tmp_path / "latent")
-    report = paths["latent_carb_estimator_report"].read_text(encoding="utf-8")
-    assert "No accepted window has a logged carb count" in report
-    assert "carbs.csv" in report
-
-    review = write_latent_meal_review_html(result, tmp_path / "latent" / "latent_meal_review.html").read_text(encoding="utf-8")
-    assert "No accepted window has a logged carb count" in review
-    assert_answer_first_page(review)
 
 
 def test_cli_workflow_from_raw_tree_with_hand_kept_carb_log(tmp_path, monkeypatch):
-    """build-dataset -> research-latent-meal-icr on a raw tree laid out like the real archive."""
+    """build-dataset, then the I:C evidence, on a raw tree laid out like the real archive."""
     import json
 
     from bayesian_t1dm.cli import main
+    from bayesian_t1dm.dataset import load_merged_dataset
 
     cloud = tmp_path / "cloud"
     runtime = tmp_path / "runtime"
@@ -277,29 +256,17 @@ def test_cli_workflow_from_raw_tree_with_hand_kept_carb_log(tmp_path, monkeypatc
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         assert main(["--root", str(repo), "build-dataset"]) == 0
-        assert (
-            main(
-                [
-                    "--root",
-                    str(repo),
-                    "research-latent-meal-icr",
-                    "--research-scope",
-                    "full",
-                    "--therapy-settings",
-                    str(settings_path),
-                ]
-            )
-            == 0
+        merged = load_merged_dataset(cloud / "data" / "raw")
+        result = run_latent_meal_icr_research(
+            merged.preparation.dataset, segments=parse_therapy_segments(), research_scope="full",
+            therapy_settings=LatentMealTherapySettings(**json.loads(settings_path.read_text(encoding="utf-8"))),
         )
 
-    output = runtime / "output" / "latent_meal"
-    evidence = pd.read_csv(output / "effective_icr_evidence.csv").query("analysis == 'primary'").set_index("segment").loc["morning"]
+    evidence = result.effective_icr_evidence.query("analysis == 'primary'").set_index("segment").loc["morning"]
     assert int(evidence["n_meals"]) >= 8
     assert evidence["status"] == "carbs_hit_softer_than_programmed"
     assert evidence["effective_icr"] == pytest.approx(12.5, rel=0.08)
-    assert (output / "latent_meal_review.html").exists()
-    estimates = pd.read_csv(output / "latent_carb_estimates.csv")
-    assert estimates["estimator"].eq("trajectory").all()
+    assert result.latent_carb_estimates["estimator"].eq("trajectory").all()
 
 
 def test_full_scope_without_pump_profile_explains_how_to_supply_settings(tmp_path):

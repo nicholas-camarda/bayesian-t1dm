@@ -446,14 +446,6 @@ def _source_label_for_window(window: ExportWindow, endpoint_family: str) -> str:
     return f'tconnectsync::{window.window_id}::{endpoint_family}'
 
 
-def _window_archive_root(workspace: ProjectPaths, window: ExportWindow, endpoint_family: str) -> Path:
-    return workspace.cloud_raw / 'tconnectsync' / window.window_id / endpoint_family
-
-
-def _window_normalized_root(workspace: ProjectPaths, window: ExportWindow) -> Path:
-    return workspace.cloud_raw / 'tconnectsync' / window.window_id / 'normalized'
-
-
 def _window_manifest_path(workspace: ProjectPaths, window: ExportWindow) -> Path:
     return workspace.cloud_raw / 'tconnectsync' / window.window_id / 'window_manifest.csv'
 
@@ -1576,75 +1568,6 @@ def _coerce_export_artifact(result: Path | str | ExportArtifact) -> ExportArtifa
     return ExportArtifact(kind='download', path=Path(result))
 
 
-def _response_metadata(response, body: bytes | None = None) -> dict[str, object]:
-    headers = {str(key).lower(): str(value) for key, value in response.headers.items()}
-    content_type = headers.get('content-type')
-    content_length = headers.get('content-length')
-    if body is None:
-        try:
-            body = response.body()
-        except Exception:
-            body = b''
-    if body is None:
-        body = b''
-    metadata: dict[str, object] = {
-        'url': response.url,
-        'method': response.request.method,
-        'status': response.status,
-        'content_type': content_type,
-        'content_length': int(content_length) if content_length and content_length.isdigit() else None,
-        'headers': headers,
-        'body_size': len(body),
-        'body_sha256': hashlib.sha256(body).hexdigest() if body else None,
-    }
-    if body:
-        try:
-            metadata['body_text_preview'] = body.decode('utf-8')[:500]
-        except Exception:
-            metadata['body_text_preview'] = None
-    else:
-        metadata['body_text_preview'] = None
-    return metadata
-
-
-def _response_suffix(metadata: dict[str, object], body: bytes) -> str:
-    content_type = str(metadata.get('content_type') or '').lower()
-    if 'csv' in content_type:
-        return '.csv'
-    if 'json' in content_type:
-        return '.json'
-    if 'text/' in content_type:
-        try:
-            decoded = body.decode('utf-8')
-        except Exception:
-            return '.txt'
-        first_line = next((line for line in decoded.splitlines() if line.strip()), '')
-        if ',' in first_line and len(first_line.split(',')) > 1:
-            return '.csv'
-        return '.txt'
-    return '.bin'
-
-
-def _write_response_artifact(
-    download_dir: Path,
-    window: ExportWindow,
-    response,
-) -> ExportArtifact:
-    try:
-        body = response.body()
-    except Exception:
-        body = b''
-    metadata = _response_metadata(response, body)
-    suffix = _response_suffix(metadata, body)
-    body_path = download_dir / f'{window.window_id}.export-response{suffix}'
-    body_path.write_bytes(body)
-    metadata['body_path'] = str(body_path)
-    metadata['kind'] = 'response'
-    metadata_path = download_dir / f'{window.window_id}.export-response.meta.json'
-    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + '\n', encoding='utf-8')
-    return ExportArtifact(kind='response', path=body_path, metadata_path=metadata_path, metadata=metadata)
-
-
 def _export_artifact_is_tabular(artifact: ExportArtifact) -> bool:
     return artifact.path.suffix.lower() in {'.csv', '.xlsx', '.xlsm', '.xls', '.parquet', '.pq'}
 
@@ -1669,10 +1592,6 @@ def _export_artifact_error_message(
 
 def _manifest_path(workspace: ProjectPaths) -> Path:
     return workspace.cloud_raw / 'tandem_export_manifest.csv'
-
-
-def _page_map_path(workspace: ProjectPaths) -> Path:
-    return workspace.cloud_archive / 'tandem_page_map.json'
 
 
 def _load_existing_manifest(path: Path) -> pd.DataFrame:
@@ -1709,7 +1628,6 @@ def _write_report(report_path: Path, workspace: ProjectPaths, records: Sequence[
         f'- runtime_root: {workspace.runtime}',
         f'- runtime_output: {workspace.reports}',
         f'- cloud_raw: {workspace.cloud_raw}',
-        f'- cloud_output: {workspace.cloud_output}',
         f'- windows_collected: {len(records)}',
         '',
         '## Windows',

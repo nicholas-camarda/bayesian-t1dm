@@ -16,9 +16,7 @@ def _fake_merged(preparation):
     grid = pd.DataFrame(columns=["timestamp", "glucose", "carb_grams", "bolus_units"])
     return SimpleNamespace(preparation=preparation, data_quality=DataQualitySummary(status="degraded", contributing_window_ids=[], incomplete_window_count=2, reason_counts={}, evaluation_touches_incomplete_windows=False), grid=grid, mode_events=pd.DataFrame(), data=SimpleNamespace(nutrition=pd.DataFrame(), workouts=pd.DataFrame()))
 from bayesian_t1dm.acquisition import ExportWindow, NormalizedWindowResult
-from bayesian_t1dm.health_auto_export import ModelDataPreparationResult
 from bayesian_t1dm.quality import DataQualitySummary
-from synthetic_dataset import synthetic_base_dataset
 
 
 def _latest_log_dir(runtime_root: Path, command: str) -> Path:
@@ -45,26 +43,6 @@ def _built_raw_tree(tmp_path: Path, workspace_root: Path, fixture_dir: Path) -> 
     shutil.copytree(fixture_dir, raw_root)
     assert main(["--root", str(workspace_root), "build-dataset", "--raw", str(raw_root)]) == 0
     return raw_root
-
-
-def test_validate_raw_command_writes_summary_report(tmp_path):
-    workbook = tmp_path / "therapy_events_2023-02.xlsx"
-    frame = pd.DataFrame(
-        {
-            "eventDateTime": pd.date_range("2023-02-04 09:00:00", periods=4, freq="5min"),
-            "egv_estimatedGlucoseValue": [100, 101, 102, 103],
-        }
-    )
-    with pd.ExcelWriter(workbook) as writer:
-        frame.to_excel(writer, index=False)
-
-    report = tmp_path / "validation.md"
-    exit_code = main(["--root", str(tmp_path), "validate-raw", "--raw", str(tmp_path), "--report", str(report)])
-
-    assert exit_code == 0
-    text = report.read_text(encoding="utf-8")
-    assert "dense_cgm_files: 1" in text
-    assert "therapy_events_2023-02.xlsx" in text
 
 
 class _FakeApiClient:
@@ -235,25 +213,6 @@ def test_backfill_command_continues_on_partial_window(tmp_path, monkeypatch):
     assert (client.workspace.output_source / "tandem_acquisition_summary.md").exists()
 
 
-def test_ingest_command_defaults_report_to_runtime_output(tmp_path, tandem_fixture_dir, monkeypatch):
-    workspace_root = tmp_path / "repo"
-    workspace_root.mkdir()
-    cloud_root = tmp_path / "cloud"
-    runtime_root = tmp_path / "runtime"
-    monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(cloud_root))
-    monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
-
-    raw_root = _built_raw_tree(tmp_path, workspace_root, tandem_fixture_dir)
-    exit_code = main(["--root", str(workspace_root), "ingest", "--raw", str(raw_root)])
-
-    assert exit_code == 0
-    assert (runtime_root / "output" / "source" / "coverage.md").exists()
-    assert (runtime_root / "output" / "source" / "coverage_review.html").exists()
-    assert (cloud_root / "data" / "raw" / "tandem_export_manifest.csv").exists()
-    coverage_text = (runtime_root / "output" / "source" / "coverage.md").read_text(encoding="utf-8")
-    assert "[coverage_review_html](coverage_review.html)" in coverage_text
-
-
 def test_normalize_raw_command_rebuilds_archived_window(tmp_path, monkeypatch):
     workspace_root = tmp_path / "repo"
     workspace_root.mkdir()
@@ -295,10 +254,9 @@ def test_build_dataset_without_apple_writes_tandem_only_dataset_and_skips_unchan
     merged = cloud_root / "data" / "merged"
     prepared = pd.read_parquet(merged / "prepared_model_data_5min.parquet")
     assert "health_activity_value" not in prepared.columns
-    text = (runtime_root / "output" / "prepare" / "model_data_preparation.md").read_text(encoding="utf-8")
-    assert "- mode: tandem_only" in text
-    assert "- apple_available: False" in text
     manifest = json.loads((merged / "dataset.json").read_text(encoding="utf-8"))
+    assert manifest["dataset"]["mode"] == "tandem_only"
+    assert manifest["dataset"]["apple_available"] is False
     built_at = manifest["built_at"]
     run_dir = _latest_log_dir(runtime_root, "build-dataset")
     events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
@@ -319,279 +277,46 @@ def test_build_dataset_without_apple_writes_tandem_only_dataset_and_skips_unchan
     else:
         raise AssertionError("expected a stale-dataset error after adding a raw file")
 
-def test_validate_latent_meal_command_writes_artifacts(tmp_path, capsys):
-    workspace_root = tmp_path / "repo"
-    workspace_root.mkdir()
-    report_dir = tmp_path / "latent_validation"
-
-    exit_code = main(
-        [
-            "--root",
-            str(workspace_root),
-            "validate-latent-meal",
-            "--report-dir",
-            str(report_dir),
-            "--meals",
-            "25",
-        ]
-    )
-
-    assert exit_code == 0
-    assert "pass" in capsys.readouterr().out
-    report = (report_dir / "latent_meal_truth_recovery.md").read_text(encoding="utf-8")
-    assert "everything_at_once" in report
-    assert (report_dir / "latent_meal_truth_recovery_summary.csv").exists()
-    assert (report_dir / "latent_meal_truth_recovery_meals.csv").exists()
-
-
-def test_research_latent_meal_icr_command_writes_artifacts_and_review(tmp_path, monkeypatch):
-    workspace_root = tmp_path / "repo"
-    workspace_root.mkdir()
-    dataset = synthetic_base_dataset(apple=True, explicit_carbs=True)
-    preparation = ModelDataPreparationResult(
-        dataset=dataset,
-        apple_available=True,
-        apple_span_start=pd.Timestamp("2025-01-01 00:00:00"),
-        apple_span_end=pd.Timestamp("2025-01-07 23:55:00"),
-        tandem_span_before_start=pd.Timestamp("2025-01-01 00:00:00"),
-        tandem_span_before_end=pd.Timestamp("2025-01-07 23:55:00"),
-        tandem_span_after_start=pd.Timestamp("2025-01-01 00:00:00"),
-        tandem_span_after_end=pd.Timestamp("2025-01-07 23:55:00"),
-        requested_tandem_start=pd.Timestamp("2025-01-01 00:00:00"),
-        requested_tandem_end=pd.Timestamp("2025-01-07 23:55:00"),
-        overlap_start=pd.Timestamp("2025-01-01 00:00:00"),
-        overlap_end=pd.Timestamp("2025-01-07 23:55:00"),
-        final_dataset_start=pd.Timestamp("2025-01-01 00:00:00"),
-        final_dataset_end=pd.Timestamp("2025-01-07 23:55:00"),
-        final_row_count=len(dataset.frame),
-    )
-    monkeypatch.setattr(cli, "_load_dataset", lambda args, session=None: _fake_merged(preparation))
-
-    report_dir = tmp_path / "latent_meal"
-    review_html = report_dir / "latent_meal_review.html"
-    exit_code = main(
-        [
-            "--root",
-            str(workspace_root),
-            "research-latent-meal-icr",
-            "--report-dir",
-            str(report_dir),
-            "--review-html",
-            str(review_html),
-        ]
-    )
-
-    assert exit_code == 0
-    assert (report_dir / "latent_meal_research_gate.md").exists()
-    assert (report_dir / "meal_truth_semantics_report.md").exists()
-    assert (report_dir / "meal_event_registry.csv").exists()
-    assert (report_dir / "first_meal_clean_window_registry.csv").exists()
-    assert (report_dir / "first_meal_clean_window_audit.md").exists()
-    assert (report_dir / "first_meal_exclusion_summary.csv").exists()
-    assert review_html.exists()
-
-
-def test_research_latent_meal_icr_full_scope_writes_outputs(tmp_path, monkeypatch):
-    workspace_root = tmp_path / "repo"
-    workspace_root.mkdir()
-    report_dir = tmp_path / "latent_meal_full"
-    review_html = report_dir / "latent_meal_review.html"
-    raw_root = tmp_path / "raw"
-    metadata_dir = raw_root / "tconnectsync" / "2026-03-02__2026-03-31" / "raw"
-    metadata_dir.mkdir(parents=True)
-    (metadata_dir / "pump_event_metadata.json").write_text(
-        json.dumps(
-            {
-                "requested_end": "2026-03-31",
-                "selected_pump": {
-                    "lastUpload": {
-                        "lastUploadedAt": "2026-04-01T02:15:16.6",
-                        "settings": {
-                            "profiles": {
-                                "activeIdp": 0,
-                                "profile": [
-                                    {
-                                        "idp": 0,
-                                        "name": "Main",
-                                        "insulinDuration": 300,
-                                        "maxBolus": 25000,
-                                        "tDependentSegs": [
-                                            {"startTime": 0, "carbRatio": 7000, "isf": 60, "targetBg": 110},
-                                            {"startTime": 900, "carbRatio": 6800, "isf": 60, "targetBg": 110},
-                                        ],
-                                    }
-                                ],
-                            },
-                            "pumpSettings": {"maxBolus": 25000},
-                        },
-                    }
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    dataset = synthetic_base_dataset(apple=True, explicit_carbs=True)
-    preparation = ModelDataPreparationResult(
-        dataset=dataset,
-        apple_available=True,
-        apple_span_start=pd.Timestamp("2025-01-01 00:00:00"),
-        apple_span_end=pd.Timestamp("2025-01-07 23:55:00"),
-        tandem_span_before_start=pd.Timestamp("2025-01-01 00:00:00"),
-        tandem_span_before_end=pd.Timestamp("2025-01-07 23:55:00"),
-        tandem_span_after_start=pd.Timestamp("2025-01-01 00:00:00"),
-        tandem_span_after_end=pd.Timestamp("2025-01-07 23:55:00"),
-        requested_tandem_start=pd.Timestamp("2025-01-01 00:00:00"),
-        requested_tandem_end=pd.Timestamp("2025-01-07 23:55:00"),
-        overlap_start=pd.Timestamp("2025-01-01 00:00:00"),
-        overlap_end=pd.Timestamp("2025-01-07 23:55:00"),
-        final_dataset_start=pd.Timestamp("2025-01-01 00:00:00"),
-        final_dataset_end=pd.Timestamp("2025-01-07 23:55:00"),
-        final_row_count=len(dataset.frame),
-    )
-    monkeypatch.setattr(cli, "_load_dataset", lambda args, session=None: _fake_merged(preparation))
-
-    exit_code = main(
-        [
-            "--root",
-            str(workspace_root),
-            "research-latent-meal-icr",
-            "--raw",
-            str(raw_root),
-            "--research-scope",
-            "full",
-            "--report-dir",
-            str(report_dir),
-            "--review-html",
-            str(review_html),
-        ]
-    )
-
-    assert exit_code == 0
-    assert (report_dir / "latent_meal_research_gate.md").exists()
-    assert (report_dir / "meal_event_registry.csv").exists()
-    assert (report_dir / "meal_window_audit.md").exists()
-    assert (report_dir / "latent_meal_window_audit.csv").exists()
-    assert (report_dir / "latent_carb_estimator_report.md").exists()
-    assert (report_dir / "latent_carb_estimates.csv").exists()
-    assert (report_dir / "latent_meal_fit_summary.md").exists()
-    assert (report_dir / "latent_meal_posterior_meals.csv").exists()
-    assert (report_dir / "latent_meal_confidence_report.md").exists()
-    assert (report_dir / "latent_meal_model_comparison.md").exists()
-    cache_dir = cli.ProjectPaths.from_root(workspace_root).cache_latent_meal
-    assert (cache_dir / "latent_carb_estimates.csv").exists()
-    assert (cache_dir / "therapy_settings_used.json").exists()
-    assert (cache_dir / "latent_carb_posterior_samples.parquet").exists()
-    assert review_html.exists()
-
-
-def test_build_latent_meal_fixture_command_writes_fixture_bundle(tmp_path):
-    workspace_root = tmp_path / "repo"
-    workspace_root.mkdir()
-    prepared_csv = tmp_path / "prepared_model_data_5min.csv"
-    output_dir = tmp_path / "latent_meal_fixture"
-    review_html = output_dir / "latent_meal_review.html"
-    dataset = synthetic_base_dataset(apple=True, explicit_carbs=True)
-    dataset.frame.to_csv(prepared_csv, index=False)
-
-    exit_code = main(
-        [
-            "--root",
-            str(workspace_root),
-            "build-latent-meal-fixture",
-            "--prepared-csv",
-            str(prepared_csv),
-            "--output-dir",
-            str(output_dir),
-            "--review-html",
-            str(review_html),
-            "--background-days",
-            "2",
-        ]
-    )
-
-    assert exit_code == 0
-    assert (output_dir / "prepared_model_data_5min.csv").exists()
-    assert (output_dir / "latent_meal_fixture_summary.md").exists()
-    assert (output_dir / "latent_meal_fixture_day_manifest.csv").exists()
-    assert (output_dir / "latent_meal_research_gate.md").exists()
-    assert (output_dir / "meal_truth_semantics_report.md").exists()
-    assert (output_dir / "first_meal_clean_window_registry.csv").exists()
-    assert review_html.exists()
-
-
-def test_status_command_reports_source_quality_and_writes_cache_artifacts(tmp_path, monkeypatch):
-    workspace_root = tmp_path / "repo"
-    workspace_root.mkdir()
-    cloud_root = tmp_path / "cloud"
-    runtime_root = tmp_path / "runtime"
-    monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(cloud_root))
-    monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
-
-    dataset = synthetic_base_dataset(apple=True, explicit_carbs=True)
-    preparation = ModelDataPreparationResult(
-        dataset=dataset,
-        apple_available=True,
-        apple_span_start=pd.Timestamp("2025-01-01 00:00:00"),
-        apple_span_end=pd.Timestamp("2025-01-07 23:55:00"),
-        tandem_span_before_start=pd.Timestamp("2025-01-01 00:00:00"),
-        tandem_span_before_end=pd.Timestamp("2025-01-07 23:55:00"),
-        tandem_span_after_start=pd.Timestamp("2025-01-01 00:00:00"),
-        tandem_span_after_end=pd.Timestamp("2025-01-07 23:55:00"),
-        requested_tandem_start=pd.Timestamp("2025-01-01 00:00:00"),
-        requested_tandem_end=pd.Timestamp("2025-01-07 23:55:00"),
-        overlap_start=pd.Timestamp("2025-01-01 00:00:00"),
-        overlap_end=pd.Timestamp("2025-01-07 23:55:00"),
-        final_dataset_start=pd.Timestamp("2025-01-01 00:00:00"),
-        final_dataset_end=pd.Timestamp("2025-01-07 23:55:00"),
-        final_row_count=len(dataset.frame),
-    )
-    monkeypatch.setattr(cli, "_load_dataset", lambda args, session=None: _fake_merged(preparation))
-    output_root = runtime_root / "output"
-    output_root.mkdir(parents=True, exist_ok=True)
-    (output_root / "old_artifact.md").write_text("old", encoding="utf-8")
-
-    exit_code = main(
-        [
-            "--root",
-            str(workspace_root),
-            "status",
-        ]
-    )
-
-    assert exit_code == 0
-    current_payload = json.loads((runtime_root / "cache" / "status" / "current_status.json").read_text(encoding="utf-8"))
-    assert current_payload["overall_state"] == "blocked"
-    assert [item["code"] for item in current_payload["primary_blockers"]] == ["degraded_source_quality"]
-    assert "therapy" not in current_payload
-    assert (output_root / "current_status.html").exists()
-    assert not (output_root / "old_artifact.md").exists()
-    assert _latest_log_dir(runtime_root, "status").joinpath("events.jsonl").exists()
-
-
-def test_ingest_failure_is_logged(tmp_path, tandem_fixture_dir, monkeypatch):
+def test_a_failing_command_is_logged(tmp_path, tandem_fixture_dir, monkeypatch):
     workspace_root = tmp_path / "repo"
     workspace_root.mkdir()
     runtime_root = tmp_path / "runtime"
     monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(tmp_path / "cloud"))
     monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(runtime_root))
-    monkeypatch.setattr(cli, "load_merged_dataset", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(cli, "build_merged_dataset", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
 
     try:
-        main(
-            [
-                "--root",
-                str(workspace_root),
-                "ingest",
-                "--raw",
-                str(tandem_fixture_dir),
-            ]
-        )
+        main(["--root", str(workspace_root), "build-dataset", "--raw", str(tandem_fixture_dir)])
     except RuntimeError as exc:
         assert str(exc) == "boom"
     else:
-        raise AssertionError("expected ingest to fail")
+        raise AssertionError("expected build-dataset to fail")
 
-    run_dir = _latest_log_dir(runtime_root, "ingest")
+    run_dir = _latest_log_dir(runtime_root, "build-dataset")
     events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
     assert any(event["event"] == "command.error" and event["fields"]["error_type"] == "RuntimeError" for event in events)
     assert any(event["event"] == "command.complete" and event["status"] == "failed" for event in events)
+
+
+def test_refresh_runs_collect_build_and_readout_in_order_and_stops_at_a_failure(tmp_path, monkeypatch):
+    from bayesian_t1dm import readout_report
+
+    monkeypatch.setenv("BAYESIAN_T1DM_CLOUD_ROOT", str(tmp_path / "cloud"))
+    monkeypatch.setenv("BAYESIAN_T1DM_RUNTIME_ROOT", str(tmp_path / "runtime"))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "_collect_or_backfill", lambda args, *rest: calls.append(args.command) or 0)
+    monkeypatch.setattr(cli, "build_merged_dataset", lambda *args, **kwargs: calls.append("build-dataset"))
+    monkeypatch.setattr(readout_report, "run", lambda *args, **kwargs: calls.append("readout") or 0)
+    assert main(["--root", str(repo), "refresh"]) == 0
+    assert calls == ["collect", "build-dataset", "readout"]
+
+    calls.clear()
+    assert main(["--root", str(repo), "refresh", "--no-collect"]) == 0
+    assert calls == ["build-dataset", "readout"]
+
+    calls.clear()
+    monkeypatch.setattr(cli, "_collect_or_backfill", lambda args, *rest: calls.append(args.command) or 3)
+    assert main(["--root", str(repo), "refresh"]) == 3
+    assert calls == ["collect"], "a failed download stops the refresh before the dataset is rebuilt"
