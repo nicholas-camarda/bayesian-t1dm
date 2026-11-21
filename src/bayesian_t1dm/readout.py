@@ -155,10 +155,8 @@ def daily_table(analysis) -> DayTable:
     days["recovery_score"] = recovery_score(days["resting_hr_z"], days["hrv_z"])
 
     workouts = merged.data.workouts
-    energy = workouts.groupby(workouts["start_timestamp"].dt.normalize())["active_energy_value"].sum()
     minutes = workouts.groupby(workouts["start_timestamp"].dt.normalize())["duration_seconds"].sum() / 60.0
-    watched_from = workouts["start_timestamp"].min().normalize()
-    energy = energy.reindex(full).fillna(0.0).where(full >= watched_from)
+    energy = workout_energy_by_day(workouts, measurements, full)
     days["workout_kcal"] = energy.reindex(days.index)
     days["workout_minutes"] = minutes.reindex(days.index).fillna(0.0).where(days["workout_kcal"].notna())
     for column, lag in (("workout_1d", 1), ("workout_2d", 2)):
@@ -171,9 +169,27 @@ def daily_table(analysis) -> DayTable:
 
     days["excluded_day"] = days.index.isin(pd.DatetimeIndex(analysis.excluded_days))
     days["weekend"] = days.index.dayofweek >= 5
-    days["insulin_vs_usual_pct"] = 100.0 * (days["insulin_units"] / days["insulin_units"].shift(1).rolling(BASELINE_DAYS, min_periods=BASELINE_MIN_DAYS).median() - 1.0)
-    days["carbs_vs_usual_pct"] = 100.0 * (days["carb_grams"] / days["carb_grams"].shift(1).rolling(BASELINE_DAYS, min_periods=BASELINE_MIN_DAYS).median() - 1.0)
+    days["insulin_vs_usual_pct"] = versus_usual(days["insulin_units"])
+    days["carbs_vs_usual_pct"] = versus_usual(days["carb_grams"])
     return DayTable(days=days, site_observed_from=observed_from)
+
+
+def workout_energy_by_day(workouts: pd.DataFrame, measurements: pd.DataFrame, dates: pd.DatetimeIndex) -> pd.Series:
+    """Workout active energy per day; 0 on a day a wearable recorded no workout, NaN when nothing was recording.
+
+    A day counts as measured when it has a workout or any heart-rate reading (a ring or watch was worn), from the first
+    workout in the record on. Without this, days the wearable was off would count as rest days.
+    """
+    energy = workouts.groupby(workouts["start_timestamp"].dt.normalize())["active_energy_value"].sum().reindex(dates)
+    worn = dates.isin(pd.DatetimeIndex(measurements.loc[measurements["metric"].eq("heart_rate"), "timestamp"].dt.normalize().unique()))
+    started = dates >= workouts["start_timestamp"].min().normalize()
+    return energy.fillna(0.0).where(started & (worn | energy.notna()))
+
+
+def versus_usual(values: pd.Series) -> pd.Series:
+    """Percent above or below the median of the previous 28 days; NaN when that median is missing or zero."""
+    usual = values.shift(1).rolling(BASELINE_DAYS, min_periods=BASELINE_MIN_DAYS).median().replace(0.0, np.nan)
+    return 100.0 * (values / usual - 1.0)
 
 
 def recovery_score(resting_hr_z: pd.Series, hrv_z: pd.Series) -> pd.Series:

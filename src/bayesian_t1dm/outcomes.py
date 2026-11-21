@@ -26,6 +26,7 @@ TARGET_HIGH = 180.0
 VERY_LOW = 54.0
 VERY_HIGH = 250.0
 # Consensus targets: time in range above 70%, below 70 under 4%, below 54 under 1%.
+TIME_IN_RANGE_TARGET_PERCENT = 70.0
 LOW_LIMIT_PERCENT = 4.0
 VERY_LOW_LIMIT_PERCENT = 1.0
 

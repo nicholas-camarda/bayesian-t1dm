@@ -116,6 +116,7 @@ UNKNOWN_SETTINGS_COLOR = _NOT_PUMP[0]
 READOUT_STYLE = {
     "glucose": GroupStyle("Glucose", NEUTRAL_LINE, "", "-"),
     "range": GroupStyle("Target range 70-180 mg/dL", "#20854E", "", "-"),
+    "below_target": GroupStyle("Day below the 70% time-in-range target", JCO[8], "", "-"),
     "sleep": GroupStyle("Sleep", JCO[4], "", "-"),
     "workout": GroupStyle("Workout", JCO[1], "", "-"),
     "carbs": GroupStyle("Carbs entered", JCO[3], "^", ""),

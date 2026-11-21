@@ -9,7 +9,7 @@ import pytest
 from bayesian_t1dm import readout as ro
 from bayesian_t1dm import readout_model as rm
 from bayesian_t1dm import readout_settings as rs
-from bayesian_t1dm.readout_page import Readout, render
+from bayesian_t1dm.readout_page import Readout, render, rings
 
 
 def test_baseline_z_is_per_device_and_uses_only_earlier_days() -> None:
@@ -100,7 +100,7 @@ def test_suggestions_move_insulin_the_right_way_and_respect_low_limits() -> None
     status, text = rs.suggestion_for("I:C", 6.0, "needs less insulin", -0.12, lows_ok=True)
     assert "6.6" in text and "less" in text
     status, text = rs.suggestion_for("basal", 0.7, "needs more insulin", 0.43, lows_ok=False)
-    assert status == "fits" and text.startswith("held")
+    assert status == rs.HELD
 
 
 def test_icr_status_compares_the_setting_with_the_effective_range() -> None:
@@ -145,3 +145,41 @@ def test_page_renders_every_section_at_phone_width() -> None:
         assert f"<h2>{heading}</h2>" in html
     assert "nan" not in html.lower().replace("nanos", "")
     assert "viewBox='0 0 340" in html, "charts are drawn at phone width"
+
+
+def test_drivers_model_stops_with_a_clear_message_when_no_driver_is_estimable() -> None:
+    days = synthetic_days(60)
+    for column in ro.DRIVER_COLUMNS:
+        days[column] = False
+    with pytest.raises(ValueError, match="needs a longer record"):
+        rm.fit_outcome(days, "time_in_range", draws=50, tune=50, chains=1)
+
+
+def test_held_suggestion_has_its_own_status() -> None:
+    status, text = rs.suggestion_for("basal", 0.7, "needs more insulin", 0.43, lows_ok=False)
+    assert status == rs.HELD and status in rs.STATUSES
+    assert "no added insulin" in text
+
+
+def test_usual_comparison_is_missing_not_infinite_when_the_baseline_is_zero() -> None:
+    dates = pd.date_range("2025-01-01", periods=21, freq="D")
+    assert np.isnan(ro.versus_usual(pd.Series([0.0] * 20 + [90.0], index=dates)).iloc[-1])
+    assert ro.versus_usual(pd.Series([40.0] * 20 + [44.0], index=dates)).iloc[-1] == pytest.approx(10.0)
+
+
+def test_days_without_a_worn_wearable_have_unknown_workout_status() -> None:
+    dates = pd.date_range("2025-01-01", periods=4, freq="D")
+    workouts = pd.DataFrame({"start_timestamp": pd.to_datetime(["2025-01-01 07:00"]), "active_energy_value": [300.0]})
+    measurements = pd.DataFrame({"timestamp": pd.to_datetime(["2025-01-02 10:00", "2025-01-04 10:00"]), "metric": ["heart_rate", "heart_rate"]})
+    energy = ro.workout_energy_by_day(workouts, measurements, dates)
+    assert energy.iloc[0] == 300.0
+    assert energy.iloc[1] == 0.0, "worn, no workout: a rest day"
+    assert np.isnan(energy.iloc[2]), "nothing recording: unknown, not a rest day"
+
+
+def test_time_in_range_ring_changes_color_below_the_target() -> None:
+    from bayesian_t1dm.figures import READOUT_STYLE
+
+    day = pd.Series({"time_in_range_pct": 38.0, "time_below_70_pct": 0.0, "insulin_vs_usual_pct": 2.0})
+    assert READOUT_STYLE["below_target"].color in rings(day, None)
+    assert READOUT_STYLE["range"].color in rings(pd.Series({**day.to_dict(), "time_in_range_pct": 80.0}), None)

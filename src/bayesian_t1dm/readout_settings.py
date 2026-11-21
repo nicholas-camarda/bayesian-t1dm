@@ -6,7 +6,8 @@ Both pieces of evidence are reused as they are:
 - I:C: the effective I:C from clean first meals (:func:`therapy_research.run_latent_meal_icr_research`, summarised by
   :func:`proposals.segment_summary`), compared with the ratio the segment holds now.
 
-Each becomes one of four statuses: fits, needs more insulin, needs less insulin, not enough data. A suggestion is one
+Each becomes one of five statuses: fits, needs more insulin, needs less insulin, held (more insulin indicated but lows
+are over a limit), not enough data. A suggestion is one
 step of 10% or 20%, the step nearer the size of the gap. Nothing that adds insulin is suggested in a segment whose lows
 are over a consensus limit over the last 90 days. Control-IQ adjusts basal throughout, so both are observational and
 are for discussion with the endocrinologist.
@@ -28,7 +29,8 @@ from .therapy_research import (
     run_latent_meal_icr_research,
 )
 
-STATUSES = ("fits", "needs more insulin", "needs less insulin", "not enough data")
+HELD = "held: lows over a limit"
+STATUSES = ("fits", "needs more insulin", "needs less insulin", HELD, "not enough data")
 STEPS = (0.10, 0.20)
 MEAL_SEGMENTS = ("morning", "afternoon", "evening")  # first meals of the day counted as I:C evidence (as the proposal does)
 CHANGES_LOOKBACK_DAYS = 90
@@ -85,7 +87,7 @@ def suggestion_for(setting: str, now: float, status: str, gap: float, *, lows_ok
         return status, ""
     more = status == "needs more insulin"
     if more and not lows_ok:
-        return "fits", "held: lows in these hours are over a consensus limit, so no added insulin"
+        return HELD, "the evidence points to more insulin, but lows in these hours over the last 90 days are over a consensus limit, so no added insulin is suggested"
     step = step_for(gap)
     factor = (1 + step) if (setting == "basal") == more else (1 - step)
     unit, digits = ("U/h", 2) if setting == "basal" else ("g/U", 1)

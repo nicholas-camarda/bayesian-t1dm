@@ -55,6 +55,8 @@ def fit_outcome(days: pd.DataFrame, outcome: str, *, draws: int = DRAWS, tune: i
 
     count_column, _ = OUTCOMES[outcome]
     drivers, counts = estimable_drivers(days)
+    if not drivers:
+        raise ValueError(f"No driver has {MIN_DAYS_EACH_SIDE} modelled days with it and {MIN_DAYS_EACH_SIDE} without ({len(days)} days); the drivers model needs a longer record.")
     x = days[drivers].astype(float).to_numpy()
     weekend = days["weekend"].astype(float).to_numpy()
     month_codes, months = pd.factorize(days.index.to_period("M"), sort=True)

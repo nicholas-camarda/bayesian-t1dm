@@ -14,14 +14,16 @@ import numpy as np
 import pandas as pd
 
 from .figures import READOUT_STYLE
-from .readout import DRIVER_COLUMNS, DRIVER_LABELS, DRIVERS
+from .outcomes import TIME_IN_RANGE_TARGET_PERCENT
+from .readout import DRIVER_COLUMNS, DRIVER_LABELS, DRIVERS, LATE_MEAL_MINUTE
+from .readout_settings import HELD
 from .readout_model import reading
 from .report_page import CSS, _text, esc, fmt
 
 TRACE_DAYS = 7
 TRACE_LOW, TRACE_HIGH = 40.0, 350.0
 CHART_WIDTH = 340  # drawn at phone width so text stays readable at its true size
-STATUS_CLASS = {"fits": "good", "needs more insulin": "warn", "needs less insulin": "warn", "not enough data": "info"}
+STATUS_CLASS = {"fits": "good", "needs more insulin": "warn", "needs less insulin": "warn", HELD: "warn", "not enough data": "info"}
 EXTRA_CSS = """
 main { max-width: 640px; }
 .rings { display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 8px; text-align:center; }
@@ -113,7 +115,7 @@ def why_today(day: pd.Series, yesterday: pd.Series | None, effects: pd.DataFrame
         else:
             add("No workout in the last two days", "", None, False)
     if day.get("late_meal"):
-        add("Late meal last night", "carbs entered at or after 21:00", "late_meal", True)
+        add("Late meal last night", f"carbs entered at or after {LATE_MEAL_MINUTE // 60:02d}:{LATE_MEAL_MINUTE % 60:02d}", "late_meal", True)
     if pd.notna(day.get("site_age_days")):
         add(f"Infusion site day {int(day['site_age_days']) + 1}", "", "old_site", bool(day.get("old_site")))
     if pd.notna(day.get("insulin_vs_usual_pct")):
@@ -122,14 +124,16 @@ def why_today(day: pd.Series, yesterday: pd.Series | None, effects: pd.DataFrame
     return f"<ul class='why'>{''.join(items)}</ul>"
 
 
-def rings(day: pd.Series) -> str:
+def rings(day: pd.Series, yesterday: pd.Series | None) -> str:
+    """Time in range and insulin for the day; recovery for the day before, the same day the low-recovery driver reads."""
     tir = day["time_in_range_pct"]
     insulin = day.get("insulin_vs_usual_pct", np.nan)
-    recovery = day.get("recovery_score", np.nan)
+    recovery = yesterday.get("recovery_score", np.nan) if yesterday is not None else np.nan
+    tir_color = READOUT_STYLE["range"].color if tir >= TIME_IN_RANGE_TARGET_PERCENT else READOUT_STYLE["below_target"].color
     return "<div class='rings'>" + "".join([
-        _ring(f"{tir:.0f}%", tir / 100, "Time in range", f"below 70: {day['time_below_70_pct']:.1f}%", READOUT_STYLE["range"].color),
+        _ring(f"{tir:.0f}%", tir / 100, "Time in range", f"below 70: {day['time_below_70_pct']:.1f}%", tir_color),
         _ring("n/a" if pd.isna(insulin) else f"{insulin:+.0f}%", abs(insulin) / 50 if pd.notna(insulin) else 0.0, "Insulin vs usual", "against the previous 28 days", READOUT_STYLE["workout"].color),
-        _ring("n/a" if pd.isna(recovery) else f"{recovery:.0f}", recovery / 100 if pd.notna(recovery) else 0.0, "Recovery", "50 is a usual night", READOUT_STYLE["sleep"].color),
+        _ring("n/a" if pd.isna(recovery) else f"{recovery:.0f}", recovery / 100 if pd.notna(recovery) else 0.0, "Recovery yesterday", "50 is a usual day", READOUT_STYLE["sleep"].color),
     ]) + "</div>"
 
 
@@ -268,6 +272,8 @@ def legend() -> str:
 def render(readout: Readout) -> str:
     days = readout.days
     today = days.loc[readout.as_of]
+    previous = readout.as_of - pd.Timedelta(days=1)
+    yesterday = days.loc[previous] if previous in days.index else None
     week = days.loc[readout.as_of - pd.Timedelta(days=TRACE_DAYS - 1): readout.as_of]
     week = week[week["counted"]]
     week_tir = 100 * week["in_range_readings"].sum() / week["readings"].sum()
@@ -279,7 +285,7 @@ def render(readout: Readout) -> str:
     usable = all(readout.usable.values())
     body = [
         f"<p class='sub'>{readout.as_of:%A %d %B %Y} &middot; the latest full day of data</p>",
-        f"<div class='card'>{rings(today)}{why_today(today, days.loc[readout.as_of - pd.Timedelta(days=1)] if readout.as_of - pd.Timedelta(days=1) in days.index else None, tir_effects)}</div>",
+        f"<div class='card'>{rings(today, yesterday)}{why_today(today, yesterday, tir_effects)}</div>",
         "<h2>This week</h2>",
         f"<div class='card'><div class='big'>{week_tir:.0f}% in range</div><p class='muted'>{len(week)} full days ending {readout.as_of:%d %b}; below 70: {week_low:.1f}%. "
         f"Your usual week: {median:.0f}% (most weeks {lo:.0f}% to {hi:.0f}%, the middle 80% of 7-day stretches in the 90 days before).</p>"
@@ -290,7 +296,7 @@ def render(readout: Readout) -> str:
         + effects_chart(tir_effects, unit_label="time in range, percentage points of the day")
         + "<p class='muted'>Time below 70 on the same days:</p>"
         + effects_chart(readout.effects["time_below_70"], unit_label="time below 70, percentage points of the day")
-        + f"<p class='caption'>From {readout.model_days} days with every driver measured. These are patterns in your own record, not proof of cause.{'' if usable else ' The model fit did not pass its sampler checks; treat these as unreliable.'}</p>"
+        + f"<p class='caption'>From {readout.model_days} days with every driver measured.{'' if usable else ' The model fit did not pass its sampler checks; treat these as unreliable.'}</p>"
         + f"<details><summary>What each driver means</summary><ul>{definitions}</ul></details></div>",
         "<h2>Settings check</h2>",
         "<div class='card'><p class='muted'>Basal: what Control-IQ delivered against the programmed rate in hours without meals, boluses or exercise. "
